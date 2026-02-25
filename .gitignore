@@ -1,0 +1,74 @@
+# Build directories
+src/build/
+src/output/
+build/
+output/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!subjects.cmake
+!src/thirdparts/**/*.cmake
+
+# Compiled Object files
+*.o
+*.obj
+*.lo
+*.slo
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.a
+*.lib
+*.la
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Core dumps
+core
+core.*
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Package managers
+*.tar.gz
+*.zip
+
+# Claude Code
+.claude/

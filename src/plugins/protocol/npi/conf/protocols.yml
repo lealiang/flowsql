@@ -1,0 +1,785 @@
+# [1,256)        -- Layer
+# [256,512)      -- L2 layer protocol
+# [512,1024)     -- L3 layer protocol
+# (1024,16384)   -- L4 protocol
+# [16384,65536)  -- Private protocol
+# payload.regex     : /regexexpression/regexexpression/flags
+# flags : {
+#  'i':HS_FLAG_CASELESS, 
+#  'm':HS_FLAG_MULTILINE, 
+#  's':HS_FLAG_DOTALL, 
+#  'H':HS_FLAG_SINGLEMATCH, 
+#  'V':HS_FLAG_ALLOWEMPTY, 
+#  '8':HS_FLAG_UTF8, 
+#  'W':HS_FLAG_UCP
+# }
+# payload.enumerate : number:position:width(1-8bytes)
+# 
+# Protocol reference:
+#   https://wiki.wireshark.org/SampleCaptures
+# Hyperscan regex performance reference:
+#   http://intel.github.io/hyperscan/dev-reference/performance.html
+#################################################################################
+################                      Layer                      ################
+Layer:
+  - ETHERNET: 2
+    desc_ch: "以太网"
+    desc_en: "Ethernet"
+  - VLAN: 3
+    desc_ch: "虚拟局域网"
+    desc_en: "Virtual Local Area Network"
+  - PPPoE_Session: 4
+    desc_ch: "以太网上的点对点协议-会话"
+    desc_en: "Point-to-Point Protocol Over Ethernet - Session Stage"
+  - PPP: 5
+    desc_ch: "点对点协议"
+    desc_en: "Point to Point Protocol"
+  - MPLS: 6
+    desc_ch: "多协议标签交换"
+    desc_en: "Multi-Protocol Label Switching"
+  - IPv4: 17
+    desc_ch: "互联网通信协议第四版"
+    desc_en: "Internet Protocol version 4"
+  - IPv6: 18
+    desc_ch: "互联网通信协议第6版"
+    desc_en: "Internet Protocol version 6"
+  - IPv6_EXT_HOPOPTS: 19
+    desc_ch: "Hop-by-hop Options Header for IPv6"
+    desc_en: "Hop-by-hop Options Header for IPv6"
+  - IPv6_EXT_ROUTING: 20
+    desc_ch: "Routing Header for IPv6"
+    desc_en: "Routing Header for IPv6"
+  - IPv6_EXT_FRAGMENT: 21
+    desc_ch: "Fragment Header for IPv6"
+    desc_en: "Fragment Header for IPv6"
+  - IPv6_EXT_ESP: 22
+    desc_ch: "Encapsulating Security Payload Protocol"
+    desc_en: "Encapsulating Security Payload Protocol"
+  - IPv6_EXT_AH: 23
+    desc_ch: "Authentication Header"
+    desc_en: "Authentication Header"
+  - IPv6_EXT_DSTOPTS: 24
+    desc_ch: "Destination Options Header for IPv6"
+    desc_en: "Destination Options Header for IPv6"
+  - GRE: 25
+    desc_ch: "通用路由封装协议"
+    desc_en: "Generic Routing Encapsulation Protocol"
+  - TCP: 33
+    desc_ch: "传输控制协议"
+    desc_en: "Transmission Control Protocol"
+  - UDP: 34
+    desc_ch: "用户数据报协议"
+    desc_en: "User Datagram Protocol"
+  - SCTP: 35
+    desc_ch: "流控制传输协议"
+    desc_en: "Stream Control Transmission Protocol"
+  - DCCP: 36
+    desc_ch: "Datagram Congestion Control Protocol"
+    desc_en: "Datagram Congestion Control Protocol"
+  - VXLAN: 37
+    desc_ch: "虚拟扩展局域网"
+    desc_en: "Virtual eXtensible Local Area Network"
+  - VXLAN_GPE: 38
+    desc_ch: "Generic Protocol Extension for VXLAN"
+    desc_en: "Generic Protocol Extension for VXLAN"
+  - GENEVE: 39
+    desc_ch: "Generic Network Virtualization Encapsulation"
+    desc_en: "Generic Network Virtualization Encapsulation"
+  - L2TP: 40
+    desc_ch: "第二层隧道协议"
+    desc_en: "Layer Two Tunneling Protocol"
+  - GTP: 41
+    desc_ch: "GPRS管道协议-用户面"
+    desc_en: "GPRS Tunneling Protocol - User Plane"
+  - TPKT: 42
+    desc_ch: "应用程数据传输协议"
+    desc_en: "ISO transport services on top of the TCP (TPKT)"
+  - COTP: 43
+    desc_ch: "COTP"
+    desc_en: "Connection Oriented Transport Protocol"
+#################################################################################
+################                     Protocol                    ################
+Protocol:
+###########################
+####    L2 Protocol    ####
+  - ARP: 256
+    desc_ch: "地址解析协议"
+    desc_en: "Address Resolution Protocol"
+    features:
+      - feature:
+        - l2.protocol: 0x0806
+  - RARP: 257
+    desc_ch: "反向地址转换协议"
+    desc_en: "Reverse Address Resolution Protocol"
+    features:
+      - feature:
+        - l2.protocol: 0x8035
+  - PTP: 258
+    desc_ch: "高精度时间同步协议"
+    desc_en: "Precision Time Protocol"
+    features:
+      - feature:
+        - l2.protocol: 0x88F7
+      - feature:
+        - udp.port: [319,320]
+  - PPPOE-Discovery: 259
+    desc_ch: "以太网上的点对点协议-发现"
+    desc_en: "Point-to-Point Protocol Over Ethernet - Discovery Stage"
+    features:
+      - feature:
+        - l2.protocol: 0x8863
+  - GOOSE: 260
+    desc_ch: "通用变电站事件"
+    desc_en: "IEC 61850/GOOSE(Generic Object Oriented Substation Event), defined in the IEC61850 standard."
+    # https://blog.csdn.net/leixj025/article/details/107077716
+    features:
+      - feature:
+        - l2.protocol: 0x88b8
+  - GSSE: 261
+    desc_ch: "通用变电站状态事件"
+    desc_en: "Generic Substation State Event, defined in the IEC61850 standard."
+    # https://wenku.baidu.com/view/e0329991f221dd36a32d7375a417866fb84ac015.html
+    features:
+      - feature:
+        - l2.protocol: 0x88b9
+  - SMV: 262
+    desc_ch: "采样测量值"
+    desc_en: "IEC 61850/SV (Sampled Value Transmission), defined in the IEC61850 standard(IEC61850-9-2)."
+    # https://blog.csdn.net/leixj025/article/details/107077716
+    features:
+      - feature:
+        - l2.protocol: 0x88ba
+  - LLAP: 263
+    desc_ch: "LocalTalk 链路访问协议"
+    desc_en: "LocalTalk Link Access Protocol"
+    features:
+      - feature:
+        - l2.protocol: 0x809b
+  - IPX: 264
+    desc_ch: "互联网分组交换协议"
+    desc_en: "Internetwork Packet Exchange protocol"
+    features:
+      - feature:
+        - l2.protocol: 0x8137
+  ###########################
+  ####    L3 Protocol    ####
+  # https://www.iana.org/assignments/icmp-parameters/icmp-parameters.xhtml
+  - ICMP: 512
+    desc_ch: "互联网控制报文协议"
+    desc_en: "Internet Control Message Protocol"
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "*:0:1"
+  - ICMP-EchoReply: 513
+    desc_ch: "互联网控制报文协议-回送应答"
+    desc_en: "Internet Control Message Protocol - Echo Reply"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "0:0:1"
+  - ICMP-Unreachable: 514
+    desc_ch: "互联网控制报文协议-目标不可达"
+    desc_en: "Internet Control Message Protocol - Destination Unreachable"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "3:0:1"
+  - ICMP-SourceQuench: 515
+    desc_ch: "互联网控制报文协议-原点抑制"
+    desc_en: "Internet Control Message Protocol - Source Quench"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "4:0:1"
+  - ICMP-Redirect: 516
+    desc_ch: "互联网控制报文协议-重定向"
+    desc_en: "Internet Control Message Protocol - Redirect"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "5:0:1"
+  - ICMP-EchoRequest: 517
+    desc_ch: "互联网控制报文协议-回送请求"
+    desc_en: "Internet Control Message Protocol - Echo"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "8:0:1"
+  - ICMP-RouterAdvertisement: 518
+    desc_ch: "互联网控制报文协议-路由器公告"
+    desc_en: "Internet Control Message Protocol - Router Advertisement"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "9:0:1"
+  - ICMP-RouteSelection: 519
+    desc_ch: "互联网控制报文协议-路由器请求"
+    desc_en: "Internet Control Message Protocol - Router Selection"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "10:0:1"
+  - ICMP-TimeExceeded: 520
+    desc_ch: "互联网控制报文协议-超时"
+    desc_en: "Internet Control Message Protocol - Time Exceeded"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "11:0:1"
+  - ICMP-ParameterProblem: 521
+    desc_ch: "互联网控制报文协议-参数问题"
+    desc_en: "Internet Control Message Protocol - Parameter Problem"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "12:0:1"
+  - ICMP-Timestamp: 522
+    desc_ch: "互联网控制报文协议-Timestamp"
+    desc_en: "Internet Control Message Protocol - Timestamp"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "13:0:1"
+  - ICMP-TimestampReply: 523
+    desc_ch: "互联网控制报文协议-Timestamp Reply"
+    desc_en: "Internet Control Message Protocol - Timestamp Reply"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "14:0:1"
+  - ICMP-AddressMaskRequest: 524
+    desc_ch: "互联网控制报文协议-Address Mask Request"
+    desc_en: "Internet Control Message Protocol - Address Mask Request"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "17:0:1"
+  - ICMP-AddressMaskReply: 525
+    desc_ch: "互联网控制报文协议-Address Mask Reply"
+    desc_en: "Internet Control Message Protocol - Address Mask Reply"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "18:0:1"
+  - ICMP-Traceroute: 526
+    desc_ch: "互联网控制报文协议-Traceroute"
+    desc_en: "Internet Control Message Protocol - Traceroute"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "30:0:1"
+  - ICMP-Photuris: 527
+    desc_ch: "互联网控制报文协议-Photuris"
+    desc_en: "Internet Control Message Protocol - Photuris"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "40:0:1"
+  - ICMP-EMP: 528
+    desc_ch: "互联网控制报文协议-ICMP messages utilized by experimental mobility protocols"
+    desc_en: "Internet Control Message Protocol - ICMP messages utilized by experimental mobility protocols"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "41:0:1"
+  - ICMP-ExtendedEchoRequest: 529
+    desc_ch: "互联网控制报文协议-Extended Echo Request"
+    desc_en: "Internet Control Message Protocol - Extended Echo Request"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "42:0:1"
+  - ICMP-ExtendedEchoReply: 530
+    desc_ch: "互联网控制报文协议-Extended Echo Reply"
+    desc_en: "Internet Control Message Protocol - Extended Echo Reply"
+    parents: 512
+    features:
+      - feature:
+        - l3.protocol: 1
+        - l3.payload.enumerate: "43:0:1"
+  # https://www.iana.org/assignments/icmpv6-parameters/icmpv6-parameters.xhtml#icmpv6-parameters-2
+  - ICMPv6: 560
+    desc_ch: "互联网控制报文协议v6-回送应答"
+    desc_en: "Internet Control Message Protocol version 6"
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "*:0:1"
+  - ICMPv6-Unreachable: 561
+    desc_ch: "互联网控制报文协议v6-目标不可达"
+    desc_en: "Internet Control Message Protocol version 6 - Destination Unreachable"
+    parents: 560
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "1:0:1"
+  - ICMPv6-Unreachable: 562
+    desc_ch: "互联网控制报文协议v6-超大数据包"
+    desc_en: "Internet Control Message Protocol version 6 - Packet Too Big"
+    parents: 560
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "2:0:1"
+  - ICMPv6-TimeExceeded: 563
+    desc_ch: "互联网控制报文协议v6-超时"
+    desc_en: "Internet Control Message Protocol version 6 - Time Exceeded"
+    parents: 560
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "3:0:1"
+  - ICMPv6-ParameterProblem: 564
+    desc_ch: "互联网控制报文协议v6-参数问题"
+    desc_en: "Internet Control Message Protocol version 6 - Parameter Problem"
+    parents: 560
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "4:0:1"
+  - ICMPv6-EchoReply: 565
+    desc_ch: "互联网控制报文协议v6-回送应答"
+    desc_en: "Internet Control Message Protocol version 6 - Echo Reply"
+    parents: 560
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "129:0:1"
+  - ICMPv6-EchoRequest: 566
+    desc_ch: "互联网控制报文协议v6-回送请求"
+    desc_en: "Internet Control Message Protocol version 6 - Echo Request"
+    parents: 560
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "128:0:1"
+  - ICMPv6-Solicitation: 567
+    desc_ch: "互联网控制报文协议v6-路由请求"
+    desc_en: "Internet Control Message Protocol version 6 - Router Solicitation"
+    parents: 560
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "133:0:1"
+  - ICMPv6-RouterAdvertisement: 568
+    desc_ch: "互联网控制报文协议v6-路由器公告"
+    desc_en: "Internet Control Message Protocol version 6 - Router Advertisement"
+    parents: 560
+    features:
+      - feature:
+        - l3.protocol: 58
+        - l3.payload.enumerate: "134:0:1"
+  - IGMP: 600
+    desc_ch: "互联网组管理协议"
+    desc_en: "Internet Group Management Protocol"
+    features:
+      - feature:
+        - l3.protocol: 2
+  - GGP: 601
+    desc_ch: "网关到网关协议"
+    desc_en: "Gateway to Gateway Protocol"
+    features:
+      - feature:
+        - l3.protocol: 3
+  - EGP: 602
+    desc_ch: "外部网关协议"
+    desc_en: "Exterior Gateway Protocol"
+    features:
+      - feature:
+        - l3.protocol: 8
+  - IGRP: 603
+    desc_ch: "内部网关路由协议"
+    desc_en: "Interior Gateway Routing Protocol"
+    features:
+      - feature:
+        - l3.protocol: 9
+  - RSVP: 604
+    desc_ch: "资源预留协议"
+    desc_en: "Resource Reservation Protocol"
+    features:
+      - feature:
+        - l3.protocol: 46
+  - EIGRP: 605
+    desc_ch: "增强型内部网关路由协议"
+    desc_en: "Enhanced Inter-Gateway Routing Protocol"
+    features:
+      - feature:
+        - l3.protocol: 88
+  - OSPF: 606
+    desc_ch: "开放最短路径优先"
+    desc_en: "Open Shortest Path First"
+    features:
+      - feature:
+        - l3.protocol: 89
+  - PGM: 607
+    desc_ch: "实际通用组播协议"
+    desc_en: "Pragmatic General Multicast Protocol"
+    features:
+      - feature:
+        - l3.protocol: 113
+
+  ###########################
+  ####    L4 Protocol    ####
+  - DNS: 1024
+    desc_ch: "域名解析协议"
+    desc_en: "Domain Name System Protocol"
+    features:
+      - feature:
+        - port: 53
+  - SNMP: 1025
+    desc_ch: "简单网络管理协议"
+    desc_en: "Simple Network Management Protocol"
+    features:
+      - feature:
+        - tcp.port: 161
+  - DHCP: 1026
+    desc_ch: "动态主机配置协议"
+    desc_en: "Dynamic Host Configuration Protocol"
+    features:
+      - feature:
+        - port: [67,68]
+  - DHCPv6: 1027
+    desc_ch: "动态主机配置协议6"
+    desc_en: "Dynamic Host Configuration Protocol v6"
+    features:
+      - feature:
+        - port: [546,547]
+  - FTP: 1028
+    desc_ch: "文件传输协议"
+    desc_en: "File Transfer Protocol - Control"
+    features:
+      - feature:
+        - tcp.port: 21
+      - feature:
+        # Request
+        - l4.payload.regex: !!str /^(ABOR|ACCT|ALLO|APPE|CDUP|CWD||DELE|EPRT|EPSV|FEAT|HELP|LIST|MDTM|MKD|MODE|NLST|NOOP|OPTS|PASS|PASV|PORT|PWD||QUIT|REIN|REST|RETR|RMD||RNFR|RNTO|SITE|SIZE|SMNT|STAT|STOR|STOU|STRU|SYST|TYPE|USER|XCUP|XCWD|XMKD|XPWD|XRMD)(\x20[\S]+)?\x0d\x0a$/sH
+      - feature:
+        # Response single-line
+        - l4.payload.regex: !!str /^[1-5][0-9][0-9][\x20\x2d]((\x22?[\x2f\w]?\x22?\x20)?([\w\.]+\x20)*([\w\.]+|\x28[0-9,]+\x29|\x28[0-9]+\x20bytes\x29)|(\x28\w+\x20[0-9\.]+\x29))[\.\:]?\x0d\x0a$/sH
+      - feature:
+        # Response multi-line (211/214)
+        - l4.payload.regex: !!str /^(((\x20[A-Za-z]{4,}|\x20[A-Z]{3}\x20?)(\x0d\x0a)?))+[1-5][0-9][0-9]\x20(\w\x20?)+\.?\x0d\x0a$/sH
+  - FTP_DATA: 1029
+    desc_ch: "文件传输协议"
+    desc_en: "File Transfer Protocol - Data"
+    features:
+      - feature:
+        - tcp.port: 20
+  - SSH: 1030
+    desc_ch: "Secure Shell (SSH) Protocol"
+    desc_en: "Secure Shell (SSH) Protocol"
+    features:
+      - feature:
+        - tcp.port: 22
+  - TELNET: 1031
+    desc_ch: "远程登录协议"
+    desc_en: "Telnet"
+    features:
+      - feature:
+        - tcp.port: 23
+  - SMTP: 1032
+    desc_ch: "简单邮件传输协议"
+    desc_en: "Simple Mail Transfer Protocol"
+    features:
+      - feature:
+        - tcp.port: 25
+  - POP2: 1033
+    desc_ch: "邮局协议第2版"
+    desc_en: "Post Office Protocol 2"
+    features:
+      - feature:
+        - tcp.port: 109
+  - POP3: 1034
+    desc_ch: "邮局协议第3版"
+    desc_en: "Post Office Protocol 3"
+    features:
+      - feature:
+        - tcp.port: 110
+  - IMAP4: 1035
+    desc_ch: "邮件访问协议第4版"
+    desc_en: "Internet Message Access Protocol 4"
+    features:
+      - feature:
+        - tcp.port: 143
+  - IMAP3: 1036
+    desc_ch: "邮件访问协议第3版"
+    desc_en: "Internet Message Access Protocol 3"
+    features:
+      - feature:
+        - tcp.port: 220
+  - TFTP: 1037
+    desc_ch: "简单文件传送协议"
+    desc_en: "Trivial File Transfer Protocol"
+    features:
+      - feature:
+        - udp.port: 69
+  - SFTP: 1038
+    desc_ch: "简单文件传输协议"
+    desc_en: "Simple File Transfer Protocol"
+    features:
+      - feature:
+        - tcp.port: 115
+  - BGP: 1039
+    desc_ch: "边界网关协议"
+    desc_en: "Border Gateway Protocol"
+    features:
+      - feature:
+        - tcp.port: 179
+  - GTP_C: 1040
+    desc_ch: "GPRS隧道协议-控制面"
+    desc_en: "GPRS Tunneling Protocol - Control plane"
+    features:
+      - feature:
+        - udp.port: 2123
+  - RIP: 1041
+    desc_ch: "路由信息协议"
+    desc_en: "Routing Information Protocol"
+    features:
+      - feature:
+        - udp.port: 520
+  - SSDP: 1042
+    desc_ch: "简单服务发现协议"
+    desc_en: "Simple Service Discovery Protocol"
+    features:
+      - feature:
+        - udp.port: 1900
+  - FTPS: 1043
+    desc_ch: "安全文件传输协议"
+    desc_en: "FTP control over TLS/SSL"
+    features:
+      - feature:
+        - tcp.port: 990
+  - FTPS_DATA: 1044
+    desc_ch: "安全文件传输协议"
+    desc_en: "FTP Data over TLS/SSL"
+    features:
+      - feature:
+        - tcp.port: 989
+  - TELNET_SSL: 1045
+    desc_ch: "Telnet over TLS/SSL"
+    desc_en: "Telnet over TLS/SSL"
+    features:
+      - feature:
+        - tcp.port: 992
+  - SMTP_SSL: 1046
+    desc_ch: "SMTP over TLS/SSL"
+    desc_en: "SMTP over TLS/SSL"
+    features:
+      - feature:
+        - tcp.port: 995
+  - IMAP4_SSL: 1047
+    desc_ch: "IMAP4 over TLS/SSL"
+    desc_en: "IMAP4 over TLS/SSL"
+    features:
+      - feature:
+        - tcp.port: 993
+  - POP3_SSL: 1048
+    desc_ch: "POP3 over TLS/SSL"
+    desc_en: "POP3 over TLS/SSL"
+    features:
+      - feature:
+        - tcp.port: 995
+  - NTP: 1049
+    desc_ch: "网络校时协议"
+    desc_en: "Network Time Protocol"
+    features:
+      - feature:
+        - port: 123
+  - RDP: 1050
+    desc_ch: "远程桌面协议"
+    desc_en: "Remote Desktop Protocol"
+    features:
+      - feature:
+        - tcp.port: 3389
+  - MODBUS_TCP: 1051
+    desc_ch: "Modbus Over TCP"
+    desc_en: "Modbus Over TCP"
+    features:
+      - feature:
+        - port: 502
+  - S7COMM: 1052
+    desc_ch: "S7COMM"
+    desc_en: "S7COMM"
+    # https://www.cnblogs.com/Iitt1evegbird/p/15767656.html
+    # https://www.freebuf.com/articles/ics-articles/188159.html
+    features:
+      - feature:
+        - tcp.port: 102
+        - tcp.payload.regex: !!str /^\x03\x00.{2}\x02\xf0\x80\x32[\x01\x02\x03\x07]/sH
+  - MMS: 1053
+    desc_ch: "制造报文规范"
+    desc_en: "ISO/IEC9506-MMS(Manufacturing Message Specification)"
+    # ISO/IEC 9506-2
+    # https://blog.csdn.net/ttood/article/details/120080734
+    # https://wenku.baidu.com/view/2a50568c49649b6649d74737.html
+    features:
+      - feature:
+        - tcp.port: 102
+        - tcp.payload.regex: !!str /^\x03\x00.{2}\x02\xf0\x80(\x01\x00){2}.{16}/^\x02\xf0\x80(\x01\x00){2}.{16}/sH
+  - IEC104: 1054
+    desc_ch: "IEC60870-5-104规约"
+    desc_en: "IEC60870-5-104 is an extension of the IEC 101, including transport, network, link&physical layer extensions to enable a full network access."
+    # https://blog.csdn.net/chenyitao736866376/article/details/99120024
+    features:
+      - feature:
+        - port: 2404
+  - DNP3: 1055
+    desc_ch: "分布式网络协议3"
+    desc_en: "Distributed Network Protocol 3"
+    # https://blog.csdn.net/weixin_43047908/article/details/119206553
+    features:
+      - feature:
+        - tcp.port: 20000
+        - tcp.payload.regex: !!str /^0x05\x64.{8}/sH
+  - SIP: 1056
+    desc_ch: "会话初始协议"
+    desc_en: "Session Initiation Protocol"
+    # https://wiki.wireshark.org/SIP
+    features:
+      - feature:
+        - port: 5060
+  - LDAP: 1057
+    desc_ch: "轻量级目录访问协议"
+    desc_en: "Lightweight Directory Access Protocol"
+    # https://wiki.wireshark.org/LDAP
+    features:
+      - feature:
+        - tcp.port: 389
+  - LLRP: 1058
+    desc_ch: "底层读写器协议"
+    desc_en: "Low-Level Reader Protocol"
+    # https://wiki.wireshark.org/LLRP
+    features:
+      - feature:
+        - tcp.port: 5084
+  - NETBIOS: 1059
+    desc_ch: "网络基本输入输出系统"
+    desc_en: "Network Basic Input/Output System"
+    # https://wiki.wireshark.org/NETBIOS
+  - NETBIOS-NameService: 1060
+    desc_ch: "底层读写器协议-NameService"
+    desc_en: "Network Basic Input/Output System - Name Service"
+    parents: 1059
+    features:
+      - feature:
+        - port: 137
+  - NETBIOS-DatagramService: 1061
+    desc_ch: "底层读写器协议-DatagramService"
+    desc_en: "Network Basic Input/Output System - Datagram Service"
+    parents: 1059
+    features:
+      - feature:
+        - udp.port: 138
+  - NETBIOS-SessionService: 1062
+    desc_ch: "底层读写器协议-SessionService"
+    desc_en: "Network Basic Input/Output System - Session Service"
+    parents: 1059
+    features:
+      - feature:
+        - tcp.port: 139
+  - MYSQL: 1065
+    desc_ch: "MYSQL"
+    desc_en: "MYSQL"
+    features:
+      - feature:
+        - tcp.port: 3306
+  - MSSQL: 1066
+    desc_ch: "MSSQL"
+    desc_en: "Microsoft SQL Server protocol - Tabular Data Stream (TDS)"
+    features:
+      - feature:
+        - tcp.port: 1433
+  - PostgreSQL: 1067
+    desc_ch: "PostgreSQL Database"
+    desc_en: "PostgreSQL Database"
+    features:
+      - feature:
+        - tcp.port: 5432
+  - IPMI: 1068
+    desc_ch: "智能型平台管理接口"
+    desc_en: "Intelligent Platform Management Interface"
+    features:
+      # udp:623-rmcp-IPMI
+      - feature:
+        - udp.port: 623
+        - udp.payload.regex: !!str /^[\x00-\x10]\x00.[\x07\x87]/sH
+  # Add Protocol recognized by port above this line.
+
+  # The protocol recognized by payload below...
+  - HTTP: 2000
+    desc_ch: "超文本传输协议"
+    desc_en: "Hypertext Transfer Protocol"
+    features:
+        - feature:
+          - l4.payload.regex: !!str /^(GET|POST|OPTIONS|HEAD|PUT|DELETE|TRACE|CONNECT)\s+\S+\s+HTTP\x2f[0-3]\.[0-9]\s*\x0d\x0a/sH
+        - feature:
+          - l4.payload.regex: !!str /^HTTP\x2f[0-3]\x2e[0-9]\s+[1-5][0-9][0-9].*\x0d\x0a/sH
+  - TLS: 2001
+    desc_ch: "传输层加密协议"
+    desc_en: "Transport Layer Security Protocol"
+    # https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml
+    features:
+        # Change cipher spec protocol
+        - feature:
+          - tcp.payload.regex: !!str /^\x14\x03[\x01-\x04]\x00\x01\x01/sH
+        # TLS Alert Clear
+        - feature:
+          - tcp.payload.regex: !!str /^\x15\x03[\x01-\x04]\x02[\x01\x02][\x0a\x14-\x16\x1e\x28\x2a-\x33\x3c\x46\x47\x50\x5a\x64]/sH
+        # TLS Alert Encrypt
+        - feature:
+          - tcp.payload.regex: !!str /^\x15\x03[\x01-\x04].{2}.{3,}/sH
+        # TLS HandShake protocol 
+        - feature:
+          - tcp.payload.regex: !!str /^\x16\x03[\x01-\x04].{2}[\x00\x01\x02\x0b-\x10\x14].{3}\x03[\x01-\x04]/sH
+        # TLS Application Data protocol 
+        - feature:
+          - tcp.payload.regex: !!str /^\x17\x03[\x01-\x04].{2}/sH
+  - MQ: 2002
+    desc_ch: "WebSphere MQ"
+    desc_en: "WebSphere MQ"
+    features:
+        # Transmission Segment Header
+        - feature:
+          - tcp.payload.regex: !!str /^(TSH\x20).{4}[\x01\x02][\x01-\x0f\x81-\xba]/sH
+  - RTCP: 2003
+    desc_ch: "实时传输控制协议"
+    desc_en: "Real-time Transport Control Protocol"
+    features:
+      # https://www.rfc-editor.org/rfc/rfc3550.html
+      - feature:
+        - udp.payload.regex: !!str /^[\x80-\xbf][\xc8-\xd2].+/sH
+  - RTP: 2004
+    desc_ch: "实时传输协议"
+    desc_en: "Real-time Transport Protocol"
+    features:
+      # https://www.rfc-editor.org/rfc/rfc3551.html
+      - feature:
+        # Maker bit = 0
+        - udp.payload.regex: !!str /^[\x80-\xbf][\x00-\x13\x19-\x1a\x1c\x1f-\x22\x48-\x4c\x60-\x7f].+/sH
+  - H.225: 2005
+    desc_ch: "H.225"
+    desc_en: "H.225"
+    # Layer: TCP--TPKT--Q.931-H.225
+    # - tcp.payload.regex: ^\x03\x00.{2}\x08[\x01\x02]
+  - H.223: 2006
+    desc_ch: "H.223"
+    desc_en: "H.223"
+    # Layer: UDP-RTP-H.223
