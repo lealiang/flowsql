@@ -202,7 +202,7 @@ inline void *PluginLoader::First(const Guid &iid) {
 
 }  // namespace flowsql
 
-EXPORT_API flowsql::IQuerier *getiquerier() {
+EXPORT_API inline flowsql::IQuerier *getiquerier() {
     flowsql::PluginLoader *_loader = flowsql::PluginLoader::Single();
     return dynamic_cast<flowsql::IQuerier *>(_loader);
 }

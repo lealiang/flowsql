@@ -6,3 +6,9 @@
 | 2026-02-25 | 讨论 stage1.md 方案：IDataFrame 默认实现效率问题，要求提供高性能方案 |
 | 2026-02-25 | 讨论 stage1.md：IDataFrame 默认实现效率问题，列举高效方案供选择 |
 - 2026-02-25: 头文件防止重复包含的宏定义全部调整为 _FLOWSQL_当前目录_文件名_H_ 格式
+- 2026-02-25: Stage 1 设计变更：DataFrame 改用 Arrow RecordBatch 存储，通信协议改为 REST + Arrow IPC
+- 2026-02-25: 实现 Stage 1 全部代码
+- 2026-02-25: 第三方依赖构建隔离：将 thirdparts 编译产物移到 build 目录外，避免每次清理重建
+- 2026-02-25: 将 .thirdparts_installed 和 .thirdparts_prefix 加到 .gitignore
+- 2026-02-25: 列举 stage1 已实现的能力
+- 2026-02-25: 更新 docs/stage1.md 实施清单，标记已完成项

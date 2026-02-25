@@ -4,6 +4,10 @@ src/output/
 build/
 output/
 
+# Third-party dependency cache (outside build dir)
+src/.thirdparts_installed/
+src/.thirdparts_prefix/
+
 # CMake
 CMakeCache.txt
 CMakeFiles/

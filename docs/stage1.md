@@ -10,16 +10,19 @@ Stage 1 实现 FlowSQL 插件式进程框架的 C++ 核心部分，包括：
 - 流水线（Pipeline）：负责 Channel ↔ DataFrame 转换，算子只操作 DataFrame
 - 服务进程主框架（Service）
 - 示例插件（MemoryChannel、PassthroughOperator）及测试
+- Apache Arrow 依赖引入（Stage 1 引入，Stage 2/3 用于 IPC 通信）
 
 ## 关键设计决策
 
 1. **命名空间**：统一使用 `flowsql`
 2. **统一算子接口**：C++ 和 Python 算子共享 `Work(IDataFrame* in, IDataFrame* out)` 接口
-3. **IDataFrame**：C++ 侧表格数据结构，与 pandas.DataFrame 语义对齐，通过 JSON 序列化互通
+3. **IDataFrame**：C++ 侧表格数据结构，内部基于 Apache Arrow RecordBatch 存储，与 pandas.DataFrame 语义对齐，支持 Arrow IPC 零拷贝传输和 JSON 序列化互通
 4. **IChannel**：融合 `Catelog/Name/Put/Get` + `Open/Close` 生命周期
 5. **IDataEntity**：采用 `std::variant<...>` 方案（FieldValue），C++17 类型安全
 6. **Pipeline 负责 Channel ↔ DataFrame 转换**：算子只关心 DataFrame，Pipeline 处理通道 I/O 和批量转换
 7. **复用现有代码**：PluginRegistry 包装 PluginLoader，不修改 loader.hpp
+8. **Arrow 存储**：DataFrame 内部使用 Arrow RecordBatch 列式存储，两阶段模式（构建期用 ArrayBuilder，读取前 Finalize 生成不可变 batch）
+9. **C++ ↔ Python 通信**：Stage 2/3 采用 REST + Arrow IPC 二进制传输，Stage 1 引入 Arrow 依赖并保留 JSON 端点用于调试
 
 ## 数据流架构
 
@@ -137,7 +140,7 @@ interface IDataEntity {
 
 ### 2. IDataFrame（`framework/interfaces/idataframe.h`）
 
-表格数据结构接口，C++ 算子和 Python 算子的统一数据交换格式。
+表格数据结构接口，C++ 算子和 Python 算子的统一数据交换格式。内部基于 Apache Arrow RecordBatch 存储。
 
 ```cpp
 namespace flowsql {
@@ -160,6 +163,10 @@ interface IDataFrame {
     // IDataEntity 互操作
     virtual int AppendEntity(IDataEntity* entity) = 0;
     virtual std::shared_ptr<IDataEntity> GetEntity(int32_t index) const = 0;
+
+    // Arrow 互操作（零拷贝）
+    virtual std::shared_ptr<arrow::RecordBatch> ToArrow() const = 0;
+    virtual void FromArrow(std::shared_ptr<arrow::RecordBatch> batch) = 0;
 
     // 序列化（C++ ↔ Python 数据交换，兼容 pandas to_json(orient='split')）
     virtual std::string ToJson() const = 0;
@@ -260,13 +267,55 @@ interface IOperator : public IPlugin {
 
 ### 6. DataFrame（`framework/core/dataframe.h/.cpp`）
 
-IDataFrame 的默认实现。
+IDataFrame 的默认实现，基于 Apache Arrow RecordBatch 的薄包装。
 
-- 内部存储：`vector<Field> schema_` + `vector<vector<FieldValue>> rows_`
-- `AppendEntity()`：从 IDataEntity 提取字段值追加为一行
-- `GetEntity()`：将一行数据包装为 IDataEntity 返回
-- `ToJson()`：输出与 pandas `to_json(orient='split')` 兼容的 JSON 格式
-- `FromJson()`：解析上述 JSON 格式
+#### 内部结构
+
+```cpp
+class DataFrame : public IDataFrame {
+    std::shared_ptr<arrow::Schema> arrow_schema_;      // Arrow schema
+    std::shared_ptr<arrow::RecordBatch> batch_;         // 不可变列式数据
+    std::vector<std::unique_ptr<arrow::ArrayBuilder>> builders_;  // 构建期列构建器
+    std::vector<Field> schema_;                         // FlowSQL schema
+    int32_t pending_rows_ = 0;                          // 构建期待提交行数
+
+    void Finalize();  // builders_ → batch_，构建期结束，生成不可变 RecordBatch
+};
+```
+
+#### 两阶段模式
+
+- **构建期**：`AppendRow()` / `AppendEntity()` 向 `builders_` 追加数据，`pending_rows_` 递增
+- **读取前**：`Finalize()` 将 `builders_` 中的数据生成不可变 `batch_`（Arrow RecordBatch）
+- **读取期**：`GetRow()` / `GetColumn()` / `RowCount()` / `ToArrow()` 从 `batch_` 读取
+- `ToArrow()` / `FromArrow()` 零拷贝，直接返回/设置内部 `batch_`
+
+#### DataType ↔ Arrow 类型映射
+
+| FlowSQL DataType | Arrow 类型 | 说明 |
+|-------------------|-----------|------|
+| INT32 | `arrow::int32()` | 32 位有符号整数 |
+| INT64 | `arrow::int64()` | 64 位有符号整数 |
+| UINT32 | `arrow::uint32()` | 32 位无符号整数 |
+| UINT64 | `arrow::uint64()` | 64 位无符号整数 |
+| FLOAT | `arrow::float32()` | 单精度浮点 |
+| DOUBLE | `arrow::float64()` | 双精度浮点 |
+| STRING | `arrow::utf8()` | UTF-8 字符串 |
+| BYTES | `arrow::binary()` | 二进制数据 |
+| TIMESTAMP | `arrow::int64()` | 时间戳（复用 int64） |
+| BOOLEAN | `arrow::boolean()` | 布尔值 |
+
+#### 关键方法
+
+- `SetSchema()`：根据 FlowSQL schema 创建对应的 Arrow schema 和 ArrayBuilder
+- `AppendRow()` / `AppendEntity()`：向 builders_ 追加数据
+- `Finalize()`：调用各 builder 的 `Finish()` 生成 Arrow Array，组装为 RecordBatch
+- `GetRow(i)`：从 batch_ 中按行索引提取各列值
+- `GetColumn(name)`：从 batch_ 中按列名提取整列数据
+- `ToArrow()`：直接返回 batch_（零拷贝）
+- `FromArrow(batch)`：直接设置 batch_ 并从 Arrow schema 反推 FlowSQL schema
+- `ToJson()` / `FromJson()`：保持与 pandas `to_json(orient='split')` 兼容的 JSON 格式
+- `Clear()`：重置 builders_ 和 batch_，回到构建期初始状态
 
 #### JSON 数据交换格式
 
@@ -305,6 +354,7 @@ void Pipeline::Run() {
         out_frame.Clear();
 
         // 1. 从 source channels 批量读取，组装 DataFrame
+        //    ReserveRows(batch_size_) 预分配 builder 容量
         for (auto* ch : sources_) {
             for (int i = 0; i < batch_size_; ++i) {
                 IDataEntity* entity = ch->Get();
@@ -322,6 +372,7 @@ void Pipeline::Run() {
         }
 
         // 3. 将结果 DataFrame 拆解为 Entity，写回 sink channel
+        //    直接从 out_frame 的 Arrow batch_ 读取，避免额外拷贝
         if (sink_) {
             for (int32_t i = 0; i < out_frame.RowCount(); ++i) {
                 auto entity = out_frame.GetEntity(i);
@@ -335,6 +386,13 @@ void Pipeline::Run() {
 - `PipelineState`：IDLE / RUNNING / STOPPED / FAILED
 - `PipelineBuilder`：链式构建 `AddSource() → SetOperator() → SetSink() → SetBatchSize() → Build()`
 - 批量大小可配置（默认 1000 行/批）
+
+#### Pipeline Arrow 优化
+
+- `ReserveRows(n)`：在批量读取前预分配 Arrow ArrayBuilder 容量，减少内存重分配
+- 批量 `AppendEntity()` 后统一调用 `Finalize()` 生成 RecordBatch，避免频繁构建
+- sink 写回直接从 `batch_` 读取列式数据，无需中间转换
+- 算子间传递 Arrow RecordBatch 时可实现零拷贝（同进程内）
 
 ### 9. Service（`framework/core/service.h/.cpp`）
 
@@ -374,19 +432,20 @@ int Work(IDataFrame* in, IDataFrame* out) override {
 
 ---
 
-## IDataEntity ↔ IDataFrame 映射关系
+## IDataEntity ↔ IDataFrame ↔ Arrow 映射关系
 
 ```
-IDataEntity（单行）          IDataFrame（表格）           pandas.DataFrame
-┌─────────────────┐      ┌──────────────────────┐    ┌──────────────────┐
-│ GetEntityType()  │      │ GetSchema() = columns│    │ df.columns       │
-│ GetSchema()      │ ──→  │ RowCount() = len     │ ←→ │ len(df)          │
-│ GetFieldValue()  │      │ GetRow(i) = row      │    │ df.iloc[i]       │
-│ SetFieldValue()  │      │ GetColumn(name)      │    │ df[name]         │
-└─────────────────┘      │ AppendEntity()       │    │ df.append()      │
-   一行数据               │ ToJson() / FromJson()│    │ df.to_json()     │
-                          └──────────────────────┘    └──────────────────┘
-                             C++ 侧                      Python 侧
+IDataEntity（单行）          IDataFrame（表格）           Arrow RecordBatch        pandas.DataFrame
+┌─────────────────┐      ┌──────────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│ GetEntityType()  │      │ GetSchema() = columns│    │ schema()         │    │ df.columns       │
+│ GetSchema()      │ ──→  │ RowCount() = len     │ ←→ │ num_rows()       │ ←→ │ len(df)          │
+│ GetFieldValue()  │      │ GetRow(i) = row      │    │ column(i)        │    │ df.iloc[i]       │
+│ SetFieldValue()  │      │ GetColumn(name)      │    │ GetColumnByName()│    │ df[name]         │
+└─────────────────┘      │ AppendEntity()       │    └──────────────────┘    │ df.append()      │
+   一行数据               │ ToArrow() ──────────→│←── FromArrow()            │ df.to_json()     │
+                          │ ToJson() / FromJson()│                           └──────────────────┘
+                          └──────────────────────┘       零拷贝传输               Python 侧
+                             C++ 侧
 ```
 
 ---
@@ -428,6 +487,67 @@ IDataEntity（单行）          IDataFrame（表格）           pandas.DataFra
 
 ---
 
+## C++ ↔ Python 通信协议（Stage 2/3 预告）
+
+Stage 1 引入 Arrow 依赖，Stage 2/3 实现完整的 C++ ↔ Python 通信。
+
+### 协议设计
+
+采用 REST + Arrow IPC 二进制传输方案：
+
+```
+C++ Service                          Python Worker
+    │                                      │
+    │  POST /work                          │
+    │  Content-Type: application/vnd.      │
+    │    apache.arrow.stream               │
+    │  Body: Arrow IPC stream (in_frame)   │
+    │ ────────────────────────────────────→ │
+    │                                      │  pyarrow.ipc.open_stream()
+    │                                      │  → pandas DataFrame
+    │                                      │  → operator.work(df_in)
+    │                                      │  → df_out
+    │  200 OK                              │
+    │  Content-Type: application/vnd.      │
+    │    apache.arrow.stream               │
+    │  Body: Arrow IPC stream (out_frame)  │
+    │ ←──────────────────────────────────── │
+    │                                      │
+```
+
+### 关键特性
+
+- **高性能**：Arrow IPC 二进制传输，C++ 和 Python 之间零序列化开销
+- **零拷贝**：`pyarrow.RecordBatch` 与 `pandas.DataFrame` 之间通过 `to_pandas()` / `from_pandas()` 转换
+- **JSON 调试端点**：保留 `POST /work?format=json` 端点，使用 JSON 格式传输，便于调试和开发
+- **向后兼容**：Stage 1 的 `ToJson()` / `FromJson()` 接口保留，Stage 2/3 新增 Arrow IPC 通道
+
+### Python 侧示例
+
+```python
+import pyarrow as pa
+import pyarrow.ipc as ipc
+import pandas as pd
+
+# 接收 Arrow IPC stream → pandas DataFrame
+reader = ipc.open_stream(request.body)
+table = reader.read_all()
+df_in = table.to_pandas()
+
+# 算子处理
+df_out = operator.work(df_in)
+
+# pandas DataFrame → Arrow IPC stream 返回
+batch = pa.RecordBatch.from_pandas(df_out)
+sink = pa.BufferOutputStream()
+writer = ipc.new_stream(sink, batch.schema)
+writer.write_batch(batch)
+writer.close()
+response.body = sink.getvalue()
+```
+
+---
+
 ## 复用的现有文件
 
 | 文件 | 复用内容 |
@@ -442,6 +562,29 @@ IDataEntity（单行）          IDataFrame（表格）           pandas.DataFra
 
 ## 构建集成
 
+### Arrow 第三方依赖（`src/thirdparts/arrow-config.cmake`）
+
+```cmake
+ExternalProject_Add(arrow_ep
+    URL https://github.com/apache/arrow/archive/refs/tags/apache-arrow-18.1.0.tar.gz
+    SOURCE_SUBDIR cpp
+    CMAKE_ARGS
+        -DARROW_BUILD_STATIC=ON
+        -DARROW_BUILD_SHARED=OFF
+        -DARROW_COMPUTE=OFF
+        -DARROW_JSON=ON
+        -DARROW_IPC=ON
+        -DARROW_WITH_UTF8PROC=OFF
+        -DARROW_WITH_RE2=OFF
+        -DCMAKE_INSTALL_PREFIX=${THIRDPARTS_INSTALL_DIR}
+        -DCMAKE_BUILD_TYPE=Release
+)
+```
+
+通过 `add_thirddepen(TARGET arrow)` 宏自动处理 include/link 目录和库链接。
+
+### CMakeLists.txt 集成
+
 修改 `src/CMakeLists.txt`，新增：
 ```cmake
 add_subdirectory(${CMAKE_SOURCE_DIR}/framework ${CMAKE_BINARY_DIR}/framework)
@@ -450,7 +593,7 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_framework ${CMAKE_BINARY_DIR}/te
 ```
 
 构建产物：
-- `libflowsql_framework.a` — 框架静态库
+- `libflowsql_framework.a` — 框架静态库（链接 Arrow 静态库）
 - `libflowsql_example.so` — 示例插件动态库
 - `test_framework` — 框架测试可执行文件
 
@@ -472,16 +615,17 @@ cd src/build && rm -rf * && cmake .. && make -j$(nproc)
 
 ## 实施顺序
 
-1. 创建 `src/framework/` 目录结构
-2. `idata_entity.h` — 数据类型和实体接口
-3. `idataframe.h` — DataFrame 接口
-4. `ichannel.h` — 通道接口
-5. `ioperator.h` — 算子接口
-6. `macros.h` — 注册宏
-7. `dataframe.h/.cpp` — DataFrame 默认实现（含 JSON 序列化）
-8. `plugin_registry.h/.cpp` — 插件注册中心
-9. `pipeline.h/.cpp` — 流水线（含 Channel ↔ DataFrame 转换）
-10. `service.h/.cpp` — 服务主框架
-11. 示例插件（MemoryChannel + PassthroughOperator）
-12. 框架测试（test_framework）
-13. CMakeLists.txt 集成 + 编译验证
+1. ~~创建 `src/framework/` 目录结构~~ ✅
+2. ~~`idata_entity.h` — 数据类型和实体接口~~ ✅
+3. ~~`idataframe.h` — DataFrame 接口（含 ToArrow/FromArrow）~~ ✅
+4. ~~`ichannel.h` — 通道接口~~ ✅
+5. ~~`ioperator.h` — 算子接口~~ ✅
+6. ~~`macros.h` — 注册宏~~ ✅
+7. ~~`dataframe.h/.cpp` — DataFrame 默认实现（Arrow RecordBatch 薄包装 + JSON 序列化）~~ ✅
+8. ~~`plugin_registry.h/.cpp` — 插件注册中心~~ ✅
+9. ~~`pipeline.h/.cpp` — 流水线（含 Channel ↔ DataFrame 转换 + Arrow 优化）~~ ✅
+10. ~~`service.h/.cpp` — 服务主框架~~ ✅
+11. ~~示例插件（MemoryChannel + PassthroughOperator）~~ ✅
+12. ~~框架测试（test_framework）~~ ✅ — 5 个用例全部通过
+13. ~~`arrow-config.cmake` — Arrow 第三方依赖配置~~ ✅ — 支持 pyarrow / 缓存 / 源码编译三级回退
+14. ~~CMakeLists.txt 集成 + 编译验证~~ ✅ — 第三方依赖隔离到 build 目录外

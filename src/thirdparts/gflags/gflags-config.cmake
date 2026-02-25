@@ -1,13 +1,18 @@
-
 include(ExternalProject)
 
-set(PROJECT_NAME gflags)
+set(_gflags_install ${THIRDPARTS_INSTALL_DIR}/gflags)
 
-ExternalProject_Add(${PROJECT_NAME}
-    PREFIX ${CMAKE_BINARY_DIR}/${PROJECT_NAME}-prefix
-    URL "https://github.com/gflags/gflags/archive/v2.3.0.tar.gz"
-    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${CMAKE_BINARY_DIR}/${PROJECT_NAME}
+if(EXISTS "${_gflags_install}/lib/libgflags.a")
+    message(STATUS "gflags: using cached install at ${_gflags_install}")
+    add_custom_target(gflags)
+else()
+    ExternalProject_Add(gflags
+        PREFIX ${THIRDPARTS_PREFIX_DIR}/gflags
+        URL "https://github.com/gflags/gflags/archive/v2.3.0.tar.gz"
+        CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${_gflags_install}
     )
-set(gflags_LINK_INC ${CMAKE_BINARY_DIR}/${PROJECT_NAME}/include)
-set(gflags_LINK_DIR ${CMAKE_BINARY_DIR}/${PROJECT_NAME}/lib)
+endif()
+
+set(gflags_LINK_INC ${_gflags_install}/include)
+set(gflags_LINK_DIR ${_gflags_install}/lib)
 set(gflags_LINK_TAR -lgflags)

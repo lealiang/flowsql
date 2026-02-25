@@ -42,3 +42,8 @@ add_thirdparts()
 # 添加外部子项目
 add_subdirectory(${CMAKE_SOURCE_DIR}/plugins/protocol/npi ${CMAKE_BINARY_DIR}/npi_plugin)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_npi ${CMAKE_BINARY_DIR}/test_npi)
+
+# Stage 1: 框架核心
+add_subdirectory(${CMAKE_SOURCE_DIR}/framework ${CMAKE_BINARY_DIR}/framework)
+add_subdirectory(${CMAKE_SOURCE_DIR}/plugins/example ${CMAKE_BINARY_DIR}/example_plugin)
+add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_framework ${CMAKE_BINARY_DIR}/test_framework)
