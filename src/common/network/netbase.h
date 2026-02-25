@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_NETBASE_H_
-#define _FAST_NETBASE_H_
+#ifndef _FLOWSQL_COMMON_NETWORK_NETBASE_H_
+#define _FLOWSQL_COMMON_NETWORK_NETBASE_H_
 
 #include <stdint.h>
 #include "../typedef.h"
@@ -722,4 +722,4 @@ struct CotpHeader {
 
 }  // namespace flowsql
 
-#endif  //_FAST_NETBASE_H_
+#endif  //_FLOWSQL_COMMON_NETWORK_NETBASE_H_

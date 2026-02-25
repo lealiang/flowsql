@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef SRC_0_2_FAST_BLOCK_MEM_H_
-#define SRC_0_2_FAST_BLOCK_MEM_H_
+#ifndef _FLOWSQL_COMMON_BLOCK_MEM_H_
+#define _FLOWSQL_COMMON_BLOCK_MEM_H_
 #include <stdint.h>
 
 namespace flowsql {
@@ -32,4 +32,4 @@ struct Mem {
 #pragma pack(pop)
 }  // namespace flowsql
 
-#endif  // SRC_0_2_FAST_BLOCK_MEM_H_
+#endif  // _FLOWSQL_COMMON_BLOCK_MEM_H_

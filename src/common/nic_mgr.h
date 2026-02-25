@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_IF_CONF_H_
-#define _FAST_IF_CONF_H_
+#ifndef _FLOWSQL_COMMON_NIC_MGR_H_
+#define _FLOWSQL_COMMON_NIC_MGR_H_
 
 #include "define.h"
 

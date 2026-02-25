@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef SRC_0_2_FAST_IQUERIER_HPP_
-#define SRC_0_2_FAST_IQUERIER_HPP_
+#ifndef _FLOWSQL_COMMON_IQUERIER_HPP_
+#define _FLOWSQL_COMMON_IQUERIER_HPP_
 #include <common/guid.h>
 #include <common/typedef.h>
 #include <exception>
@@ -86,4 +86,4 @@ ILog* _ilog = QuerierGuard::First(flowsql::IID_LOG);
 
 }  // namespace flowsql
 
-#endif  // SRC_0_2_FAST_IQUERIER_HPP_
+#endif  // _FLOWSQL_COMMON_IQUERIER_HPP_

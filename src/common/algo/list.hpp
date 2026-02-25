@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_COMMON_ALGO_LIST_HPP_
-#define _FAST_COMMON_ALGO_LIST_HPP_
+#ifndef _FLOWSQL_COMMON_ALGO_LIST_HPP_
+#define _FLOWSQL_COMMON_ALGO_LIST_HPP_
 
 #include <functional>
 #include "../threadsafe/lock.h"
@@ -185,4 +185,4 @@ class SinglyList {
 
 }  // namespace flowsql
 
-#endif  //_FAST_COMMON_ALGO_LIST_HPP_
+#endif  //_FLOWSQL_COMMON_ALGO_LIST_HPP_

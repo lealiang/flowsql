@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_COMMON_MODULARITY_MBASIC_H_
-#define _FAST_COMMON_MODULARITY_MBASIC_H_
+#ifndef _FLOWSQL_COMMON_MODULARITY_MBASIC_H_
+#define _FLOWSQL_COMMON_MODULARITY_MBASIC_H_
 
 #include <fast/typedef.h>
 #include <functional>
@@ -110,4 +110,4 @@ ____INTERFACE(IID_CAPTURE, fast::ICapture)
 END_MOD_REGIST
 ****************************************************/
 
-#endif  //_FAST_COMMON_MODULARITY_MBASIC_H_
+#endif  //_FLOWSQL_COMMON_MODULARITY_MBASIC_H_

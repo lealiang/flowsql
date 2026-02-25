@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_BASE_BITMAP_HPP_
-#define _FAST_BASE_BITMAP_HPP_
+#ifndef _FLOWSQL_COMMON_ALGO_BITMAP_HPP_
+#define _FLOWSQL_COMMON_ALGO_BITMAP_HPP_
 
 #include <stdint.h>
 
@@ -36,4 +36,4 @@ struct Bitmap {
     ValueType bitmap[Range] = {0};
 };
 
-#endif  //_FAST_BASE_BITMAP_HPP_
+#endif  //_FLOWSQL_COMMON_ALGO_BITMAP_HPP_

@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef BASE_COMMON_TOOLKIT_H_
-#define BASE_COMMON_TOOLKIT_H_
+#ifndef _FLOWSQL_COMMON_TOOLKIT_HPP_
+#define _FLOWSQL_COMMON_TOOLKIT_HPP_
 #include <dirent.h>
 #ifndef __APPLE__
 #include <linux/limits.h>
@@ -279,4 +279,4 @@ inline const char* get_file_ext(const char* fname) {
 }
 }  // namespace flowsql
 
-#endif  // BASE_COMMON_TOOLKIT_H_
+#endif  // _FLOWSQL_COMMON_TOOLKIT_HPP_

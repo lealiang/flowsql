@@ -13,8 +13,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_COMMON_DEFER_H_
-#define _FAST_COMMON_DEFER_H_
+#ifndef _FLOWSQL_COMMON_DEFER_HPP_
+#define _FLOWSQL_COMMON_DEFER_HPP_
 
 #include <functional>
 
@@ -48,4 +48,4 @@ class scope_guard_t {
 #define ON_SCOPE_EXIT(callback) flowsql::scope_guard_t SCOPEGUARD_LINENAME(EXIT, __LINE__)(callback)
 #define defer(statement) flowsql::scope_guard_t SCOPEGUARD_LINENAME(EXIT, __LINE__)([&]() { statement; })
 
-#endif  //_FAST_COMMON_DEFER_H_
+#endif  //_FLOWSQL_COMMON_DEFER_HPP_

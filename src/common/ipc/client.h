@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _BASE_IPC_CLIENT_H_
-#define _BASE_IPC_CLIENT_H_
+#ifndef _FLOWSQL_COMMON_IPC_CLIENT_H_
+#define _FLOWSQL_COMMON_IPC_CLIENT_H_
 
 #include "common.h"
 

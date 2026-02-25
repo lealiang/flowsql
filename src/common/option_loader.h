@@ -1,5 +1,5 @@
-#ifndef _FAST_OPTION_LOADER_H_
-#define _FAST_OPTION_LOADER_H_
+#ifndef _FLOWSQL_COMMON_OPTION_LOADER_H_
+#define _FLOWSQL_COMMON_OPTION_LOADER_H_
 
 #include <common/logger_helper.h>
 #include <common/singleton.h>

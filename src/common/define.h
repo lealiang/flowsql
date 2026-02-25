@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_DEFINE_H_
-#define _FAST_DEFINE_H_
+#ifndef _FLOWSQL_COMMON_DEFINE_H_
+#define _FLOWSQL_COMMON_DEFINE_H_
 
 namespace flowsql {
 

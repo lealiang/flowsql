@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_NPI_BITMAPMATCH_H_
-#define _FAST_NPI_BITMAPMATCH_H_
+#ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_BITMAPMATCH_H_
+#define _FLOWSQL_PLUGINS_PROTOCOL_NPI_BITMAPMATCH_H_
 
 #include <stdint.h>
 #include <common/algo/bitmap.hpp>
@@ -48,4 +48,4 @@ class BitmapDualRecognizer : public BitmapRecognizer {
 }  // namespace protocol
 }  // namespace flowsql
 
-#endif  // _FAST_NPI_BITMAPMATCH_H_
+#endif  // _FLOWSQL_PLUGINS_PROTOCOL_NPI_BITMAPMATCH_H_

@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef SRC_0_2_FAST_TYPEDEF_H_
-#define SRC_0_2_FAST_TYPEDEF_H_
+#ifndef _FLOWSQL_COMMON_TYPEDEF_H_
+#define _FLOWSQL_COMMON_TYPEDEF_H_
 
 #ifndef __APPLE__
 #include <linux/limits.h>
@@ -86,4 +86,4 @@ typedef __uint128_t uint128_t;
 #define n2h32(x) bswap_32(x)
 #define n2h128(x) (bswap_64(x >> 64) | bswap_64(x))
 
-#endif  // SRC_0_2_FAST_TYPEDEF_H_
+#endif  // _FLOWSQL_COMMON_TYPEDEF_H_

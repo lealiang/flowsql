@@ -24,8 +24,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_PLUGIN_NPI_CONFIG_H_
-#define _FAST_PLUGIN_NPI_CONFIG_H_
+#ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_CONFIG_H_
+#define _FLOWSQL_PLUGINS_PROTOCOL_NPI_CONFIG_H_
 
 #include <common/algo/bitmap.hpp>
 #include <common/algo/objects_pool.hpp>
@@ -114,4 +114,4 @@ class Config {
 }  // namespace protocol
 }  // namespace flowsql
 
-#endif  //_FAST_PLUGIN_NPI_CONFIG_H_
+#endif  //_FLOWSQL_PLUGINS_PROTOCOL_NPI_CONFIG_H_

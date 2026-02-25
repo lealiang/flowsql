@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef SRC_0_2_FAST_GUID_H_
-#define SRC_0_2_FAST_GUID_H_
+#ifndef _FLOWSQL_COMMON_GUID_H_
+#define _FLOWSQL_COMMON_GUID_H_
 #include <stdint.h>
 #include <string.h>
 #include <iomanip>
@@ -99,4 +99,4 @@ std::basic_istream<charwide>& operator>>(std::basic_istream<charwide>& ss, Guid&
 
 }  // namespace flowsql
 
-#endif  // SRC_0_2_FAST_GUID_H_
+#endif  // _FLOWSQL_COMMON_GUID_H_

@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef SRC_FAST_BLOCK_BUFFER_H_
-#define SRC_FAST_BLOCK_BUFFER_H_
+#ifndef _FLOWSQL_COMMON_BLOCK_BUFFER_H_
+#define _FLOWSQL_COMMON_BLOCK_BUFFER_H_
 
 #include <concurrentqueue/concurrentqueue.h>
 #include <stdint.h>
@@ -153,4 +153,4 @@ Mem* ThreadBuffer::get_exit_buff() { return m_inused_buff.exchange(NULL); }
 
 }  // namespace flowsql
 
-#endif  // SRC_FAST_BLOCK_BUFFER_H_
+#endif  // _FLOWSQL_COMMON_BLOCK_BUFFER_H_

@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_NPI_ENUMERATEMATCH_H_
-#define _FAST_NPI_ENUMERATEMATCH_H_
+#ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_ENUMERATEMATCH_H_
+#define _FLOWSQL_PLUGINS_PROTOCOL_NPI_ENUMERATEMATCH_H_
 
 #include <stdint.h>
 #include <common/algo/bitmap.hpp>
@@ -121,4 +121,4 @@ class EnumerateRecognizerPool {
 }  // namespace protocol
 }  // namespace flowsql
 
-#endif  // _FAST_NPI_ENUMERATEMATCH_H_
+#endif  // _FLOWSQL_PLUGINS_PROTOCOL_NPI_ENUMERATEMATCH_H_

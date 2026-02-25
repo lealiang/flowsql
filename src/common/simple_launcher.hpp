@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef SRC_0_2_FAST_SIMPLE_LAUNCHER_HPP_
-#define SRC_0_2_FAST_SIMPLE_LAUNCHER_HPP_
+#ifndef _FLOWSQL_COMMON_SIMPLE_LAUNCHER_HPP_
+#define _FLOWSQL_COMMON_SIMPLE_LAUNCHER_HPP_
 
 #include <stdint.h>
 #include <iostream>
@@ -43,4 +43,4 @@ class Launcher {
 };
 }  // namespace flowsql
 
-#endif  // SRC_0_2_FAST_SIMPLE_LAUNCHER_HPP_
+#endif  // _FLOWSQL_COMMON_SIMPLE_LAUNCHER_HPP_

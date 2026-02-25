@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_BASE_ALGO_OBJECTS_POOL_HPP_
-#define _FAST_BASE_ALGO_OBJECTS_POOL_HPP_
+#ifndef _FLOWSQL_COMMON_ALGO_OBJECTS_POOL_HPP_
+#define _FLOWSQL_COMMON_ALGO_OBJECTS_POOL_HPP_
 
 #include <stdint.h>
 #include <string.h>
@@ -100,4 +100,4 @@ class ObjectsPool {
 };
 }  // namespace flowsql
 
-#endif  //_FAST_BASE_ALGO_OBJECTS_POOL_HPP_
+#endif  //_FLOWSQL_COMMON_ALGO_OBJECTS_POOL_HPP_

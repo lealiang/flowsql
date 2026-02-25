@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_COMMON_MODULARITY_IID_H_
-#define _FAST_COMMON_MODULARITY_IID_H_
+#ifndef _FLOWSQL_COMMON_MODULARITY_IID_H_
+#define _FLOWSQL_COMMON_MODULARITY_IID_H_
 
 // You should create your own iid definition file and include this file.
 #include <stdint.h>
@@ -35,4 +35,4 @@ enum class eIID {
 };
 }  // namespace flowsql
 
-#endif  //_FAST_COMMON_MODULARITY_IID_H_
+#endif  //_FLOWSQL_COMMON_MODULARITY_IID_H_

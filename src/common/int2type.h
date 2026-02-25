@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_BASE_INT2TYPE_H
-#define _FAST_BASE_INT2TYPE_H
+#ifndef _FLOWSQL_COMMON_INT2TYPE_H_
+#define _FLOWSQL_COMMON_INT2TYPE_H_
 
 #include <stdint.h>
 
@@ -21,4 +21,4 @@ struct int2type {
     enum { value = val };
 };
 
-#endif  //_FAST_BASE_INT2TYPE_H
+#endif  //_FLOWSQL_COMMON_INT2TYPE_H_

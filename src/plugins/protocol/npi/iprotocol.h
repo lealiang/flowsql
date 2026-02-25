@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_PLUGIN_NPI_IPROTOCOL_H_
-#define _FAST_PLUGIN_NPI_IPROTOCOL_H_
+#ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_IPROTOCOL_H_
+#define _FLOWSQL_PLUGINS_PROTOCOL_NPI_IPROTOCOL_H_
 
 #include <common/guid.h>
 #include <common/network/netbase.h>
@@ -154,4 +154,4 @@ interface IProtocol {
 
 }  // namespace flowsql
 
-#endif  //_FAST_PLUGIN_NPI_IPROTOCOL_H_
+#endif  //_FLOWSQL_PLUGINS_PROTOCOL_NPI_IPROTOCOL_H_

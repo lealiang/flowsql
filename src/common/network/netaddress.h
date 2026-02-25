@@ -13,8 +13,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_NETADDRESS_H_
-#define _FAST_NETADDRESS_H_
+#ifndef _FLOWSQL_COMMON_NETWORK_NETADDRESS_H_
+#define _FLOWSQL_COMMON_NETWORK_NETADDRESS_H_
 
 #ifndef __APPLE__
 #include <byteswap.h>
@@ -154,4 +154,4 @@ struct IPv6Address {
     }
 } FAST_MEM_ALIGN_PACKED;
 
-#endif // _FAST_NETADDRESS_H_
+#endif // _FLOWSQL_COMMON_NETWORK_NETADDRESS_H_

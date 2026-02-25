@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _BASE_SHM_SERVER_H_
-#define _BASE_SHM_SERVER_H_
+#ifndef _FLOWSQL_COMMON_SHARE_MEMORY_SHM_SERVER_H_
+#define _FLOWSQL_COMMON_SHARE_MEMORY_SHM_SERVER_H_
 
 #include <sys/shm.h>
 #include <map>

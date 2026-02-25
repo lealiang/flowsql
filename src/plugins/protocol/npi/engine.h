@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_PLUGIN_NPI_ENGINE_H_
-#define _FAST_PLUGIN_NPI_ENGINE_H_
+#ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_ENGINE_H_
+#define _FLOWSQL_PLUGINS_PROTOCOL_NPI_ENGINE_H_
 
 #include <common/int2type.h>
 #include <stdint.h>
@@ -118,4 +118,4 @@ class Engine {
 }  // namespace protocol
 }  // namespace flowsql
 
-#endif  //_FAST_PLUGIN_NPI_ENGINE_H_
+#endif  //_FLOWSQL_PLUGINS_PROTOCOL_NPI_ENGINE_H_

@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_BASE_POWER_HPP
-#define _FAST_BASE_POWER_HPP
+#ifndef _FLOWSQL_COMMON_POWER_HPP_
+#define _FLOWSQL_COMMON_POWER_HPP_
 
 namespace flowsql {
 template <typename value_type>
@@ -38,4 +38,4 @@ inline value_type get_power_number(value_type number) {
 }
 }  // namespace flowsql
 
-#endif  // _FAST_BASE_POWER_HPP
+#endif  // _FLOWSQL_COMMON_POWER_HPP_

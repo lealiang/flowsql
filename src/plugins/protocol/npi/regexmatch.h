@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_NPI_REGEXMATCH_H_
-#define _FAST_NPI_REGEXMATCH_H_
+#ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_REGEXMATCH_H_
+#define _FLOWSQL_PLUGINS_PROTOCOL_NPI_REGEXMATCH_H_
 
 #include <hs.h>
 #include <set>
@@ -138,4 +138,4 @@ class RegexRecognizer : public IRecognizer {
 }  // namespace protocol
 }  // namespace flowsql
 
-#endif  // _FAST_NPI_REGEXMATCH_H_
+#endif  // _FLOWSQL_PLUGINS_PROTOCOL_NPI_REGEXMATCH_H_

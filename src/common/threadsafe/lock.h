@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FA_COMMON_TS_LOCK_H_
-#define _FA_COMMON_TS_LOCK_H_
+#ifndef _FLOWSQL_COMMON_THREADSAFE_LOCK_H_
+#define _FLOWSQL_COMMON_THREADSAFE_LOCK_H_
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/time.h>
@@ -150,4 +150,4 @@ class condition {
 
 }  // namespace flowsql
 
-#endif  //_FA_COMMON_TS_LOCK_H_
+#endif  //_FLOWSQL_COMMON_THREADSAFE_LOCK_H_

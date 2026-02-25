@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_BASE_ALGO_AC_HPP_
-#define _FAST_BASE_ALGO_AC_HPP_
+#ifndef _FLOWSQL_COMMON_ALGO_AHOCORASICK_HPP_
+#define _FLOWSQL_COMMON_ALGO_AHOCORASICK_HPP_
 
 #include <string.h>
 #include "list_base.hpp"
@@ -318,4 +318,4 @@ class Searcher {
 }  // namespace ahocorasick
 }  // namespace flowsql
 
-#endif  //_FAST_BASE_ALGO_AC_HPP_
+#endif  //_FLOWSQL_COMMON_ALGO_AHOCORASICK_HPP_

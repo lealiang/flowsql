@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_COMMON_PACKET_H
-#define _FAST_COMMON_PACKET_H
+#ifndef _FLOWSQL_COMMON_NETWORK_PACKET_H_
+#define _FLOWSQL_COMMON_NETWORK_PACKET_H_
 
 #include <new>
 
@@ -477,4 +477,4 @@ class PacketGenerator {
 
 }  // namespace flowsql
 
-#endif  // _FAST_COMMON_PACKET_H
+#endif  // _FLOWSQL_COMMON_NETWORK_PACKET_H_

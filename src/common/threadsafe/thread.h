@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_COMMON_TS_THREAD_H_
-#define _FAST_COMMON_TS_THREAD_H_
+#ifndef _FLOWSQL_COMMON_THREADSAFE_THREAD_H_
+#define _FLOWSQL_COMMON_THREADSAFE_THREAD_H_
 
 #include <assert.h>
 #include <sched.h>
@@ -211,4 +211,4 @@ class task {
 };
 }  // namespace flowsql
 
-#endif  //_FAST_COMMON_TS_THREAD_H_
+#endif  //_FLOWSQL_COMMON_THREADSAFE_THREAD_H_

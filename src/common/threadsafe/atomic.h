@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_COMMON_TS_ATOMIC_H_
-#define _FAST_COMMON_TS_ATOMIC_H_
+#ifndef _FLOWSQL_COMMON_THREADSAFE_ATOMIC_H_
+#define _FLOWSQL_COMMON_THREADSAFE_ATOMIC_H_
 
 #include <atomic>
 
@@ -21,4 +21,4 @@ namespace flowsql {
 using std::atomic;
 }
 
-#endif  //_FAST_COMMON_TS_ATOMIC_H_
+#endif  //_FLOWSQL_COMMON_THREADSAFE_ATOMIC_H_

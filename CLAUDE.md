@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 2. 需要编译时直接编译，无需确认
 3. 移动或删除目录前需要用户确认
 4. 不要自动提交代码（git commit/push），等用户明确发起提交指令后再执行
+5. 将用户发起的每一条命令记录到 `docs/commands.md` 文件中（追加写入，格式：日期 + 命令内容）
 
 ## 构建
 

@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_THREAD_X_H_
-#define _FAST_THREAD_X_H_
+#ifndef _FLOWSQL_COMMON_THREADSAFE_THREADX_H_
+#define _FLOWSQL_COMMON_THREADSAFE_THREADX_H_
 
 #include "../../common/logger_helper.h"
 #include "../../common/singleton.h"

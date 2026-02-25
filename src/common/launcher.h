@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_BASE_COMMON_LAUNCHER_H_
-#define _FAST_BASE_COMMON_LAUNCHER_H_
+#ifndef _FLOWSQL_COMMON_LAUNCHER_H_
+#define _FLOWSQL_COMMON_LAUNCHER_H_
 
 #include <getopt.h>
 #include <gflags/gflags.h>
@@ -152,4 +152,4 @@ class Launcher {
     std::string logpath_ = "/tmp";
 };
 }  // namespace flowsql
-#endif  // _FAST_BASE_COMMON_LAUNCHER_H_
+#endif  // _FLOWSQL_COMMON_LAUNCHER_H_

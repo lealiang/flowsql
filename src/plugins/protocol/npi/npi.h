@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_PLUGIN_NPI_H_
-#define _FAST_PLUGIN_NPI_H_
+#ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_NPI_H_
+#define _FLOWSQL_PLUGINS_PROTOCOL_NPI_NPI_H_
 
 #include <common/guid.h>
 #include <common/typedef.h>
@@ -60,4 +60,4 @@ class NetworkProtocolIdentify : public IPlugin, public IProtocol {
 
 }  // namespace flowsql
 
-#endif  //_FAST_PLUGIN_NPI_H_
+#endif  //_FLOWSQL_PLUGINS_PROTOCOL_NPI_NPI_H_

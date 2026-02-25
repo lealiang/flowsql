@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_PLUGIN_NPI_MODEL_H_
-#define _FAST_PLUGIN_NPI_MODEL_H_
+#ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_MODEL_H_
+#define _FLOWSQL_PLUGINS_PROTOCOL_NPI_MODEL_H_
 
 #include <stdint.h>
 #include <map>
@@ -63,4 +63,4 @@ class Model {
 }  // namespace protocol
 }  // namespace flowsql
 
-#endif  //_FAST_PLUGIN_NPI_MODEL_H_
+#endif  //_FLOWSQL_PLUGINS_PROTOCOL_NPI_MODEL_H_

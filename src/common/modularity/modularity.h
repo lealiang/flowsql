@@ -11,8 +11,8 @@
  * LastEditors  : LIHUO
  * LastEditTime : 2026-02-25 12:00:00
  */
-#ifndef _FAST_COMMON_MODULARITY_MODULARITY_H_
-#define _FAST_COMMON_MODULARITY_MODULARITY_H_
+#ifndef _FLOWSQL_COMMON_MODULARITY_MODULARITY_H_
+#define _FLOWSQL_COMMON_MODULARITY_MODULARITY_H_
 
 #include <fast/typedef.h>
 #include <string.h>
@@ -251,4 +251,4 @@ class MDriver {
 };
 }  // namespace flowsql
 
-#endif  // _FAST_COMMON_MODULARITY_MODULARITY_H_
+#endif  // _FLOWSQL_COMMON_MODULARITY_MODULARITY_H_

@@ -12,8 +12,8 @@
  * LastEditTime : 2026-02-25 12:00:00
  */
 
-#ifndef _FAST_BASE_ALGO_RADIXTREE_HPP_
-#define _FAST_BASE_ALGO_RADIXTREE_HPP_
+#ifndef _FLOWSQL_COMMON_ALGO_RADIXTREE_HPP_
+#define _FLOWSQL_COMMON_ALGO_RADIXTREE_HPP_
 
 #include <assert.h>
 #include <stdint.h>
@@ -129,4 +129,4 @@ class RadixTree {
 
 }  // namespace flowsql
 
-#endif  //_FAST_BASE_ALGO_RADIXTREE_HPP_
+#endif  //_FLOWSQL_COMMON_ALGO_RADIXTREE_HPP_
