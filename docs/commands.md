@@ -12,3 +12,6 @@
 - 2026-02-25: 将 .thirdparts_installed 和 .thirdparts_prefix 加到 .gitignore
 - 2026-02-25: 列举 stage1 已实现的能力
 - 2026-02-25: 更新 docs/stage1.md 实施清单，标记已完成项
+- 2026-02-25: 分析 docs/stage2.md 设计方案
+- 2026-02-25: 更新 docs/stage2.md，新增模块 P（插件系统增强：三阶段加载 + 动态注册/注销）
+- 2026-02-25: 更新 docs/stage2.md，PluginRegistry 重构为通用 IID 动态注册接口
