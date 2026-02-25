@@ -1,17 +1,15 @@
 /*
- * Copyright (C) 2020-06 - FAST
+ * Copyright (C) 2020-06 - flowSQL
  *
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
  *
  *
- * Author       : kun.dong
+ * Author       : LIHUO
  * Date         : 2020-11-14 22:08:49
- * LastEditors  : kun.dong
- * LastEditTime : 2020-11-17 15:24:54
+ * LastEditors  : LIHUO
+ * LastEditTime : 2026-02-25 12:00:00
  */
 #ifndef STATIC_REFL_H
 #define STATIC_REFL_H

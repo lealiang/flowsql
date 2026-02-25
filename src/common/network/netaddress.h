@@ -1,17 +1,16 @@
 /*
- * Copyright (C) 2020-06 - FAST
+ * Copyright (C) 2020-06 - flowSQL
  * 
  * 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
  * the Free Software Foundation; either version 3 of the License, or 
- * (at your option) any later version.
  * 
  * 
- * Author       : Pericels
+ * Author       : LIHUO
  * Date         : 2021-11-10 12:47:28
- * LastEditors  : Pericels
- * LastEditTime : 2022-06-16 19:17:19
+ * LastEditors  : LIHUO
+ * LastEditTime : 2026-02-25 12:00:00
  */
 
 #ifndef _FAST_NETADDRESS_H_

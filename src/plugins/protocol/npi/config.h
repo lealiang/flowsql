@@ -1,32 +1,28 @@
 /*
- * Copyright (C) 2020-06 - FAST
+ * Copyright (C) 2020-06 - flowSQL
  *
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
  *
  *
- * Author       : Pericels
+ * Author       : LIHUO
  * Date         : 2021-11-15 04:31:50
- * LastEditors  : Pericels
- * LastEditTime : 2022-07-07 09:44:40
+ * LastEditors  : LIHUO
+ * LastEditTime : 2026-02-25 12:00:00
  */
 /*
- * Copyright (C) 2020-06 - FAST
+ * Copyright (C) 2020-06 - flowSQL
  *
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
  *
  *
- * Author       : Pericles
+ * Author       : LIHUO
  * Date         : 2021-01-28 03:03:51
- * LastEditors  : Pericles
- * LastEditTime : 2021-03-09 21:56:13
+ * LastEditors  : LIHUO
+ * LastEditTime : 2026-02-25 12:00:00
  */
 #ifndef _FAST_PLUGIN_NPI_CONFIG_H_
 #define _FAST_PLUGIN_NPI_CONFIG_H_

@@ -1,17 +1,15 @@
 /*
- * Copyright (C) 2020-06 - FATEAM
+ * Copyright (C) 2020-06 - flowSQL
  *
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
  *
  *
- * Author       : lealiang@qq.com
+ * Author       : LIHUO
  * Date         : 2020-07-01 11:24:50
- * LastEditors  : kun.dong
- * LastEditTime : 2020-10-22 11:13:12
+ * LastEditors  : LIHUO
+ * LastEditTime : 2026-02-25 12:00:00
  */
 #ifndef _FAST_COMMON_TS_THREAD_H_
 #define _FAST_COMMON_TS_THREAD_H_

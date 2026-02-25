@@ -1,17 +1,15 @@
 /*
- * Copyright (C) 2020-06 - FAST
+ * Copyright (C) 2020-06 - flowSQL
  *
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
  *
  *
- * Author       : wa-fly@foxmail.com
+ * Author       : LIHUO
  * Date         : 2020-09-12 22:58:01
- * LastEditors  : fei.wang@foxmail.com
- * LastEditTime : 2020-10-08 16:08:38
+ * LastEditors  : LIHUO
+ * LastEditTime : 2026-02-25 12:00:00
  */
 #ifndef SRC_0_2_FAST_GUID_H_
 #define SRC_0_2_FAST_GUID_H_
