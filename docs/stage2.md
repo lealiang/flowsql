@@ -72,157 +72,63 @@ src/
 
 ---
 
-## 模块 P：插件系统增强
+## 模块 P：插件系统增强（已实现）
 
-### 问题背景
+### 发现的问题与修复
 
-现有 PluginLoader 的注册模型是静态的：接口实例在 `pluginregist()` 中以 `static` 变量创建，数量在编译时确定。这无法满足以下场景：
-- **Python 桥接**：算子数量取决于 Python 侧运行时发现的算子，`pluginregist()` 时还不知道有哪些
-- **C++ 动态算子**：未来可能通过配置文件或 Web 管理界面动态注册/注销 C++ 算子
-- **插件间依赖**：Bridge 插件的 `pluginregist()` 中启动 Python Worker 是阻塞操作（3-5 秒），串行加载模型下会拖慢所有后续插件
+| 编号 | 级别 | 问题 | 修复方案 |
+|------|------|------|---------|
+| P0-1 | 必须 | Start() 失败无回滚，已启动模块泄漏 | StartModules() 失败时逆序 Stop() 已启动模块 |
+| P0-2 | 必须 | fntraverse 是 C 函数指针，无法捕获上下文 | PluginRegistry 通过 GetInterfaces() 直接遍历，消除 static hack |
+| P0-3 | 必须 | 泛化 Get() 丢失类型安全 | 保留类型安全模板 `Get<T>(iid, key)` + 向后兼容 GetChannel/GetOperator |
+| P0-4 | 必须 | Unload 后 ifs_ref_ 未清理，悬空指针 | Unload() 末尾 clear plugins_ref_ + ifs_ref_ |
+| P1-5 | 应该 | Load() 只调用返回的那一个 IPlugin | 记录注册前后 IPlugin 数量差值，遍历所有新注册 IPlugin 调用 Load() |
+| P1-6 | 应该 | PluginRegistry 多实例 vs PluginLoader 单例 | PluginRegistry 改为单例 Instance() |
+| P2-7 | 约定 | PythonOperatorBridge 继承链 | 动态注册只注册 IID_OPERATOR，Load/Unload 空实现 |
 
-### 改动 1：PluginLoader 三阶段加载
+### 改动 1：PluginLoader 改造（loader.hpp）
 
-现有 `loader.hpp` 已定义 `IModule` 接口（`Start()`/`Stop()`）但未使用。启用三阶段加载：
-
+**三阶段加载**：
 ```
-阶段 1: pluginregist()    → 注册接口（轻量，不做重活）
-阶段 2: IPlugin::Load()   → 插件初始化（读配置、准备资源，但不启动服务）
-阶段 3: IModule::Start()  → 启动服务（Python Worker、Web Server 等）
-```
-
-修改 `PluginLoader::Load()` 末尾，取消注释已有的 Traverse 逻辑并改为调用 `IModule::Start()`：
-
-```cpp
-int PluginLoader::Load(const char* fullpath[], int count) {
-    // 阶段 1+2: 现有逻辑不变
-    for (int pos = 0; pos < count; ++pos) {
-        // dlopen → pluginregist → plugin->Load()
-        // ...（现有代码）
-    }
-
-    // 阶段 3: 所有插件注册完成后，统一启动 IModule
-    this->Traverse(IID_MODULE, [](void* imod) {
-        return reinterpret_cast<IModule*>(imod)->Start();
-    });
-    return 0;
-}
+阶段 1: pluginregist()    → 注册接口（轻量）
+阶段 2: IPlugin::Load()   → 插件初始化（遍历本次 .so 注册的所有 IPlugin）
+阶段 3: IModule::Start()  → 启动服务（失败时逆序回滚）
 ```
 
-对应地，`Unload()` 中在调用 `IPlugin::Unload()` 之前先调用 `IModule::Stop()`：
+**新增方法**：
+- `GetInterfaces(iid)` — 只读访问接口列表，供 PluginRegistry::BuildIndex 使用
+- `StartModules()` — 遍历 IID_MODULE 逐个 Start()，失败时逆序 Stop()
+- `StopModules()` — 逆序遍历 IID_MODULE 逐个 Stop()
 
-```cpp
-int PluginLoader::Unload() {
-    // 先停止所有 IModule
-    this->Traverse(IID_MODULE, [](void* imod) {
-        return reinterpret_cast<IModule*>(imod)->Stop();
-    });
-    // 再卸载所有 IPlugin（现有逻辑）
-    this->Traverse(IID_PLUGIN, [](void* imod) {
-        return reinterpret_cast<IPlugin*>(imod)->Unload();
-    });
-    // ...
-}
-```
+**Unload 改进**：先 StopModules → 再 IPlugin::Unload → freelibrary → 清理 ifs_ref_/plugins_ref_
 
-### 改动 2：PluginRegistry 通用动态注册/注销
+### 改动 2：PluginRegistry 重构（plugin_registry.h/.cpp）
 
-重构 `PluginRegistry`，基于已有的 GUID（IID）体系做泛化，不再为每种插件类型写专用方法：
+**核心变化**：
+- 单例模式 `PluginRegistry::Instance()`
+- 双层索引：`static_index_`（从 PluginLoader 扫描）+ `dynamic_index_`（shared_ptr 管理生命周期）
+- 统一 `Traverse(iid, std::function<int(void*)>)` 替代分散的 TraverseChannels/TraverseOperators
+- 动态注册 `Register(iid, key, shared_ptr<void>)` / `Unregister(iid, key)`
+- BuildIndex 通过 `loader_->GetInterfaces()` 直接遍历，无 static 变量 hack
+- 查询合并：动态优先，遍历时跳过已被动态覆盖的静态 key
+- 类型安全模板 `Get<T>(iid, key)` + `Traverse<T>(iid, callback)`
+- 向后兼容内联：GetChannel/GetOperator/TraverseChannels/TraverseOperators
 
-```cpp
-class PluginRegistry {
-public:
-    // 静态插件（从 PluginLoader 扫描）
-    int LoadPlugin(const std::string& path);
-    void UnloadAll();
+### 改动 3：适配层
 
-    // 动态注册/注销 — 通用接口，按 IID + key 管理
-    void Register(const Guid& iid, const std::string& key, std::shared_ptr<void> instance);
-    void Unregister(const Guid& iid, const std::string& key);
-
-    // 通用查询 — 合并静态 + 动态，动态优先
-    void* Get(const Guid& iid, const std::string& key);
-    void Traverse(const Guid& iid, std::function<int(void*)> callback);
-
-private:
-    PluginLoader* loader_;
-    bool index_built_ = false;
-
-    // 静态插件索引（BuildIndex 从 PluginLoader 扫描构建）
-    // key = IID, value = { "catelog.name" → void* }
-    std::map<Guid, std::unordered_map<std::string, void*>> static_index_;
-
-    // 动态插件（shared_ptr<void> 管理生命周期，析构时自动调用正确的 deleter）
-    std::map<Guid, std::unordered_map<std::string, std::shared_ptr<void>>> dynamic_index_;
-
-    void BuildIndex();
-};
-```
-
-查询合并逻辑：
-
-```cpp
-void* PluginRegistry::Get(const Guid& iid, const std::string& key) {
-    BuildIndex();
-
-    // 动态优先
-    auto dit = dynamic_index_.find(iid);
-    if (dit != dynamic_index_.end()) {
-        auto it = dit->second.find(key);
-        if (it != dit->second.end()) return it->second.get();
-    }
-
-    // 静态
-    auto sit = static_index_.find(iid);
-    if (sit != static_index_.end()) {
-        auto it = sit->second.find(key);
-        if (it != sit->second.end()) return it->second;
-    }
-    return nullptr;
-}
-```
-
-调用方按需 cast：
-
-```cpp
-// Pipeline 获取算子
-auto* op = static_cast<IOperator*>(registry->Get(IID_OPERATOR, "explore.chisquare"));
-
-// Bridge 动态注册 Python 算子
-auto bridge = std::make_shared<PythonOperatorBridge>(catelog, name, client);
-registry->Register(IID_OPERATOR, catelog + "." + name, bridge);
-
-// Bridge 注销
-registry->Unregister(IID_OPERATOR, "explore.chisquare");
-
-// Web 模块查询通道
-auto* ch = static_cast<IChannel*>(registry->Get(IID_CHANNEL, "pcap.eth0"));
-
-// 遍历所有算子（静态 + 动态合并）
-registry->Traverse(IID_OPERATOR, [](void* iface) {
-    auto* op = static_cast<IOperator*>(iface);
-    printf("%s.%s\n", op->Catelog(), op->Name());
-    return 0;
-});
-```
-
-### 设计要点
-
-| 关注点 | 方案 |
-|--------|------|
-| 类型无关 | 基于 IID + key 泛化，新增插件类型无需修改 PluginRegistry 接口 |
-| 生命周期 | 静态插件由 PluginLoader 管（static 变量 + dlclose）；动态插件由 `shared_ptr<void>` 管，构造时记住原始类型 deleter，注销时自动正确析构 |
-| 对 Pipeline 透明 | `Get()` 返回 `void*`，调用方 `static_cast` 到具体接口，与 PluginLoader 的 `First()` 使用方式一致 |
-| 线程安全 | Stage 2 暂为单线程使用，后续可加 `std::shared_mutex` 保护 `dynamic_index_` |
-| 向后兼容 | 现有静态插件（NPI、example）的注册流程完全不变，`BuildIndex` 从 PluginLoader 扫描构建 `static_index_` |
+- `service.h/.cpp`：`PluginRegistry registry_` → `PluginRegistry* registry_`，通过 Instance() 获取
+- `test_framework/main.cpp`：适配单例 + 新增 test_dynamic_register 验证动态注册/注销/合并遍历
 
 ### 涉及文件
 
-| 文件 | 改动 |
-|------|------|
-| `common/loader.hpp` | `Load()` 末尾启用 IModule::Start() 遍历；`Unload()` 前置 IModule::Stop() |
-| `framework/core/plugin_registry.h` | 重构为通用 Register/Unregister/Get/Traverse 接口 + `static_index_`/`dynamic_index_` 双层存储 |
-| `framework/core/plugin_registry.cpp` | 实现通用注册/注销 + BuildIndex + 查询/遍历合并逻辑 |
+| 文件 | 改动类型 |
+|------|---------|
+| `common/loader.hpp` | 修改：GetInterfaces + StartModules/StopModules + Load 多 IPlugin + Unload 清理 |
+| `framework/core/plugin_registry.h` | 重构：单例 + 统一 Traverse + 泛型模板 + 动态注册 + 双层索引 |
+| `framework/core/plugin_registry.cpp` | 重构：BuildIndex 用 GetInterfaces + Traverse 合并查询 + Register/Unregister |
+| `framework/core/service.h` | 小改：registry_ 改为指针 |
+| `framework/core/service.cpp` | 小改：适配指针调用 |
+| `tests/test_framework/main.cpp` | 小改：适配单例 + 新增动态注册测试 |
 
 ---
 

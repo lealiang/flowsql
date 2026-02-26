@@ -119,20 +119,20 @@ void test_dataframe_json() {
 void test_pipeline(const std::string& plugin_dir) {
     printf("[TEST] Plugin loading + Pipeline...\n");
 
-    PluginRegistry registry;
+    PluginRegistry* registry = PluginRegistry::Instance();
 
     // PluginLoader::Load 会自动拼接 get_absolute_process_path() 前缀
     // 所以只传相对于可执行文件目录的文件名
     std::string plugin_name = "libflowsql_example.so";
-    int ret = registry.LoadPlugin(plugin_name);
+    int ret = registry->LoadPlugin(plugin_name);
     if (ret != 0) {
         printf("[SKIP] Plugin not found: %s, skipping pipeline test\n", plugin_name.c_str());
         return;
     }
 
     // 查询插件
-    IChannel* source = registry.GetChannel("example", "memory");
-    IOperator* op = registry.GetOperator("example", "passthrough");
+    IChannel* source = registry->GetChannel("example", "memory");
+    IOperator* op = registry->GetOperator("example", "passthrough");
     assert(source != nullptr);
     assert(op != nullptr);
 
@@ -174,7 +174,7 @@ void test_pipeline(const std::string& plugin_dir) {
     assert(std::get<int32_t>(row[1]) == 10);
 
     source->Close();
-    registry.UnloadAll();
+    registry->UnloadAll();
 
     printf("[PASS] Plugin loading + Pipeline\n");
 }
@@ -201,6 +201,112 @@ void test_dataframe_clear() {
 }
 
 // ============================================================
+// Test 6: 动态注册/注销 + 合并遍历
+// ============================================================
+
+// 测试用的简单 IOperator 实现
+class MockDynamicOperator : public IOperator {
+ public:
+    MockDynamicOperator(std::string catelog, std::string name)
+        : catelog_(std::move(catelog)), name_(std::move(name)) {}
+
+    int Load() override { return 0; }
+    int Unload() override { return 0; }
+    std::string Catelog() override { return catelog_; }
+    std::string Name() override { return name_; }
+    std::string Description() override { return "dynamic test operator"; }
+    OperatorPosition Position() override { return OperatorPosition::DATA; }
+    int Work(IDataFrame* in, IDataFrame* out) override { return 0; }
+    int Configure(const char*, const char*) override { return 0; }
+
+ private:
+    std::string catelog_;
+    std::string name_;
+};
+
+void test_dynamic_register() {
+    printf("[TEST] Dynamic register/unregister...\n");
+
+    PluginRegistry* registry = PluginRegistry::Instance();
+
+    // 先加载静态插件
+    std::string plugin_name = "libflowsql_example.so";
+    int ret = registry->LoadPlugin(plugin_name);
+    if (ret != 0) {
+        printf("[SKIP] Plugin not found, skipping dynamic register test\n");
+        return;
+    }
+
+    // 验证静态插件存在
+    IOperator* static_op = registry->GetOperator("example", "passthrough");
+    assert(static_op != nullptr);
+
+    // 动态注册一个新算子
+    auto dyn_op = std::make_shared<MockDynamicOperator>("dynamic", "mock");
+    registry->Register(IID_OPERATOR, "dynamic.mock", dyn_op);
+
+    // 通过 Get 查询动态算子
+    IOperator* found = registry->Get<IOperator>(IID_OPERATOR, "dynamic.mock");
+    assert(found != nullptr);
+    assert(found->Catelog() == "dynamic");
+    assert(found->Name() == "mock");
+
+    // 静态算子仍然可查
+    assert(registry->GetOperator("example", "passthrough") != nullptr);
+
+    // 遍历合并：应该同时看到静态和动态算子
+    int count = 0;
+    bool found_static = false, found_dynamic = false;
+    registry->Traverse(IID_OPERATOR, [&](void* p) -> int {
+        auto* op = static_cast<IOperator*>(p);
+        count++;
+        if (op->Catelog() == "example" && op->Name() == "passthrough") found_static = true;
+        if (op->Catelog() == "dynamic" && op->Name() == "mock") found_dynamic = true;
+        return 0;
+    });
+    assert(count >= 2);
+    assert(found_static);
+    assert(found_dynamic);
+
+    // 动态覆盖静态：注册同 key 的动态算子
+    auto override_op = std::make_shared<MockDynamicOperator>("example", "passthrough_v2");
+    registry->Register(IID_OPERATOR, "example.passthrough", override_op);
+
+    // Get 应返回动态版本
+    IOperator* overridden = registry->Get<IOperator>(IID_OPERATOR, "example.passthrough");
+    assert(overridden != nullptr);
+    assert(overridden->Name() == "passthrough_v2");
+
+    // 遍历时同 key 不重复
+    int passthrough_count = 0;
+    registry->Traverse(IID_OPERATOR, [&](void* p) -> int {
+        auto* op = static_cast<IOperator*>(p);
+        if (op->Catelog() == "example" &&
+            (op->Name() == "passthrough" || op->Name() == "passthrough_v2")) {
+            passthrough_count++;
+        }
+        return 0;
+    });
+    assert(passthrough_count == 1);  // 只有动态版本
+
+    // 注销动态覆盖
+    registry->Unregister(IID_OPERATOR, "example.passthrough");
+
+    // 恢复为静态版本
+    IOperator* restored = registry->Get<IOperator>(IID_OPERATOR, "example.passthrough");
+    assert(restored != nullptr);
+    assert(restored->Name() == "passthrough");
+
+    // 注销动态 mock
+    registry->Unregister(IID_OPERATOR, "dynamic.mock");
+    assert(registry->Get(IID_OPERATOR, "dynamic.mock") == nullptr);
+
+    registry->UnloadAll();
+
+    printf("[PASS] Dynamic register/unregister\n");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
@@ -214,6 +320,9 @@ int main(int argc, char* argv[]) {
     // Pipeline 测试需要插件 .so
     std::string plugin_dir = get_absolute_process_path();
     test_pipeline(plugin_dir);
+
+    // 动态注册测试需要插件 .so
+    test_dynamic_register();
 
     printf("\n=== All tests passed ===\n");
     return 0;

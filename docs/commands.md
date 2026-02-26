@@ -18,3 +18,8 @@
 - 2026-02-25: 提交上传代码（新增 stage2.md 设计文档）
 - 2026-02-26: 清理 src/common/ 下 28 个未引用的头文件和源文件（死代码删除）
 - 2026-02-26: 修复 test_npi 引用旧库名 libfast_npi2.0.so 的问题，改为 libflowsql_npi.so，并添加空指针防御
+- 2026-02-26: CLAUDE.md 添加编程规则：尽量使用成熟的开源方案，不重复造轮子
+- 2026-02-26: 安装 gh CLI (GitHub CLI) v2.87.3
+- 2026-02-26: 更新 CLAUDE.md 架构章节，使其与实际代码一致
+- 2026-02-26: 聚焦模块 P 分析问题和改进方案（7 个问题：Start 回滚、fntraverse 限制、类型安全、悬空指针、多 IPlugin Load、单例、继承链）
+- 2026-02-26: 实现模块 P（插件系统增强）：loader.hpp 三阶段加载 + Start 回滚 + Unload 清理；PluginRegistry 单例 + 双层索引 + 动态注册/注销 + 统一 Traverse；适配 Service 和 test_framework + 新增动态注册测试

@@ -26,22 +26,27 @@ make -j$(nproc)
 
 ```bash
 ./src/build/output/test_npi
+./src/build/output/test_framework
 ```
 
 ## 架构
 
 FlowSQL 是基于 SQL 语法的网络流量分析平台，采用插件化架构。
 
-### 插件系统（两套机制）
+### 插件系统
 
-**轻量级 PluginLoader**（`common/loader.hpp`）— 当前 NPI 插件使用此机制：
+**PluginLoader**（`common/loader.hpp`）— 所有插件统一使用此机制：
 - 插件编译为 .so，导出 `pluginregist` / `pluginunregist` 符号
-- 通过 GUID 注册接口，`IQuerier` 按 GUID 查询/遍历接口实例
+- 通过 GUID 注册接口，`IQuerier`（`common/iquerier.hpp`）按 GUID 查询/遍历接口实例
 - 注册宏：`BEGIN_PLUGIN_REGIST(ClassName)` → `____INTERFACE(IID, InterfaceName)` → `END_PLUGIN_REGIST()`
+- `IModule` 接口（Start/Stop）已在 `loader.hpp` 中预留，尚未启用
 
-**模块驱动 MDriver**（`common/modularity/modularity.h`）— 更完整的生命周期管理：
-- `InterfaceRegister` 管理模块和接口的注册/查询，支持 shared_ptr 生命周期
-- `MDriver` 负责加载 .so、调用 `RegisterInterface` 导出函数、驱动 Load/Unload
+### 框架层（Stage 1）
+
+位于 `src/framework/`，提供数据处理框架：
+- `interfaces/` — 核心接口定义：`IDataFrame`（Arrow 列式数据）、`IDataEntity`（数据实体）、`IChannel`（数据通道）、`IOperator`（数据算子）
+- `core/` — 实现：`DataFrame`（Apache Arrow 后端）、`Pipeline`（管道）、`PluginRegistry`（插件注册表）、`Service`（服务管理）
+- `macros.h` — 框架注册宏（`BEGIN_CHANNEL_REGIST`、`BEGIN_OPERATOR_REGIST`）
 
 ### NPI 插件（协议识别）
 
@@ -55,14 +60,19 @@ FlowSQL 是基于 SQL 语法的网络流量分析平台，采用插件化架构�
 
 通过 `src/thirdparts/` 下的 `*-config.cmake` 文件以 ExternalProject_Add 管理。`subjects.cmake` 中的 `add_thirddepen(TARGET lib1 lib2 ...)` 宏自动处理 include/link 目录和库链接。
 
-依赖列表：gflags、glog、hyperscan（正则引擎）、rapidjson、yaml-cpp。
+依赖列表：gflags、glog、hyperscan（正则引擎）、rapidjson、yaml-cpp、Apache Arrow（列式数据）、Boost、Ragel（状态机生成器）。
 
 ### 关键目录
 
-- `src/common/` — 公共库：算法（AhoCorasick、RadixTree、Bitmap）、网络包结构、IPC、共享内存、线程安全原语、反射
-- `src/plugins/` — 插件实现，按功能分目录
-- `src/tests/` — 测试程序
+- `src/common/` — 公共库：算法（Bitmap、对象池、链表）、网络包结构（`network/`）、线程安全原语（`threadsafe/`）、插件加载器、GUID、工具函数
+- `src/framework/` — 数据处理框架：接口定义、DataFrame、Pipeline、插件注册表
+- `src/plugins/` — 插件实现：`protocol/npi/`（协议识别）、`example/`（示例 Channel + Operator）
+- `src/tests/` — 测试程序：`test_npi/`、`test_framework/`
 - `src/data/packets/` — 测试用 pcap 抓包文件
+
+## 编程规则
+
+- 尽量使用成熟的开源方案，不重复造轮子
 
 ## 代码风格
 
