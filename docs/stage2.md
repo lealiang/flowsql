@@ -7,6 +7,89 @@ Stage 1 已完成 C++ 框架核心（IDataEntity、IDataFrame、IChannel、IOper
 2. **模块 A**：C++ ↔ Python 桥接 — 让 Python 算子（pandas/scipy/sklearn）能通过统一的 IOperator 接口被 Pipeline 调度
 3. **模块 B**：Web 管理系统 — httplib 后端 + Vue.js 前端，提供通道/算子/任务管理和 SQL 执行界面
 
+## 核心接口体系
+
+FlowSQL 的插件化架构建立在以下四个核心接口之上，通过 GUID 标识、PluginLoader 加载、PluginRegistry 索引，形成完整的组件生命周期和数据流通机制。
+
+```
+IPlugin（生命周期基元）
+├── IChannel（数据通道）    ← Pipeline 的源和汇
+├── IOperator（数据算子）   ← Pipeline 的计算节点
+└── ...（可扩展）
+
+IModule（启停控制）         ← 需要后台运行的组件额外实现
+
+IDataEntity（数据实体）     ← 单行数据的抽象
+IDataFrame（数据帧）        ← 列式数据集，Arrow RecordBatch 后端
+```
+
+### IPlugin — 插件生命周期基元
+
+定义：`common/loader.hpp` | 标识：`IID_PLUGIN`
+
+所有可加载组件的根接口。每个 .so 插件通过 `pluginregist()` 注册时，至少注册一个 IPlugin 实例。IChannel 和 IOperator 都继承自它，因此每个通道和算子天然具备生命周期管理能力。
+
+| 方法 | 职责 |
+|------|------|
+| `Load()` | 插件初始化（三阶段加载的阶段 2），此时不应调用其他接口 |
+| `Unload()` | 插件清理，同样不应调用其他接口 |
+| `Option(const char*)` | 接收加载时传入的配置参数 |
+
+### IModule — 服务启停控制
+
+定义：`common/loader.hpp` | 标识：`IID_MODULE`
+
+用于需要"运行态"的组件（如后台进程、网络监听）。与 IPlugin 正交——一个插件类可以同时实现两者（如 BridgePlugin），也可以只实现 IPlugin。
+
+| 方法 | 职责 |
+|------|------|
+| `Start()` | 启动服务（三阶段加载的阶段 3，所有 IPlugin::Load 完成后） |
+| `Stop()` | 停止服务（Unload 前逆序调用） |
+
+PluginLoader 保证：先注册 → 再初始化 → 最后启动，Start 失败时逆序回滚已启动的模块。
+
+### IChannel — 数据通道
+
+定义：`framework/interfaces/ichannel.h` | 标识：`IID_CHANNEL` | 继承：IPlugin
+
+代表数据的入口或出口，Pipeline 通过它读写数据。`Catelog()` + `Name()` 构成唯一标识（如 `"example.memory"`）。
+
+| 方法 | 职责 |
+|------|------|
+| `Open()` / `Close()` / `IsOpened()` | 通道生命周期 |
+| `Put(IDataEntity*)` | 写入一条数据实体 |
+| `Get()` → `IDataEntity*` | 读取一条数据实体 |
+| `Flush()` | 批量刷新 |
+
+典型实现如 MemoryChannel（内存队列），可扩展为 Kafka、文件、网络 socket 等，Pipeline 不关心底层实现。
+
+### IOperator — 数据算子
+
+定义：`framework/interfaces/ioperator.h` | 标识：`IID_OPERATOR` | 继承：IPlugin
+
+代表一个数据处理单元，接收 DataFrame 输入、产出 DataFrame 输出。
+
+| 方法 | 职责 |
+|------|------|
+| `Work(IDataFrame* in, IDataFrame* out)` | 核心计算方法 |
+| `Position()` | 算子位置（STORAGE 或 DATA 层） |
+| `Configure(key, value)` | 运行时调参 |
+
+Pipeline 的数据流：`Channel.Get → DataFrame → Operator.Work → DataFrame → Channel.Put`。Stage 2 的 PythonOperatorBridge 也实现此接口，将 Work 调用转发给 Python Worker，对 Pipeline 完全透明。
+
+### 数据流通路径
+
+```
+┌─────────┐   Get()    ┌───────────┐   Work()   ┌───────────┐   Put()    ┌─────────┐
+│ IChannel │ ────────→  │ IDataFrame│ ────────→  │ IOperator │ ────────→  │ IChannel│
+│ (source) │            │ (input)   │            │           │            │ (sink)  │
+└─────────┘            └───────────┘            └───────────┘            └─────────┘
+     ↑                                                                        │
+     └────────────────────── Pipeline 循环 ───────────────────────────────────┘
+```
+
+---
+
 ## 目录结构
 
 ```

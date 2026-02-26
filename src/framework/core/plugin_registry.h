@@ -1,0 +1,83 @@
+#ifndef _FLOWSQL_FRAMEWORK_CORE_PLUGIN_REGISTRY_H_
+#define _FLOWSQL_FRAMEWORK_CORE_PLUGIN_REGISTRY_H_
+
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "framework/interfaces/ichannel.h"
+#include "framework/interfaces/ioperator.h"
+
+namespace flowsql {
+
+class PluginLoader;
+
+class PluginRegistry {
+ public:
+    static PluginRegistry* Instance();
+
+    // 静态插件加载（委托 PluginLoader）
+    int LoadPlugin(const std::string& path);
+    void UnloadAll();
+
+    // 动态注册/注销 — 通用接口，按 IID + key 管理
+    void Register(const Guid& iid, const std::string& key, std::shared_ptr<void> instance);
+    void Unregister(const Guid& iid, const std::string& key);
+
+    // 统一查询 — 合并静态 + 动态，动态优先
+    void* Get(const Guid& iid, const std::string& key);
+
+    // 统一遍历 — 合并静态 + 动态，直接遍历自己的 map
+    void Traverse(const Guid& iid, std::function<int(void*)> callback);
+
+    // 类型安全的便捷模板
+    template <typename T>
+    T* Get(const Guid& iid, const std::string& key) {
+        return static_cast<T*>(Get(iid, key));
+    }
+
+    template <typename T>
+    void Traverse(const Guid& iid, std::function<void(T*)> callback) {
+        Traverse(iid, [&callback](void* p) -> int {
+            callback(static_cast<T*>(p));
+            return 0;
+        });
+    }
+    // 向后兼容（内联薄包装）
+    IChannel* GetChannel(const std::string& catelog, const std::string& name) {
+        return Get<IChannel>(IID_CHANNEL, catelog + "." + name);
+    }
+    IOperator* GetOperator(const std::string& catelog, const std::string& name) {
+        return Get<IOperator>(IID_OPERATOR, catelog + "." + name);
+    }
+
+    void TraverseChannels(std::function<void(IChannel*)> callback) {
+        Traverse<IChannel>(IID_CHANNEL, callback);
+    }
+    void TraverseOperators(std::function<void(IOperator*)> callback) {
+        Traverse<IOperator>(IID_OPERATOR, callback);
+    }
+
+ private:
+    PluginRegistry();
+    ~PluginRegistry();
+    PluginRegistry(const PluginRegistry&) = delete;
+    PluginRegistry& operator=(const PluginRegistry&) = delete;
+
+    void BuildIndex();
+
+    PluginLoader* loader_;
+    bool index_built_ = false;
+
+    // 静态索引（BuildIndex 通过 loader_->GetInterfaces() 直接遍历构建）
+    std::map<Guid, std::unordered_map<std::string, void*>> static_index_;
+    // 动态索引（shared_ptr<void> 管理生命周期）
+    std::map<Guid, std::unordered_map<std::string, std::shared_ptr<void>>> dynamic_index_;
+};
+
+}  // namespace flowsql
+
+#endif  // _FLOWSQL_FRAMEWORK_CORE_PLUGIN_REGISTRY_H_

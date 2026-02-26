@@ -47,3 +47,7 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_npi ${CMAKE_BINARY_DIR}/test_npi
 add_subdirectory(${CMAKE_SOURCE_DIR}/framework ${CMAKE_BINARY_DIR}/framework)
 add_subdirectory(${CMAKE_SOURCE_DIR}/plugins/example ${CMAKE_BINARY_DIR}/example_plugin)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_framework ${CMAKE_BINARY_DIR}/test_framework)
+
+# Stage 2: C++ ↔ Python 桥接
+add_subdirectory(${CMAKE_SOURCE_DIR}/bridge ${CMAKE_BINARY_DIR}/bridge)
+add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_bridge ${CMAKE_BINARY_DIR}/test_bridge)

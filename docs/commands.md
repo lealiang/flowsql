@@ -23,3 +23,5 @@
 - 2026-02-26: 更新 CLAUDE.md 架构章节，使其与实际代码一致
 - 2026-02-26: 聚焦模块 P 分析问题和改进方案（7 个问题：Start 回滚、fntraverse 限制、类型安全、悬空指针、多 IPlugin Load、单例、继承链）
 - 2026-02-26: 实现模块 P（插件系统增强）：loader.hpp 三阶段加载 + Start 回滚 + Unload 清理；PluginRegistry 单例 + 双层索引 + 动态注册/注销 + 统一 Traverse；适配 Service 和 test_framework + 新增动态注册测试
+- 2026-02-26: 整理核心接口说明（IPlugin/IModule/IChannel/IOperator/IDataFrame/IDataEntity），写入 docs/stage2.md 架构章节和 README.md
+- 2026-02-26: 实现模块 A（C++ ↔ Python 桥接）：ArrowIpcSerializer、PythonOperatorBridge、PythonProcessManager、BridgePlugin（C++ 端）；FastAPI Worker、OperatorBase 装饰器注册、OperatorRegistry 自动发现（Python 端）；httplib 第三方依赖；test_bridge 测试；修复 DataFrame::Finalize() 中 InitBuilders() 覆盖 batch_ 的 bug

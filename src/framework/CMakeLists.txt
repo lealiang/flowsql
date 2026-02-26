@@ -10,4 +10,5 @@ add_thirddepen(${PROJECT_NAME} arrow rapidjson)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+    POSITION_INDEPENDENT_CODE ON
 )
