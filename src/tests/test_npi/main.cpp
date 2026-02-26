@@ -78,7 +78,7 @@ int main(int argc, char* argv[]) {
     launcher.Launch(argc, argv, []() -> int32_t {
         // for test load the plugins
         flowsql::PluginLoader* _loader = flowsql::PluginLoader::Single();
-        const char* _plugins[] = {"libfast_npi2.0.so"};
+        const char* _plugins[] = {"libflowsql_npi.so"};
         std::string _protocolfile = FLAGS_protocolfile;
         char npioption[1024] = {0};
         snprintf(npioption, 1024, "{\"ldfile\":\"%s\"}", _protocolfile.c_str());
@@ -87,8 +87,18 @@ int main(int argc, char* argv[]) {
             return -1;
         }
         flowsql::IProtocol* proto = (flowsql::IProtocol*)_loader->First(flowsql::IID_PROTOCOL);
+        if (!proto) {
+            printf("No IProtocol implementation found\n");
+            _loader->Unload();
+            return -1;
+        }
         flowsql::protocol::IDictionary* dict = proto->Dictionary();
         std::string packetfile = FLAGS_packetfile;
+        if (packetfile.empty()) {
+            printf("Usage: test_npi --packetfile=<pcap> --protocolfile=<yml>\n");
+            _loader->Unload();
+            return 0;
+        }
         flowsql::protocol::Layers layers;
         uint64_t packetno = 0;
         proto->Concurrency(2);

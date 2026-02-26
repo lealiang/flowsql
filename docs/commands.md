@@ -16,3 +16,5 @@
 - 2026-02-25: 更新 docs/stage2.md，新增模块 P（插件系统增强：三阶段加载 + 动态注册/注销）
 - 2026-02-25: 更新 docs/stage2.md，PluginRegistry 重构为通用 IID 动态注册接口
 - 2026-02-25: 提交上传代码（新增 stage2.md 设计文档）
+- 2026-02-26: 清理 src/common/ 下 28 个未引用的头文件和源文件（死代码删除）
+- 2026-02-26: 修复 test_npi 引用旧库名 libfast_npi2.0.so 的问题，改为 libflowsql_npi.so，并添加空指针防御
