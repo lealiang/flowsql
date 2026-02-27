@@ -1,0 +1,52 @@
+#ifndef _FLOWSQL_FRAMEWORK_CORE_DATAFRAME_CHANNEL_H_
+#define _FLOWSQL_FRAMEWORK_CORE_DATAFRAME_CHANNEL_H_
+
+#include <memory>
+#include <mutex>
+#include <string>
+
+#include "dataframe.h"
+#include "framework/interfaces/idataframe_channel.h"
+
+namespace flowsql {
+
+// DataFrameChannel — IDataFrameChannel 的内存实现
+// Read() 快照语义（非破坏性），Write() 替换语义
+class DataFrameChannel : public IDataFrameChannel {
+ public:
+    DataFrameChannel(const std::string& catelog, const std::string& name);
+    ~DataFrameChannel() override = default;
+
+    // IPlugin
+    int Option(const char*) override { return 0; }
+    int Load() override { return 0; }
+    int Unload() override { return 0; }
+
+    // IChannel — 身份
+    const char* Catelog() override { return catelog_.c_str(); }
+    const char* Name() override { return name_.c_str(); }
+    const char* Type() override { return "dataframe"; }
+    const char* Schema() override;
+
+    // IChannel — 生命周期
+    int Open() override;
+    int Close() override;
+    bool IsOpened() const override { return opened_; }
+    int Flush() override { return 0; }
+
+    // IDataFrameChannel — 数据读写
+    int Write(IDataFrame* df) override;
+    int Read(IDataFrame* df) override;
+
+ private:
+    std::string catelog_;
+    std::string name_;
+    bool opened_ = false;
+    DataFrame data_;              // 内部存储
+    std::string schema_cache_;    // Schema() 返回值缓存
+    mutable std::mutex mutex_;    // 保护并发读写
+};
+
+}  // namespace flowsql
+
+#endif  // _FLOWSQL_FRAMEWORK_CORE_DATAFRAME_CHANNEL_H_

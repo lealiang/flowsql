@@ -17,6 +17,10 @@ EXPORT_API flowsql::IPlugin* pluginregist(flowsql::IRegister* registry, const ch
         flowsql::IChannel* iface = dynamic_cast<flowsql::IChannel*>(&_channel);
         registry->Regist(flowsql::IID_CHANNEL, iface);
     }
+    {
+        flowsql::IDataFrameChannel* iface = dynamic_cast<flowsql::IDataFrameChannel*>(&_channel);
+        registry->Regist(flowsql::IID_DATAFRAME_CHANNEL, iface);
+    }
 
     // PassthroughOperator
     static flowsql::PassthroughOperator _operator;

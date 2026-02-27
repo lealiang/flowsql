@@ -22,8 +22,8 @@ class PassthroughOperator : public IOperator {
     std::string Description() override { return "Passthrough operator for testing"; }
     OperatorPosition Position() override { return OperatorPosition::DATA; }
 
-    // 统一处理接口
-    int Work(IDataFrame* in, IDataFrame* out) override;
+    // 核心处理：从 in 通道读取 DataFrame，原样写入 out 通道
+    int Work(IChannel* in, IChannel* out) override;
 
     // 配置
     int Configure(const char*, const char*) override { return 0; }

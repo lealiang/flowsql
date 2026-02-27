@@ -20,7 +20,7 @@ struct OperatorMeta {
 };
 
 // PythonOperatorBridge — 实现 IOperator，将 Work() 转发给 Python Worker
-// 每个实例持有独立的 httplib::Client（线程安全，无锁）
+// Work() 内部 dynamic_cast 到 IDataFrameChannel，完成 Read/Write + Arrow IPC 序列化
 class PythonOperatorBridge : public IOperator {
  public:
     PythonOperatorBridge(const OperatorMeta& meta, const std::string& host, int port);
@@ -37,8 +37,8 @@ class PythonOperatorBridge : public IOperator {
     std::string Description() override { return meta_.description; }
     OperatorPosition Position() override { return meta_.position; }
 
-    // 核心：将 Work 转发给 Python Worker
-    int Work(IDataFrame* in, IDataFrame* out) override;
+    // 核心：从 in 通道读取 DataFrame → Arrow IPC → Python Worker → 写入 out 通道
+    int Work(IChannel* in, IChannel* out) override;
 
     // 配置转发
     int Configure(const char* key, const char* value) override;

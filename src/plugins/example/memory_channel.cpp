@@ -9,21 +9,29 @@ int MemoryChannel::Open() {
 
 int MemoryChannel::Close() {
     opened_ = false;
-    while (!queue_.empty()) queue_.pop();
+    data_.Clear();
     return 0;
 }
 
-int MemoryChannel::Put(IDataEntity* entity) {
-    if (!opened_ || !entity) return -1;
-    queue_.push(entity->Clone());
+int MemoryChannel::Write(IDataFrame* df) {
+    if (!opened_ || !df) return -1;
+    // 替换语义
+    data_.Clear();
+    data_.SetSchema(df->GetSchema());
+    for (int32_t i = 0; i < df->RowCount(); ++i) {
+        data_.AppendRow(df->GetRow(i));
+    }
     return 0;
 }
 
-IDataEntity* MemoryChannel::Get() {
-    if (!opened_ || queue_.empty()) return nullptr;
-    last_get_ = queue_.front();
-    queue_.pop();
-    return last_get_.get();
+int MemoryChannel::Read(IDataFrame* df) {
+    if (!opened_ || !df) return -1;
+    // 快照语义
+    df->SetSchema(data_.GetSchema());
+    for (int32_t i = 0; i < data_.RowCount(); ++i) {
+        df->AppendRow(data_.GetRow(i));
+    }
+    return 0;
 }
 
 }  // namespace flowsql

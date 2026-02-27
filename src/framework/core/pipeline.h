@@ -3,9 +3,7 @@
 
 #include <memory>
 #include <string>
-#include <vector>
 
-#include "dataframe.h"
 #include "framework/interfaces/ichannel.h"
 #include "framework/interfaces/ioperator.h"
 
@@ -18,6 +16,7 @@ enum class PipelineState : int32_t {
     FAILED
 };
 
+// Pipeline — 纯连接器，只负责将 source 和 sink 通道交给算子
 class Pipeline {
  public:
     Pipeline() = default;
@@ -30,27 +29,23 @@ class Pipeline {
  private:
     friend class PipelineBuilder;
 
-    std::vector<IChannel*> sources_;
+    IChannel* source_ = nullptr;
     IOperator* operator_ = nullptr;
     IChannel* sink_ = nullptr;
-    int32_t batch_size_ = 1000;
-    bool running_ = false;
     PipelineState state_ = PipelineState::IDLE;
 };
 
 class PipelineBuilder {
  public:
-    PipelineBuilder& AddSource(IChannel* channel);
+    PipelineBuilder& SetSource(IChannel* channel);
     PipelineBuilder& SetOperator(IOperator* op);
     PipelineBuilder& SetSink(IChannel* channel);
-    PipelineBuilder& SetBatchSize(int32_t size);
     std::unique_ptr<Pipeline> Build();
 
  private:
-    std::vector<IChannel*> sources_;
+    IChannel* source_ = nullptr;
     IOperator* operator_ = nullptr;
     IChannel* sink_ = nullptr;
-    int32_t batch_size_ = 1000;
 };
 
 }  // namespace flowsql

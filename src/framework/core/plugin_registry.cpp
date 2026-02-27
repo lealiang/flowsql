@@ -51,7 +51,7 @@ void PluginRegistry::BuildIndex() {
     if (auto* channels = loader_->GetInterfaces(IID_CHANNEL)) {
         for (void* p : *channels) {
             auto* ch = static_cast<IChannel*>(p);
-            static_index_[IID_CHANNEL][ch->Catelog() + "." + ch->Name()] = p;
+            static_index_[IID_CHANNEL][std::string(ch->Catelog()) + "." + ch->Name()] = p;
         }
     }
 

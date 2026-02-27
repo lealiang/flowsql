@@ -1,15 +1,16 @@
 #ifndef _FLOWSQL_PLUGINS_EXAMPLE_MEMORY_CHANNEL_H_
 #define _FLOWSQL_PLUGINS_EXAMPLE_MEMORY_CHANNEL_H_
 
-#include <framework/interfaces/ichannel.h>
+#include <framework/core/dataframe.h>
+#include <framework/interfaces/idataframe_channel.h>
 
-#include <memory>
-#include <queue>
 #include <string>
 
 namespace flowsql {
 
-class MemoryChannel : public IChannel {
+// MemoryChannel — IDataFrameChannel 的简单内存实现（示例插件）
+// Read() 快照语义，Write() 替换语义
+class MemoryChannel : public IDataFrameChannel {
  public:
     MemoryChannel() = default;
     ~MemoryChannel() override = default;
@@ -18,27 +19,25 @@ class MemoryChannel : public IChannel {
     int Load() override { return 0; }
     int Unload() override { return 0; }
 
-    // IChannel 元数据
-    std::string Catelog() override { return "example"; }
-    std::string Name() override { return "memory"; }
-    std::string Description() override { return "In-memory queue channel for testing"; }
+    // IChannel — 身份
+    const char* Catelog() override { return "example"; }
+    const char* Name() override { return "memory"; }
+    const char* Type() override { return "dataframe"; }
+    const char* Schema() override { return "[]"; }
 
-    // 生命周期
+    // IChannel — 生命周期
     int Open() override;
     int Close() override;
     bool IsOpened() const override { return opened_; }
-
-    // 数据操作
-    int Put(IDataEntity* entity) override;
-    IDataEntity* Get() override;
-
-    // 批量刷新
     int Flush() override { return 0; }
+
+    // IDataFrameChannel — 数据读写
+    int Write(IDataFrame* df) override;
+    int Read(IDataFrame* df) override;
 
  private:
     bool opened_ = false;
-    std::queue<std::shared_ptr<IDataEntity>> queue_;
-    std::shared_ptr<IDataEntity> last_get_;  // 保持 Get() 返回指针的生命周期
+    DataFrame data_;
 };
 
 }  // namespace flowsql
