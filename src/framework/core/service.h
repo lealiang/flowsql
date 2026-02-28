@@ -23,7 +23,7 @@ class Service {
     PluginRegistry* Registry() { return registry_; }
 
  private:
-    PluginRegistry* registry_;
+    PluginRegistry* registry_ = nullptr;
     std::vector<std::unique_ptr<Pipeline>> pipelines_;
     bool running_ = false;
 };

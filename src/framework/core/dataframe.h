@@ -49,16 +49,16 @@ class DataFrame : public IDataFrame {
     void Clear() override;
 
  private:
-    void Finalize();
-    void InitBuilders();
+    void Finalize() const;
+    void InitBuilders() const;
     void AppendValueToBuilder(int col, const FieldValue& value);
     FieldValue ExtractValue(const std::shared_ptr<arrow::Array>& array, int row) const;
 
     std::shared_ptr<arrow::Schema> arrow_schema_;
-    std::shared_ptr<arrow::RecordBatch> batch_;
-    std::vector<std::unique_ptr<arrow::ArrayBuilder>> builders_;
+    mutable std::shared_ptr<arrow::RecordBatch> batch_;
+    mutable std::vector<std::unique_ptr<arrow::ArrayBuilder>> builders_;
     std::vector<Field> schema_;
-    int32_t pending_rows_ = 0;
+    mutable int32_t pending_rows_ = 0;
 };
 
 }  // namespace flowsql

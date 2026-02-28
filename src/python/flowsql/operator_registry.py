@@ -6,7 +6,7 @@ import sys
 import traceback
 from typing import Dict, List
 
-from .operator_base import OperatorBase, OperatorAttribute, get_registered_operators
+from .operator_base import OperatorBase, OperatorAttribute, get_registered_operators, clear_registered_operators
 
 
 class OperatorRegistry:
@@ -37,10 +37,14 @@ class OperatorRegistry:
                 continue
             module_name = filename[:-3]
             try:
-                importlib.import_module(module_name)
+                # 如果模块已导入，使用 reload 获取最新代码（问题 6）
+                if module_name in sys.modules:
+                    importlib.reload(sys.modules[module_name])
+                else:
+                    importlib.import_module(module_name)
                 print(f"OperatorRegistry: loaded module '{module_name}'")
             except Exception:
-                # 导入失败不阻塞其他算子（问题 10）
+                # 导入失败不阻塞其他算子
                 print(f"OperatorRegistry: failed to load '{module_name}':")
                 traceback.print_exc()
 
@@ -56,6 +60,12 @@ class OperatorRegistry:
                 except Exception:
                     print(f"OperatorRegistry: failed to instantiate '{key}':")
                     traceback.print_exc()
+
+    def reload(self, operators_dir: str):
+        """重新加载算子：清空现有注册，重新发现（问题 6）"""
+        self._operators.clear()
+        clear_registered_operators()  # 清空模块级装饰器注册表，避免已删除算子残留
+        self.discover(operators_dir)
 
     def get(self, catelog: str, name: str) -> OperatorBase | None:
         key = f"{catelog}.{name}"

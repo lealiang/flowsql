@@ -19,6 +19,10 @@ class Database {
     Database() = default;
     ~Database();
 
+    // 禁止拷贝（持有 sqlite3* 裸指针，拷贝会 double-close，问题 9）
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
+
     // 打开数据库（文件路径，":memory:" 为内存库）
     int Open(const std::string& path);
     void Close();
@@ -28,6 +32,9 @@ class Database {
 
     // 查询，返回结果行
     std::vector<Row> Query(const std::string& sql);
+
+    // 参数化查询，返回结果行（防 SQL 注入）
+    std::vector<Row> QueryParams(const std::string& sql, const std::vector<std::string>& params);
 
     // 插入并返回 last_insert_rowid
     int64_t Insert(const std::string& sql);

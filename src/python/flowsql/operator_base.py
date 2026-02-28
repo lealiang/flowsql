@@ -1,8 +1,8 @@
 """算子基类 — 所有 Python 算子继承此类"""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Dict, Any
+from dataclasses import dataclass
+from typing import Dict
 
 import pandas as pd
 
@@ -22,10 +22,13 @@ class OperatorBase(ABC):
     def __init__(self):
         self._config: Dict[str, str] = {}
 
-    @abstractmethod
     def attribute(self) -> OperatorAttribute:
-        """返回算子元数据"""
-        ...
+        """返回算子元数据（装饰器会自动注入实现）"""
+        # 默认实现：从装饰器注入的属性获取
+        if hasattr(self.__class__, '_decorator_attr'):
+            return self.__class__._decorator_attr
+        # 如果没有使用装饰器，子类必须覆盖此方法
+        raise NotImplementedError("Must use @register_operator decorator or override attribute() method")
 
     @abstractmethod
     def work(self, df_in: pd.DataFrame) -> pd.DataFrame:
@@ -59,17 +62,15 @@ def register_operator(catelog: str, name: str, description: str = "", position: 
         key = f"{catelog}.{name}"
         _registered_operators[key] = cls
 
-        # 注入默认 attribute 实现（如果子类没有覆盖）
-        original_attr = getattr(cls, '_decorator_attr', None)
-        if original_attr is None:
-            cls._decorator_attr = OperatorAttribute(
-                catelog=catelog, name=name, description=description, position=position
-            )
-            # 如果子类的 attribute 是抽象的，提供默认实现
-            if getattr(cls.attribute, '__isabstractmethod__', False):
-                def _attribute(self):
-                    return self._decorator_attr
-                cls.attribute = _attribute
+        # 注入默认 attribute 实现
+        cls._decorator_attr = OperatorAttribute(
+            catelog=catelog, name=name, description=description, position=position
+        )
+
+        # 提供 attribute 方法的默认实现
+        def _attribute(self):
+            return cls._decorator_attr
+        cls.attribute = _attribute
 
         return cls
     return decorator
@@ -78,3 +79,8 @@ def register_operator(catelog: str, name: str, description: str = "", position: 
 def get_registered_operators() -> Dict[str, type]:
     """获取通过装饰器注册的所有算子类"""
     return _registered_operators.copy()
+
+
+def clear_registered_operators():
+    """清空装饰器注册表（reload 前必须调用，否则已删除的算子会残留）"""
+    _registered_operators.clear()

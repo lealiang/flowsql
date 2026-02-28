@@ -1,6 +1,7 @@
 #include "arrow_ipc_serializer.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace flowsql {
 namespace bridge {
@@ -44,8 +45,17 @@ int ArrowIpcSerializer::Serialize(const std::shared_ptr<arrow::RecordBatch>& bat
 int ArrowIpcSerializer::Deserialize(const std::string& data, std::shared_ptr<arrow::RecordBatch>* out) {
     if (data.empty() || !out) return -1;
 
-    auto buffer = arrow::Buffer::Wrap(data.data(), data.size());
-    auto buffer_reader = std::make_shared<arrow::io::BufferReader>(buffer);
+    // 必须使用拥有所有权的 buffer：Arrow IPC 反序列化产生的 RecordBatch 会零拷贝引用底层内存，
+    // 如果使用 Buffer::Wrap（非拥有），当 data 被销毁后 RecordBatch 会持有悬空指针
+    auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(data.size()));
+    if (!alloc_result.ok()) {
+        printf("ArrowIpcSerializer::Deserialize: AllocateBuffer failed: %s\n",
+               alloc_result.status().ToString().c_str());
+        return -1;
+    }
+    auto owned_buffer = std::move(*alloc_result);
+    memcpy(owned_buffer->mutable_data(), data.data(), data.size());
+    auto buffer_reader = std::make_shared<arrow::io::BufferReader>(std::move(owned_buffer));
 
     auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(buffer_reader);
     if (!reader_result.ok()) {

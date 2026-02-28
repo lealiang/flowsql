@@ -1,1 +1,0 @@
-"""FlowSQL Python operators"""

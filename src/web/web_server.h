@@ -23,6 +23,9 @@ class WebServer {
     // 初始化：打开数据库、注册路由、同步插件信息
     int Init(const std::string& db_path, PluginRegistry* registry);
 
+    // 设置 Python Worker 地址（用于算子激活/停用时通知 Worker 重载）
+    void SetWorkerAddress(const std::string& host, int port);
+
     // 启动监听（阻塞）
     int Start(const std::string& host, int port);
 
@@ -50,9 +53,14 @@ class WebServer {
     void HandleCreateTask(const httplib::Request& req, httplib::Response& res);
     void HandleGetTaskResult(const httplib::Request& req, httplib::Response& res);
 
+    // 通知 Python Worker 重新加载算子，并同步 PluginRegistry 到数据库
+    void NotifyWorkerReload();
+
     httplib::Server server_;
     Database db_;
     PluginRegistry* registry_ = nullptr;
+    std::string worker_host_ = "127.0.0.1";
+    int worker_port_ = 18900;
 };
 
 }  // namespace web

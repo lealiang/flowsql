@@ -6,15 +6,18 @@ namespace flowsql {
 
 void Pipeline::Run() {
     state_ = PipelineState::RUNNING;
+    error_message_.clear();
 
     if (!source_ || !operator_ || !sink_) {
-        printf("Pipeline::Run: missing source, operator, or sink\n");
+        error_message_ = "missing source, operator, or sink";
+        printf("Pipeline::Run: %s\n", error_message_.c_str());
         state_ = PipelineState::FAILED;
         return;
     }
 
     // 纯连接器：直接将 source 和 sink 通道交给算子
     if (operator_->Work(source_, sink_) != 0) {
+        error_message_ = "operator " + operator_->Catelog() + "." + operator_->Name() + " execution failed";
         state_ = PipelineState::FAILED;
         return;
     }

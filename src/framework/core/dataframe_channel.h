@@ -1,7 +1,6 @@
 #ifndef _FLOWSQL_FRAMEWORK_CORE_DATAFRAME_CHANNEL_H_
 #define _FLOWSQL_FRAMEWORK_CORE_DATAFRAME_CHANNEL_H_
 
-#include <memory>
 #include <mutex>
 #include <string>
 

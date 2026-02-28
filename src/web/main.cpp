@@ -96,6 +96,13 @@ int main(int argc, char* argv[]) {
         printf("Loaded plugin: %s\n", example_plugin.c_str());
     }
 
+    // 加载 Bridge 插件（Python 算子支持）
+    // 注意：LoadPlugin 内部已调用 StartModules()，会启动 BridgePlugin
+    std::string bridge_plugin = "libflowsql_bridge.so";
+    if (registry->LoadPlugin(bridge_plugin) == 0) {
+        printf("Loaded plugin: %s\n", bridge_plugin.c_str());
+    }
+
     // 3. 创建预填测试数据并注册
     auto test_data = CreateTestData();
     registry->Register(IID_CHANNEL, "test.data", test_data);
@@ -105,16 +112,22 @@ int main(int argc, char* argv[]) {
     // 4. 初始化 Web 服务器
     web::WebServer server;
     g_server = &server;
+    server.SetWorkerAddress("127.0.0.1", 18900);
 
     std::string db_path = "/tmp/flowsql.db";
     if (server.Init(db_path, registry) != 0) {
         printf("Failed to init web server\n");
+        registry->StopModules();
         return 1;
     }
 
-    // 5. 启动监听
-    printf("\nStarting server on http://0.0.0.0:8081\n\n");
-    server.Start("0.0.0.0", 8081);
+    // 5. 启动监听（阻塞，直到 signal_handler 调用 Stop）
+    printf("\nStarting server on http://127.0.0.1:8081\n\n");
+    server.Start("127.0.0.1", 8081);
+
+    // 6. 清理：停止模块 + 卸载插件（BridgePlugin::Stop 会终止 Python Worker）
+    printf("\nShutting down...\n");
+    registry->UnloadAll();
 
     return 0;
 }

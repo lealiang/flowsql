@@ -43,11 +43,15 @@ class PythonOperatorBridge : public IOperator {
     // 配置转发
     int Configure(const char* key, const char* value) override;
 
+    // 错误信息
+    std::string LastError() override { return last_error_; }
+
  private:
     OperatorMeta meta_;
     std::unique_ptr<httplib::Client> client_;
     std::string host_;
     int port_;
+    std::string last_error_;
 };
 
 }  // namespace bridge

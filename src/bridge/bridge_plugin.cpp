@@ -1,9 +1,7 @@
 #include "bridge_plugin.h"
 
-#include <rapidjson/document.h>
-
+#include <algorithm>
 #include <cstdio>
-#include <cstring>
 
 #include "framework/core/plugin_registry.h"
 
@@ -29,7 +27,6 @@ int BridgePlugin::Option(const char* arg) {
         else if (key == "host") host_ = val;
         else if (key == "port") port_ = std::stoi(val);
         else if (key == "operators_dir") operators_dir_ = val;
-        else if (key == "ready_timeout") ready_timeout_ms_ = std::stoi(val);
 
         pos = (end < opts.size()) ? end + 1 : opts.size();
     }
@@ -59,35 +56,16 @@ int BridgePlugin::Unload() {
 }
 
 int BridgePlugin::Start() {
-    // 启动 Python Worker 进程
+    // 设置消息处理器
+    process_manager_.SetMessageHandler(this);
+
+    // 启动 Python Worker 进程（阻塞等待就绪）
     if (process_manager_.Start(host_, port_, operators_dir_, python_path_) != 0) {
         printf("BridgePlugin::Start: Failed to start Python Worker\n");
         return -1;
     }
 
-    // 等待 Worker 就绪
-    if (process_manager_.WaitReady(ready_timeout_ms_) != 0) {
-        printf("BridgePlugin::Start: Python Worker not ready\n");
-        process_manager_.Stop();
-        return -1;
-    }
-
-    // 查询 Python 算子列表
-    auto operators = QueryPythonOperators();
-    if (operators.empty()) {
-        printf("BridgePlugin::Start: No Python operators found (Worker running but no operators)\n");
-        // 不算失败，Worker 可能后续添加算子
-    }
-
-    // 为每个算子创建 PythonOperatorBridge 并动态注册
-    for (const auto& meta : operators) {
-        auto bridge = std::make_shared<PythonOperatorBridge>(meta, host_, port_);
-        std::string key = meta.catelog + "." + meta.name;
-        registry_->Register(IID_OPERATOR, key, bridge);
-        registered_keys_.push_back(key);
-        printf("BridgePlugin::Start: Registered Python operator [%s]\n", key.c_str());
-    }
-
+    // 此时 OnWorkerReady 已被调用，算子已注册
     printf("BridgePlugin::Start: %zu Python operators registered\n", registered_keys_.size());
     return 0;
 }
@@ -105,65 +83,48 @@ int BridgePlugin::Stop() {
     return 0;
 }
 
-std::vector<OperatorMeta> BridgePlugin::QueryPythonOperators() {
-    std::vector<OperatorMeta> result;
-
-    httplib::Client client(host_, port_);
-    client.set_connection_timeout(5);
-    client.set_read_timeout(5);
-
-    auto res = client.Get("/operators");
-    if (!res || res->status != 200) {
-        printf("BridgePlugin: GET /operators failed\n");
-        return result;
+// IMessageHandler 实现
+void BridgePlugin::OnWorkerReady(const std::vector<OperatorMeta>& operators) {
+    // 为每个算子创建 PythonOperatorBridge 并动态注册
+    for (const auto& meta : operators) {
+        auto bridge = std::make_shared<PythonOperatorBridge>(meta, host_, port_);
+        std::string key = meta.catelog + "." + meta.name;
+        registry_->Register(IID_OPERATOR, key, bridge);
+        registered_keys_.push_back(key);
+        printf("BridgePlugin: Registered operator [%s]\n", key.c_str());
     }
-
-    // 解析 JSON 响应
-    rapidjson::Document doc;
-    doc.Parse(res->body.c_str());
-    if (doc.HasParseError() || !doc.IsArray()) {
-        printf("BridgePlugin: Invalid /operators response\n");
-        return result;
-    }
-
-    for (auto& item : doc.GetArray()) {
-        if (!item.IsObject()) continue;
-
-        OperatorMeta meta;
-        if (item.HasMember("catelog") && item["catelog"].IsString())
-            meta.catelog = item["catelog"].GetString();
-        if (item.HasMember("name") && item["name"].IsString())
-            meta.name = item["name"].GetString();
-        if (item.HasMember("description") && item["description"].IsString())
-            meta.description = item["description"].GetString();
-        if (item.HasMember("position") && item["position"].IsString()) {
-            std::string pos = item["position"].GetString();
-            meta.position = (pos == "STORAGE") ? OperatorPosition::STORAGE : OperatorPosition::DATA;
-        }
-
-        if (!meta.catelog.empty() && !meta.name.empty()) {
-            result.push_back(std::move(meta));
-        }
-    }
-
-    return result;
 }
 
-int BridgePlugin::Restart() {
-    // 完整重启流程：Stop → Start
-    printf("BridgePlugin::Restart: Performing full restart\n");
+void BridgePlugin::OnOperatorAdded(const OperatorMeta& meta) {
+    printf("BridgePlugin::OnOperatorAdded: %s.%s\n", meta.catelog.c_str(), meta.name.c_str());
 
-    // 注销旧注册
-    for (const auto& key : registered_keys_) {
-        registry_->Unregister(IID_OPERATOR, key);
+    // 动态注册新算子
+    auto bridge = std::make_shared<PythonOperatorBridge>(meta, host_, port_);
+    std::string key = meta.catelog + "." + meta.name;
+    registry_->Register(IID_OPERATOR, key, bridge);
+    registered_keys_.push_back(key);
+}
+
+void BridgePlugin::OnOperatorRemoved(const std::string& catelog, const std::string& name) {
+    printf("BridgePlugin::OnOperatorRemoved: %s.%s\n", catelog.c_str(), name.c_str());
+
+    // 注销算子
+    std::string key = catelog + "." + name;
+    registry_->Unregister(IID_OPERATOR, key);
+
+    // 从列表中移除
+    auto it = std::find(registered_keys_.begin(), registered_keys_.end(), key);
+    if (it != registered_keys_.end()) {
+        registered_keys_.erase(it);
     }
-    registered_keys_.clear();
+}
 
-    // 停止旧进程
-    process_manager_.Stop();
+void BridgePlugin::OnHeartbeat(const std::string& stats_json) {
+    // 暂时不处理心跳
+}
 
-    // 重新启动
-    return Start();
+void BridgePlugin::OnError(int code, const std::string& message) {
+    printf("BridgePlugin::OnError: code=%d, message=%s\n", code, message.c_str());
 }
 
 }  // namespace bridge

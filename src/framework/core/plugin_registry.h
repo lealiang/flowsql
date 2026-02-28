@@ -4,9 +4,10 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 #include "framework/interfaces/ichannel.h"
 #include "framework/interfaces/ioperator.h"
@@ -26,6 +27,10 @@ class PluginRegistry {
     // 动态注册/注销 — 通用接口，按 IID + key 管理
     void Register(const Guid& iid, const std::string& key, std::shared_ptr<void> instance);
     void Unregister(const Guid& iid, const std::string& key);
+
+    // 模块启停 — 委托 PluginLoader，不持有 mutex_（避免 Start 回调 Register 死锁）
+    int StartModules();
+    void StopModules();
 
     // 统一查询 — 合并静态 + 动态，动态优先
     void* Get(const Guid& iid, const std::string& key);
@@ -70,9 +75,9 @@ class PluginRegistry {
     void BuildIndex();
 
     PluginLoader* loader_;
-    bool index_built_ = false;
+    mutable std::shared_mutex mutex_;
 
-    // 静态索引（BuildIndex 通过 loader_->GetInterfaces() 直接遍历构建）
+    // 静态索引（LoadPlugin 成功后通过 BuildIndex 构建）
     std::map<Guid, std::unordered_map<std::string, void*>> static_index_;
     // 动态索引（shared_ptr<void> 管理生命周期）
     std::map<Guid, std::unordered_map<std::string, std::shared_ptr<void>>> dynamic_index_;

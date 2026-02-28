@@ -35,3 +35,28 @@
 - 2026-02-27: 实现步骤4-6（SQL解析器+SQLite数据库层+Web后端API）：SQL递归下降解析器；SQLite amalgamation依赖+Database封装+参数化查询；Web后端全部API端点实现并测试通过；代码审查修复3个问题（路径穿越防护、mkdir冲突、JSON安全构造）
 - 2026-02-27: 更新 stage2.md 进度：步骤3-6标记为已完成，更新已完成文件清单和需修改/新建文件状态
 - 2026-02-27: DataFrameChannel Read/Write 效率优化：逐行复制改为 Arrow RecordBatch 零拷贝传递，Schema() 改为 Write 时缓存
+- 2026-02-27: 提交推送模块 B 全部代码（IChannel重构+SQL解析+Web后端+DataFrameChannel零拷贝优化）
+- 2026-02-28: 实现步骤7（Vue.js前端开发）：初始化Vue3+Vite项目；安装vue-router/axios/element-plus依赖；实现Dashboard/Channels/Operators/Tasks四个页面；API封装适配后端数组格式；构建部署到web/static/；测试验证前后端集成
+- 2026-02-28: 修复任务历史显示问题：字段名从sql/create_time改为sql_text/created_at，状态判断从success改为completed
+- 2026-02-28: 增强算子管理功能：新增在线编写Python算子功能（对话框+代码编辑器+模板/示例插入+保存并上传/激活）；更新requirements.txt添加常用数据科学库（numpy/scipy/scikit-learn/statsmodels）
+- 2026-02-28: 修复算子上传后列表不显示问题：HandleUploadOperator增加数据库写入逻辑，从文件名解析catelog和name并插入operators表
+- 2026-02-28: 修复Python算子无法执行问题：(1)flowsql_web加载libflowsql_bridge.so启动Python Worker；(2)python_process_manager动态设置PYTHONPATH(从可执行文件路径推导)；(3)安装fastapi/uvicorn依赖；(4)修复operator_base.py装饰器bug(attribute方法从@abstractmethod改为默认实现)
+- 2026-02-28: 创建测试专家审视报告（docs/test_expert_review.md）：分析架构可测性（7个维度）、测试现状（11%覆盖率）、识别3个P0级缺陷（PluginRegistry无锁/Schema悬空指针/错误处理不一致）、10个高风险测试盲区、提供改进优先级与实施计划
+- 2026-02-28: 修复Python算子注册后查询不到的问题：根因是flowsql_framework为静态库，分别链接到主程序和bridge.so导致两个PluginRegistry单例实例；修复方案：将flowsql_framework改为共享库(SHARED)并设置-fvisibility=default导出符号
+- 2026-02-28: 代码质量修复（P0+P1+P2共9项）：PluginRegistry加shared_mutex读写锁；Pipeline state_改atomic；ControlServer修复Start竞态/accept EINTR重试/补全消息解析/加cerrno；DataFrame消除const_cast改用mutable；control_client.py修复socket泄漏；arrow_codec.py修复资源泄漏；worker.py修复资源泄漏；清理无用include和死代码
+- 2026-02-28: 排查 start_web.sh 启动报错（端口 18900 被占用）：杀掉上次残留的 python3 worker 和 flowsql_web 进程
+- 2026-02-28: 分析修复前端页面打不开问题：根因是 PluginRegistry::LoadPlugin() 持有 unique_lock 期间调用 loader_->Load() → StartModules() → BridgePlugin::Start() → WaitWorkerReady()，而 ControlServer 消息线程回调 OnWorkerReady → Register() 也需要 unique_lock，形成死锁；修复：将 StartModules() 从 loader_->Load() 中移除，在 LoadPlugin() 释放锁后单独调用
+- 2026-02-28: 修复 Python Worker 孤儿进程问题：flowsql_web 退出时未调用 BridgePlugin::Stop()，Worker 残留占用 18900 端口；修复：main.cpp 退出时调用 UnloadAll()、Init 失败调用 StopModules()；Unload() 中移除 StopModules() 避免同样的死锁；StartModules 加 started_module_count_ 跟踪避免重复启动
+- 2026-02-28: 修复前端静态文件 404 + 监听地址安全问题：set_mount_point 相对路径在非 output 目录下找不到 static；修复：基于 /proc/self/exe 定位 static 目录，CMakeLists 加 POST_BUILD 自动复制 web/static 到 output/static，监听地址从 0.0.0.0 改为 127.0.0.1
+- 2026-02-28: 实现算子激活后通知 Python Worker 重载：HandleActivateOperator 调用 Worker 的 POST /reload 端点；Worker 重新扫描算子目录，通过控制通道发送 OPERATOR_ADDED 通知 C++ 端动态注册
+- 2026-02-28: 审查 Python 端 5 个文件（worker.py/operator_base.py/operator_registry.py/control_client.py/arrow_codec.py）的资源泄漏、线程安全、死代码、逻辑 bug
+- 2026-02-28: 代码审查（web_server.h/cpp、main.cpp、database.h/cpp）：分析内存/资源泄漏、死代码、逻辑问题、SQL注入风险
+- 2026-02-28: 审查 plugin_registry.h/cpp：内存泄漏（shared_ptr 生命周期）、死代码、锁安全、LoadPlugin/UnloadAll 与 StartModules/StopModules 一致性
+- 2026-02-28: 代码审查 bridge 模块 C++ 端（bridge_plugin/python_process_manager/control_server）：分析内存/资源泄漏、文件描述符泄漏、线程生命周期、僵尸进程、双重关闭、死代码等问题
+- 2026-02-28: 代码审查修复（17项）：P0修复TCP粘包数据丢失/client_fd_双重关闭竞态/Traverse裸指针悬空/UnloadAll析构顺序；P1修复arrow_codec多batch截断/operator_registry reload/worker.py重载逻辑提取/SQL参数化查询/Database禁拷贝/JSON注入/spawn失败清理/Stop原子化/Unload重置计数器；P2清理占位符注释/未使用import/operators_dir绝对路径/SendMessage短写
+- 2026-02-28: 修复算子执行500错误信息丢失问题：IOperator新增LastError()虚方法；PythonOperatorBridge记录详细错误（含Python Worker异常信息）；Pipeline携带error_message；HandleCreateTask返回具体错误；前端catch块提取response.data.error显示
+- 2026-02-28: 修复Python算子执行崩溃（basic_string::_M_create）：根因是pd.concat产生null值，C++端ExtractValue未处理null导致对空StringArray调用GetView()崩溃；修复DataFrame::ExtractValue添加IsNull检查返回默认值
+- 2026-03-01: 修复Python算子在线创建后未注册到PluginRegistry的4个断裂点：(1)operator_base.py添加clear_registered_operators()清空模块级字典避免已删除算子残留；(2)Operators.vue激活/停用按钮传参从name改为catelog.name匹配后端查询格式；(3)ControlServer MessageLoop改为双层循环支持断线重连；(4)worker.py _do_reload()添加send返回值检查和日志，/reload改用run_in_executor避免阻塞事件循环
+- 2026-03-01: 修复Python算子执行500错误：HandleCreateTask核心执行逻辑（Configure+Pipeline::Run+结果读取）添加try-catch，捕获std::exception和未知异常，返回带具体错误信息的JSON 500响应并更新数据库任务状态为failed
+- 2026-03-01: 修复basic_string::_M_create崩溃根因：ArrowIpcSerializer::Deserialize使用Buffer::Wrap创建非拥有buffer，反序列化的RecordBatch零拷贝引用httplib响应体内存，响应体销毁后RecordBatch持有悬空指针；修复为AllocateBuffer+memcpy创建拥有所有权的buffer
+- 2026-03-01: 排查新算子operator not found问题：根因是用户复制explore_chisquare.py创建新算子时未修改@register_operator装饰器的name参数，三个文件都注册为explore.chisquare导致互相覆盖；修复explore_chi.py和explore_chi2.py的name参数

@@ -1,7 +1,5 @@
 #include "dataframe_channel.h"
 
-#include <cstdio>
-
 namespace flowsql {
 
 DataFrameChannel::DataFrameChannel(const std::string& catelog, const std::string& name)

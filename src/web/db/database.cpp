@@ -75,6 +75,35 @@ int64_t Database::Insert(const std::string& sql) {
     return sqlite3_last_insert_rowid(db_);
 }
 
+std::vector<Row> Database::QueryParams(const std::string& sql, const std::vector<std::string>& params) {
+    std::vector<Row> results;
+    if (!db_) return results;
+
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        last_error_ = sqlite3_errmsg(db_);
+        return results;
+    }
+    for (size_t i = 0; i < params.size(); ++i) {
+        sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].c_str(), -1, SQLITE_TRANSIENT);
+    }
+
+    int col_count = sqlite3_column_count(stmt);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        Row row;
+        for (int i = 0; i < col_count; ++i) {
+            const char* name = sqlite3_column_name(stmt, i);
+            const char* val = reinterpret_cast<const char*>(sqlite3_column_text(stmt, i));
+            row.emplace_back(name ? name : "", val ? val : "");
+        }
+        results.push_back(std::move(row));
+    }
+
+    sqlite3_finalize(stmt);
+    return results;
+}
+
 int Database::InitSchema(const std::string& schema_sql) {
     return Execute(schema_sql);
 }

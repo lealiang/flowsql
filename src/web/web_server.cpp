@@ -5,6 +5,9 @@
 #include <rapidjson/writer.h>
 
 #include <cstdio>
+#include <chrono>
+#include <thread>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -54,6 +57,28 @@ CREATE TABLE IF NOT EXISTS tasks (
 )";
 
 WebServer::WebServer() {}
+
+void WebServer::SetWorkerAddress(const std::string& host, int port) {
+    worker_host_ = host;
+    worker_port_ = port;
+}
+
+void WebServer::NotifyWorkerReload() {
+    // 调用 Python Worker 的 /reload 端点，触发算子重新扫描
+    httplib::Client client(worker_host_, worker_port_);
+    client.set_connection_timeout(2);
+    client.set_read_timeout(5);
+    auto result = client.Post("/reload", "", "application/json");
+    if (result && result->status == 200) {
+        printf("WebServer: Worker reload OK\n");
+        // 等待一小段时间让 ControlServer 处理 OPERATOR_ADDED 消息
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // 同步新注册的算子到数据库
+        SyncRegistryToDb();
+    } else {
+        printf("WebServer: Worker reload failed (Worker may not be running)\n");
+    }
+}
 
 int WebServer::Init(const std::string& db_path, PluginRegistry* registry) {
     registry_ = registry;
@@ -135,11 +160,24 @@ void WebServer::RegisterRoutes() {
             HandleGetTaskResult(req, res);
         });
 
-    // 静态文件（Vue.js 构建产物）
-    server_.set_mount_point("/", "static");
+    // 静态文件（Vue.js 构建产物）— 基于可执行文件位置定位
+    std::string static_dir = "static";
+    char exe_path[1024];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len > 0) {
+        exe_path[len] = '\0';
+        std::string exe_dir(exe_path);
+        size_t pos = exe_dir.find_last_of('/');
+        if (pos != std::string::npos) {
+            static_dir = exe_dir.substr(0, pos) + "/static";
+        }
+    }
+    if (!server_.set_mount_point("/", static_dir)) {
+        printf("WebServer: WARNING - static dir not found: %s\n", static_dir.c_str());
+    } else {
+        printf("WebServer: serving static files from %s\n", static_dir.c_str());
+    }
 }
-
-// PLACEHOLDER_HANDLERS
 
 // --- JSON 辅助 ---
 static void SetCorsHeaders(httplib::Response& res) {
@@ -211,8 +249,6 @@ void WebServer::HandleGetOperators(const httplib::Request&, httplib::Response& r
     res.set_content(RowsToJson(rows), "application/json");
 }
 
-// PLACEHOLDER_HANDLERS2
-
 void WebServer::HandleUploadOperator(const httplib::Request& req, httplib::Response& res) {
     SetCorsHeaders(res);
     // 从 multipart form 获取文件
@@ -228,8 +264,23 @@ void WebServer::HandleUploadOperator(const httplib::Request& req, httplib::Respo
         return;
     }
 
-    // 保存到 operators 目录
-    std::string operators_dir = "operators";
+    // 保存到 operators 目录（基于可执行文件位置推导绝对路径，问题 16）
+    std::string operators_dir;
+    {
+        char op_exe_path[1024];
+        ssize_t op_len = readlink("/proc/self/exe", op_exe_path, sizeof(op_exe_path) - 1);
+        if (op_len > 0) {
+            op_exe_path[op_len] = '\0';
+            std::string op_exe_dir(op_exe_path);
+            size_t op_pos = op_exe_dir.find_last_of('/');
+            if (op_pos != std::string::npos) {
+                operators_dir = op_exe_dir.substr(0, op_pos) + "/operators";
+            }
+        }
+        if (operators_dir.empty()) {
+            operators_dir = "operators";
+        }
+    }
 
     // 安全校验：文件名不能包含路径分隔符（防止路径穿越）
     if (file.filename.find('/') != std::string::npos || file.filename.find('\\') != std::string::npos ||
@@ -253,6 +304,25 @@ void WebServer::HandleUploadOperator(const httplib::Request& req, httplib::Respo
     fwrite(file.content.data(), 1, file.content.size(), fp);
     fclose(fp);
 
+    // 解析文件名提取 catelog 和 name
+    // 文件名格式: catelog_name.py
+    std::string filename = file.filename;
+    if (filename.size() > 3 && filename.substr(filename.size() - 3) == ".py") {
+        filename = filename.substr(0, filename.size() - 3);  // 去掉 .py
+    }
+
+    size_t underscore_pos = filename.find('_');
+    if (underscore_pos != std::string::npos) {
+        std::string catelog = filename.substr(0, underscore_pos);
+        std::string name = filename.substr(underscore_pos + 1);
+
+        // 插入数据库（如果已存在则忽略）
+        db_.ExecuteParams(
+            "INSERT OR IGNORE INTO operators (catelog, name, description, position, source, file_path, active) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            {catelog, name, "", "DATA", "uploaded", filepath, "0"});
+    }
+
     rapidjson::StringBuffer ubuf;
     rapidjson::Writer<rapidjson::StringBuffer> uw(ubuf);
     uw.StartObject();
@@ -264,17 +334,36 @@ void WebServer::HandleUploadOperator(const httplib::Request& req, httplib::Respo
 
 void WebServer::HandleActivateOperator(const httplib::Request& req, httplib::Response& res) {
     SetCorsHeaders(res);
-    // 路径参数：/api/operators/{name}/activate
     std::string op_key = req.matches[1];
     db_.ExecuteParams("UPDATE operators SET active=1 WHERE catelog||'.'||name=?1", {op_key});
-    res.set_content(R"({"status":"activated","operator":")" + op_key + R"("})", "application/json");
+
+    // 通知 Python Worker 重新加载算子
+    NotifyWorkerReload();
+
+    // 使用 rapidjson 构造响应，防止 op_key 中特殊字符破坏 JSON（问题 10）
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("status"); w.String("activated");
+    w.Key("operator"); w.String(op_key.c_str());
+    w.EndObject();
+    res.set_content(buf.GetString(), "application/json");
 }
 
 void WebServer::HandleDeactivateOperator(const httplib::Request& req, httplib::Response& res) {
     SetCorsHeaders(res);
     std::string op_key = req.matches[1];
     db_.ExecuteParams("UPDATE operators SET active=0 WHERE catelog||'.'||name=?1", {op_key});
-    res.set_content(R"({"status":"deactivated","operator":")" + op_key + R"("})", "application/json");
+
+    // TODO: 通知 Worker 移除算子（需要 Worker 支持按名称卸载）
+
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("status"); w.String("deactivated");
+    w.Key("operator"); w.String(op_key.c_str());
+    w.EndObject();
+    res.set_content(buf.GetString(), "application/json");
 }
 
 // --- Tasks ---
@@ -283,8 +372,6 @@ void WebServer::HandleGetTasks(const httplib::Request&, httplib::Response& res) 
     auto rows = db_.Query("SELECT id, sql_text, status, error_msg, created_at, finished_at FROM tasks ORDER BY id DESC");
     res.set_content(RowsToJson(rows), "application/json");
 }
-
-// PLACEHOLDER_HANDLERS3
 
 void WebServer::HandleCreateTask(const httplib::Request& req, httplib::Response& res) {
     SetCorsHeaders(res);
@@ -357,83 +444,108 @@ void WebServer::HandleCreateTask(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    // 传递 WITH 参数
-    for (auto& [k, v] : stmt.with_params) {
-        op->Configure(k.c_str(), v.c_str());
-    }
-
-    // PLACEHOLDER_PIPELINE_EXEC
-
-    // 准备 sink channel
-    std::shared_ptr<DataFrameChannel> temp_sink;
-    IChannel* sink = nullptr;
-
-    if (!stmt.dest.empty()) {
-        // INTO 指定了目标通道，查找或创建
-        registry_->TraverseChannels([&](IChannel* ch) {
-            if (std::string(ch->Name()) == stmt.dest ||
-                (std::string(ch->Catelog()) + "." + ch->Name()) == stmt.dest) {
-                sink = ch;
-            }
-        });
-        if (!sink) {
-            // 创建新的 DataFrameChannel 并注册
-            temp_sink = std::make_shared<DataFrameChannel>("result", stmt.dest);
-            temp_sink->Open();
-            registry_->Register(IID_CHANNEL, "result." + stmt.dest, temp_sink);
-            registry_->Register(IID_DATAFRAME_CHANNEL, "result." + stmt.dest, temp_sink);
-            sink = temp_sink.get();
-            // 同步到数据库
-            db_.ExecuteParams("INSERT OR IGNORE INTO channels (catelog, name, type) VALUES ('result', ?1, 'dataframe')",
-                              {stmt.dest});
+    try {
+        // 传递 WITH 参数
+        for (auto& [k, v] : stmt.with_params) {
+            op->Configure(k.c_str(), v.c_str());
         }
-    } else {
-        // 无 INTO，创建临时 sink
-        temp_sink = std::make_shared<DataFrameChannel>("_temp", "sink");
-        temp_sink->Open();
-        sink = temp_sink.get();
-    }
 
-    // 执行 Pipeline
-    auto pipeline = PipelineBuilder().SetSource(source).SetOperator(op).SetSink(sink).Build();
-    pipeline->Run();
+        // 准备 sink channel
+        std::shared_ptr<DataFrameChannel> temp_sink;
+        IChannel* sink = nullptr;
 
-    if (pipeline->State() == PipelineState::FAILED) {
-        std::string err = "pipeline execution failed";
-        db_.ExecuteParams("UPDATE tasks SET status='failed', error_msg=?1, finished_at=CURRENT_TIMESTAMP WHERE id=?2",
-                          {err, std::to_string(task_id)});
+        if (!stmt.dest.empty()) {
+            // INTO 指定了目标通道，查找或创建
+            registry_->TraverseChannels([&](IChannel* ch) {
+                if (std::string(ch->Name()) == stmt.dest ||
+                    (std::string(ch->Catelog()) + "." + ch->Name()) == stmt.dest) {
+                    sink = ch;
+                }
+            });
+            if (!sink) {
+                // 创建新的 DataFrameChannel 并注册
+                temp_sink = std::make_shared<DataFrameChannel>("result", stmt.dest);
+                temp_sink->Open();
+                registry_->Register(IID_CHANNEL, "result." + stmt.dest, temp_sink);
+                registry_->Register(IID_DATAFRAME_CHANNEL, "result." + stmt.dest, temp_sink);
+                sink = temp_sink.get();
+                // 同步到数据库
+                db_.ExecuteParams(
+                    "INSERT OR IGNORE INTO channels (catelog, name, type) VALUES ('result', ?1, 'dataframe')",
+                    {stmt.dest});
+            }
+        } else {
+            // 无 INTO，创建临时 sink
+            temp_sink = std::make_shared<DataFrameChannel>("_temp", "sink");
+            temp_sink->Open();
+            sink = temp_sink.get();
+        }
+
+        // 执行 Pipeline
+        auto pipeline = PipelineBuilder().SetSource(source).SetOperator(op).SetSink(sink).Build();
+        pipeline->Run();
+
+        if (pipeline->State() == PipelineState::FAILED) {
+            // 优先从算子获取详细错误信息
+            std::string err = op->LastError();
+            if (err.empty()) err = pipeline->ErrorMessage();
+            if (err.empty()) err = "pipeline execution failed";
+            db_.ExecuteParams(
+                "UPDATE tasks SET status='failed', error_msg=?1, finished_at=CURRENT_TIMESTAMP WHERE id=?2",
+                {err, std::to_string(task_id)});
+            res.status = 500;
+            res.set_content(MakeErrorJson(err, task_id), "application/json");
+            return;
+        }
+
+        // 从 sink 读取结果
+        auto* df_sink = dynamic_cast<IDataFrameChannel*>(sink);
+        DataFrame result;
+        std::string result_json = "[]";
+        if (df_sink && df_sink->Read(&result) == 0 && result.RowCount() > 0) {
+            result_json = result.ToJson();
+        }
+
+        // 更新任务状态（参数化查询，无需转义）
+        db_.ExecuteParams(
+            "UPDATE tasks SET status='completed', result_json=?1, finished_at=CURRENT_TIMESTAMP WHERE id=?2",
+            {result_json, std::to_string(task_id)});
+
+        // 返回结果
+        rapidjson::StringBuffer buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+        w.StartObject();
+        w.Key("task_id"); w.Int64(task_id);
+        w.Key("status"); w.String("completed");
+        w.Key("rows"); w.Int(result.RowCount());
+        w.EndObject();
+        res.set_content(buf.GetString(), "application/json");
+
+    } catch (const std::exception& e) {
+        // 捕获执行过程中的异常，返回具体错误信息
+        std::string err = std::string("internal error: ") + e.what();
+        printf("HandleCreateTask: exception: %s\n", err.c_str());
+        db_.ExecuteParams(
+            "UPDATE tasks SET status='failed', error_msg=?1, finished_at=CURRENT_TIMESTAMP WHERE id=?2",
+            {err, std::to_string(task_id)});
         res.status = 500;
         res.set_content(MakeErrorJson(err, task_id), "application/json");
-        return;
+    } catch (...) {
+        // 捕获非标准异常
+        std::string err = "internal error: unknown exception";
+        printf("HandleCreateTask: unknown exception\n");
+        db_.ExecuteParams(
+            "UPDATE tasks SET status='failed', error_msg=?1, finished_at=CURRENT_TIMESTAMP WHERE id=?2",
+            {err, std::to_string(task_id)});
+        res.status = 500;
+        res.set_content(MakeErrorJson(err, task_id), "application/json");
     }
-
-    // 从 sink 读取结果
-    auto* df_sink = dynamic_cast<IDataFrameChannel*>(sink);
-    DataFrame result;
-    std::string result_json = "[]";
-    if (df_sink && df_sink->Read(&result) == 0 && result.RowCount() > 0) {
-        result_json = result.ToJson();
-    }
-
-    // 更新任务状态（参数化查询，无需转义）
-    db_.ExecuteParams("UPDATE tasks SET status='completed', result_json=?1, finished_at=CURRENT_TIMESTAMP WHERE id=?2",
-                      {result_json, std::to_string(task_id)});
-
-    // 返回结果
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("task_id"); w.Int64(task_id);
-    w.Key("status"); w.String("completed");
-    w.Key("rows"); w.Int(result.RowCount());
-    w.EndObject();
-    res.set_content(buf.GetString(), "application/json");
 }
 
 void WebServer::HandleGetTaskResult(const httplib::Request& req, httplib::Response& res) {
     SetCorsHeaders(res);
     std::string task_id = req.matches[1];
-    auto rows = db_.Query("SELECT status, result_json, error_msg FROM tasks WHERE id=" + task_id);
+    auto rows = db_.QueryParams("SELECT status, result_json, error_msg FROM tasks WHERE id=?1", {task_id});
     if (rows.empty()) {
         res.status = 404;
         res.set_content(R"({"error":"task not found"})", "application/json");

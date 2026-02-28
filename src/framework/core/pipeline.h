@@ -1,8 +1,8 @@
 #ifndef _FLOWSQL_FRAMEWORK_CORE_PIPELINE_H_
 #define _FLOWSQL_FRAMEWORK_CORE_PIPELINE_H_
 
+#include <atomic>
 #include <memory>
-#include <string>
 
 #include "framework/interfaces/ichannel.h"
 #include "framework/interfaces/ioperator.h"
@@ -24,7 +24,8 @@ class Pipeline {
 
     void Run();
     void Stop();
-    PipelineState State() const { return state_; }
+    PipelineState State() const { return state_.load(); }
+    const std::string& ErrorMessage() const { return error_message_; }
 
  private:
     friend class PipelineBuilder;
@@ -32,7 +33,8 @@ class Pipeline {
     IChannel* source_ = nullptr;
     IOperator* operator_ = nullptr;
     IChannel* sink_ = nullptr;
-    PipelineState state_ = PipelineState::IDLE;
+    std::atomic<PipelineState> state_{PipelineState::IDLE};
+    std::string error_message_;
 };
 
 class PipelineBuilder {

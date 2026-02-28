@@ -756,10 +756,13 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_web ${CMAKE_BINARY_DIR}/test_web
 - `web/main.cpp`（flowsql_web 入口：加载插件 → 预填 20 行测试数据 → 初始化 WebServer → 监听 8081）
 - `web/CMakeLists.txt`（编译为 flowsql_web 可执行文件，链接 framework + arrow + httplib + rapidjson + sqlite）
 
-### 步骤 7：Vue.js 前端
+### 步骤 7：Vue.js 前端 ✅
 - `web-ui/` 项目脚手架（Vue 3 + Vite + Element Plus）
 - Dashboard、Channels、Operators、Tasks 四个页面
 - `npm run build` → 产物复制到 `web/static/`
+- API 封装适配后端数组格式（channels/operators/tasks 直接返回数组）
+- 数据格式转换（schema_json 解析、active 字段布尔转换、任务结果行列转换）
+- 测试脚本 `test_frontend.sh` 验证全部功能通过
 
 ### 步骤 8：集成测试
 - `tests/test_web/` — Web API 测试
@@ -874,7 +877,7 @@ flowsql_web 启动时硬编码创建 `test_data` DataFrameChannel，Schema 和�
 - ✅ `src/framework/core/dataframe_channel.h/.cpp` — DataFrameChannel 内存实现
 - ✅ `src/framework/core/sql_parser.h/.cpp` — SQL 解析器（递归下降）
 - ✅ `src/web/` — Web 后端（web_server、db/）
-- `src/web-ui/` — Vue.js 前端（待实现）
+- ✅ `src/web-ui/` — Vue.js 前端（已实现）
 - ✅ `src/thirdparts/sqlite/sqlite-config.cmake` — SQLite 依赖
 - `src/tests/test_web/` — Web API 测试（待实现）
 
@@ -906,3 +909,17 @@ flowsql_web 启动时硬编码创建 `test_data` DataFrameChannel，Schema 和�
 | `tests/test_framework/main.cpp` | 适配新接口 + 新增 DataFrameChannel 测试 |
 | `CMakeLists.txt` | 新增 web 子目录 |
 | `framework/macros.h` | 已删除（未使用的死代码） |
+| `web-ui/src/main.js` | Vue 3 入口文件 + Element Plus 全局注册（新建） |
+| `web-ui/src/App.vue` | 根组件 + 布局（新建） |
+| `web-ui/src/router/index.js` | Vue Router 配置（新建） |
+| `web-ui/src/api/index.js` | Axios API 封装（新建） |
+| `web-ui/src/components/Sidebar.vue` | 侧边栏导航组件（新建） |
+| `web-ui/src/views/Dashboard.vue` | 仪表盘页面（新建） |
+| `web-ui/src/views/Channels.vue` | 通道列表页面（新建） |
+| `web-ui/src/views/Operators.vue` | 算子管理页面（新建） |
+| `web-ui/src/views/Tasks.vue` | SQL 工作台页面（新建） |
+| `web-ui/vite.config.js` | Vite 配置 + 开发代理（新建） |
+| `web-ui/package.json` | 前端依赖配置（新建） |
+| `web-ui/index.html` | HTML 入口（新建） |
+| `test_frontend.sh` | 前端功能测试脚本（新建） |
+| `docs/frontend_verification.md` | 前端验证指南（新建） |

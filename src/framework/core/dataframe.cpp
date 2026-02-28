@@ -6,7 +6,6 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
-#include <cassert>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -59,7 +58,7 @@ void DataFrame::SetSchema(const std::vector<Field>& schema) {
     InitBuilders();
 }
 
-void DataFrame::InitBuilders() {
+void DataFrame::InitBuilders() const {
     builders_.clear();
     if (!arrow_schema_) return;
     auto pool = arrow::default_memory_pool();
@@ -78,7 +77,7 @@ void DataFrame::InitBuilders() {
 
 int32_t DataFrame::RowCount() const {
     if (pending_rows_ > 0) {
-        const_cast<DataFrame*>(this)->Finalize();
+        Finalize();
     }
     return batch_ ? static_cast<int32_t>(batch_->num_rows()) : 0;
 }
@@ -96,7 +95,7 @@ int DataFrame::AppendRow(const std::vector<FieldValue>& row) {
 
 std::vector<FieldValue> DataFrame::GetRow(int32_t index) const {
     if (pending_rows_ > 0) {
-        const_cast<DataFrame*>(this)->Finalize();
+        Finalize();
     }
     std::vector<FieldValue> row;
     if (!batch_ || index < 0 || index >= batch_->num_rows()) return row;
@@ -111,7 +110,7 @@ std::vector<FieldValue> DataFrame::GetRow(int32_t index) const {
 
 std::vector<FieldValue> DataFrame::GetColumn(const std::string& name) const {
     if (pending_rows_ > 0) {
-        const_cast<DataFrame*>(this)->Finalize();
+        Finalize();
     }
     std::vector<FieldValue> col;
     if (!batch_) return col;
@@ -188,7 +187,7 @@ std::shared_ptr<IDataEntity> DataFrame::GetEntity(int32_t index) const {
 
 std::shared_ptr<arrow::RecordBatch> DataFrame::ToArrow() const {
     if (pending_rows_ > 0) {
-        const_cast<DataFrame*>(this)->Finalize();
+        Finalize();
     }
     return batch_;
 }
@@ -248,7 +247,7 @@ static DataType StringToDataType(const std::string& s) {
 
 std::string DataFrame::ToJson() const {
     if (pending_rows_ > 0) {
-        const_cast<DataFrame*>(this)->Finalize();
+        Finalize();
     }
     rapidjson::StringBuffer sb;
     rapidjson::Writer<rapidjson::StringBuffer> w(sb);
@@ -359,7 +358,7 @@ void DataFrame::Clear() {
 
 // --- Finalize: builders_ → batch_ ---
 
-void DataFrame::Finalize() {
+void DataFrame::Finalize() const {
     if (pending_rows_ == 0 || builders_.empty()) return;
     std::vector<std::shared_ptr<arrow::Array>> arrays;
     arrays.reserve(builders_.size());
@@ -423,6 +422,19 @@ void DataFrame::AppendValueToBuilder(int col, const FieldValue& value) {
 // --- ExtractValue ---
 
 FieldValue DataFrame::ExtractValue(const std::shared_ptr<arrow::Array>& array, int row) const {
+    // null 值返回类型对应的默认值
+    if (array->IsNull(row)) {
+        switch (array->type_id()) {
+            case arrow::Type::INT32:   return int32_t(0);
+            case arrow::Type::INT64:   return int64_t(0);
+            case arrow::Type::UINT32:  return uint32_t(0);
+            case arrow::Type::UINT64:  return uint64_t(0);
+            case arrow::Type::FLOAT:   return float(0);
+            case arrow::Type::DOUBLE:  return double(0);
+            case arrow::Type::BOOL:    return false;
+            default:                   return std::string{};
+        }
+    }
     switch (array->type_id()) {
         case arrow::Type::INT32:
             return std::static_pointer_cast<arrow::Int32Array>(array)->Value(row);

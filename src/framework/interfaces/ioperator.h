@@ -31,6 +31,9 @@ interface IOperator : public IPlugin {
 
     // 配置
     virtual int Configure(const char* key, const char* value) = 0;
+
+    // 最近一次执行错误信息（默认空）
+    virtual std::string LastError() { return ""; }
 };
 
 }  // namespace flowsql
