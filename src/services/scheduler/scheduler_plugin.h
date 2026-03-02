@@ -11,6 +11,9 @@
 namespace flowsql {
 
 class PluginRegistry;
+class IChannel;
+class IOperator;
+struct SqlStatement;
 
 namespace scheduler {
 
@@ -37,6 +40,19 @@ class SchedulerPlugin : public IPlugin {
     void HandleExecute(const httplib::Request& req, httplib::Response& res);
     void HandleGetChannels(const httplib::Request& req, httplib::Response& res);
     void HandleGetOperators(const httplib::Request& req, httplib::Response& res);
+
+    // 通道查找辅助（支持 catelog.name 和模糊匹配）
+    IChannel* FindChannel(const std::string& name);
+
+    // 执行路径：无算子的纯数据搬运
+    int ExecuteTransfer(IChannel* source, IChannel* sink,
+                        const std::string& source_type, const std::string& sink_type,
+                        const SqlStatement& stmt);
+
+    // 执行路径：有算子，自动适配通道类型
+    int ExecuteWithOperator(IChannel* source, IChannel* sink, IOperator* op,
+                            const std::string& source_type, const std::string& sink_type,
+                            const SqlStatement& stmt);
 
     PluginRegistry* registry_ = nullptr;
     httplib::Server server_;

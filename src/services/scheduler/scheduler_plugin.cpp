@@ -8,12 +8,14 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "framework/core/channel_adapter.h"
 #include "framework/core/dataframe.h"
 #include "framework/core/dataframe_channel.h"
 #include "framework/core/pipeline.h"
 #include "framework/core/plugin_registry.h"
 #include "framework/core/sql_parser.h"
 #include "framework/interfaces/ichannel.h"
+#include "framework/interfaces/idatabase_channel.h"
 #include "framework/interfaces/idataframe_channel.h"
 #include "framework/interfaces/ioperator.h"
 
@@ -142,7 +144,180 @@ void SchedulerPlugin::RegisterRoutes() {
     });
 }
 
-// --- HandleExecute: 核心 SQL 执行逻辑（从 web_server.cpp HandleCreateTask 提取） ---
+// --- 通道查找辅助 ---
+IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
+    // 先按完整 key 查找
+    IChannel* ch = registry_->Get<IChannel>(IID_CHANNEL, name);
+    if (ch) return ch;
+
+    // 按 catelog.name 格式拆分后查找
+    auto dot = name.find('.');
+    if (dot != std::string::npos) {
+        std::string key = name.substr(0, dot) + "." + name.substr(dot + 1);
+        ch = registry_->Get<IChannel>(IID_CHANNEL, key);
+        if (ch) return ch;
+    }
+
+    // 模糊匹配：遍历所有通道
+    registry_->Traverse<IChannel>(IID_CHANNEL, [&](IChannel* c) {
+        if (std::string(c->Name()) == name ||
+            (std::string(c->Catelog()) + "." + c->Name()) == name) {
+            ch = c;
+        }
+    });
+    return ch;
+}
+
+// --- 构建 Database 查询语句 ---
+static std::string BuildQuery(const std::string& source_name, const SqlStatement& stmt) {
+    // 从通道名提取表名（catelog.table → table）
+    std::string table = source_name;
+    auto dot = table.find('.');
+    if (dot != std::string::npos) {
+        table = table.substr(dot + 1);
+    }
+
+    // 构建 SELECT 子句
+    std::string select_clause = "*";
+    if (!stmt.columns.empty()) {
+        select_clause.clear();
+        for (size_t i = 0; i < stmt.columns.size(); ++i) {
+            if (i > 0) select_clause += ", ";
+            select_clause += stmt.columns[i];
+        }
+    }
+
+    std::string query = "SELECT " + select_clause + " FROM " + table;
+
+    // WITH 参数中的 where 条件
+    auto it = stmt.with_params.find("where");
+    if (it != stmt.with_params.end()) {
+        query += " WHERE " + it->second;
+    }
+
+    return query;
+}
+
+// --- 从 sink 通道名提取目标表名 ---
+static std::string ExtractTableName(const std::string& dest_name) {
+    auto dot = dest_name.find('.');
+    if (dot != std::string::npos) {
+        return dest_name.substr(dot + 1);
+    }
+    return dest_name;
+}
+
+// --- 无算子：纯数据搬运 ---
+int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
+                                      const std::string& source_type,
+                                      const std::string& sink_type,
+                                      const SqlStatement& stmt) {
+    if (source_type == "dataframe" && sink_type == "dataframe") {
+        // DataFrame → DataFrame：直接搬运
+        auto* src = dynamic_cast<IDataFrameChannel*>(source);
+        auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
+        if (!src || !dst) return -1;
+        return ChannelAdapter::CopyDataFrame(src, dst);
+    }
+
+    if (source_type == "dataframe" && sink_type == "database") {
+        // DataFrame → Database：写入
+        auto* src = dynamic_cast<IDataFrameChannel*>(source);
+        auto* dst = dynamic_cast<IDatabaseChannel*>(sink);
+        if (!src || !dst) return -1;
+        std::string table = ExtractTableName(stmt.dest);
+        return ChannelAdapter::WriteFromDataFrame(src, dst, table.c_str());
+    }
+
+    if (source_type == "database" && sink_type == "dataframe") {
+        // Database → DataFrame：读取
+        auto* src = dynamic_cast<IDatabaseChannel*>(source);
+        auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
+        if (!src || !dst) return -1;
+        std::string query = BuildQuery(stmt.source, stmt);
+        return ChannelAdapter::ReadToDataFrame(src, query.c_str(), dst);
+    }
+
+    if (source_type == "database" && sink_type == "database") {
+        // Database → Database：通过临时 DataFrame 中转
+        auto* src = dynamic_cast<IDatabaseChannel*>(source);
+        auto* dst = dynamic_cast<IDatabaseChannel*>(sink);
+        if (!src || !dst) return -1;
+
+        auto tmp = std::make_shared<DataFrameChannel>("_adapter", "tmp");
+        tmp->Open();
+
+        std::string query = BuildQuery(stmt.source, stmt);
+        int rc = ChannelAdapter::ReadToDataFrame(src, query.c_str(), tmp.get());
+        if (rc != 0) return rc;
+
+        std::string table = ExtractTableName(stmt.dest);
+        return ChannelAdapter::WriteFromDataFrame(tmp.get(), dst, table.c_str());
+    }
+
+    printf("SchedulerPlugin: unsupported transfer: %s → %s\n",
+           source_type.c_str(), sink_type.c_str());
+    return -1;
+}
+
+// --- 有算子：自动适配通道类型 ---
+int SchedulerPlugin::ExecuteWithOperator(IChannel* source, IChannel* sink,
+                                          IOperator* op,
+                                          const std::string& source_type,
+                                          const std::string& sink_type,
+                                          const SqlStatement& stmt) {
+    IChannel* actual_source = source;
+    IChannel* actual_sink = sink;
+    std::shared_ptr<DataFrameChannel> tmp_in, tmp_out;
+
+    // source 是 Database → 先读取到临时 DataFrame
+    if (source_type == "database") {
+        auto* db_src = dynamic_cast<IDatabaseChannel*>(source);
+        if (!db_src) return -1;
+
+        tmp_in = std::make_shared<DataFrameChannel>("_adapter", "in");
+        tmp_in->Open();
+
+        std::string query = BuildQuery(stmt.source, stmt);
+        int rc = ChannelAdapter::ReadToDataFrame(db_src, query.c_str(), tmp_in.get());
+        if (rc != 0) return rc;
+
+        actual_source = tmp_in.get();
+    }
+
+    // sink 是 Database → 算子输出到临时 DataFrame，之后再写入数据库
+    if (sink_type == "database") {
+        tmp_out = std::make_shared<DataFrameChannel>("_adapter", "out");
+        tmp_out->Open();
+        actual_sink = tmp_out.get();
+    }
+
+    // 执行 Pipeline：算子看到的永远是 IDataFrameChannel
+    auto pipeline = PipelineBuilder()
+                        .SetSource(actual_source)
+                        .SetOperator(op)
+                        .SetSink(actual_sink)
+                        .Build();
+    pipeline->Run();
+
+    if (pipeline->State() == PipelineState::FAILED) {
+        return -1;
+    }
+
+    // 如果 sink 是 Database，将临时 DataFrame 写入数据库
+    if (sink_type == "database" && tmp_out) {
+        auto* db_sink = dynamic_cast<IDatabaseChannel*>(sink);
+        if (!db_sink) return -1;
+
+        std::string table = ExtractTableName(stmt.dest);
+        int rc = ChannelAdapter::WriteFromDataFrame(tmp_out.get(), db_sink, table.c_str());
+        if (rc != 0) return rc;
+    }
+
+    return 0;
+}
+
+// --- HandleExecute: 类型感知的 SQL 执行逻辑 ---
 void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Response& res) {
     SetCorsHeaders(res);
 
@@ -166,43 +341,36 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
     }
 
     // 查找 source channel
-    std::string source_cat = stmt.source.substr(0, stmt.source.find('.'));
-    std::string source_name = stmt.source.find('.') != std::string::npos
-                                  ? stmt.source.substr(stmt.source.find('.') + 1)
-                                  : stmt.source;
-    IChannel* source = registry_->Get<IChannel>(IID_CHANNEL, source_cat + "." + source_name);
-    if (!source) {
-        registry_->Traverse<IChannel>(IID_CHANNEL, [&](IChannel* ch) {
-            if (std::string(ch->Name()) == stmt.source ||
-                (std::string(ch->Catelog()) + "." + ch->Name()) == stmt.source) {
-                source = ch;
-            }
-        });
-    }
+    IChannel* source = FindChannel(stmt.source);
     if (!source) {
         res.status = 400;
         res.set_content(MakeErrorJson("source channel not found: " + stmt.source), "application/json");
         return;
     }
 
-    // 查找 operator
-    IOperator* op = registry_->Get<IOperator>(IID_OPERATOR, stmt.op_catelog + "." + stmt.op_name);
-    if (!op) {
-        registry_->Traverse<IOperator>(IID_OPERATOR, [&](IOperator* o) {
-            if (o->Catelog() == stmt.op_catelog && o->Name() == stmt.op_name) op = o;
-        });
-    }
-    if (!op) {
-        res.status = 400;
-        res.set_content(MakeErrorJson("operator not found: " + stmt.op_catelog + "." + stmt.op_name),
-                        "application/json");
-        return;
+    // 查找 operator（可选）
+    IOperator* op = nullptr;
+    if (stmt.HasOperator()) {
+        op = registry_->Get<IOperator>(IID_OPERATOR, stmt.op_catelog + "." + stmt.op_name);
+        if (!op) {
+            registry_->Traverse<IOperator>(IID_OPERATOR, [&](IOperator* o) {
+                if (o->Catelog() == stmt.op_catelog && o->Name() == stmt.op_name) op = o;
+            });
+        }
+        if (!op) {
+            res.status = 400;
+            res.set_content(MakeErrorJson("operator not found: " + stmt.op_catelog + "." + stmt.op_name),
+                            "application/json");
+            return;
+        }
     }
 
     try {
-        // 传递 WITH 参数
-        for (auto& [k, v] : stmt.with_params) {
-            op->Configure(k.c_str(), v.c_str());
+        // 传递 WITH 参数给算子
+        if (op) {
+            for (auto& [k, v] : stmt.with_params) {
+                op->Configure(k.c_str(), v.c_str());
+            }
         }
 
         // 准备 sink channel
@@ -210,14 +378,9 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
         IChannel* sink = nullptr;
 
         if (!stmt.dest.empty()) {
-            // INTO 指定了目标通道，查找或创建
-            registry_->Traverse<IChannel>(IID_CHANNEL, [&](IChannel* ch) {
-                if (std::string(ch->Name()) == stmt.dest ||
-                    (std::string(ch->Catelog()) + "." + ch->Name()) == stmt.dest) {
-                    sink = ch;
-                }
-            });
+            sink = FindChannel(stmt.dest);
             if (!sink) {
+                // 目标通道不存在，创建临时 DataFrameChannel
                 temp_sink = std::make_shared<DataFrameChannel>("result", stmt.dest);
                 temp_sink->Open();
                 registry_->Register(IID_CHANNEL, "result." + stmt.dest, temp_sink);
@@ -231,14 +394,23 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
             sink = temp_sink.get();
         }
 
-        // 执行 Pipeline
-        auto pipeline = PipelineBuilder().SetSource(source).SetOperator(op).SetSink(sink).Build();
-        pipeline->Run();
+        // 获取通道类型
+        std::string source_type(source->Type());
+        std::string sink_type(sink->Type());
 
-        if (pipeline->State() == PipelineState::FAILED) {
-            std::string err = op->LastError();
-            if (err.empty()) err = pipeline->ErrorMessage();
-            if (err.empty()) err = "pipeline execution failed";
+        int rc = 0;
+
+        if (!op) {
+            // 无算子：纯数据搬运
+            rc = ExecuteTransfer(source, sink, source_type, sink_type, stmt);
+        } else {
+            // 有算子：需要确保算子看到的是 IDataFrameChannel
+            rc = ExecuteWithOperator(source, sink, op, source_type, sink_type, stmt);
+        }
+
+        if (rc != 0) {
+            std::string err = op ? op->LastError() : "";
+            if (err.empty()) err = "execution failed";
             res.status = 500;
             res.set_content(MakeErrorJson(err), "application/json");
             return;

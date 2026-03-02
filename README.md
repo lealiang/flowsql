@@ -161,6 +161,7 @@ flowSQL/
 - [架构演进方案](docs/framework.md) — 整体架构设计与实现状态
 - [Stage 1 设计文档](docs/stage1.md) — C++ 框架核心
 - [Stage 2 设计文档](docs/stage2.md) — C++ ↔ Python 桥接 + Web 管理系统
+- [Stage 3 设计文档](docs/stage3.md) — 数据库闭环 + 流式架构 + 平台增强
 
 ## 许可证
 

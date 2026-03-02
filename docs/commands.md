@@ -83,3 +83,5 @@
 - 2026-03-02: 同步 docs/framework.md：更新部署配置（gateway.yaml同步实际）、新增项目目录结构章节、新增构建与运行命令、更新实现状态（IModule合并、目录重构）
 - 2026-03-02: 提交并推送代码到 main 分支（commit eefb507）：项目架构重构，模块化服务设计，统一插件系统
 - 2026-03-02: 更新 README.md：同步架构（Gateway+多服务拓扑、IPlugin/IChannel/IOperator新接口、数据面双路径）、更新项目结构（services/目录、plugins/npi/扁平化、thirdparts提到根）、更新编译运行命令、SQL语法示例改为当前实现格式、新增framework.md文档链接
+- 2026-03-02: 创建 docs/stage3.md（数据库闭环+流式架构+平台增强）：整合 stage2 未实现任务（P1 DatabaseChannel/store/extract、P2 SQL列选择/多算子Pipeline、P3 异步任务/认证）+ framework.md 流式架构章节；从 framework.md 移除流式架构设计阶段内容；从 stage2.md 移除"待下阶段实现"列表改为指向 stage3；更新 README.md 文档链接
+- 2026-03-02: Pipeline 自动适配通道类型：去掉 system.store/system.extract 算子，新增 ChannelAdapter 工具类（ReadToDataFrame/WriteFromDataFrame/CopyDataFrame）；SQL 解析器改造（USING 可选 + columns 列选择 + HasOperator()）；Scheduler 类型感知执行路径（FindChannel/ExecuteTransfer/ExecuteWithOperator）；新增 SQL 解析器测试和 ChannelAdapter 测试；更新 stage3.md 文档

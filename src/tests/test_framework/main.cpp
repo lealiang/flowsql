@@ -6,10 +6,12 @@
 #include <vector>
 
 #include <common/toolkit.hpp>
+#include <framework/core/channel_adapter.h>
 #include <framework/core/dataframe.h>
 #include <framework/core/dataframe_channel.h>
 #include <framework/core/pipeline.h>
 #include <framework/core/plugin_registry.h>
+#include <framework/core/sql_parser.h>
 #include <framework/interfaces/ichannel.h>
 #include <framework/interfaces/idataframe_channel.h>
 #include <framework/interfaces/ioperator.h>
@@ -355,6 +357,110 @@ void test_dataframe_channel() {
 }
 
 // ============================================================
+// Test 8: SQL 解析器 — USING 可选 + 列选择
+// ============================================================
+void test_sql_parser() {
+    printf("[TEST] SQL parser (USING optional + columns)...\n");
+    SqlParser parser;
+
+    // 1. 完整语法（兼容旧格式）
+    {
+        auto stmt = parser.Parse("SELECT * FROM test.data USING explore.chisquare WITH threshold=0.05 INTO result");
+        assert(stmt.error.empty());
+        assert(stmt.source == "test.data");
+        assert(stmt.op_catelog == "explore");
+        assert(stmt.op_name == "chisquare");
+        assert(stmt.with_params["threshold"] == "0.05");
+        assert(stmt.dest == "result");
+        assert(stmt.columns.empty());  // SELECT *
+        assert(stmt.HasOperator());
+    }
+
+    // 2. 无 USING（纯数据搬运）
+    {
+        auto stmt = parser.Parse("SELECT * FROM memory_data INTO clickhouse.my_table");
+        assert(stmt.error.empty());
+        assert(stmt.source == "memory_data");
+        assert(stmt.op_catelog.empty());
+        assert(stmt.op_name.empty());
+        assert(stmt.dest == "clickhouse.my_table");
+        assert(!stmt.HasOperator());
+    }
+
+    // 3. 无 USING 无 INTO（纯查询）
+    {
+        auto stmt = parser.Parse("SELECT * FROM test.data");
+        assert(stmt.error.empty());
+        assert(stmt.source == "test.data");
+        assert(!stmt.HasOperator());
+        assert(stmt.dest.empty());
+    }
+
+    // 4. 列选择
+    {
+        auto stmt = parser.Parse("SELECT src_ip, dst_ip, bytes_sent FROM test.data USING explore.chisquare");
+        assert(stmt.error.empty());
+        assert(stmt.columns.size() == 3);
+        assert(stmt.columns[0] == "src_ip");
+        assert(stmt.columns[1] == "dst_ip");
+        assert(stmt.columns[2] == "bytes_sent");
+        assert(stmt.source == "test.data");
+        assert(stmt.HasOperator());
+    }
+
+    // 5. 无 USING + WITH（WITH 参数用于 Database 过滤）
+    {
+        auto stmt = parser.Parse("SELECT * FROM clickhouse.my_table WITH where=\"date > '2026-01-01'\" INTO memory_result");
+        assert(stmt.error.empty());
+        assert(stmt.source == "clickhouse.my_table");
+        assert(!stmt.HasOperator());
+        assert(stmt.with_params.count("where") == 1);
+        assert(stmt.dest == "memory_result");
+    }
+
+    // 6. 大小写不敏感
+    {
+        auto stmt = parser.Parse("select * from test.data into result");
+        assert(stmt.error.empty());
+        assert(stmt.source == "test.data");
+        assert(stmt.dest == "result");
+    }
+
+    printf("[PASS] SQL parser (USING optional + columns)\n");
+}
+
+// ============================================================
+// Test 9: ChannelAdapter — DataFrame 搬运
+// ============================================================
+void test_channel_adapter_copy() {
+    printf("[TEST] ChannelAdapter CopyDataFrame...\n");
+
+    DataFrameChannel src("test", "src");
+    DataFrameChannel dst("test", "dst");
+    src.Open();
+    dst.Open();
+
+    DataFrame df;
+    df.SetSchema({{"x", DataType::INT32, 0, ""}, {"y", DataType::STRING, 0, ""}});
+    df.AppendRow({int32_t(1), std::string("hello")});
+    df.AppendRow({int32_t(2), std::string("world")});
+    src.Write(&df);
+
+    int rc = ChannelAdapter::CopyDataFrame(&src, &dst);
+    assert(rc == 0);
+
+    DataFrame result;
+    dst.Read(&result);
+    assert(result.RowCount() == 2);
+    assert(std::get<int32_t>(result.GetRow(0)[0]) == 1);
+    assert(std::get<std::string>(result.GetRow(1)[1]) == "world");
+
+    src.Close();
+    dst.Close();
+    printf("[PASS] ChannelAdapter CopyDataFrame\n");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
@@ -365,6 +471,8 @@ int main(int argc, char* argv[]) {
     test_dataframe_json();
     test_dataframe_clear();
     test_dataframe_channel();
+    test_sql_parser();
+    test_channel_adapter_copy();
 
     // Pipeline 测试需要插件 .so
     std::string plugin_dir = get_absolute_process_path();

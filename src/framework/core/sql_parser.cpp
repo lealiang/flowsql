@@ -63,13 +63,29 @@ SqlStatement SqlParser::Parse(const std::string& sql) {
         return stmt;
     }
 
-    // *
+    // 列选择：* 或 col1, col2, ...
     SkipWhitespace();
-    if (pos_ >= end_ || *pos_ != '*') {
-        stmt.error = "expected * after SELECT";
-        return stmt;
+    if (pos_ < end_ && *pos_ == '*') {
+        ++pos_;
+        // columns 为空表示 SELECT *
+    } else {
+        // 读取列名列表
+        while (true) {
+            std::string col = ReadIdentifier();
+            if (col.empty()) {
+                stmt.error = "expected column name or * after SELECT";
+                return stmt;
+            }
+            stmt.columns.push_back(col);
+
+            SkipWhitespace();
+            if (pos_ < end_ && *pos_ == ',') {
+                ++pos_;  // 跳过逗号
+            } else {
+                break;
+            }
+        }
     }
-    ++pos_;
 
     // FROM <source>
     if (!MatchKeyword("FROM")) {
@@ -82,19 +98,20 @@ SqlStatement SqlParser::Parse(const std::string& sql) {
         return stmt;
     }
 
-    // USING <catelog.name>
-    if (!MatchKeyword("USING")) {
-        stmt.error = "expected USING";
-        return stmt;
+    // [USING <catelog.name>]（可选）
+    const char* saved_pos = pos_;
+    if (MatchKeyword("USING")) {
+        std::string op_full = ReadIdentifier();
+        auto dot = op_full.find('.');
+        if (dot == std::string::npos || dot == 0 || dot == op_full.size() - 1) {
+            stmt.error = "expected catelog.name format after USING, got: " + op_full;
+            return stmt;
+        }
+        stmt.op_catelog = op_full.substr(0, dot);
+        stmt.op_name = op_full.substr(dot + 1);
+    } else {
+        pos_ = saved_pos;  // 回退，USING 不存在
     }
-    std::string op_full = ReadIdentifier();
-    auto dot = op_full.find('.');
-    if (dot == std::string::npos || dot == 0 || dot == op_full.size() - 1) {
-        stmt.error = "expected catelog.name format after USING, got: " + op_full;
-        return stmt;
-    }
-    stmt.op_catelog = op_full.substr(0, dot);
-    stmt.op_name = op_full.substr(dot + 1);
 
     // [WITH key=val, ...]
     if (MatchKeyword("WITH")) {
