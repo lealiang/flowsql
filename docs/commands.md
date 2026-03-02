@@ -81,3 +81,5 @@
 - 2026-03-02: src 目录整理重构：thirdparts/build/.thirdparts_*提到项目根；bridge/scheduler/gateway/web归入services/；plugins/protocol/npi上提为plugins/npi；web-ui重命名frontend；data移入tests/；删除废弃ragel/boost；project(npi_test)→project(flowsql)；CMake路径全部适配；编译+测试通过
 - 2026-03-02: 修复目录重构后PYTHONPATH路径问题：service_manager.cpp和python_process_manager.cpp中../../python改为../../src/python
 - 2026-03-02: 同步 docs/framework.md：更新部署配置（gateway.yaml同步实际）、新增项目目录结构章节、新增构建与运行命令、更新实现状态（IModule合并、目录重构）
+- 2026-03-02: 提交并推送代码到 main 分支（commit eefb507）：项目架构重构，模块化服务设计，统一插件系统
+- 2026-03-02: 更新 README.md：同步架构（Gateway+多服务拓扑、IPlugin/IChannel/IOperator新接口、数据面双路径）、更新项目结构（services/目录、plugins/npi/扁平化、thirdparts提到根）、更新编译运行命令、SQL语法示例改为当前实现格式、新增framework.md文档链接

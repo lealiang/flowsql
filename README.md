@@ -1,169 +1,164 @@
 # FlowSQL
 
-基于SQL语法的网络流量分析共创平台
+基于 SQL 语法的网络流量分析共创平台
 
 ## 项目简介
 
-FlowSQL 是一个全栈式网络流量分析平台，通过扩展的SQL语法提供从数据采集、流量分析到数据探索的完整能力。用户无需深入了解底层技术（如DPDK、Hyperscan），只需使用熟悉的SQL语句即可构建自己的流量分析系统。
+FlowSQL 是一个全栈式网络流量分析平台，通过扩展的 SQL 语法提供从数据采集、流量分析到数据探索的完整能力。用户无需深入了解底层技术（如 DPDK、Hyperscan），只需使用熟悉的 SQL 语句即可构建自己的流量分析系统。
+
+平台采用 Gateway + 多服务插件架构，C++ 服务共享同一个框架程序（加载不同 .so），Python Worker 作为独立 FastAPI 进程运行。控制面统一走 HTTP + URI 路由，数据面通过共享内存 / Arrow IPC 实现零拷贝传输。
 
 ## 核心特性
 
-- **数据采集**：通过SQL语句从网卡或存储空间采集网络流量
-- **NPM分析**：实时或事后的网络性能监控分析
-- **数据查询**：标准SQL查询语法支持
-- **统计分析**：描述性统计分析能力
-- **探索性分析**：支持PCA、朴素贝叶斯等机器学习算法
-- **模型助手**：提供数据预处理和神经网络模型训练
+- **插件化架构**：所有功能模块以 .so 插件形式加载，统一框架程序驱动
+- **Gateway 路由**：星型服务拓扑，URI 路由注册/发现/转发，心跳监控与自动重启
+- **C++ ↔ Python 桥接**：共享内存 + Arrow IPC 零拷贝数据传输，HTTP 仅传控制指令
+- **SQL 驱动**：扩展 SQL 语法统一数据采集、分析、探索操作
+- **Web 管理**：Vue.js 前端 + REST API，支持通道/算子/任务管理和在线编写 Python 算子
+- **流式处理（设计中）**：DPDK 大页内存零拷贝、IStreamChannel/IStreamOperator 接口
 
 ## 快速开始
 
 ### 环境要求
 
 - CMake 3.12+
-- C++17 编译器
+- C++17 编译器（GCC 7+ / Clang 5+）
 - Linux 系统
+- Python 3.8+（Python 算子运行时）
 
 ### 编译
 
 ```bash
-cd src
-mkdir -p build
-cd build
-cmake ..
-make
+cmake -B build src && cmake --build build -j$(nproc)
 ```
 
-## SQL语法示例
+### 运行
 
-### 数据采集
-```sql
-select *packet* from *netcard.nic1, netcard.nic2* into *ss.packets*
+```bash
+cd build/output
+LD_LIBRARY_PATH=. ./flowsql --config ../../config/gateway.yaml
 ```
 
-### NPM分析
-```sql
-npm.basic packet from *netcard.nic1, netcard.nic2* into *ts.npm*
+启动后 Gateway(18800) 自动 spawn Web(8081) + Scheduler(18803) + PyWorker(18900)，浏览器访问 `http://127.0.0.1:8081` 进入管理界面。
+
+### 测试
+
+```bash
+cd build/output
+./test_framework
+./test_bridge
 ```
-
-### 数据查询
-```sql
-select * from *ts.npm.tcp_session* where ip = '8.8.8.8'
-```
-
-### 统计分析
-```sql
-statistic.hist bps from *ts.npm.tcp_session*
-where time = '[2024/07/14 00:00:00 - 2024/07/14 23:59:59]'
-group by application granularity 60
-```
-
-### 探索性分析
-```sql
-explore.pca bps,rss,connect_suc_rate from *ts.npm.tcp_session*
-where time = '[2024/07/14 00:00:00 - 2024/07/14 23:59:59]'
-group by application granularity 60
-```
-
-## 扩展关键字
-
-| 关键字 | 描述 |
-|--------|------|
-| 通道 | netcard、kafka、ss、ts、smq |
-| 算子 | npm、statistic、explore、model |
-| granularity | 数据聚合粒度（秒） |
-| into | 指定数据输出目标 |
-| label | 模型训练标签字段 |
-| with | 算子或模型附加参数 |
 
 ## 架构
 
-FlowSQL 采用插件化架构，核心由四个接口驱动：
+### 服务拓扑
 
 ```
-IPlugin（生命周期基元）
-├── IChannel（数据通道）    ← Pipeline 的源和汇
-├── IOperator（数据算子）   ← Pipeline 的计算节点
+                    ┌─────────────────────┐
+                    │   Gateway/Manager   │
+                    │ (框架 + gateway.so)  │
+                    │  - 路由表（URI→地址） │
+                    │  - 服务注册/发现     │
+                    │  - 生命周期管理       │
+                    └──────┬──────────────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+     ┌────────▼───┐  ┌────▼─────┐  ┌───▼──────────┐
+     │ Web 服务   │  │Scheduler │  │ Python Worker │
+     │(框架+web.so)│  │(框架+    │  │  (FastAPI)    │
+     │ 前端+API   │  │sched.so+ │  │  算子执行     │
+     └────────────┘  │算子插件) │  └───────────────┘
+                     │SQL+执行  │
+                     └──────────┘
+```
+
+### 核心接口
+
+```
+IPlugin（生命周期 + 启停控制）
+├── IChannel（数据通道描述符）
+│   ├── IDataFrameChannel（批处理：快照 Read / 替换 Write）
+│   ├── IDatabaseChannel（数据库：Reader/Writer 工厂）
+│   └── IStreamChannel（流式，设计中）
+├── IOperator（数据算子：Work(IChannel*, IChannel*)）
 └── ...（可扩展）
-
-IModule（启停控制）         ← 需要后台运行的组件额外实现
 ```
 
-### IPlugin — 插件生命周期基元
+- **IPlugin**（`common/loader.hpp`）— 所有可加载组件的根接口，三阶段加载：`pluginregist()` 注册 → `Load()` 初始化 → `Start()` 启动
+- **IChannel**（`framework/interfaces/ichannel.h`）— 数据源/汇描述符，`Catelog()` + `Name()` 构成唯一标识，算子通过 `dynamic_cast` 获取具体子类型操作数据
+- **IOperator**（`framework/interfaces/ioperator.h`）— 数据处理单元，`Work(IChannel* in, IChannel* out)` 核心计算方法
+- **IDataFrame**（`framework/interfaces/idataframe.h`）— 列式数据集，Apache Arrow RecordBatch 后端
 
-定义：`common/loader.hpp` | 标识：`IID_PLUGIN`
-
-所有可加载组件的根接口。IChannel 和 IOperator 都继承自它，因此每个通道和算子天然具备生命周期管理能力。
-
-- `Load()` — 插件初始化（三阶段加载的阶段 2），此时不应调用其他接口
-- `Unload()` — 插件清理
-- `Option(const char*)` — 接收加载时传入的配置参数
-
-### IModule — 服务启停控制
-
-定义：`common/loader.hpp` | 标识：`IID_MODULE`
-
-用于需要"运行态"的组件（如后台进程、网络监听）。与 IPlugin 正交，一个插件类可以同时实现两者。
-
-- `Start()` — 启动服务（阶段 3，所有 IPlugin::Load 完成后）
-- `Stop()` — 停止服务（Unload 前逆序调用，Start 失败时自动回滚）
-
-### IChannel — 数据通道
-
-定义：`framework/interfaces/ichannel.h` | 标识：`IID_CHANNEL` | 继承 IPlugin
-
-代表数据的入口或出口。`Catelog()` + `Name()` 构成唯一标识（如 `"example.memory"`）。
-
-- `Open()` / `Close()` — 通道生命周期
-- `Put(IDataEntity*)` — 写入数据实体
-- `Get()` → `IDataEntity*` — 读取数据实体
-- `Flush()` — 批量刷新
-
-### IOperator — 数据算子
-
-定义：`framework/interfaces/ioperator.h` | 标识：`IID_OPERATOR` | 继承 IPlugin
-
-数据处理单元，接收 DataFrame 输入、产出 DataFrame 输出。
-
-- `Work(IDataFrame* in, IDataFrame* out)` — 核心计算方法
-- `Position()` — 算子位置（STORAGE 或 DATA 层）
-- `Configure(key, value)` — 运行时调参
-
-### IDataFrame / IDataEntity — 数据抽象
-
-- `IDataFrame`（`framework/interfaces/idataframe.h`）— 列式数据集，Apache Arrow RecordBatch 后端，支持行列操作、Arrow 零拷贝互操作、JSON 序列化
-- `IDataEntity`（`framework/interfaces/idata_entity.h`）— 单行数据实体，Schema + FieldValue，支持 Clone 和 JSON 序列化
-
-### 数据流
+### 数据面
 
 ```
-┌─────────┐  Get()  ┌───────────┐  Work()  ┌───────────┐  Put()  ┌─────────┐
-│ IChannel│ ──────→ │ IDataFrame│ ──────→  │ IOperator │ ──────→ │ IChannel│
-│ (source)│         │ (input)   │          │           │         │ (sink)  │
-└─────────┘         └───────────┘          └───────────┘         └─────────┘
+C++ 算子路径（进程内，零开销）：
+  Pipeline → operator->Work(source_channel, sink_channel)
+
+Python 算子路径（跨进程，共享内存零拷贝）：
+  Pipeline → PythonOperatorBridge->Work(source, sink)
+    → Arrow IPC memcpy 写入 /dev/shm/flowsql_<uuid>_in
+    → HTTP 控制指令（仅传文件路径）
+    → Python Worker: memory_map → Polars DataFrame → 算子处理
+    → 结果写入 /dev/shm/flowsql_<uuid>_out
+    → Bridge 读取结果 → 写入 sink IChannel
 ```
 
-所有组件通过 GUID 标识，由 PluginLoader 加载 .so 插件，PluginRegistry 统一索引和查询。插件加载遵循三阶段流程：`pluginregist()` 注册 → `IPlugin::Load()` 初始化 → `IModule::Start()` 启动服务。
+## SQL 语法示例
+
+```sql
+-- 数据采集
+SELECT * FROM netcard USING npm INTO ts.db1
+
+-- 探索性分析（Python 算子）
+SELECT * FROM example.memory USING explore.chisquare WITH target='label'
+
+-- 统计分析
+SELECT bps FROM ts.npm.tcp_session USING statistic.hist
+WHERE time = '[2024/07/14 00:00:00 - 2024/07/14 23:59:59]'
+```
 
 ## 项目结构
 
 ```
 flowSQL/
+├── thirdparts/                 # 第三方依赖构建配置（非源码）
+├── build/                      # cmake 构建产物（可随时 rm -rf）
+│   └── output/                 # 编译产物（.so、可执行文件）
+├── .thirdparts_installed/      # 第三方依赖安装缓存（独立于 build）
+├── .thirdparts_prefix/         # 第三方依赖编译缓存（独立于 build）
+│
 ├── src/
-│   ├── common/           # 公共库：插件加载器、GUID、工具函数、网络包结构
-│   ├── framework/
-│   │   ├── interfaces/   # 核心接口：IDataFrame、IDataEntity、IChannel、IOperator
-│   │   └── core/         # 实现：DataFrame、Pipeline、PluginRegistry、Service
+│   ├── common/                 # 公共头文件（define.h、loader.hpp 等）
+│   ├── framework/              # 框架核心（IPlugin、PluginRegistry、Pipeline 等）
+│   │
+│   ├── services/               # 服务插件
+│   │   ├── bridge/             # C++ ↔ Python 桥接（libflowsql_bridge.so）
+│   │   ├── scheduler/          # 调度服务（libflowsql_scheduler.so）
+│   │   ├── gateway/            # 网关服务（libflowsql_gateway.so）
+│   │   └── web/                # Web 管理系统（libflowsql_web.so + flowsql 可执行文件）
+│   │
 │   ├── plugins/
-│   │   ├── protocol/npi/ # NPI 协议识别插件（Hyperscan 正则 + 位图 + 枚举匹配）
-│   │   └── example/      # 示例插件（MemoryChannel + PassthroughOperator）
-│   ├── tests/            # 测试：test_npi、test_framework
-│   └── thirdparts/       # 第三方依赖（ExternalProject 管理）
-├── docs/                 # 设计文档
-└── CLAUDE.md             # AI 助手指引
+│   │   ├── example/            # 示例插件（MemoryChannel + PassthroughOperator）
+│   │   └── npi/                # NPI 协议识别插件（Hyperscan 正则 + 位图 + 枚举匹配）
+│   │
+│   ├── python/                 # Python Worker（FastAPI + 算子运行时）
+│   ├── frontend/               # Vue.js 前端项目
+│   │
+│   └── tests/
+│       ├── test_framework/
+│       ├── test_bridge/
+│       ├── test_npi/
+│       └── data/               # 测试数据（NPI pcap 文件等）
+│
+├── config/                     # 运行配置（gateway.yaml）
+└── docs/                       # 设计文档
 ```
 
 ## 文档
 
+- [架构演进方案](docs/framework.md) — 整体架构设计与实现状态
 - [Stage 1 设计文档](docs/stage1.md) — C++ 框架核心
 - [Stage 2 设计文档](docs/stage2.md) — C++ ↔ Python 桥接 + Web 管理系统
 
