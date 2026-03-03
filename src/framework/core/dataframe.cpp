@@ -7,7 +7,6 @@
 #include <rapidjson/writer.h>
 
 #include <stdexcept>
-#include <unordered_map>
 
 namespace flowsql {
 
@@ -121,66 +120,6 @@ std::vector<FieldValue> DataFrame::GetColumn(const std::string& name) const {
         col.push_back(ExtractValue(arr, static_cast<int>(i)));
     }
     return col;
-}
-
-// --- IDataEntity 互操作 ---
-
-int DataFrame::AppendEntity(IDataEntity* entity) {
-    if (!entity) return -1;
-    if (schema_.empty()) {
-        SetSchema(entity->GetSchema());
-    }
-    std::vector<FieldValue> row;
-    row.reserve(schema_.size());
-    for (auto& f : schema_) {
-        row.push_back(entity->GetFieldValue(f.name));
-    }
-    return AppendRow(row);
-}
-
-// GenericDataEntity: 用于 GetEntity() 返回的通用实体
-class GenericDataEntity : public IDataEntity {
- public:
-    GenericDataEntity(const std::string& type, const std::vector<Field>& schema,
-                      const std::vector<FieldValue>& values)
-        : type_(type), schema_(schema) {
-        for (size_t i = 0; i < schema.size() && i < values.size(); ++i) {
-            fields_[schema[i].name] = values[i];
-        }
-    }
-
-    std::string GetEntityType() const override { return type_; }
-    std::vector<Field> GetSchema() const override { return schema_; }
-    bool HasField(const std::string& name) const override { return fields_.count(name) > 0; }
-    FieldValue GetFieldValue(const std::string& name) const override {
-        auto it = fields_.find(name);
-        return it != fields_.end() ? it->second : FieldValue{};
-    }
-    void SetFieldValue(const std::string& name, const FieldValue& value) override {
-        fields_[name] = value;
-    }
-    std::string ToJson() const override { return "{}"; }
-    bool FromJson(const std::string&) override { return false; }
-    std::shared_ptr<IDataEntity> Clone() const override {
-        std::vector<FieldValue> vals;
-        vals.reserve(schema_.size());
-        for (auto& f : schema_) {
-            auto it = fields_.find(f.name);
-            vals.push_back(it != fields_.end() ? it->second : FieldValue{});
-        }
-        return std::make_shared<GenericDataEntity>(type_, schema_, vals);
-    }
-
- private:
-    std::string type_;
-    std::vector<Field> schema_;
-    std::unordered_map<std::string, FieldValue> fields_;
-};
-
-std::shared_ptr<IDataEntity> DataFrame::GetEntity(int32_t index) const {
-    auto row = GetRow(index);
-    if (row.empty()) return nullptr;
-    return std::make_shared<GenericDataEntity>("dataframe_row", schema_, row);
 }
 
 // --- Arrow 互操作 ---

@@ -4,7 +4,7 @@
 #include <string>
 #include <thread>
 
-#include <common/loader.hpp>
+#include <common/iplugin.h>
 
 #include "web_server.h"
 
@@ -20,7 +20,7 @@ class WebPlugin : public IPlugin {
 
     // IPlugin
     int Option(const char* arg) override;
-    int Load() override;
+    int Load(IQuerier* querier) override;
     int Unload() override;
     int Start() override;
     int Stop() override;

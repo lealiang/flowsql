@@ -4,6 +4,16 @@ import pyarrow as pa
 import polars as pl
 
 
+def _ensure_arrow_table(df) -> pa.Table:
+    """将 DataFrame（Polars 或 Pandas）转为 Arrow Table"""
+    if isinstance(df, pa.Table):
+        return df
+    if isinstance(df, pl.DataFrame):
+        return df.to_arrow()
+    # pandas DataFrame 或其他兼容类型
+    return pa.Table.from_pandas(df)
+
+
 def decode_arrow_ipc(data: bytes) -> pl.DataFrame:
     """将 Arrow IPC stream 字节解码为 Polars DataFrame"""
     reader = pa.ipc.open_stream(data)
@@ -14,9 +24,9 @@ def decode_arrow_ipc(data: bytes) -> pl.DataFrame:
         reader.close()
 
 
-def encode_arrow_ipc(df: pl.DataFrame) -> bytes:
-    """将 Polars DataFrame 编码为 Arrow IPC stream 字节"""
-    table = df.to_arrow()
+def encode_arrow_ipc(df) -> bytes:
+    """将 DataFrame（Polars/Pandas）编码为 Arrow IPC stream 字节"""
+    table = _ensure_arrow_table(df)
     batches = table.to_batches()
     if not batches:
         batches = [pa.record_batch([], schema=table.schema)]
@@ -45,9 +55,9 @@ def decode_arrow_ipc_file(path: str) -> pl.DataFrame:
         mmap.close()
 
 
-def encode_arrow_ipc_file(df: pl.DataFrame, path: str):
-    """Polars DataFrame → Arrow IPC 写入文件（零拷贝）"""
-    table = df.to_arrow()
+def encode_arrow_ipc_file(df, path: str):
+    """DataFrame（Polars/Pandas）→ Arrow IPC 写入文件"""
+    table = _ensure_arrow_table(df)
     batches = table.to_batches()
     if not batches:
         batches = [pa.record_batch([], schema=table.schema)]

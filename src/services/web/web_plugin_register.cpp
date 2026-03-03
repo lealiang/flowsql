@@ -1,4 +1,4 @@
-#include <common/loader.hpp>
+#include <common/iplugin.h>
 
 #include "web_plugin.h"
 

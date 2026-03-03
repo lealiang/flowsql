@@ -9,7 +9,80 @@ Stage 1 完成了 C++ 框架核心，Stage 2 完成了 C++ ↔ Python 桥接 + W
 - Web 管理界面（通道/算子/任务管理 + SQL 执行）
 - 单算子 Pipeline（SELECT * FROM ... USING ... WITH ... INTO ...）
 
+**Stage 2→3 过渡期架构清理（已完成）**：
+- 消除 PluginRegistry + libflowsql_framework.so，回归纯 PluginLoader 架构
+- IChannel/IOperator 解耦 IPlugin（纯接口不继承生命周期接口）
+- IBridge 接口（Python 算子查询/遍历/刷新，替代 `dynamic_cast<IRegister*>` hack）
+- 算子刷新链路（Web → Worker reload → Scheduler refresh → IBridge::Refresh）
+- arrow_codec.py 统一转换层（兼容 Polars/Pandas/Arrow Table）
+
 Stage 3 目标：补齐数据库读写闭环，扩展 SQL 能力和 Pipeline 编排，引入流式处理架构，提升平台可用性。
+
+## 已完成：架构重构
+
+### 纯插件架构回归
+
+删除 PluginRegistry 和 libflowsql_framework.so，回归 PluginLoader 单层架构。
+
+**设计决策**：
+- PluginRegistry 双层索引 + 共享库导出符号导致多实例问题（静态库链接到多个 .so 时单例失效），根因无法优雅解决
+- IPlugin::Load 签名从 `Load(IRegister*)` 改为 `Load(IQuerier*)`，插件只需查询能力，不需要注册能力
+- Pipeline / ChannelAdapter 从 framework 移入 scheduler.so（唯一使用者）
+- flowsql_framework 库消除，公共头文件归入 flowsql_common（header-only）
+
+**关键文件**：
+- `common/iplugin.h` — 从 framework 拆出，含 IRegister/IPlugin/注册宏
+- `common/loader.hpp` — PluginLoader 实现 IRegister + IQuerier
+- `common/iquerier.hpp` — 插件查询接口
+
+### 接口解耦（IChannel/IOperator 去掉 IPlugin 继承）
+
+**设计决策**：
+- IChannel/IOperator 是纯数据接口，不应继承 IPlugin 生命周期接口
+- 具体实现类（MemoryChannel、PassthroughOperator）显式多继承 `IPlugin` + 数据接口
+- 内部使用的类（DataFrameChannel、PythonOperatorBridge）不需要 IPlugin，只实现数据接口
+
+**关键文件**：
+- `framework/interfaces/ichannel.h` — 纯接口，不继承 IPlugin
+- `framework/interfaces/ioperator.h` — 纯接口，不继承 IPlugin
+
+### IBridge 接口
+
+**设计决策**：
+- 替代 `dynamic_cast<IRegister*>` 向 PluginLoader 动态注册 Python 算子的 hack
+- BridgePlugin 多继承 `IPlugin, IBridge`，通过注册宏暴露 IID_BRIDGE
+- Scheduler 通过 `IQuerier::First(IID_BRIDGE)` 获取 IBridge，调用 FindOperator/TraverseOperators
+- 刷新链路：Web 激活算子 → Worker reload → Scheduler `/refresh-operators` → `IBridge::Refresh()`
+
+**接口方法**：
+- `FindOperator(catelog, name)` → `shared_ptr<IOperator>`（生命周期安全）
+- `TraverseOperators(fn)` — 遍历所有已发现的 Python 算子
+- `Refresh()` — 重新从 Python Worker 发现算子
+
+**关键文件**：
+- `framework/interfaces/ibridge.h` — IBridge 纯接口
+- `services/bridge/bridge_plugin.h` — `BridgePlugin : IPlugin, IBridge`
+
+## 核心接口体系
+
+```
+IPlugin（生命周期：Load/Unload/Start/Stop）
+  ├── BridgePlugin : IPlugin, IBridge
+  ├── SchedulerPlugin : IPlugin
+  ├── GatewayPlugin : IPlugin
+  ├── WebPlugin : IPlugin
+  ├── MemoryChannel : IDataFrameChannel, IPlugin    ← 显式多继承
+  └── PassthroughOperator : IOperator, IPlugin      ← 显式多继承
+
+IChannel（纯接口：身份 + 生命周期 + 元数据，不继承 IPlugin）
+  ├── IDataFrameChannel（批处理 + DataFrame）
+  ├── IDatabaseChannel（批处理 + 数据库）
+  └── IStreamChannel（流式，待实现）
+
+IOperator（纯接口：元数据 + Work + Configure，不继承 IPlugin）
+
+IBridge（纯接口：FindOperator + TraverseOperators + Refresh）
+```
 
 ## 任务总览
 
@@ -99,7 +172,7 @@ SELECT * FROM memory_data USING explore.chisquare INTO clickhouse.my_table
 
 ### 清理任务
 
-- 删除 IDataEntity 相关死代码（`idata_entity.h`、DataFrame 中的 AppendEntity/GetEntity），当前无任何代码使用
+- ~~删除 IDataEntity 相关死代码~~（已完成：删除 `idata_entity.h`，`DataType`/`FieldValue`/`Field` 移入 `idataframe.h`，清理 `DataFrame` 中 `AppendEntity`/`GetEntity`/`GenericDataEntity` 死代码）
 
 ---
 
@@ -191,17 +264,16 @@ Channel = 描述符
 
 ### 通道接口体系
 
-```
-IChannel（基类：生命周期 + 身份 + 元数据）
-  ├── IDataFrameChannel（批处理 + DataFrame：快照 Read / 替换 Write）
-  ├── IDatabaseChannel（批处理 + 数据库：Reader/Writer 工厂）
-  └── IStreamChannel（流式行为基类，不绑定数据格式）
-       ├── NetcardChannel（流式 + packet/rte_mbuf）
-       ├── DataFrameStreamChannel（流式 + DataFrame）
-       └── ...
-```
+> 注：核心接口继承关系见上方"核心接口体系"章节。以下为流式扩展设计。
 
 IStreamChannel 不限定 IDataFrame 作为数据格式。数据格式由具体子类型决定，算子通过 dynamic_cast 获取所需类型——与批处理算子 cast 到 IDataFrameChannel 是同一模式。
+
+```
+IStreamChannel（流式行为基类，不绑定数据格式，待实现）
+  ├── NetcardChannel（流式 + packet/rte_mbuf）
+  ├── DataFrameStreamChannel（流式 + DataFrame）
+  └── ...
+```
 
 ### 部署模式：是否独立进程取决于复杂度
 
@@ -306,7 +378,34 @@ GET /netcard/ring_buffers → { "eth0": { "path": "/dev/shm/...", "schema": "...
 - IStreamChannel / IStreamOperator 的具体接口方法
 - ITask 统一任务抽象（BatchTask / InProcessStreamingTask / DistributedStreamingTask）
 - StreamWorker 控制协议
-- 服务发现与任务类型自动判断（PluginRegistry vs Gateway 路由表）
+- 服务发现与任务类型自动判断（Gateway 路由表）
 - ring buffer 多消费者策略、满时策略、背压机制
 - 流式任务的错误恢复与生命周期管理
 - 部署配置中流式服务的声明方式
+
+---
+
+## 关键文件索引
+
+### 架构重构新增/变更（Stage 2→3 过渡期）
+
+| 文件 | 说明 |
+|------|------|
+| `common/iplugin.h` | 从 framework 拆出，含 IRegister/IPlugin/注册宏 |
+| `common/loader.hpp` | PluginLoader 实现 IRegister + IQuerier |
+| `common/iquerier.hpp` | 插件查询接口 |
+| `framework/interfaces/ibridge.h` | IBridge 纯接口（新增） |
+| `framework/interfaces/ichannel.h` | IChannel 纯接口（去掉 IPlugin 继承） |
+| `framework/interfaces/ioperator.h` | IOperator 纯接口（去掉 IPlugin 继承） |
+| `services/bridge/bridge_plugin.h` | BridgePlugin : IPlugin, IBridge |
+| `plugins/example/memory_channel.h` | MemoryChannel : IDataFrameChannel, IPlugin |
+| `plugins/example/passthrough_operator.h` | PassthroughOperator : IOperator, IPlugin |
+| `python/flowsql/arrow_codec.py` | `_ensure_arrow_table()` 统一转换层 |
+
+### P1 相关（已有/待实现）
+
+| 文件 | 说明 |
+|------|------|
+| `framework/interfaces/idatabase_channel.h` | IDatabaseChannel 接口（已定义） |
+| `framework/interfaces/idataframe.h` | IDataFrame 接口 + DataType/FieldValue/Field 类型定义 |
+| `services/scheduler/scheduler_plugin.h` | ChannelAdapter + Pipeline + 类型感知执行 |

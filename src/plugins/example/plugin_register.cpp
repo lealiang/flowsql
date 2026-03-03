@@ -1,5 +1,5 @@
 #include <common/typedef.h>
-#include <common/loader.hpp>
+#include <common/iplugin.h>
 
 #include "memory_channel.h"
 #include "passthrough_operator.h"
@@ -7,31 +7,16 @@
 EXPORT_API void pluginunregist() {}
 
 EXPORT_API flowsql::IPlugin* pluginregist(flowsql::IRegister* registry, const char* opt) {
-    // MemoryChannel
+    // MemoryChannel — 同时注册为 IPlugin、IChannel、IDataFrameChannel
     static flowsql::MemoryChannel _channel;
-    {
-        flowsql::IPlugin* iface = dynamic_cast<flowsql::IPlugin*>(&_channel);
-        registry->Regist(flowsql::IID_PLUGIN, iface);
-    }
-    {
-        flowsql::IChannel* iface = dynamic_cast<flowsql::IChannel*>(&_channel);
-        registry->Regist(flowsql::IID_CHANNEL, iface);
-    }
-    {
-        flowsql::IDataFrameChannel* iface = dynamic_cast<flowsql::IDataFrameChannel*>(&_channel);
-        registry->Regist(flowsql::IID_DATAFRAME_CHANNEL, iface);
-    }
+    registry->Regist(flowsql::IID_PLUGIN, static_cast<flowsql::IPlugin*>(&_channel));
+    registry->Regist(flowsql::IID_CHANNEL, static_cast<flowsql::IChannel*>(&_channel));
+    registry->Regist(flowsql::IID_DATAFRAME_CHANNEL, static_cast<flowsql::IDataFrameChannel*>(&_channel));
 
-    // PassthroughOperator
+    // PassthroughOperator — 同时注册为 IPlugin、IOperator
     static flowsql::PassthroughOperator _operator;
-    {
-        flowsql::IPlugin* iface = dynamic_cast<flowsql::IPlugin*>(&_operator);
-        registry->Regist(flowsql::IID_PLUGIN, iface);
-    }
-    {
-        flowsql::IOperator* iface = dynamic_cast<flowsql::IOperator*>(&_operator);
-        registry->Regist(flowsql::IID_OPERATOR, iface);
-    }
+    registry->Regist(flowsql::IID_PLUGIN, static_cast<flowsql::IPlugin*>(&_operator));
+    registry->Regist(flowsql::IID_OPERATOR, static_cast<flowsql::IOperator*>(&_operator));
 
     _channel.Option(opt);
     _operator.Option(opt);

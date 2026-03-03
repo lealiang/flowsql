@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "framework/core/plugin_registry.h"
+#include <common/loader.hpp>
 #include "services/gateway/service_client.h"
 
 using namespace flowsql;
@@ -66,15 +66,25 @@ static void WaitForSignal() {
     sigwait(&waitset, &sig);
 }
 
+// 加载单个插件（封装 PluginLoader 调用）
+static int LoadPlugin(PluginLoader* loader, const std::string& path, const char* option) {
+    std::string app_path = get_absolute_process_path();
+    const char* relapath[] = {path.c_str()};
+    const char* options[] = {option};
+    int ret = loader->Load(app_path.c_str(), relapath, options, 1);
+    if (ret != 0) return ret;
+    return loader->StartAll();
+}
+
 // --- Gateway 模式 ---
 static int RunGateway(const std::string& config_path) {
     printf("========================================\n");
     printf("  FlowSQL Gateway\n");
     printf("========================================\n\n");
 
-    auto* registry = PluginRegistry::Instance();
+    auto* loader = PluginLoader::Single();
 
-    if (registry->LoadPlugin("libflowsql_gateway.so", config_path.c_str()) != 0) {
+    if (LoadPlugin(loader, "libflowsql_gateway.so", config_path.c_str()) != 0) {
         printf("Failed to load gateway plugin\n");
         return 1;
     }
@@ -83,7 +93,8 @@ static int RunGateway(const std::string& config_path) {
     WaitForSignal();
 
     printf("\nShutting down gateway...\n");
-    registry->UnloadAll();
+    loader->StopAll();
+    loader->Unload();
     return 0;
 }
 
@@ -93,7 +104,7 @@ static int RunService(const Args& args) {
     printf("  FlowSQL Service: %s\n", args.role.c_str());
     printf("========================================\n\n");
 
-    auto* registry = PluginRegistry::Instance();
+    auto* loader = PluginLoader::Single();
 
     // 加载指定的插件（自动将 port 注入 option）
     auto plugin_list = Split(args.plugins, ',');
@@ -106,7 +117,7 @@ static int RunService(const Args& args) {
     }
     for (const auto& plugin : plugin_list) {
         const char* opt = auto_option.empty() ? nullptr : auto_option.c_str();
-        if (registry->LoadPlugin(plugin, opt) != 0) {
+        if (LoadPlugin(loader, plugin, opt) != 0) {
             printf("Failed to load plugin: %s\n", plugin.c_str());
         } else {
             printf("Loaded plugin: %s\n", plugin.c_str());
@@ -126,7 +137,6 @@ static int RunService(const Args& args) {
         }
         client.SetGateway(gw_host, gw_port);
 
-        // 注册路由前缀：/<role>
         std::string local_addr = "127.0.0.1:" + std::to_string(args.port);
         std::string prefix = "/" + args.role;
         client.RegisterRoute(prefix, local_addr);
@@ -139,7 +149,8 @@ static int RunService(const Args& args) {
 
     printf("\nShutting down service %s...\n", args.role.c_str());
     client.StopHeartbeat();
-    registry->UnloadAll();
+    loader->StopAll();
+    loader->Unload();
     return 0;
 }
 

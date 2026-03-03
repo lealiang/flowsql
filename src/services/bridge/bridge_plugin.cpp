@@ -11,8 +11,6 @@
 #include <httplib.h>
 #include <rapidjson/document.h>
 
-#include "framework/core/plugin_registry.h"
-
 namespace flowsql {
 namespace bridge {
 
@@ -60,18 +58,13 @@ int BridgePlugin::Option(const char* arg) {
     return 0;
 }
 
-int BridgePlugin::Load() {
-    registry_ = PluginRegistry::Instance();
-    if (!registry_) {
-        printf("BridgePlugin::Load: PluginRegistry not available\n");
-        return -1;
-    }
+int BridgePlugin::Load(IQuerier* querier) {
+    querier_ = querier;
 
     // 从环境变量获取 Gateway 地址，通过 Gateway 路由发现 PyWorker
     const char* gw = std::getenv("FLOWSQL_GATEWAY_ADDR");
     if (gw) {
         gateway_addr_ = gw;
-        // 通过 Gateway 查询 PyWorker 路由
         std::string gw_host = "127.0.0.1";
         int gw_port = 18800;
         size_t colon = gateway_addr_.find(':');
@@ -120,15 +113,12 @@ int BridgePlugin::Unload() {
 }
 
 int BridgePlugin::Start() {
-    // 清理残留共享内存文件
     CleanupShmFiles("/dev/shm");
     CleanupShmFiles("/tmp");
 
-    // 等待 Python Worker 就绪（Gateway 模式下 Worker 由 Gateway 启动，可能还没准备好）
-    // 重试最多 30 秒
     for (int retry = 0; retry < 30; ++retry) {
-        if (DiscoverAndRegisterOperators() == 0) {
-            printf("BridgePlugin::Start: %zu Python operators registered\n", registered_keys_.size());
+        if (DiscoverOperators() == 0) {
+            printf("BridgePlugin::Start: %zu Python operators registered\n", registered_operators_.size());
             return 0;
         }
         printf("BridgePlugin::Start: waiting for Python Worker... (%d/30)\n", retry + 1);
@@ -140,16 +130,11 @@ int BridgePlugin::Start() {
 }
 
 int BridgePlugin::Stop() {
-    for (const auto& key : registered_keys_) {
-        registry_->Unregister(IID_OPERATOR, key);
-        printf("BridgePlugin::Stop: Unregistered [%s]\n", key.c_str());
-    }
-    registered_keys_.clear();
+    registered_operators_.clear();
     return 0;
 }
 
-int BridgePlugin::DiscoverAndRegisterOperators() {
-    // 通过 HTTP 获取 Python Worker 的算子列表
+int BridgePlugin::DiscoverOperators() {
     httplib::Client client(host_, port_);
     client.set_connection_timeout(2);
     client.set_read_timeout(5);
@@ -159,7 +144,6 @@ int BridgePlugin::DiscoverAndRegisterOperators() {
         return -1;
     }
 
-    // 解析 JSON 响应: [{"catelog":"...", "name":"...", "description":"...", "position":"..."}]
     rapidjson::Document doc;
     doc.Parse(res->body.c_str());
     if (doc.HasParseError() || !doc.IsArray()) {
@@ -177,12 +161,34 @@ int BridgePlugin::DiscoverAndRegisterOperators() {
 
         auto bridge = std::make_shared<PythonOperatorBridge>(meta, host_, port_);
         std::string key = meta.catelog + "." + meta.name;
-        registry_->Register(IID_OPERATOR, key, bridge);
-        registered_keys_.push_back(key);
-        printf("BridgePlugin: Registered operator [%s]\n", key.c_str());
+
+        // 只存内部，不注册到 PluginLoader
+        registered_operators_.push_back(bridge);
+        printf("BridgePlugin: Discovered operator [%s]\n", key.c_str());
     }
 
     return 0;
+}
+
+// IBridge::FindOperator — 按 catelog + name 查找 Python 算子
+std::shared_ptr<IOperator> BridgePlugin::FindOperator(const std::string& catelog, const std::string& name) {
+    for (auto& op : registered_operators_) {
+        if (op->Catelog() == catelog && op->Name() == name) return op;
+    }
+    return nullptr;
+}
+
+// IBridge::TraverseOperators — 遍历所有已发现的 Python 算子
+void BridgePlugin::TraverseOperators(std::function<int(IOperator*)> fn) {
+    for (auto& op : registered_operators_) {
+        if (fn(op.get()) == -1) break;
+    }
+}
+
+// IBridge::Refresh — 重新从 Python Worker 发现算子
+int BridgePlugin::Refresh() {
+    registered_operators_.clear();
+    return DiscoverOperators();
 }
 
 }  // namespace bridge

@@ -8,8 +8,8 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
 
 add_thirddepen(${PROJECT_NAME} arrow rapidjson httplib)
 
-add_dependencies(${PROJECT_NAME} flowsql_framework flowsql_bridge)
-target_link_libraries(${PROJECT_NAME} flowsql_framework)
+add_dependencies(${PROJECT_NAME} flowsql_common flowsql_bridge)
+target_link_libraries(${PROJECT_NAME} flowsql_common)
 
 # 直接链接 bridge 的 .o 文件（测试不需要加载 .so）
 target_sources(${PROJECT_NAME} PRIVATE

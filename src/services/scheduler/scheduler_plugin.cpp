@@ -12,7 +12,6 @@
 #include "framework/core/dataframe.h"
 #include "framework/core/dataframe_channel.h"
 #include "framework/core/pipeline.h"
-#include "framework/core/plugin_registry.h"
 #include "framework/core/sql_parser.h"
 #include "framework/interfaces/ichannel.h"
 #include "framework/interfaces/idatabase_channel.h"
@@ -60,12 +59,8 @@ int SchedulerPlugin::Option(const char* arg) {
     return 0;
 }
 
-int SchedulerPlugin::Load() {
-    registry_ = PluginRegistry::Instance();
-    if (!registry_) {
-        printf("SchedulerPlugin::Load: PluginRegistry not available\n");
-        return -1;
-    }
+int SchedulerPlugin::Load(IQuerier* querier) {
+    querier_ = querier;
     printf("SchedulerPlugin::Load: host=%s, port=%d\n", host_.c_str(), port_);
     return 0;
 }
@@ -74,9 +69,14 @@ int SchedulerPlugin::Unload() {
     return 0;
 }
 
+// --- 通道管理 ---
+void SchedulerPlugin::RegisterChannel(const std::string& key, std::shared_ptr<IChannel> ch) {
+    channels_[key] = std::move(ch);
+}
+
 // --- IPlugin::Start ---
 int SchedulerPlugin::Start() {
-    // 创建预填测试数据（通道注册在 Scheduler 进程中）
+    // 创建预填测试数据
     auto ch = std::make_shared<DataFrameChannel>("test", "data");
     ch->Open();
 
@@ -99,8 +99,7 @@ int SchedulerPlugin::Start() {
                   std::string("HTTPS"), uint64_t(2048), uint64_t(8192)});
 
     ch->Write(&df);
-    registry_->Register(IID_CHANNEL, "test.data", ch);
-    registry_->Register(IID_DATAFRAME_CHANNEL, "test.data", ch);
+    RegisterChannel("test.data", ch);
 
     RegisterRoutes();
 
@@ -117,13 +116,13 @@ int SchedulerPlugin::Start() {
 int SchedulerPlugin::Stop() {
     server_.stop();
     if (server_thread_.joinable()) server_thread_.join();
+    channels_.clear();
     printf("SchedulerPlugin::Stop: done\n");
     return 0;
 }
 
 // --- 路由注册 ---
 void SchedulerPlugin::RegisterRoutes() {
-    // CORS 预检
     server_.Options(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -142,42 +141,86 @@ void SchedulerPlugin::RegisterRoutes() {
     server_.Get("/operators", [this](const httplib::Request& req, httplib::Response& res) {
         HandleGetOperators(req, res);
     });
+
+    server_.Post("/refresh-operators", [this](const httplib::Request&, httplib::Response& res) {
+        HandleRefreshOperators(res);
+    });
 }
 
 // --- 通道查找辅助 ---
 IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
-    // 先按完整 key 查找
-    IChannel* ch = registry_->Get<IChannel>(IID_CHANNEL, name);
-    if (ch) return ch;
+    // 先在内部通道表中查找
+    auto it = channels_.find(name);
+    if (it != channels_.end()) return it->second.get();
 
     // 按 catelog.name 格式拆分后查找
     auto dot = name.find('.');
     if (dot != std::string::npos) {
         std::string key = name.substr(0, dot) + "." + name.substr(dot + 1);
-        ch = registry_->Get<IChannel>(IID_CHANNEL, key);
-        if (ch) return ch;
+        it = channels_.find(key);
+        if (it != channels_.end()) return it->second.get();
     }
 
-    // 模糊匹配：遍历所有通道
-    registry_->Traverse<IChannel>(IID_CHANNEL, [&](IChannel* c) {
-        if (std::string(c->Name()) == name ||
-            (std::string(c->Catelog()) + "." + c->Name()) == name) {
-            ch = c;
+    // 通过 IQuerier 遍历静态注册的通道
+    IChannel* found = nullptr;
+    if (querier_) {
+        querier_->Traverse(IID_CHANNEL, [&](void* p) -> int {
+            auto* c = static_cast<IChannel*>(p);
+            std::string full_name = std::string(c->Catelog()) + "." + c->Name();
+            if (full_name == name || std::string(c->Name()) == name) {
+                found = c;
+                return -1;  // 找到了，停止遍历
+            }
+            return 0;
+        });
+    }
+
+    // 模糊匹配内部通道表
+    if (!found) {
+        for (auto& [k, v] : channels_) {
+            auto* c = v.get();
+            if (std::string(c->Name()) == name ||
+                (std::string(c->Catelog()) + "." + c->Name()) == name) {
+                found = c;
+                break;
+            }
         }
+    }
+    return found;
+}
+
+// --- 算子查找 ---
+// 先查 C++ 静态算子（IQuerier），再查 Python 算子（IBridge）
+std::shared_ptr<IOperator> SchedulerPlugin::FindOperator(const std::string& catelog, const std::string& name) {
+    if (!querier_) return nullptr;
+
+    // 1. 先查 C++ 静态算子
+    IOperator* found = nullptr;
+    querier_->Traverse(IID_OPERATOR, [&](void* p) -> int {
+        auto* op = static_cast<IOperator*>(p);
+        if (op->Catelog() == catelog && op->Name() == name) {
+            found = op;
+            return -1;
+        }
+        return 0;
     });
-    return ch;
+    // C++ 算子由 PluginLoader 管理生命周期，用空 deleter 包装
+    if (found) return std::shared_ptr<IOperator>(found, [](IOperator*) {});
+
+    // 2. 再查 Python 算子（通过 IBridge）
+    auto* bridge = static_cast<IBridge*>(querier_->First(IID_BRIDGE));
+    if (bridge) return bridge->FindOperator(catelog, name);
+    return nullptr;
 }
 
 // --- 构建 Database 查询语句 ---
 static std::string BuildQuery(const std::string& source_name, const SqlStatement& stmt) {
-    // 从通道名提取表名（catelog.table → table）
     std::string table = source_name;
     auto dot = table.find('.');
     if (dot != std::string::npos) {
         table = table.substr(dot + 1);
     }
 
-    // 构建 SELECT 子句
     std::string select_clause = "*";
     if (!stmt.columns.empty()) {
         select_clause.clear();
@@ -189,7 +232,6 @@ static std::string BuildQuery(const std::string& source_name, const SqlStatement
 
     std::string query = "SELECT " + select_clause + " FROM " + table;
 
-    // WITH 参数中的 where 条件
     auto it = stmt.with_params.find("where");
     if (it != stmt.with_params.end()) {
         query += " WHERE " + it->second;
@@ -198,7 +240,6 @@ static std::string BuildQuery(const std::string& source_name, const SqlStatement
     return query;
 }
 
-// --- 从 sink 通道名提取目标表名 ---
 static std::string ExtractTableName(const std::string& dest_name) {
     auto dot = dest_name.find('.');
     if (dot != std::string::npos) {
@@ -213,7 +254,6 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
                                       const std::string& sink_type,
                                       const SqlStatement& stmt) {
     if (source_type == "dataframe" && sink_type == "dataframe") {
-        // DataFrame → DataFrame：直接搬运
         auto* src = dynamic_cast<IDataFrameChannel*>(source);
         auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
         if (!src || !dst) return -1;
@@ -221,7 +261,6 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
     }
 
     if (source_type == "dataframe" && sink_type == "database") {
-        // DataFrame → Database：写入
         auto* src = dynamic_cast<IDataFrameChannel*>(source);
         auto* dst = dynamic_cast<IDatabaseChannel*>(sink);
         if (!src || !dst) return -1;
@@ -230,7 +269,6 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
     }
 
     if (source_type == "database" && sink_type == "dataframe") {
-        // Database → DataFrame：读取
         auto* src = dynamic_cast<IDatabaseChannel*>(source);
         auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
         if (!src || !dst) return -1;
@@ -239,7 +277,6 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
     }
 
     if (source_type == "database" && sink_type == "database") {
-        // Database → Database：通过临时 DataFrame 中转
         auto* src = dynamic_cast<IDatabaseChannel*>(source);
         auto* dst = dynamic_cast<IDatabaseChannel*>(sink);
         if (!src || !dst) return -1;
@@ -270,7 +307,6 @@ int SchedulerPlugin::ExecuteWithOperator(IChannel* source, IChannel* sink,
     IChannel* actual_sink = sink;
     std::shared_ptr<DataFrameChannel> tmp_in, tmp_out;
 
-    // source 是 Database → 先读取到临时 DataFrame
     if (source_type == "database") {
         auto* db_src = dynamic_cast<IDatabaseChannel*>(source);
         if (!db_src) return -1;
@@ -285,14 +321,12 @@ int SchedulerPlugin::ExecuteWithOperator(IChannel* source, IChannel* sink,
         actual_source = tmp_in.get();
     }
 
-    // sink 是 Database → 算子输出到临时 DataFrame，之后再写入数据库
     if (sink_type == "database") {
         tmp_out = std::make_shared<DataFrameChannel>("_adapter", "out");
         tmp_out->Open();
         actual_sink = tmp_out.get();
     }
 
-    // 执行 Pipeline：算子看到的永远是 IDataFrameChannel
     auto pipeline = PipelineBuilder()
                         .SetSource(actual_source)
                         .SetOperator(op)
@@ -304,7 +338,6 @@ int SchedulerPlugin::ExecuteWithOperator(IChannel* source, IChannel* sink,
         return -1;
     }
 
-    // 如果 sink 是 Database，将临时 DataFrame 写入数据库
     if (sink_type == "database" && tmp_out) {
         auto* db_sink = dynamic_cast<IDatabaseChannel*>(sink);
         if (!db_sink) return -1;
@@ -317,11 +350,10 @@ int SchedulerPlugin::ExecuteWithOperator(IChannel* source, IChannel* sink,
     return 0;
 }
 
-// --- HandleExecute: 类型感知的 SQL 执行逻辑 ---
+// --- HandleExecute ---
 void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Response& res) {
     SetCorsHeaders(res);
 
-    // 解析请求 JSON: {"sql": "SELECT * FROM ..."}
     rapidjson::Document doc;
     doc.Parse(req.body.c_str());
     if (doc.HasParseError() || !doc.HasMember("sql") || !doc["sql"].IsString()) {
@@ -331,7 +363,6 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
     }
     std::string sql_text = doc["sql"].GetString();
 
-    // 解析 SQL
     SqlParser parser;
     auto stmt = parser.Parse(sql_text);
     if (!stmt.error.empty()) {
@@ -340,7 +371,6 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
         return;
     }
 
-    // 查找 source channel
     IChannel* source = FindChannel(stmt.source);
     if (!source) {
         res.status = 400;
@@ -348,63 +378,51 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
         return;
     }
 
-    // 查找 operator（可选）
     IOperator* op = nullptr;
+    std::shared_ptr<IOperator> op_holder;  // 持有 shared_ptr 保证算子生命周期
     if (stmt.HasOperator()) {
-        op = registry_->Get<IOperator>(IID_OPERATOR, stmt.op_catelog + "." + stmt.op_name);
-        if (!op) {
-            registry_->Traverse<IOperator>(IID_OPERATOR, [&](IOperator* o) {
-                if (o->Catelog() == stmt.op_catelog && o->Name() == stmt.op_name) op = o;
-            });
-        }
-        if (!op) {
+        op_holder = FindOperator(stmt.op_catelog, stmt.op_name);
+        if (!op_holder) {
             res.status = 400;
             res.set_content(MakeErrorJson("operator not found: " + stmt.op_catelog + "." + stmt.op_name),
                             "application/json");
             return;
         }
+        op = op_holder.get();
     }
 
     try {
-        // 传递 WITH 参数给算子
         if (op) {
             for (auto& [k, v] : stmt.with_params) {
                 op->Configure(k.c_str(), v.c_str());
             }
         }
 
-        // 准备 sink channel
         std::shared_ptr<DataFrameChannel> temp_sink;
         IChannel* sink = nullptr;
 
         if (!stmt.dest.empty()) {
             sink = FindChannel(stmt.dest);
             if (!sink) {
-                // 目标通道不存在，创建临时 DataFrameChannel
                 temp_sink = std::make_shared<DataFrameChannel>("result", stmt.dest);
                 temp_sink->Open();
-                registry_->Register(IID_CHANNEL, "result." + stmt.dest, temp_sink);
-                registry_->Register(IID_DATAFRAME_CHANNEL, "result." + stmt.dest, temp_sink);
+                RegisterChannel("result." + stmt.dest, temp_sink);
                 sink = temp_sink.get();
             }
         } else {
-            // 无 INTO，创建临时 sink
             temp_sink = std::make_shared<DataFrameChannel>("_temp", "sink");
             temp_sink->Open();
             sink = temp_sink.get();
         }
 
-        // 获取通道类型
         std::string source_type(source->Type());
         std::string sink_type(sink->Type());
 
         int rc = 0;
 
         if (!op) {
-            // 无算子：纯数据搬运
             rc = ExecuteTransfer(source, sink, source_type, sink_type, stmt);
         } else {
-            // 有算子：需要确保算子看到的是 IDataFrameChannel
             rc = ExecuteWithOperator(source, sink, op, source_type, sink_type, stmt);
         }
 
@@ -416,7 +434,6 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
             return;
         }
 
-        // 从 sink 读取结果
         auto* df_sink = dynamic_cast<IDataFrameChannel*>(sink);
         DataFrame result;
         std::string result_json = "[]";
@@ -424,7 +441,6 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
             result_json = result.ToJson();
         }
 
-        // 返回执行结果
         rapidjson::StringBuffer buf;
         rapidjson::Writer<rapidjson::StringBuffer> w(buf);
         w.StartObject();
@@ -449,52 +465,102 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
     }
 }
 
-// --- HandleGetChannels: 返回已注册通道列表 ---
+// --- HandleGetChannels ---
 void SchedulerPlugin::HandleGetChannels(const httplib::Request&, httplib::Response& res) {
     SetCorsHeaders(res);
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
     w.StartArray();
-    registry_->Traverse<IChannel>(IID_CHANNEL, [&w](IChannel* ch) {
+
+    // 内部通道表
+    for (auto& [key, ch_ptr] : channels_) {
+        auto* ch = ch_ptr.get();
         w.StartObject();
-        w.Key("catelog");
-        w.String(ch->Catelog());
-        w.Key("name");
-        w.String(ch->Name());
-        w.Key("type");
-        w.String(ch->Type());
-        w.Key("schema");
-        w.String(ch->Schema());
+        w.Key("catelog"); w.String(ch->Catelog());
+        w.Key("name"); w.String(ch->Name());
+        w.Key("type"); w.String(ch->Type());
+        w.Key("schema"); w.String(ch->Schema());
         w.EndObject();
-    });
+    }
+
+    // 静态注册的通道（通过 IQuerier）
+    if (querier_) {
+        querier_->Traverse(IID_CHANNEL, [&w](void* p) -> int {
+            auto* ch = static_cast<IChannel*>(p);
+            w.StartObject();
+            w.Key("catelog"); w.String(ch->Catelog());
+            w.Key("name"); w.String(ch->Name());
+            w.Key("type"); w.String(ch->Type());
+            w.Key("schema"); w.String(ch->Schema());
+            w.EndObject();
+            return 0;
+        });
+    }
+
     w.EndArray();
     res.set_content(buf.GetString(), "application/json");
 }
 
-// --- HandleGetOperators: 返回已注册算子列表 ---
+// --- HandleGetOperators ---
 void SchedulerPlugin::HandleGetOperators(const httplib::Request&, httplib::Response& res) {
     SetCorsHeaders(res);
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
     w.StartArray();
-    registry_->Traverse<IOperator>(IID_OPERATOR, [&w](IOperator* op) {
-        w.StartObject();
-        w.Key("catelog");
-        w.String(op->Catelog().c_str());
-        w.Key("name");
-        w.String(op->Name().c_str());
-        w.Key("description");
-        w.String(op->Description().c_str());
-        std::string pos = (op->Position() == OperatorPosition::STORAGE) ? "STORAGE" : "DATA";
-        w.Key("position");
-        w.String(pos.c_str());
-        w.EndObject();
-    });
+
+    if (querier_) {
+        querier_->Traverse(IID_OPERATOR, [&w](void* p) -> int {
+            auto* op = static_cast<IOperator*>(p);
+            w.StartObject();
+            w.Key("catelog"); w.String(op->Catelog().c_str());
+            w.Key("name"); w.String(op->Name().c_str());
+            w.Key("description"); w.String(op->Description().c_str());
+            std::string pos = (op->Position() == OperatorPosition::STORAGE) ? "STORAGE" : "DATA";
+            w.Key("position"); w.String(pos.c_str());
+            w.EndObject();
+            return 0;
+        });
+
+        // Python 算子（通过 IBridge 遍历）
+        auto* bridge = static_cast<IBridge*>(querier_->First(IID_BRIDGE));
+        if (bridge) {
+            bridge->TraverseOperators([&w](IOperator* op) -> int {
+                w.StartObject();
+                w.Key("catelog"); w.String(op->Catelog().c_str());
+                w.Key("name"); w.String(op->Name().c_str());
+                w.Key("description"); w.String(op->Description().c_str());
+                std::string pos = (op->Position() == OperatorPosition::STORAGE) ? "STORAGE" : "DATA";
+                w.Key("position"); w.String(pos.c_str());
+                w.EndObject();
+                return 0;
+            });
+        }
+    }
+
     w.EndArray();
     res.set_content(buf.GetString(), "application/json");
 }
 
+// --- HandleRefreshOperators ---
+void SchedulerPlugin::HandleRefreshOperators(httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto* bridge = static_cast<IBridge*>(querier_->First(IID_BRIDGE));
+    if (bridge) {
+        int rc = bridge->Refresh();
+        if (rc == 0) {
+            res.set_content(R"({"status":"refreshed"})", "application/json");
+        } else {
+            res.status = 500;
+            res.set_content(R"({"error":"refresh failed"})", "application/json");
+        }
+    } else {
+        res.status = 404;
+        res.set_content(R"({"error":"bridge not available"})", "application/json");
+    }
+}
+
 }  // namespace scheduler
 }  // namespace flowsql
+

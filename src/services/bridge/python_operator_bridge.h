@@ -26,11 +26,6 @@ class PythonOperatorBridge : public IOperator {
     PythonOperatorBridge(const OperatorMeta& meta, const std::string& host, int port);
     ~PythonOperatorBridge() override = default;
 
-    // IPlugin
-    int Option(const char*) override { return 0; }
-    int Load() override { return 0; }
-    int Unload() override { return 0; }
-
     // IOperator 元数据
     std::string Catelog() override { return meta_.catelog; }
     std::string Name() override { return meta_.name; }

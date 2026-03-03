@@ -33,10 +33,6 @@ class DataFrame : public IDataFrame {
     // 列操作
     std::vector<FieldValue> GetColumn(const std::string& name) const override;
 
-    // IDataEntity 互操作
-    int AppendEntity(IDataEntity* entity) override;
-    std::shared_ptr<IDataEntity> GetEntity(int32_t index) const override;
-
     // Arrow 互操作
     std::shared_ptr<arrow::RecordBatch> ToArrow() const override;
     void FromArrow(std::shared_ptr<arrow::RecordBatch> batch) override;

@@ -10,8 +10,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
 
 add_thirddepen(${PROJECT_NAME} httplib rapidjson yaml-cpp)
 
-add_dependencies(${PROJECT_NAME} flowsql_framework)
-target_link_libraries(${PROJECT_NAME} flowsql_framework)
+# Gateway 不需要 flowsql_common（不使用 DataFrame 等公共基础设施）
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output

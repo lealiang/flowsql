@@ -1,8 +1,12 @@
-project(flowsql_framework)
+project(flowsql_common)
 
-file(GLOB_RECURSE DIR_SRCS core/*.cpp)
-
-add_library(${PROJECT_NAME} SHARED ${DIR_SRCS})
+# 公共基础设施：DataFrame、DataFrameChannel、SqlParser
+# 不含 PluginRegistry（已删除）、Pipeline/ChannelAdapter（移入 scheduler.so）
+add_library(${PROJECT_NAME} SHARED
+    core/dataframe.cpp
+    core/dataframe_channel.cpp
+    core/sql_parser.cpp
+)
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
 

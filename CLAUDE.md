@@ -2,56 +2,56 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Workflow Orchestration
+## 工作流编排
 
-### 1. Plan Node Default
-- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
-- If something goes sideways, STOP and re-plan immediately - don't keep pushing
-- Use plan mode for verification steps, not just building
-- Write detailed specs upfront to reduce ambiguity
+### 1. 默认规划节点 (Plan Node Default)
+- 对于任何非平凡任务（3个以上步骤或涉及架构决策），**必须**进入规划模式。
+- 如果事情偏离轨道，**立即停止**并重新规划——不要强行推进。
+- 将规划模式用于验证步骤，而不仅仅是构建步骤。
+- 预先编写详细的规格说明以减少歧义。
 
-### 2. Subagent Strategy
-- Use subagents liberally to keep main context window clean
-- Offload research, exploration, and parallel analysis to subagents
-- For complex problems, throw more compute at it via subagents
-- One tack per subagent for focused execution
+### 2. 子代理策略 (Subagent Strategy)
+- 大量使用子代理以保持主上下文窗口整洁。
+- 将研究、探索和并行分析工作卸载给子代理。
+- 对于复杂问题，通过子代理投入更多算力。
+- 每个子代理专注于一个具体的切入点以确保执行聚焦。
 
-### 3. Self-Improvement Loop
-- After ANY correction from the user: update `tasks/lessons.md` with the pattern
-- Write rules for yourself that prevent the same mistake
-- Ruthlessly iterate on these lessons until mistake rate drops
-- Review lessons at session start for relevant project
+### 3. 自我改进循环 (Self-Improvement Loop)
+- 在收到用户的**任何**纠正后：立即更新 `tasks/lessons.md` 记录该模式。
+- 为自己编写规则以防止同样的错误再次发生。
+- 无情地迭代这些教训，直到错误率下降。
+- 在会话开始时审查与当前项目相关的教训。
 
-### 4. Verification Before Done
-- Never mark a task complete without proving it works
-- Diff behavior between main and your changes when relevant
-- Ask yourself: "Would a staff engineer approve this?"
-- Run tests, check logs, demonstrate correctness
+### 4. 完成前验证 (Verification Before Done)
+- 在没有证明其有效之前，**绝不**标记任务为完成。
+- 在相关情况下，对比主分支与你更改后的行为差异。
+- 自问：“资深工程师会批准这个吗？”
+- 运行测试、检查日志、展示正确性。
 
-### 5. Demand Elegance (Balanced)
-- For non-trivial changes: pause and ask "is there a more elegant way?"
-- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
-- Skip this for simple, obvious fixes - don't over-engineer
-- Challenge your own work before presenting it
+### 5. 追求优雅（平衡之道）(Demand Elegance - Balanced)
+- 对于非平凡的变更：暂停并自问“是否有更优雅的方式？”
+- 如果修复感觉像是在打补丁（hacky）： “鉴于我现在所知的一切，实施那个优雅的解决方案。”
+- 对于简单、明显的修复可跳过此步——不要过度工程化。
+- 在提交成果前先挑战自己的工作。
 
-### 6. Autonomous Bug Fixing
-- When given a bug report: just fix it. Don't ask for hand-holding
-- Point at logs, errors, failing tests - then resolve them
-- Zero context switching required from the user
-- Go fix failing CI tests without being told how
+### 6. 自主缺陷修复 (Autonomous Bug Fixing)
+- 当收到缺陷报告时：**直接修复它**。不要请求手把手的指导。
+- 指向日志、错误或失败的测试——然后解决它们。
+- 无需用户进行任何上下文切换。
+- 主动修复失败的 CI 测试，无需被告知如何做。
 
-## Task Management
-1. **Plan First**: Write plan to `tasks/todo.md` with checkable items
-2. **Verify Plan**: Check in before starting implementation
-3. **Track Progress**: Mark items complete as you go
-4. **Explain Changes**: High-level summary at each step
-5. **Document Results**: Add review section to `tasks/todo.md`
-6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+## 任务管理
+1. **先规划**：将计划写入 `tasks/todo.md`，包含可检查的项目。
+2. **验证计划**：在开始实施前进行检查确认。
+3. **追踪进度**：随进展标记项目为完成。
+4. **解释变更**：每一步都提供高层级的摘要。
+5. **记录结果**：在 `tasks/todo.md` 中添加回顾部分。
+6. **汲取教训**：在收到纠正后更新 `tasks/lessons.md`。
 
-## Core Principles
-- **Simplicity First**: Make every change as simple as possible. Impact minimal code.
-- **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
-- **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+## 核心原则
+- **简洁优先**：使每次变更尽可能简单。影响最小化的代码。
+- **拒绝懒惰**：寻找根本原因。杜绝临时修复。遵循资深开发者标准。
+- **最小影响**：变更应仅触及必要部分。避免引入新的 bug。
 
 ## 交流规则
 

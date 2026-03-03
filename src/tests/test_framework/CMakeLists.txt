@@ -8,8 +8,14 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
 
 add_thirddepen(${PROJECT_NAME} arrow rapidjson)
 
-add_dependencies(${PROJECT_NAME} flowsql_framework flowsql_example)
-target_link_libraries(${PROJECT_NAME} flowsql_framework)
+add_dependencies(${PROJECT_NAME} flowsql_common flowsql_example)
+target_link_libraries(${PROJECT_NAME} flowsql_common)
+
+# Pipeline 和 ChannelAdapter 源码直接编译进测试（测试不依赖 scheduler.so）
+target_sources(${PROJECT_NAME} PRIVATE
+    ${CMAKE_SOURCE_DIR}/framework/core/pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/framework/core/channel_adapter.cpp
+)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output

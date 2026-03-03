@@ -1,16 +1,19 @@
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_ICHANNEL_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_ICHANNEL_H_
 
-#include <common/loader.hpp>
+#include <common/guid.h>
+#include <common/typedef.h>
 
 namespace flowsql {
 
 // {0xc1d2e3f4-abcd-ef01-2345-6789abcdef01}
 const Guid IID_CHANNEL = {0xc1d2e3f4, 0xabcd, 0xef01, {0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01}};
 
-// IChannel — 数据通道基类
+// IChannel — 数据通道基类（纯接口，不继承 IPlugin）
 // 只定义生命周期、身份和元数据，数据读写方法由子类定义（IDataFrameChannel、IDatabaseChannel 等）
-interface IChannel : public IPlugin {
+interface IChannel {
+    virtual ~IChannel() = default;
+
     // 身份标识
     virtual const char* Catelog() = 0;
     virtual const char* Name() = 0;

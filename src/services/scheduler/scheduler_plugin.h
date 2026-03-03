@@ -3,14 +3,17 @@
 
 #include <httplib.h>
 
+#include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
-#include <common/loader.hpp>
+#include <common/iplugin.h>
+
+#include "framework/interfaces/ibridge.h"
 
 namespace flowsql {
 
-class PluginRegistry;
 class IChannel;
 class IOperator;
 struct SqlStatement;
@@ -18,8 +21,7 @@ struct SqlStatement;
 namespace scheduler {
 
 // SchedulerPlugin — SQL 执行调度插件
-// 提供 HTTP 端点接收 SQL 执行请求，在本进程内完成 Pipeline 执行
-// Gateway 架构下：算子（含 Python 桥接）注册在 Scheduler 进程，Web 进程通过 Gateway 转发到此
+// 内部维护通道表和算子查找，通过 IQuerier 遍历插件接口
 class SchedulerPlugin : public IPlugin {
  public:
     SchedulerPlugin() = default;
@@ -27,7 +29,7 @@ class SchedulerPlugin : public IPlugin {
 
     // IPlugin
     int Option(const char* arg) override;
-    int Load() override;
+    int Load(IQuerier* querier) override;
     int Unload() override;
     int Start() override;
     int Stop() override;
@@ -40,9 +42,14 @@ class SchedulerPlugin : public IPlugin {
     void HandleExecute(const httplib::Request& req, httplib::Response& res);
     void HandleGetChannels(const httplib::Request& req, httplib::Response& res);
     void HandleGetOperators(const httplib::Request& req, httplib::Response& res);
+    void HandleRefreshOperators(httplib::Response& res);
 
-    // 通道查找辅助（支持 catelog.name 和模糊匹配）
+    // 通道管理（原来在 PluginRegistry 里，现在内部维护）
     IChannel* FindChannel(const std::string& name);
+    void RegisterChannel(const std::string& key, std::shared_ptr<IChannel> ch);
+
+    // 算子查找（先查 C++ 静态算子，再查 IBridge Python 算子）
+    std::shared_ptr<IOperator> FindOperator(const std::string& catelog, const std::string& name);
 
     // 执行路径：无算子的纯数据搬运
     int ExecuteTransfer(IChannel* source, IChannel* sink,
@@ -54,9 +61,12 @@ class SchedulerPlugin : public IPlugin {
                             const std::string& source_type, const std::string& sink_type,
                             const SqlStatement& stmt);
 
-    PluginRegistry* registry_ = nullptr;
+    IQuerier* querier_ = nullptr;  // Load 时传入，用于查询算子等插件接口
     httplib::Server server_;
     std::thread server_thread_;
+
+    // 通道表（Scheduler 内部管理，替代 PluginRegistry 的动态注册）
+    std::unordered_map<std::string, std::shared_ptr<IChannel>> channels_;
 
     std::string host_ = "127.0.0.1";
     int port_ = 18803;

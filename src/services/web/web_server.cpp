@@ -11,10 +11,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#include "framework/core/plugin_registry.h"
-#include "framework/interfaces/ichannel.h"
-#include "framework/interfaces/ioperator.h"
-
 namespace flowsql {
 namespace web {
 
@@ -73,15 +69,24 @@ void WebServer::NotifyWorkerReload() {
     auto result = client.Post("/pyworker/reload", "", "application/json");
     if (result && result->status == 200) {
         printf("WebServer: Worker reload OK\n");
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        SyncRegistryToDb();
     } else {
         printf("WebServer: Worker reload failed (Worker may not be running)\n");
     }
 }
 
-int WebServer::Init(const std::string& db_path, PluginRegistry* registry) {
-    registry_ = registry;
+void WebServer::NotifySchedulerRefresh() {
+    httplib::Client client(scheduler_host_, scheduler_port_);
+    client.set_connection_timeout(2);
+    client.set_read_timeout(5);
+    auto result = client.Post("/scheduler/refresh-operators", "", "application/json");
+    if (result && result->status == 200) {
+        printf("WebServer: Scheduler refresh OK\n");
+    } else {
+        printf("WebServer: Scheduler refresh failed\n");
+    }
+}
+
+int WebServer::Init(const std::string& db_path) {
 
     if (db_.Open(db_path) != 0) {
         printf("WebServer::Init: failed to open database: %s\n", db_path.c_str());
@@ -93,7 +98,6 @@ int WebServer::Init(const std::string& db_path, PluginRegistry* registry) {
         return -1;
     }
 
-    SyncRegistryToDb();
     RegisterRoutes();
 
     printf("WebServer::Init: OK (db=%s)\n", db_path.c_str());
@@ -209,24 +213,6 @@ static std::string RowsToJson(const std::vector<Row>& rows) {
     }
     w.EndArray();
     return buf.GetString();
-}
-
-// --- SyncRegistryToDb ---
-void WebServer::SyncRegistryToDb() {
-    if (!registry_) return;
-
-    // 同步通道
-    registry_->Traverse<IChannel>(IID_CHANNEL, [this](IChannel* ch) {
-        db_.ExecuteParams("INSERT OR IGNORE INTO channels (catelog, name, type, schema_json) VALUES (?1, ?2, ?3, ?4)",
-                          {ch->Catelog(), ch->Name(), ch->Type(), ch->Schema()});
-    });
-
-    // 同步算子
-    registry_->Traverse<IOperator>(IID_OPERATOR, [this](IOperator* op) {
-        std::string pos = (op->Position() == OperatorPosition::STORAGE) ? "STORAGE" : "DATA";
-        db_.ExecuteParams("INSERT OR IGNORE INTO operators (catelog, name, description, position) VALUES (?1, ?2, ?3, ?4)",
-                          {op->Catelog(), op->Name(), op->Description(), pos});
-    });
 }
 
 // --- Health ---
@@ -359,6 +345,8 @@ void WebServer::HandleActivateOperator(const httplib::Request& req, httplib::Res
 
     // 通知 Python Worker 重新加载算子
     NotifyWorkerReload();
+    // Worker 已就绪，通知 Scheduler 刷新算子列表
+    NotifySchedulerRefresh();
 
     // 使用 rapidjson 构造响应，防止 op_key 中特殊字符破坏 JSON（问题 10）
     rapidjson::StringBuffer buf;
@@ -375,7 +363,9 @@ void WebServer::HandleDeactivateOperator(const httplib::Request& req, httplib::R
     std::string op_key = req.matches[1];
     db_.ExecuteParams("UPDATE operators SET active=0 WHERE catelog||'.'||name=?1", {op_key});
 
-    // TODO: 通知 Worker 移除算子（需要 Worker 支持按名称卸载）
+    // 通知 Worker 重载 + Scheduler 刷新
+    NotifyWorkerReload();
+    NotifySchedulerRefresh();
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);

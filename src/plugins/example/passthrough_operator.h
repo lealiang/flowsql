@@ -2,18 +2,19 @@
 #define _FLOWSQL_PLUGINS_EXAMPLE_PASSTHROUGH_OPERATOR_H_
 
 #include <framework/interfaces/ioperator.h>
+#include <common/iplugin.h>
 
 #include <string>
 
 namespace flowsql {
 
-class PassthroughOperator : public IOperator {
+class PassthroughOperator : public IOperator, public IPlugin {
  public:
     PassthroughOperator() = default;
     ~PassthroughOperator() override = default;
 
     // IPlugin
-    int Load() override { return 0; }
+    int Load(IQuerier* /* querier */) override { return 0; }
     int Unload() override { return 0; }
 
     // IOperator 元数据

@@ -9,9 +9,6 @@
 #include "db/database.h"
 
 namespace flowsql {
-
-class PluginRegistry;
-
 namespace web {
 
 // Web 管理系统主服务器
@@ -20,8 +17,8 @@ class WebServer {
     WebServer();
     ~WebServer() = default;
 
-    // 初始化：打开数据库、注册路由、同步插件信息
-    int Init(const std::string& db_path, PluginRegistry* registry);
+    // 初始化：打开数据库、注册路由
+    int Init(const std::string& db_path);
 
     // 设置 Python Worker 地址（用于算子激活/停用时通知 Worker 重载）
     void SetWorkerAddress(const std::string& host, int port);
@@ -36,14 +33,10 @@ class WebServer {
     void Stop();
 
     Database& GetDatabase() { return db_; }
-    PluginRegistry* GetRegistry() { return registry_; }
 
  private:
     // 注册所有 API 路由
     void RegisterRoutes();
-
-    // 同步 PluginRegistry 中的通道和算子信息到 SQLite
-    void SyncRegistryToDb();
 
     // API 处理函数
     void HandleHealth(const httplib::Request& req, httplib::Response& res);
@@ -56,12 +49,14 @@ class WebServer {
     void HandleCreateTask(const httplib::Request& req, httplib::Response& res);
     void HandleGetTaskResult(const httplib::Request& req, httplib::Response& res);
 
-    // 通知 Python Worker 重新加载算子，并同步 PluginRegistry 到数据库
+    // 通知 Python Worker 重新加载算子
     void NotifyWorkerReload();
+
+    // 通知 Scheduler 刷新算子列表（Worker reload 完成后调用）
+    void NotifySchedulerRefresh();
 
     httplib::Server server_;
     Database db_;
-    PluginRegistry* registry_ = nullptr;
     std::string worker_host_ = "127.0.0.1";
     int worker_port_ = 18900;
     std::string scheduler_host_ = "127.0.0.1";

@@ -60,3 +60,6 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/services/scheduler ${CMAKE_BINARY_DIR}/sche
 
 # Stage 3: Gateway 服务
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/gateway ${CMAKE_BINARY_DIR}/gateway)
+
+# 通用入口（flowsql 可执行文件）
+add_subdirectory(${CMAKE_SOURCE_DIR}/app ${CMAKE_BINARY_DIR}/app)

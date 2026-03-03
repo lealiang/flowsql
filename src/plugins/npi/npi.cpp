@@ -72,7 +72,7 @@ int NetworkProtocolIdentify::Option(const char* option) {
     return 0;
 }
 
-int NetworkProtocolIdentify::Load() { return engine_->Create(config_); }
+int NetworkProtocolIdentify::Load(IQuerier* /* querier */) { return engine_->Create(config_); }
 
 int NetworkProtocolIdentify::Unload() { return 0; }
 

@@ -4,8 +4,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "framework/core/plugin_registry.h"
-
 namespace flowsql {
 namespace web {
 
@@ -47,7 +45,7 @@ int WebPlugin::Option(const char* arg) {
     return 0;
 }
 
-int WebPlugin::Load() {
+int WebPlugin::Load(IQuerier* /* querier */) {
     printf("WebPlugin::Load: host=%s, port=%d, db=%s\n", host_.c_str(), port_, db_path_.c_str());
     return 0;
 }
@@ -57,15 +55,13 @@ int WebPlugin::Unload() {
 }
 
 int WebPlugin::Start() {
-    auto* registry = PluginRegistry::Instance();
-
     // 初始化 WebServer
     server_.SetWorkerAddress(worker_host_, worker_port_);
 
     // Gateway 模式下，Scheduler 转发地址与 Worker 相同（都通过 Gateway 路由）
     server_.SetSchedulerAddress(worker_host_, worker_port_);
 
-    if (server_.Init(db_path_, registry) != 0) {
+    if (server_.Init(db_path_) != 0) {
         printf("WebPlugin::Start: failed to init WebServer\n");
         return -1;
     }

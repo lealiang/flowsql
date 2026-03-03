@@ -1,7 +1,8 @@
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IOPERATOR_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IOPERATOR_H_
 
-#include <common/loader.hpp>
+#include <common/guid.h>
+#include <common/typedef.h>
 
 #include <cstdint>
 #include <string>
@@ -19,7 +20,10 @@ enum class OperatorPosition : int32_t {
     DATA = 1
 };
 
-interface IOperator : public IPlugin {
+// IOperator — 算子纯接口，不继承 IPlugin
+interface IOperator {
+    virtual ~IOperator() = default;
+
     // 元数据
     virtual std::string Catelog() = 0;
     virtual std::string Name() = 0;

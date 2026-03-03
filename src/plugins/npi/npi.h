@@ -16,7 +16,7 @@
 
 #include <common/guid.h>
 #include <common/typedef.h>
-#include <common/loader.hpp>
+#include <common/iplugin.h>
 #include "iprotocol.h"
 
 namespace flowsql {
@@ -35,7 +35,7 @@ class NetworkProtocolIdentify : public IPlugin, public IProtocol {
 
     // IPlugin
     virtual int Option(const char* arg);
-    virtual int Load();    // do not call any interface in this func.
+    virtual int Load(IQuerier* querier);    // do not call any interface in this func.
     virtual int Unload();  // do not call any interface in this func.
 
     // IProrocol

@@ -3,6 +3,7 @@
 
 #include <framework/core/dataframe.h>
 #include <framework/interfaces/idataframe_channel.h>
+#include <common/iplugin.h>
 
 #include <string>
 
@@ -10,13 +11,13 @@ namespace flowsql {
 
 // MemoryChannel — IDataFrameChannel 的简单内存实现（示例插件）
 // Read() 快照语义，Write() 替换语义
-class MemoryChannel : public IDataFrameChannel {
+class MemoryChannel : public IDataFrameChannel, public IPlugin {
  public:
     MemoryChannel() = default;
     ~MemoryChannel() override = default;
 
     // IPlugin
-    int Load() override { return 0; }
+    int Load(IQuerier* /* querier */) override { return 0; }
     int Unload() override { return 0; }
 
     // IChannel — 身份

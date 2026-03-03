@@ -1,19 +1,11 @@
 #include <common/typedef.h>
-#include <common/loader.hpp>
+#include <common/iplugin.h>
 
+#include "framework/interfaces/ibridge.h"
 #include "bridge_plugin.h"
 
-EXPORT_API void pluginunregist() {}
-
-EXPORT_API flowsql::IPlugin* pluginregist(flowsql::IRegister* registry, const char* opt) {
-    static flowsql::bridge::BridgePlugin _plugin;
-
-    // 注册 IPlugin（生命周期管理 + 启停控制）
-    {
-        flowsql::IPlugin* iface = dynamic_cast<flowsql::IPlugin*>(&_plugin);
-        registry->Regist(flowsql::IID_PLUGIN, iface);
-    }
-
-    _plugin.Option(opt);
-    return &_plugin;
-}
+// 注册 BridgePlugin 为动态库插件，同时暴露 IPlugin 和 IBridge 接口
+BEGIN_PLUGIN_REGIST(flowsql::bridge::BridgePlugin)
+    ____INTERFACE(flowsql::IID_PLUGIN, flowsql::IPlugin)
+    ____INTERFACE(flowsql::IID_BRIDGE, flowsql::IBridge)
+END_PLUGIN_REGIST()

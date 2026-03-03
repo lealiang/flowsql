@@ -16,11 +16,6 @@ class DataFrameChannel : public IDataFrameChannel {
     DataFrameChannel(const std::string& catelog, const std::string& name);
     ~DataFrameChannel() override = default;
 
-    // IPlugin
-    int Option(const char*) override { return 0; }
-    int Load() override { return 0; }
-    int Unload() override { return 0; }
-
     // IChannel — 身份
     const char* Catelog() override { return catelog_.c_str(); }
     const char* Name() override { return name_.c_str(); }

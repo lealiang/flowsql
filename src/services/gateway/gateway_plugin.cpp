@@ -23,7 +23,7 @@ int GatewayPlugin::Option(const char* arg) {
     return 0;
 }
 
-int GatewayPlugin::Load() {
+int GatewayPlugin::Load(IQuerier* /* querier */) {
     printf("GatewayPlugin::Load: gateway=%s:%d, %zu services\n", config_.host.c_str(), config_.port,
            config_.services.size());
     return 0;
