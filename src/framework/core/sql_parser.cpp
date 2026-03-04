@@ -1,5 +1,6 @@
 #include "sql_parser.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 
@@ -98,6 +99,44 @@ SqlStatement SqlParser::Parse(const std::string& sql) {
         return stmt;
     }
 
+    // [WHERE <condition>]（可选）
+    // WHERE 子句读取到下一个关键字（USING/WITH/INTO）或结尾
+    {
+        const char* saved = pos_;
+        if (MatchKeyword("WHERE")) {
+            SkipWhitespace();
+            const char* where_start = pos_;
+            // 向前扫描直到遇到 USING/WITH/INTO 关键字或结尾
+            while (pos_ < end_) {
+                const char* check = pos_;
+                SkipWhitespace();
+                if (MatchKeyword("USING") || MatchKeyword("WITH") || MatchKeyword("INTO")) {
+                    pos_ = check;  // 回退到关键字之前
+                    break;
+                }
+                pos_ = check;
+                if (pos_ < end_) ++pos_;
+            }
+            // 去除尾部空白
+            const char* where_end = pos_;
+            while (where_end > where_start && std::isspace(*(where_end - 1))) --where_end;
+            stmt.where_clause = std::string(where_start, where_end);
+
+            if (stmt.where_clause.empty()) {
+                stmt.error = "expected condition after WHERE";
+                return stmt;
+            }
+
+            // 安全验证
+            if (!ValidateWhereClause(stmt.where_clause)) {
+                stmt.error = "WHERE clause contains forbidden keywords: " + stmt.where_clause;
+                return stmt;
+            }
+        } else {
+            pos_ = saved;
+        }
+    }
+
     // [USING <catelog.name>]（可选）
     const char* saved_pos = pos_;
     if (MatchKeyword("USING")) {
@@ -148,6 +187,38 @@ SqlStatement SqlParser::Parse(const std::string& sql) {
     }
 
     return stmt;
+}
+
+// 验证 WHERE 子句安全性
+// 拒绝包含 DDL/DML 危险关键字的条件
+bool SqlParser::ValidateWhereClause(const std::string& clause) {
+    // 转为大写进行检查
+    std::string upper = clause;
+    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+
+    // 危险关键字列表
+    static const char* forbidden[] = {
+        "DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE",
+        "EXEC", "EXECUTE", "TRUNCATE", "GRANT", "REVOKE",
+        "--", "/*", "*/", ";",
+    };
+
+    for (const char* kw : forbidden) {
+        std::string keyword(kw);
+        auto pos = upper.find(keyword);
+        if (pos != std::string::npos) {
+            // 对于字母关键字，确保是独立单词（前后不是字母数字下划线）
+            if (std::isalpha(keyword[0])) {
+                bool word_start = (pos == 0 || !std::isalnum(upper[pos - 1]));
+                bool word_end = (pos + keyword.size() >= upper.size() ||
+                                 !std::isalnum(upper[pos + keyword.size()]));
+                if (word_start && word_end) return false;
+            } else {
+                return false;  // 符号类直接拒绝
+            }
+        }
+    }
+    return true;
 }
 
 }  // namespace flowsql

@@ -15,6 +15,7 @@
 #include "framework/core/sql_parser.h"
 #include "framework/interfaces/ichannel.h"
 #include "framework/interfaces/idatabase_channel.h"
+#include "framework/interfaces/idatabase_factory.h"
 #include "framework/interfaces/idataframe_channel.h"
 #include "framework/interfaces/ioperator.h"
 
@@ -177,15 +178,28 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
 
     // 模糊匹配内部通道表
     if (!found) {
-        for (auto& [k, v] : channels_) {
-            auto* c = v.get();
-            if (std::string(c->Name()) == name ||
-                (std::string(c->Catelog()) + "." + c->Name()) == name) {
-                found = c;
-                break;
+        // 【第四层】尝试通过 IDatabaseFactory 获取数据库通道
+        // 支持三段式（type.name.table）和两段式（type.name）
+        if (querier_) {
+            auto* factory = static_cast<IDatabaseFactory*>(
+                querier_->First(IID_DATABASE_FACTORY));
+            if (factory) {
+                // 尝试解析 type.name 格式
+                auto pos = name.find('.');
+                if (pos != std::string::npos) {
+                    std::string type = name.substr(0, pos);
+                    std::string rest = name.substr(pos + 1);
+                    // 对于三段式 type.name.table，取前两段作为 type.name
+                    auto pos2 = rest.find('.');
+                    std::string db_name = (pos2 != std::string::npos) ? rest.substr(0, pos2) : rest;
+
+                    auto* db_ch = factory->Get(type.c_str(), db_name.c_str());
+                    if (db_ch) found = db_ch;
+                }
             }
         }
     }
+
     return found;
 }
 
@@ -214,11 +228,24 @@ std::shared_ptr<IOperator> SchedulerPlugin::FindOperator(const std::string& cate
 }
 
 // --- 构建 Database 查询语句 ---
+// 支持三段式 type.name.table 和两段式 catelog.table
 static std::string BuildQuery(const std::string& source_name, const SqlStatement& stmt) {
-    std::string table = source_name;
-    auto dot = table.find('.');
-    if (dot != std::string::npos) {
-        table = table.substr(dot + 1);
+    // 从 source_name 中提取表名
+    // 三段式: sqlite.mydb.users → users
+    // 两段式: catelog.table → table
+    std::string table;
+    auto pos1 = source_name.find('.');
+    if (pos1 != std::string::npos) {
+        auto pos2 = source_name.find('.', pos1 + 1);
+        if (pos2 != std::string::npos) {
+            // 三段式
+            table = source_name.substr(pos2 + 1);
+        } else {
+            // 两段式
+            table = source_name.substr(pos1 + 1);
+        }
+    } else {
+        table = source_name;
     }
 
     std::string select_clause = "*";
@@ -232,20 +259,40 @@ static std::string BuildQuery(const std::string& source_name, const SqlStatement
 
     std::string query = "SELECT " + select_clause + " FROM " + table;
 
-    auto it = stmt.with_params.find("where");
-    if (it != stmt.with_params.end()) {
-        query += " WHERE " + it->second;
+    // 使用解析后的 WHERE 子句
+    if (!stmt.where_clause.empty()) {
+        query += " WHERE " + stmt.where_clause;
     }
 
     return query;
 }
 
+// 从目标名称中提取表名（支持三段式 type.name.table）
 static std::string ExtractTableName(const std::string& dest_name) {
-    auto dot = dest_name.find('.');
-    if (dot != std::string::npos) {
-        return dest_name.substr(dot + 1);
+    auto pos1 = dest_name.find('.');
+    if (pos1 != std::string::npos) {
+        auto pos2 = dest_name.find('.', pos1 + 1);
+        if (pos2 != std::string::npos) {
+            return dest_name.substr(pos2 + 1);  // 三段式
+        }
+        return dest_name.substr(pos1 + 1);  // 两段式
     }
     return dest_name;
+}
+
+// --- 辅助：对 DataFrame 通道应用 WHERE 过滤 ---
+// 读取数据，过滤后写回临时通道，返回过滤后的通道
+static std::shared_ptr<DataFrameChannel> ApplyDataFrameFilter(
+    IDataFrameChannel* src, const std::string& where_clause) {
+    DataFrame data;
+    if (src->Read(&data) != 0 || data.RowCount() == 0) return nullptr;
+
+    if (data.Filter(where_clause.c_str()) != 0) return nullptr;
+
+    auto filtered = std::make_shared<DataFrameChannel>("_filter", "tmp");
+    filtered->Open();
+    filtered->Write(&data);
+    return filtered;
 }
 
 // --- 无算子：纯数据搬运 ---
@@ -257,6 +304,13 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
         auto* src = dynamic_cast<IDataFrameChannel*>(source);
         auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
         if (!src || !dst) return -1;
+
+        // DataFrame + WHERE → 先过滤再复制
+        if (!stmt.where_clause.empty()) {
+            auto filtered = ApplyDataFrameFilter(src, stmt.where_clause);
+            if (!filtered) return -1;
+            return ChannelAdapter::CopyDataFrame(filtered.get(), dst);
+        }
         return ChannelAdapter::CopyDataFrame(src, dst);
     }
 
@@ -265,6 +319,13 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
         auto* dst = dynamic_cast<IDatabaseChannel*>(sink);
         if (!src || !dst) return -1;
         std::string table = ExtractTableName(stmt.dest);
+
+        // DataFrame + WHERE → 先过滤再写入
+        if (!stmt.where_clause.empty()) {
+            auto filtered = ApplyDataFrameFilter(src, stmt.where_clause);
+            if (!filtered) return -1;
+            return ChannelAdapter::WriteFromDataFrame(filtered.get(), dst, table.c_str());
+        }
         return ChannelAdapter::WriteFromDataFrame(src, dst, table.c_str());
     }
 
@@ -318,6 +379,14 @@ int SchedulerPlugin::ExecuteWithOperator(IChannel* source, IChannel* sink,
         int rc = ChannelAdapter::ReadToDataFrame(db_src, query.c_str(), tmp_in.get());
         if (rc != 0) return rc;
 
+        actual_source = tmp_in.get();
+    } else if (source_type == "dataframe" && !stmt.where_clause.empty()) {
+        // DataFrame + WHERE → 先过滤
+        auto* df_src = dynamic_cast<IDataFrameChannel*>(source);
+        if (!df_src) return -1;
+
+        tmp_in = ApplyDataFrameFilter(df_src, stmt.where_clause);
+        if (!tmp_in) return -1;
         actual_source = tmp_in.get();
     }
 
@@ -404,9 +473,9 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
         if (!stmt.dest.empty()) {
             sink = FindChannel(stmt.dest);
             if (!sink) {
+                // 临时通道仅由局部 shared_ptr 持有，不注册到 channels_ 避免累积
                 temp_sink = std::make_shared<DataFrameChannel>("result", stmt.dest);
                 temp_sink->Open();
-                RegisterChannel("result." + stmt.dest, temp_sink);
                 sink = temp_sink.get();
             }
         } else {
@@ -437,8 +506,17 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
         auto* df_sink = dynamic_cast<IDataFrameChannel*>(sink);
         DataFrame result;
         std::string result_json = "[]";
+        int row_count = 0;
         if (df_sink && df_sink->Read(&result) == 0 && result.RowCount() > 0) {
             result_json = result.ToJson();
+            row_count = result.RowCount();
+        } else if (sink_type == "database") {
+            // 写入数据库时，从 source 端统计行数
+            auto* df_src = dynamic_cast<IDataFrameChannel*>(source);
+            if (df_src) {
+                DataFrame src_data;
+                if (df_src->Read(&src_data) == 0) row_count = src_data.RowCount();
+            }
         }
 
         rapidjson::StringBuffer buf;
@@ -447,7 +525,7 @@ void SchedulerPlugin::HandleExecute(const httplib::Request& req, httplib::Respon
         w.Key("status");
         w.String("completed");
         w.Key("rows");
-        w.Int(result.RowCount());
+        w.Int(row_count);
         w.Key("data");
         w.RawValue(result_json.c_str(), result_json.size(), rapidjson::kArrayType);
         w.EndObject();
@@ -496,6 +574,19 @@ void SchedulerPlugin::HandleGetChannels(const httplib::Request&, httplib::Respon
             w.EndObject();
             return 0;
         });
+
+        // 数据库通道（通过 IDatabaseFactory）
+        auto* factory = static_cast<IDatabaseFactory*>(querier_->First(IID_DATABASE_FACTORY));
+        if (factory) {
+            factory->List([&w](const char* type, const char* name) {
+                w.StartObject();
+                w.Key("catelog"); w.String(type);
+                w.Key("name"); w.String(name);
+                w.Key("type"); w.String("database");
+                w.Key("schema"); w.String("[]");
+                w.EndObject();
+            });
+        }
     }
 
     w.EndArray();
@@ -546,6 +637,11 @@ void SchedulerPlugin::HandleGetOperators(const httplib::Request&, httplib::Respo
 // --- HandleRefreshOperators ---
 void SchedulerPlugin::HandleRefreshOperators(httplib::Response& res) {
     SetCorsHeaders(res);
+    if (!querier_) {
+        res.status = 500;
+        res.set_content(R"({"error":"querier not initialized"})", "application/json");
+        return;
+    }
     auto* bridge = static_cast<IBridge*>(querier_->First(IID_BRIDGE));
     if (bridge) {
         int rc = bridge->Refresh();

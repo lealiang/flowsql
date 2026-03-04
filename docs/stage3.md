@@ -87,10 +87,17 @@ IBridge（纯接口：FindOperator + TraverseOperators + Refresh）
 ## 任务总览
 
 ```
-P1（数据库闭环）—— 从 demo 到可用的关键跨越
-  ├── DatabaseChannel 实现（ClickHouse 对接）
+P1（数据库闭环）—— 从 demo 到可用的关键跨越（已完成）
+  ├── IDatabaseFactory 工厂接口 + DatabasePlugin 实现（已完成）
+  ├── IDbDriver 驱动抽象 + SQLite 驱动（已完成）
+  ├── DatabaseChannel 通道实现（已完成）
+  ├── SQL WHERE 解析 + DataFrame Filter（已完成）
+  ├── 安全基线（SQL 注入防护 + 只读模式）（已完成）
   ├── ChannelAdapter 自动适配（已完成）
-  └── SQL 解析器增强（USING 可选 + 列选择，已完成）
+  ├── SQL 解析器增强（USING 可选 + 列选择，已完成）
+  ├── 端到端测试（14 项全部通过）（已完成）
+  ├── 代码审查修复（P1×6 + P2×3）（已完成）
+  └── 未来扩展：MySQL/ClickHouse 驱动、连接池、事务支持、Schema 元数据查询
 
 P2（SQL + Pipeline 增强）—— 易用性提升
   └── 多算子 Pipeline（单 SQL 串联多个算子）
@@ -108,22 +115,78 @@ P3（平台增强）—— 体验优化
 
 ---
 
-## P1：数据库闭环
+## P1：数据库闭环（已完成）
 
-### DatabaseChannel 实现
+### 架构总览
 
-**前置条件**：IDatabaseChannel 接口已定义（`framework/interfaces/idatabase_channel.h`），含 IBatchReader/IBatchWriter 工厂模式。
+实现了完整的多数据库通道能力，采用三层架构：工厂层（DatabasePlugin）→ 通道层（DatabaseChannel）→ 驱动层（IDbDriver）。
 
-**目标**：实现 ClickHouse 对接，作为第一个 IDatabaseChannel 具体实现。
+```
+Scheduler FindChannel("sqlite.mydb")
+    → IQuerier::First(IID_DATABASE_FACTORY)
+    → factory->Get("sqlite", "mydb")
+    → DatabaseChannel（持有 IDbDriver）
+    → SqliteDriver（sqlite3 操作）
+```
 
-**设计要点**：
-- ClickHouse 原生支持 `FORMAT Arrow`，Arrow IPC 交换几乎零转换开销
-- IBatchReader：执行 SQL 查询，流式返回 Arrow RecordBatch
-- IBatchWriter：内部攒批，达到阈值自动 flush，`Close()` 返回写入统计
-- 连接管理：通道 Open/Close 对应连接建立/释放，IsConnected() 检测可用性
-- 通道标识：`Catelog()` 返回数据库实例名（如 `"clickhouse"`），`Name()` 返回库名（如 `"ts"`）
+### IDatabaseFactory 工厂接口 + DatabasePlugin（已完成）
 
-**配置方式**：通过 `Option()` 传入连接参数（host、port、database、user、password），或从配置文件读取。
+- `IDatabaseFactory` 纯接口：`Get(type, name)` 懒加载获取通道、`List(fn)` 遍历已配置通道、`Release(type, name)` 释放连接
+- `DatabasePlugin` 实现：IPlugin 生命周期 + IDatabaseFactory 工厂，通过 `Option()` 解析 `type=sqlite;name=mydb;path=:memory:` 配置
+- 支持环境变量替换（`$ENV_VAR` 或 `${ENV_VAR}`）
+
+**关键文件**：
+- `framework/interfaces/idatabase_factory.h` — IDatabaseFactory 纯接口
+- `services/database/database_plugin.h/.cpp` — DatabasePlugin 工厂实现
+
+### IDbDriver 驱动抽象 + SQLite 驱动（已完成）
+
+- `IDbDriver` 纯虚基类：Connect/Disconnect/IsConnected + CreateReader/CreateWriter
+- `SqliteDriver` 实现：FULLMUTEX 多线程安全、WAL 模式、只读模式支持
+- `SqliteBatchReader`：sqlite3_step 流式读取 → Arrow RecordBatch → IPC 序列化
+- `SqliteBatchWriter`：IPC 反序列化 → 自动建表 → 事务批量 INSERT
+
+**关键文件**：
+- `services/database/idb_driver.h` — IDbDriver 驱动抽象
+- `services/database/drivers/sqlite_driver.h/.cpp` — SQLite 驱动实现
+
+### DatabaseChannel 通道实现（已完成）
+
+- 实现 IDatabaseChannel 接口，委托所有数据库操作给 IDbDriver
+- `Type()` 返回 `"database"`，`Catelog()` 返回驱动类型，`Name()` 返回实例名
+- Open/Close 对应连接建立/释放
+
+**关键文件**：
+- `services/database/database_channel.h/.cpp` — DatabaseChannel 通道实现
+
+### SQL WHERE 解析 + DataFrame Filter（已完成）
+
+- SqlParser 新增 WHERE 子句解析，支持 `WHERE condition` 与 USING/INTO/WITH 组合
+- `SqlParser::ValidateWhereClause()` SQL 注入防护（分号、注释、危险关键字检测，单词边界匹配）
+- `DataFrame::Filter()` 支持 `=, !=, >, <, >=, <=` 操作符，数值/字符串/布尔类型比较
+
+### 安全基线（已完成）
+
+- WHERE 子句 SQL 注入防护（黑名单 + 单词边界匹配）
+- SQLite 只读模式（readonly 配置参数）
+- 环境变量替换（避免硬编码密码）
+
+### Scheduler 集成（已完成）
+
+- `FindChannel()` 四层查找：内部通道表 → catelog.name 拆分 → IQuerier 遍历 → IDatabaseFactory
+- 支持三段式（`sqlite.mydb.users`）和两段式（`sqlite.mydb`）通道引用
+- `BuildQuery()` 从通道名提取表名，组合 SELECT/WHERE 生成 SQL
+
+### 端到端测试（已完成，14 项全部通过）
+
+- 配置解析、SQLite 连接、CreateReader/CreateWriter、错误路径
+- SQL 解析器 WHERE、DataFrame Filter、安全基线
+- E2E：Database→DataFrame、Database+WHERE→DataFrame、DataFrame→Database、Database→Database、DataFrame+Filter→Database、错误路径+断线重连
+
+### 代码审查修复（已完成，P1×6 + P2×3）
+
+- P1：IPC 序列化失败补 writer->Close()、BindValue 返回错误码+ROLLBACK、HandleRefreshOperators 空指针防御、临时通道不注册 channels_、IPC 反序列化失败报错、测试 assert 精确化
+- P2：FindChannel 删除冗余第五层、Filter 去引号前后匹配、Tasks.vue 错误信息默认值
 
 ### ChannelAdapter 自动适配（已完成）
 
@@ -131,30 +194,25 @@ P3（平台增强）—— 体验优化
 
 **新 SQL 语法**：
 ```sql
-SELECT [* | col1, col2, ...] FROM <source> [USING <catelog.name>] [WITH key=val, ...] [INTO <dest>]
+SELECT [* | col1, col2, ...] FROM <source> [WHERE condition] [USING <catelog.name>] [WITH key=val, ...] [INTO <dest>]
 ```
 
 关键变化：USING 子句变为可选。没有 USING 时，Pipeline 做纯数据搬运；有 USING 时，Pipeline 在算子前后自动插入格式转换。
 
 **SQL 示例**：
 ```sql
--- DataFrame → Database（自动写入，无需 system.store）
-SELECT * FROM memory_data INTO clickhouse.my_table
+-- DataFrame → Database（自动写入）
+SELECT * FROM memory_data INTO sqlite.mydb.users
 
--- Database → DataFrame（自动读取，无需 system.extract）
-SELECT * FROM clickhouse.my_table INTO memory_result
+-- Database → DataFrame（自动读取 + WHERE 过滤）
+SELECT * FROM sqlite.mydb.users WHERE age>18 INTO memory_result
 
 -- Database → 算子 → DataFrame（自动适配）
-SELECT * FROM clickhouse.my_table USING explore.chisquare
+SELECT col1, col2 FROM sqlite.mydb.users WHERE age>18 USING explore.chisquare
 
 -- DataFrame → 算子 → Database（自动适配）
-SELECT * FROM memory_data USING explore.chisquare INTO clickhouse.my_table
+SELECT * FROM memory_data USING explore.chisquare INTO sqlite.mydb.results
 ```
-
-**实现文件**：
-- `framework/core/channel_adapter.h/.cpp`：ChannelAdapter 工具类（ReadToDataFrame / WriteFromDataFrame / CopyDataFrame）
-- `framework/core/sql_parser.h/.cpp`：USING 可选 + columns 字段 + HasOperator() 方法
-- `services/scheduler/scheduler_plugin.h/.cpp`：类型感知执行路径（FindChannel / ExecuteTransfer / ExecuteWithOperator）
 
 **Scheduler 执行路径**：
 ```
@@ -166,9 +224,23 @@ SELECT * FROM memory_data USING explore.chisquare INTO clickhouse.my_table
 
 有算子（算子始终面向 IDataFrameChannel）：
   source 是 Database → 先 ReadToDataFrame() 到临时 DFC
+  source 是 DataFrame + WHERE → 先 ApplyDataFrameFilter()
   sink 是 Database   → 算子输出到临时 DFC，再 WriteFromDataFrame()
   Pipeline: operator->Work(actual_source, actual_sink)
 ```
+
+### 未来扩展（未实现）
+
+| 项目 | 说明 |
+|------|------|
+| MySQL 驱动 | 实现 IDbDriver，对接 libmysqlclient |
+| ClickHouse 驱动 | 实现 IDbDriver，利用 `FORMAT Arrow` 零转换 |
+| 连接池 | DatabasePlugin 层面管理连接复用 |
+| 事务支持 | 显式 BEGIN/COMMIT/ROLLBACK |
+| Schema 元数据查询 | `DatabaseChannel::Schema()` 返回实际表/列信息（当前返回空数组） |
+| 预编译语句缓存 | 高频查询性能优化 |
+| 复杂 WHERE | 客户端解析 AND/OR/括号组合（当前直接透传给数据库引擎） |
+| SQL 注入防护升级 | 黑名单 → 白名单 → 参数化查询 |
 
 ### 清理任务
 
@@ -402,10 +474,19 @@ GET /netcard/ring_buffers → { "eth0": { "path": "/dev/shm/...", "schema": "...
 | `plugins/example/passthrough_operator.h` | PassthroughOperator : IOperator, IPlugin |
 | `python/flowsql/arrow_codec.py` | `_ensure_arrow_table()` 统一转换层 |
 
-### P1 相关（已有/待实现）
+### P1 相关（已完成）
 
 | 文件 | 说明 |
 |------|------|
-| `framework/interfaces/idatabase_channel.h` | IDatabaseChannel 接口（已定义） |
+| `framework/interfaces/idatabase_channel.h` | IDatabaseChannel + IBatchReader/IBatchWriter 接口 |
+| `framework/interfaces/idatabase_factory.h` | IDatabaseFactory 工厂接口 |
 | `framework/interfaces/idataframe.h` | IDataFrame 接口 + DataType/FieldValue/Field 类型定义 |
-| `services/scheduler/scheduler_plugin.h` | ChannelAdapter + Pipeline + 类型感知执行 |
+| `framework/core/sql_parser.h/.cpp` | SQL 解析器（WHERE + ValidateWhereClause） |
+| `framework/core/dataframe.h/.cpp` | DataFrame Filter 实现 |
+| `framework/core/channel_adapter.h/.cpp` | ChannelAdapter 自动适配工具类 |
+| `services/database/database_plugin.h/.cpp` | DatabasePlugin 工厂实现 |
+| `services/database/database_channel.h/.cpp` | DatabaseChannel 通道实现 |
+| `services/database/idb_driver.h` | IDbDriver 驱动抽象 |
+| `services/database/drivers/sqlite_driver.h/.cpp` | SQLite 驱动实现 |
+| `services/scheduler/scheduler_plugin.h/.cpp` | FindChannel + 类型感知执行 + BuildQuery |
+| `tests/test_database/main.cpp` | 14 项端到端测试 |

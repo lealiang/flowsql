@@ -15,6 +15,7 @@ services:
       - libflowsql_scheduler.so
       - libflowsql_bridge.so
       - libflowsql_example.so
+      - "libflowsql_database.so:type=sqlite;name=testdb;path=:memory:"
     port: 18803
 
   - name: pyworker

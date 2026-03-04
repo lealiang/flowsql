@@ -28,6 +28,9 @@
         <div v-if="currentResult.error" class="error-message">
           <el-alert type="error" :title="currentResult.error" :closable="false" />
         </div>
+        <div v-else-if="currentResult.message">
+          <el-alert type="success" :title="currentResult.message" :closable="false" />
+        </div>
         <div v-else>
           <div class="result-meta">
             <el-tag>{{ currentResult.rows?.length || 0 }} 行</el-tag>
@@ -144,6 +147,7 @@ const executeSQL = async () => {
   try {
     const res = await api.createTask(sqlText.value)
     const taskId = res.data.task_id
+    const writeRows = res.data.rows || 0
     ElMessage.success(`任务已提交 (ID: ${taskId})`)
 
     // 获取结果
@@ -152,16 +156,25 @@ const executeSQL = async () => {
 
     if (result.status === 'completed' && result.data) {
       // 转换数据格式：将 data.data 数组转换为对象数组
-      const rows = result.data.data.map(row => {
-        const obj = {}
-        result.data.columns.forEach((col, idx) => {
-          obj[col] = row[idx]
+      // INTO 写入数据库时 data 可能是空数组，无 columns/data 属性
+      if (result.data.columns && result.data.data) {
+        const rows = result.data.data.map(row => {
+          const obj = {}
+          result.data.columns.forEach((col, idx) => {
+            obj[col] = row[idx]
+          })
+          return obj
         })
-        return obj
-      })
-      currentResult.value = {
-        columns: result.data.columns,
-        rows: rows
+        currentResult.value = {
+          columns: result.data.columns,
+          rows: rows
+        }
+      } else {
+        currentResult.value = {
+          columns: [],
+          rows: [],
+          message: `执行完成（${writeRows} 行已写入）`
+        }
       }
     } else if (result.status === 'failed') {
       currentResult.value = { error: result.error || '执行失败' }
@@ -171,7 +184,7 @@ const executeSQL = async () => {
     await loadTasks()
   } catch (error) {
     // 提取后端返回的具体错误信息
-    const detail = error.response?.data?.error || error.message
+    const detail = error.response?.data?.error || error.message || '未知错误'
     ElMessage.error('执行失败: ' + detail)
     currentResult.value = { error: detail }
   } finally {
@@ -185,7 +198,7 @@ const loadTasks = async () => {
     const res = await api.getTasks()
     tasks.value = res.data
   } catch (error) {
-    ElMessage.error('加载任务列表失败: ' + error.message)
+    ElMessage.error('加载任务列表失败: ' + (error.message || '未知错误'))
   } finally {
     loading.value = false
   }
@@ -198,16 +211,24 @@ const viewResult = async (taskId) => {
 
     if (result.status === 'completed' && result.data) {
       // 转换数据格式
-      const rows = result.data.data.map(row => {
-        const obj = {}
-        result.data.columns.forEach((col, idx) => {
-          obj[col] = row[idx]
+      if (result.data.columns && result.data.data) {
+        const rows = result.data.data.map(row => {
+          const obj = {}
+          result.data.columns.forEach((col, idx) => {
+            obj[col] = row[idx]
+          })
+          return obj
         })
-        return obj
-      })
-      dialogResult.value = {
-        columns: result.data.columns,
-        rows: rows
+        dialogResult.value = {
+          columns: result.data.columns,
+          rows: rows
+        }
+      } else {
+        dialogResult.value = {
+          columns: [],
+          rows: [],
+          message: `执行完成（${result.rows || 0} 行已写入）`
+        }
       }
     } else if (result.status === 'failed') {
       dialogResult.value = { error: result.error || '执行失败' }
@@ -215,7 +236,7 @@ const viewResult = async (taskId) => {
 
     resultDialogVisible.value = true
   } catch (error) {
-    ElMessage.error('加载结果失败: ' + error.message)
+    ElMessage.error('加载结果失败: ' + (error.message || '未知错误'))
   }
 }
 

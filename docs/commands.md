@@ -92,4 +92,11 @@
 - 2026-03-03: 修复 Python 算子执行报错 'DataFrame' object has no attribute 'to_arrow'：arrow_codec.py 新增 _ensure_arrow_table() 统一转换层，encode 函数兼容 Polars/Pandas/Arrow Table 三种输入
 - 2026-03-03: 清理 IDataEntity 死代码：删除 idata_entity.h，DataType/FieldValue/Field 移入 idataframe.h，删除 DataFrame 中 AppendEntity/GetEntity/GenericDataEntity，清理 test_bridge 无用 include，更新 stage3.md
 - 2026-03-03: 多服务框架基本实现，创建分支 feature/multi-service-framework 并提交代码（统一插件系统 + 应用启动器）
+- 2026-03-03: 切换回 main 分支，合并 feature/multi-service-framework 分支（Fast-forward 合并）
 - 2026-03-03: 推送分支到远程（网络连接失败，待重试）
+- 2026-03-04: 读取 JSONL 对话记录文件，提取 design_database_channel.md 审查的所有具体修改内容
+- 2026-03-04: 审查修改 docs/design_database_channel.md（18 个问题：接口合并、重复标题、WHERE 职责、SQL 注入标注、重连逻辑、并发安全、错误信息、ParseChannelReference 类型检查、Phase 依赖并行化、单元测试、错误路径测试等）
+- 2026-03-04: 实施 DatabaseChannel 多数据库通道能力（Phase 1-7）：IDatabaseFactory 接口、IDbDriver 驱动抽象、DatabaseChannel 通道实现、DatabasePlugin 工厂、SQLite 驱动、Scheduler 集成、SQL WHERE 解析、DataFrame 过滤、安全基线、端到端测试
+- 2026-03-04: 修复 SqliteDriver::CreateReader 的 Schema 推断 bug：去掉 sqlite3_step+sqlite3_reset 推断类型，改用纯 sqlite3_column_decltype；修复 SqliteBatchReader 缺少 done_ 状态跟踪导致 auto-reset 重复读取的问题；14 个测试全部通过
+- 2026-03-04: 代码审查修复（P1×6 + P2×3）：sqlite_driver IPC序列化失败补writer->Close()、BindValue返回错误码+ROLLBACK、HandleRefreshOperators加querier_空检查、临时通道不注册channels_、channel_adapter IPC反序列化失败报错、test assert精确化；删除FindChannel第五层冗余、Filter去引号前后匹配、Tasks.vue错误信息默认值
+- 2026-03-04: 读取 design_database_channel.md 完整内容，找出所有 TODO/未完成/待实现/Phase/预留等任务项及未打勾的实施清单项

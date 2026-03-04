@@ -44,6 +44,9 @@ class DataFrame : public IDataFrame {
     // 清空
     void Clear() override;
 
+    // 按条件过滤
+    int Filter(const char* condition) override;
+
  private:
     void Finalize() const;
     void InitBuilders() const;

@@ -41,6 +41,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 主动修复失败的 CI 测试，无需被告知如何做。
 
 ## 任务管理
+
 1. **先规划**：将计划写入 `tasks/todo.md`，包含可检查的项目。
 2. **验证计划**：在开始实施前进行检查确认。
 3. **追踪进度**：随进展标记项目为完成。
@@ -48,7 +49,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 5. **记录结果**：在 `tasks/todo.md` 中添加回顾部分。
 6. **汲取教训**：在收到纠正后更新 `tasks/lessons.md`。
 
+## 架构原则
+
+1. **统一框架（Python Worker 例外）**：C++ 服务都是同一个框架程序加载不同 .so 运行起来的，彼此对等；Python Worker 是独立的 FastAPI 进程
+2. **IPlugin 机制保留**：所有功能模块以 .so 插件形式加载
+3. **控制面 HTTP 统一**：服务间控制面通信全部走 HTTP + URI 路由
+4. **数据面独立通道**：高吞吐数据传输走共享内存 / Arrow IPC，不经过 HTTP
+5. **Interface 思维**：Plugin 通过 interface（纯虚基类）向本进程内的其他 Plugin 暴露能力，调用方通过 IQuerier 按 IID 查找，不直接依赖具体实现类
+
 ## 核心原则
+
 - **简洁优先**：使每次变更尽可能简单。影响最小化的代码。
 - **拒绝懒惰**：寻找根本原因。杜绝临时修复。遵循资深开发者标准。
 - **最小影响**：变更应仅触及必要部分。避免引入新的 bug。

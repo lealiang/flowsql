@@ -100,11 +100,23 @@ interface IDatabaseFactory {
     // 返回: 通道指针（工厂持有所有权），失败返回 nullptr
     virtual IDatabaseChannel* Get(const char* type, const char* name) = 0;
 
+    // [预留] 获取数据库通道（带用户上下文）
+    // 未来实现权限管理时，可根据 user_context 检查权限或选择凭证
+    // 当前默认实现：忽略 user_context，调用 Get(type, name)
+    virtual IDatabaseChannel* GetWithContext(const char* type,
+                                             const char* name,
+                                             const char* user_context) {
+        return Get(type, name);
+    }
+
     // 列出所有已配置的数据库连接
     virtual void List(std::function<void(const char* type, const char* name)> callback) = 0;
 
     // 释放指定通道（关闭连接，从池中移除）
     virtual int Release(const char* type, const char* name) = 0;
+
+    // 获取最近一次操作的错误信息（线程安全：内部使用 thread_local 存储）
+    virtual const char* LastError() = 0;
 };
 
 }  // namespace flowsql
@@ -173,7 +185,7 @@ public:
     const char* Catelog() override { return type_.c_str(); }
     const char* Name() override { return name_.c_str(); }
     const char* Type() override { return "database"; }
-    const char* Schema() override { return "[]"; }
+    const char* Schema() override { return "[]"; }  // TODO: 后续可查询数据库元数据返回表列表
 
     int Open() override;
     int Close() override;
@@ -243,8 +255,11 @@ public:
 
     // IDatabaseFactory
     IDatabaseChannel* Get(const char* type, const char* name) override;
+    IDatabaseChannel* GetWithContext(const char* type, const char* name,
+                                     const char* user_context) override;
     void List(std::function<void(const char* type, const char* name)> callback) override;
     int Release(const char* type, const char* name) override;
+    const char* LastError() override;
 
 private:
     std::unique_ptr<IDbDriver> CreateDriver(const std::string& type);
@@ -257,6 +272,9 @@ private:
 
     std::mutex mutex_;
     IQuerier* querier_ = nullptr;
+
+    // 线程安全的错误信息存储
+    static thread_local std::string last_error_;
 };
 
 }  // namespace flowsql::database
@@ -282,7 +300,7 @@ int DatabasePlugin::Option(const char* arg) {
     return 0;
 }
 
-// 懒加载获取通道
+// 懒加载获取通道（含断线重连）
 IDatabaseChannel* DatabasePlugin::Get(const char* type, const char* name) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -291,18 +309,26 @@ IDatabaseChannel* DatabasePlugin::Get(const char* type, const char* name) {
     // 1. 查找已存在的通道
     auto it = channels_.find(key);
     if (it != channels_.end()) {
-        return it->second.get();
+        // 检查连接是否仍然有效，断开则移除并重建
+        if (!it->second->IsConnected()) {
+            printf("DatabasePlugin: connection lost for %s, reconnecting...\n", key.c_str());
+            channels_.erase(it);
+        } else {
+            return it->second.get();
+        }
     }
 
     // 2. 查找配置
     auto cfg_it = configs_.find(key);
     if (cfg_it == configs_.end()) {
+        last_error_ = "database not configured: " + key;
         return nullptr;  // 未配置
     }
 
     // 3. 创建驱动
     auto driver = CreateDriver(type);
     if (!driver) {
+        last_error_ = "unsupported database type: " + std::string(type);
         return nullptr;  // 不支持的数据库类型
     }
 
@@ -312,12 +338,17 @@ IDatabaseChannel* DatabasePlugin::Get(const char* type, const char* name) {
 
     // 5. 打开连接
     if (channel->Open() != 0) {
+        last_error_ = "connection failed: " + key;
         return nullptr;  // 连接失败
     }
 
     // 6. 加入通道池
     channels_[key] = channel;
     return channel.get();
+}
+
+const char* DatabasePlugin::LastError() {
+    return last_error_.c_str();
 }
 
 // 驱动工厂
@@ -378,16 +409,33 @@ int SqliteDriver::Connect(const std::unordered_map<std::string, std::string>& pa
     auto it = params.find("path");
     db_path_ = (it != params.end()) ? it->second : ":memory:";
 
-    int rc = sqlite3_open(db_path_.c_str(), &db_);
+    // 使用 FULLMUTEX 模式，保证多线程安全
+    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
+
+    // 支持只读模式
+    auto ro_it = params.find("readonly");
+    if (ro_it != params.end() && ro_it->second == "true") {
+        flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX;
+    }
+
+    int rc = sqlite3_open_v2(db_path_.c_str(), &db_, flags, nullptr);
     if (rc != SQLITE_OK) {
         last_error_ = sqlite3_errmsg(db_);
         sqlite3_close(db_);
         db_ = nullptr;
         return -1;
     }
+
+    // 开启 WAL 模式，提升并发读写性能
+    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     return 0;
 }
 ```
+
+**并发模型**：
+- SQLite 使用 `SQLITE_OPEN_FULLMUTEX`（serialized 模式），保证同一连接的多线程安全
+- WAL 模式允许并发读取，写入仍然串行
+- 对于 MySQL/ClickHouse 等 client/server 数据库，连接本身是线程安全的
 
 ### 4.2 SqliteBatchReader
 
@@ -629,13 +677,26 @@ src/
 - 创建 `src/services/database/CMakeLists.txt`
 - 更新 `src/CMakeLists.txt` 添加 `add_subdirectory(services/database)`
 
+#### 1.6 单元测试
+- 创建 `src/tests/test_database/` 测试目标
+- 测试 DatabasePlugin::Option 配置解析
+- 测试 DatabasePlugin::Get 在无驱动时返回 nullptr 并设置 LastError
+- 测试 DatabasePlugin::List 列出已配置的连接
+- 测试 IID_PLUGIN 和 IID_DATABASE_FACTORY 注册
+
 #### 验收标准
 ```bash
 # 编译通过
 cmake --build build
 
-# 插件可加载（无数据库驱动，Get 返回 nullptr）
-./build/output/test_framework
+# 单元测试通过
+./build/output/test_database
+
+# 测试用例：
+# 1. Option 解析 "type=sqlite;name=mydb;path=/data/test.db"
+# 2. Get("sqlite", "mydb") 返回 nullptr（无 SQLite 驱动）
+# 3. LastError() 返回 "unsupported database type: sqlite"
+# 4. List 回调被调用
 ```
 
 **输出**：
@@ -675,14 +736,15 @@ cmake --build build
 # 编译通过
 cmake --build build
 
-# 单元测试：SQLite 驱动
-./build/output/test_sqlite_driver
+# 单元测试：SQLite 驱动（使用 :memory: 模式，无文件系统副作用）
+./build/output/test_database
 
 # 测试用例：
-# 1. Connect/Disconnect
-# 2. CreateReader 执行 SELECT
-# 3. CreateWriter 写入数据
-# 4. 类型映射正确性
+# 1. Connect(:memory:) / Disconnect
+# 2. CreateReader 执行 SELECT，验证 Arrow IPC 序列化
+# 3. CreateWriter 写入数据，验证自动建表
+# 4. 类型映射正确性（INTEGER/REAL/TEXT/BLOB）
+# 5. 错误路径：查询语法错误、连接失败（错误路径）
 ```
 
 **输出**：
@@ -705,20 +767,24 @@ cmake --build build
 - 修改 `Scheduler::FindChannel`
 - 增加第四层查找：通过 `IDatabaseFactory::Get` 获取数据库通道
 
-#### 3.3 BuildQuery 改造
-- 修改 `BuildQuery` 函数签名，接受 `table_name` 参数
-- 从 `stmt.where_clause` 读取 WHERE 条件（暂时为空，Phase 4 实现）
+#### 3.3 SqlStatement 预留 where_clause 字段
+- 在 `SqlStatement` 中添加空的 `where_clause` 字段（解析逻辑在 Phase 4 实现）
+- 确保 Phase 3 代码可以引用该字段而不报编译错误
 
-#### 3.4 ExecuteTransfer 改造
+#### 3.4 BuildQuery 改造
+- 修改 `BuildQuery` 函数签名，接受 `table_name` 参数
+- 从 `stmt.where_clause` 读取 WHERE 条件（Phase 3 阶段该字段始终为空，Phase 4 填充）
+
+#### 3.5 ExecuteTransfer 改造
 - 修改 `ExecuteTransfer` 签名，增加 `source_table` 和 `dest_table` 参数
 - 调用 `BuildQuery(source_table, stmt)` 构建数据库查询
 - 调用 `ChannelAdapter::WriteFromDataFrame(src, dst, dest_table.c_str())`
 
-#### 3.5 ExecuteWithOperator 改造
+#### 3.6 ExecuteWithOperator 改造
 - 修改 `ExecuteWithOperator` 签名，增加 `source_table` 和 `dest_table` 参数
 - 适配 Database source/sink
 
-#### 3.6 HandleExecute 改造
+#### 3.7 HandleExecute 改造
 - 调用 `ParseChannelReference` 解析 source 和 dest
 - 传递 `table_name` 给 `ExecuteTransfer/ExecuteWithOperator`
 
@@ -756,7 +822,7 @@ curl -X POST http://localhost:18801/execute \
 
 ### Phase 4：SQL 解析器扩展（1-2 天）
 
-**目标**：支持 WHERE 子句。
+**目标**：支持 WHERE 子句。可与 Phase 2/3 并行开发。
 
 #### 4.1 SqlParser 扩展
 - 在 `SqlStatement` 中增加 `where_clause` 字段
@@ -795,7 +861,15 @@ curl -X POST http://localhost:18801/execute \
 
 ### Phase 5：DataFrame 过滤（2-3 天）
 
-**目标**：支持 DataFrame source 的 WHERE 过滤。
+**目标**：支持 DataFrame source 的 WHERE 过滤。可与 Phase 2/3/4 并行开发。
+
+**实现方案**：列式过滤（类似 `df[df[key]>1]` 的语义）
+1. 解析条件：提取列名、操作符、值
+2. 取出整列数据（`GetColumn(column_name)`）
+3. 对整列做比较运算，生成布尔掩码（mask）
+4. 用 mask 过滤所有行，生成新的 DataFrame
+
+> 后续如果数据量大到需要 SIMD 加速，可以改用 Arrow Compute kernel（`ToArrow()` → `arrow::compute::Filter`）。
 
 #### 5.1 IDataFrame::Filter 接口
 - 在 `idataframe.h` 中增加 `Filter` 方法声明
@@ -806,12 +880,9 @@ curl -X POST http://localhost:18801/execute \
 - 使用 Arrow Compute 的 Filter kernel
 - 支持操作符：`=`, `!=`, `>`, `<`, `>=`, `<=`
 
-#### 5.3 ChannelAdapter 改造
-- 修改 `ChannelAdapter::WriteFromDataFrame` 签名，增加 `where_clause` 参数
-- 在写入前调用 `DataFrame::Filter`
-
-#### 5.4 Scheduler 调用
-- 在 `ExecuteTransfer` 中传递 `stmt.where_clause` 给 `WriteFromDataFrame`
+#### 5.3 Scheduler 层 WHERE 过滤集成
+- 在 `ExecuteTransfer` 和 `ExecuteWithOperator` 中，对 DataFrame source + WHERE 场景调用 `Filter()`
+- ChannelAdapter 保持不变，不增加 where_clause 参数
 
 #### 验收标准
 ```bash
@@ -890,16 +961,25 @@ curl -X POST http://localhost:18801/execute \
 - Database + WHERE → DataFrame
 - DataFrame → Database（无 WHERE）
 - DataFrame + WHERE → Database
+- DataFrame + WHERE → DataFrame
 - Database → Database（跨数据库）
 - Database + WHERE → 算子 → DataFrame
-- DataFrame → DataFrame + WHERE（应报错）
+- DataFrame + WHERE → 算子 → DataFrame
 
-#### 7.2 性能测试
+#### 7.2 错误路径测试
+- 连接失败场景（错误的路径/主机）
+- 查询语法错误场景
+- WHERE 条件列不存在
+- SQL 注入防护验证
+- 只读模式写入拒绝
+- 连接断开后重连
+
+#### 7.3 性能测试
 - 批量写入 10 万行数据
 - 批量读取 10 万行数据
 - WHERE 过滤性能对比（全表 vs 索引）
 
-#### 7.3 文档更新
+#### 7.4 文档更新
 - 更新 `docs/stage3.md`（标记 P1 完成）
 - 更新 `docs/commands.md`（记录实施命令）
 - 编写用户手册（SQL 语法、配置示例）
@@ -908,9 +988,7 @@ curl -X POST http://localhost:18801/execute \
 ```bash
 # 所有测试通过
 ./build/output/test_framework
-./build/output/test_sqlite_driver
-./build/output/test_dataframe_filter
-./build/output/test_sql_parser
+./build/output/test_database
 
 # 性能测试
 ./scripts/benchmark_database_channel.sh
@@ -933,17 +1011,17 @@ curl -X POST http://localhost:18801/execute \
 ```
 Phase 1: 基础框架
     ↓
-Phase 2: SQLite 驱动 ← 可独立测试
+    ├── Phase 2: SQLite 驱动 ← 可独立测试
+    │     ↓
+    │     Phase 3: Scheduler 集成 ← 依赖 Phase 1 + 2
+    │
+    ├── Phase 4: WHERE 解析 ← 可与 Phase 2/3 并行
+    │
+    └── Phase 5: DataFrame 过滤 ← 可与 Phase 2/3/4 并行
+          ↓
+Phase 6: 安全基线 ← 可与 Phase 5 并行
     ↓
-Phase 3: Scheduler 集成 ← 依赖 Phase 1 + 2
-    ↓
-Phase 4: WHERE 解析 ← 依赖 Phase 3
-    ↓
-Phase 5: DataFrame 过滤 ← 依赖 Phase 4
-    ↓
-Phase 6: 安全基线 ← 可并行于 Phase 5
-    ↓
-Phase 7: 端到端测试
+Phase 7: 端到端测试 ← 依赖所有 Phase
 ```
 
 ## 10. 风险控制
@@ -974,15 +1052,15 @@ Phase 7: 端到端测试
 
 ## 11. 验收标准总结
 
-| 阶段 | 编译 | 单元测试 | 集成测试 | 文档 |
-|------|------|----------|----------|------|
-| Phase 1 | ✓ | - | - | 接口文档 |
-| Phase 2 | ✓ | ✓ | - | 驱动文档 |
-| Phase 3 | ✓ | ✓ | ✓ | 集成文档 |
-| Phase 4 | ✓ | ✓ | ✓ | SQL 语法 |
-| Phase 5 | ✓ | ✓ | ✓ | Filter 文档 |
-| Phase 6 | ✓ | ✓ | ✓ | 安全文档 |
-| Phase 7 | ✓ | ✓ | ✓ | 完整文档 |
+| 阶段 | 编译 | 单元测试 | 集成测试 | 可并行 |
+|------|------|----------|----------|--------|
+| Phase 1 | ✓ | ✓ | - | - |
+| Phase 2 | ✓ | ✓ | - | - |
+| Phase 3 | ✓ | ✓ | ✓ | - |
+| Phase 4 | ✓ | ✓ | - | Phase 2/3 |
+| Phase 5 | ✓ | ✓ | - | Phase 2/3/4 |
+| Phase 6 | ✓ | ✓ | ✓ | Phase 5 |
+| Phase 7 | ✓ | ✓ | ✓ | - |
 
 ## 12. 验证计划
 
@@ -1111,20 +1189,40 @@ struct ChannelReference {
     std::string table_name;    // 表名（仅 Database 通道有效）
 };
 
+// 已知的数据库类型前缀（用于区分三段式数据库通道和二段式 DataFrame 通道）
+static const std::unordered_set<std::string> kDatabaseTypes = {
+    "sqlite", "mysql", "clickhouse", "postgres", "oracle"
+};
+
 static ChannelReference ParseChannelReference(const std::string& ref) {
     ChannelReference result;
 
     auto first_dot = ref.find('.');
+    if (first_dot == std::string::npos) {
+        // 无点号：非法格式，原样返回
+        result.channel_name = ref;
+        result.table_name = "";
+        return result;
+    }
+
     auto second_dot = ref.find('.', first_dot + 1);
 
     if (second_dot != std::string::npos) {
-        // 三段式：type.instance.table（Database 通道）
-        std::string type = ref.substr(0, first_dot);
-        std::string instance = ref.substr(first_dot + 1, second_dot - first_dot - 1);
-        std::string table = ref.substr(second_dot + 1);
+        // 有两个点号：检查第一段是否为已知数据库类型
+        std::string first_segment = ref.substr(0, first_dot);
 
-        result.channel_name = type + "." + instance;  // "sqlite.mydb"
-        result.table_name = table;                     // "users"
+        if (kDatabaseTypes.count(first_segment)) {
+            // 三段式：type.instance.table（Database 通道）
+            std::string instance = ref.substr(first_dot + 1, second_dot - first_dot - 1);
+            std::string table = ref.substr(second_dot + 1);
+
+            result.channel_name = first_segment + "." + instance;  // "sqlite.mydb"
+            result.table_name = table;                              // "users"
+        } else {
+            // 第一段不是数据库类型，视为二段式（DataFrame 通道名中包含多个点）
+            result.channel_name = ref;
+            result.table_name = "";
+        }
     } else {
         // 二段式：catelog.name（DataFrame 通道）
         result.channel_name = ref;                     // "test.data"
@@ -1134,6 +1232,11 @@ static ChannelReference ParseChannelReference(const std::string& ref) {
     return result;
 }
 ```
+
+**设计说明**：
+- 通过 `kDatabaseTypes` 集合区分数据库通道和 DataFrame 通道，避免歧义
+- DataFrame 通道要求二段式命名（`catelog.name`），不应使用数据库类型名作为 catelog
+- 新增数据库类型时，需要同步更新 `kDatabaseTypes` 集合
 
 ---
 
@@ -1160,20 +1263,14 @@ int DataFrame::Filter(const char* condition) {
     //    支持操作符：=, !=, >, <, >=, <=
     //    示例："age>18" → column="age", op=">", value="18"
 
-    // 2. 使用 Arrow Compute 的 Filter kernel
-    //    - 构建比较表达式（arrow::compute::greater）
-    //    - 应用过滤（arrow::compute::Filter）
-    //    - 生成新的 RecordBatch
+    // 2. 列式过滤（类似 df[df[key]>1] 语义）
+    //    - 取出整列数据：GetColumn(column_name)
+    //    - 对整列做比较运算，生成布尔掩码（mask）
+    //    - 用 mask 过滤所有行
 
-    // 3. 替换当前 batch_
-
-    // 简单实现示例：
-    // auto filter_expr = arrow::compute::greater(
-    //     arrow::compute::field_ref("age"),
-    //     arrow::compute::literal(18)
-    // );
-    // auto result = arrow::compute::Filter(batch_, filter_expr);
-    // batch_ = result.ValueOrDie();
+    // 3. 用过滤后的行重建 DataFrame
+    //    - 保留 schema 不变
+    //    - 只保留 mask 为 true 的行
 
     return 0;
 }
@@ -1185,58 +1282,25 @@ int DataFrame::Filter(const char* condition) {
 
 ---
 
-#### 5. ChannelAdapter 改造
+#### 5. Scheduler 层 WHERE 过滤
+
+**设计原则**：WHERE 过滤在 Scheduler 层完成，ChannelAdapter 保持纯粹的格式转换职责。
+
+- Database source：WHERE 拼入 SQL 查询，下推到数据库执行
+- DataFrame source：Scheduler 读取 DataFrame 后调用 `Filter()`，再交给 ChannelAdapter
 
 ```cpp
-// src/framework/core/channel_adapter.h
+// ChannelAdapter 保持不变，不增加 where_clause 参数
 class ChannelAdapter {
 public:
-    // [修改] WriteFromDataFrame 增加 where_clause 参数
     static int WriteFromDataFrame(IDataFrameChannel* df_in,
                                   IDatabaseChannel* db_out,
-                                  const char* table,
-                                  const char* where_clause = nullptr);
+                                  const char* table);
 
-    // 其他方法保持不变
     static int ReadToDataFrame(IDatabaseChannel* db, const char* query,
                                IDataFrameChannel* df_out);
     static int CopyDataFrame(IDataFrameChannel* src, IDataFrameChannel* dst);
 };
-```
-
-**实现**：
-```cpp
-// src/framework/core/channel_adapter.cpp
-int ChannelAdapter::WriteFromDataFrame(IDataFrameChannel* df_in,
-                                       IDatabaseChannel* db_out,
-                                       const char* table,
-                                       const char* where_clause) {
-    DataFrame tmp;
-    int rc = df_in->Read(&tmp);
-    if (rc != 0) return rc;
-
-    // [新增] 如果有 WHERE 条件，先过滤
-    if (where_clause && strlen(where_clause) > 0) {
-        rc = tmp.Filter(where_clause);
-        if (rc != 0) {
-            printf("ChannelAdapter: Filter failed: %s\n", where_clause);
-            return rc;
-        }
-    }
-
-    // 序列化并写入数据库
-    IBatchWriter* writer = nullptr;
-    rc = db_out->CreateWriter(table, &writer);
-    if (rc != 0) return rc;
-
-    auto batch = tmp.ToArrow();
-    // ... 序列化为 Arrow IPC ...
-    writer->Write(buf, len);
-    writer->Close(&stats);
-    writer->Release();
-
-    return 0;
-}
 ```
 
 ---
@@ -1309,10 +1373,16 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
         auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
         if (!src || !dst) return -1;
 
-        // [新增] DataFrame 不支持 WHERE（CopyDataFrame 不支持过滤）
+        // [新增] DataFrame→DataFrame + WHERE：先 Filter 再 Copy
         if (!stmt.where_clause.empty()) {
-            printf("SchedulerPlugin: DataFrame → DataFrame 不支持 WHERE 子句\n");
-            return -1;
+            DataFrame tmp;
+            if (src->Read(&tmp) != 0) return -1;
+            if (tmp.Filter(stmt.where_clause.c_str()) != 0) return -1;
+            // 写入临时通道再 Copy
+            auto filtered = std::make_shared<DataFrameChannel>("_filter", "tmp");
+            filtered->Open();
+            filtered->Write(&tmp);
+            return ChannelAdapter::CopyDataFrame(filtered.get(), dst);
         }
 
         return ChannelAdapter::CopyDataFrame(src, dst);
@@ -1323,10 +1393,18 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
         auto* dst = dynamic_cast<IDatabaseChannel*>(sink);
         if (!src || !dst) return -1;
 
-        // [修改] 传递 where_clause 给 ChannelAdapter
-        return ChannelAdapter::WriteFromDataFrame(src, dst,
-                                                   dest_table.c_str(),
-                                                   stmt.where_clause.c_str());
+        // [新增] DataFrame source + WHERE：Scheduler 层先 Filter
+        if (!stmt.where_clause.empty()) {
+            DataFrame tmp;
+            if (src->Read(&tmp) != 0) return -1;
+            if (tmp.Filter(stmt.where_clause.c_str()) != 0) return -1;
+            auto filtered = std::make_shared<DataFrameChannel>("_filter", "tmp");
+            filtered->Open();
+            filtered->Write(&tmp);
+            return ChannelAdapter::WriteFromDataFrame(filtered.get(), dst, dest_table.c_str());
+        }
+
+        return ChannelAdapter::WriteFromDataFrame(src, dst, dest_table.c_str());
     }
 
     if (source_type == "database" && sink_type == "dataframe") {
@@ -1334,7 +1412,7 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
         auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
         if (!src || !dst) return -1;
 
-        // [修改] 使用 source_table 构建查询
+        // Database source：WHERE 下推到 SQL 查询
         std::string query = BuildQuery(source_table, stmt);
         return ChannelAdapter::ReadToDataFrame(src, query.c_str(), dst);
     }
@@ -1347,12 +1425,11 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
         auto tmp = std::make_shared<DataFrameChannel>("_adapter", "tmp");
         tmp->Open();
 
-        // [修改] 使用 source_table 构建查询
+        // Database source：WHERE 下推到 SQL 查询
         std::string query = BuildQuery(source_table, stmt);
         int rc = ChannelAdapter::ReadToDataFrame(src, query.c_str(), tmp.get());
         if (rc != 0) return rc;
 
-        // [修改] 使用 dest_table
         return ChannelAdapter::WriteFromDataFrame(tmp.get(), dst, dest_table.c_str());
     }
 
@@ -1380,10 +1457,24 @@ int SchedulerPlugin::ExecuteWithOperator(IChannel* source, IChannel* sink,
         tmp_in = std::make_shared<DataFrameChannel>("_adapter", "in");
         tmp_in->Open();
 
-        // [修改] 使用 source_table 构建查询
+        // Database source：WHERE 下推到 SQL 查询
         std::string query = BuildQuery(source_table, stmt);
         int rc = ChannelAdapter::ReadToDataFrame(db_src, query.c_str(), tmp_in.get());
         if (rc != 0) return rc;
+
+        actual_source = tmp_in.get();
+    } else if (source_type == "dataframe" && !stmt.where_clause.empty()) {
+        // DataFrame source + WHERE：Scheduler 层先 Filter
+        auto* df_src = dynamic_cast<IDataFrameChannel*>(source);
+        if (!df_src) return -1;
+
+        tmp_in = std::make_shared<DataFrameChannel>("_adapter", "in");
+        tmp_in->Open();
+
+        DataFrame tmp;
+        if (df_src->Read(&tmp) != 0) return -1;
+        if (tmp.Filter(stmt.where_clause.c_str()) != 0) return -1;
+        tmp_in->Write(&tmp);
 
         actual_source = tmp_in.get();
     }
@@ -1414,7 +1505,7 @@ int SchedulerPlugin::ExecuteWithOperator(IChannel* source, IChannel* sink,
         auto* db_sink = dynamic_cast<IDatabaseChannel*>(sink);
         if (!db_sink) return -1;
 
-        // [修改] 使用 dest_table
+        // 使用 dest_table
         int rc = ChannelAdapter::WriteFromDataFrame(tmp_out.get(), db_sink, dest_table.c_str());
         if (rc != 0) return rc;
     }
@@ -1464,13 +1555,15 @@ ParseChannelReference("sqlite.mydb.users")
   ↓
 ExecuteTransfer(dataframe → database)
   ↓
-ChannelAdapter::WriteFromDataFrame(src, dst, "users", "key=1")
+src->Read(&tmp)                          ← Scheduler 层读取 DataFrame
   ↓
-src->Read(&tmp)
+tmp.Filter("key=1")                      ← Scheduler 层过滤
   ↓
-tmp.Filter("key=1")  ← DataFrame 原生过滤
+filtered->Write(&tmp)                    ← 写入临时 DataFrameChannel
   ↓
-WriteToDatabase(tmp, "users")
+ChannelAdapter::WriteFromDataFrame(filtered, dst, "users")
+  ↓
+WriteToDatabase(filtered_data, "users")  ← ChannelAdapter 纯格式转换
 ```
 
 **场景 3：Database + WHERE → 算子 → DataFrame**
@@ -1493,12 +1586,12 @@ Pipeline(tmp_in → operator → sink)
 
 #### 8. 边界情况处理
 
-**1. DataFrame → DataFrame + WHERE（不支持）**
+**1. DataFrame → DataFrame + WHERE（支持）**
 ```sql
 SELECT * FROM test.data1 WHERE key=1 INTO test.data2
 ```
-- ExecuteTransfer 检测到 DataFrame → DataFrame 且有 WHERE，返回错误
-- 原因：CopyDataFrame 不支持过滤，需要用户显式使用算子
+- Scheduler 读取 DataFrame 后调用 `Filter("key=1")`，再 CopyDataFrame 到目标
+- WHERE 过滤在 Scheduler 层完成，ChannelAdapter 不感知 WHERE 语义
 
 **2. WHERE 子句包含特殊字符**
 ```sql
@@ -1519,23 +1612,18 @@ SELECT * FROM sqlite.mydb.users WHERE age>  -- 语法错误
 SELECT * FROM test.data WHERE invalid_column=1 INTO sqlite.mydb.users
 ```
 - DataFrame::Filter 返回错误码
-- ChannelAdapter 检测错误并返回
+- Scheduler（ExecuteTransfer/ExecuteWithOperator）检测错误并返回
 
 ---
 
 #### 9. 实施计划
 
-1. 扩展 `SqlParser`，增加 `where_clause` 字段和 WHERE 子句解析
-2. 实现 `ParseChannelReference` 函数
-3. 实现 `IDataFrame::Filter()` 方法（使用 Arrow Compute）
-4. 修改 `ChannelAdapter::WriteFromDataFrame`，增加 `where_clause` 参数
-5. 修改 `BuildQuery`，从 `stmt.where_clause` 读取，接受 `table_name` 参数
-6. 修改 `ExecuteTransfer` 和 `ExecuteWithOperator`，增加 `source_table` 和 `dest_table` 参数
-7. 修改 `HandleExecute`，调用 `ParseChannelReference` 解析通道引用
-8. 更新 SQL 语法文档
-9. 编写测试用例验证 WHERE 下推和 DataFrame 过滤
-
-## 14. 未来扩展
+1. Phase 3：在 SqlStatement 中预留 `where_clause` 字段，实现 `ParseChannelReference`
+2. Phase 4：扩展 `SqlParser`，实现 WHERE 子句解析和 `ValidateWhereClause`
+3. Phase 5：实现 `IDataFrame::Filter()` 方法
+4. Phase 3/5：修改 `ExecuteTransfer` 和 `ExecuteWithOperator`，Scheduler 层处理 WHERE
+5. Phase 4：修改 `BuildQuery`，从 `stmt.where_clause` 读取
+6. Phase 7：编写测试用例验证 WHERE 下推和 DataFrame 过滤
 
 ## 14. 未来扩展
 
@@ -1590,31 +1678,8 @@ virtual int Rollback() = 0;
 
 #### IDatabaseFactory 扩展预留
 
-```cpp
-// src/framework/interfaces/idatabase_factory.h
-interface IDatabaseFactory {
-    virtual ~IDatabaseFactory() = default;
-
-    // [当前] 获取数据库通道（无权限检查）
-    virtual IDatabaseChannel* Get(const char* type, const char* name) = 0;
-
-    // [预留] 获取数据库通道（带用户上下文）
-    // 未来实现时，可以根据 user_context 选择不同的凭证或检查权限
-    // 当前实现：忽略 user_context，调用 Get(type, name)
-    virtual IDatabaseChannel* GetWithContext(const char* type,
-                                             const char* name,
-                                             const char* user_context) {
-        // 默认实现：忽略用户上下文
-        return Get(type, name);
-    }
-
-    // 列出所有已配置的数据库连接
-    virtual void List(std::function<void(const char* type, const char* name)> callback) = 0;
-
-    // 释放指定通道
-    virtual int Release(const char* type, const char* name) = 0;
-};
-```
+`GetWithContext` 方法已在 §3.1 的正式接口定义中包含（带默认实现），无需额外修改。
+未来实现权限管理时，只需 override `GetWithContext` 方法即可。
 
 #### IAuthService 接口定义（预留）
 
@@ -1831,12 +1896,16 @@ int GatewayPlugin::HandleRequest(const HttpRequest& req) {
 password: ${DB_PASSWORD}
 ```
 
-#### 2. SQL 注入防护
+#### 2. SQL 注入防护（临时方案）
+
+> **风险提示**：当前采用关键字黑名单方案，存在绕过风险（大小写混合、注释插入等）。
+> 中期应升级为白名单验证（只允许比较运算符、AND/OR、括号、字面量），
+> 长期应使用参数化查询。
 
 ```cpp
 // SqlParser 增加 WHERE 子句验证
 bool SqlParser::ValidateWhereClause(const std::string& where_clause) {
-    // 检查危险关键字
+    // 检查危险关键字（临时方案，后续升级为白名单）
     static const std::vector<std::string> dangerous_keywords = {
         "DROP", "DELETE", "UPDATE", "INSERT", "TRUNCATE", "ALTER", "CREATE",
         "--", "/*", "*/", "EXEC", "EXECUTE"

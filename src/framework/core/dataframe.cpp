@@ -403,4 +403,119 @@ FieldValue DataFrame::ExtractValue(const std::shared_ptr<arrow::Array>& array, i
     }
 }
 
+// --- Filter 实现 ---
+// 解析简单条件表达式并过滤行
+// 支持: column=value, column>value, column<value, column>=value, column<=value, column!=value
+int DataFrame::Filter(const char* condition) {
+    if (!condition || !*condition) return -1;
+
+    Finalize();
+    if (!batch_ || batch_->num_rows() == 0) return 0;
+
+    // 解析条件：找到操作符
+    std::string cond(condition);
+    std::string col_name, op, value;
+
+    // 支持的操作符（按长度降序匹配）
+    static const char* ops[] = {">=", "<=", "!=", "=", ">", "<"};
+    size_t op_pos = std::string::npos;
+    for (const char* o : ops) {
+        op_pos = cond.find(o);
+        if (op_pos != std::string::npos) {
+            op = o;
+            col_name = cond.substr(0, op_pos);
+            value = cond.substr(op_pos + op.size());
+            break;
+        }
+    }
+
+    if (op_pos == std::string::npos) return -1;
+
+    // 去除空白
+    while (!col_name.empty() && std::isspace(col_name.back())) col_name.pop_back();
+    while (!value.empty() && std::isspace(value.front())) value.erase(value.begin());
+
+    // 去除值的引号（前后引号必须匹配）
+    if (value.size() >= 2 && (value.front() == '\'' || value.front() == '"') &&
+        value.back() == value.front()) {
+        value = value.substr(1, value.size() - 2);
+    }
+
+    // 查找列索引
+    int col_idx = -1;
+    for (size_t i = 0; i < schema_.size(); ++i) {
+        if (schema_[i].name == col_name) {
+            col_idx = static_cast<int>(i);
+            break;
+        }
+    }
+    if (col_idx < 0) return -1;  // 列不存在
+
+    // 逐行过滤，保留匹配的行
+    std::vector<std::vector<FieldValue>> kept_rows;
+    int32_t nrows = batch_->num_rows();
+
+    for (int32_t r = 0; r < nrows; ++r) {
+        auto row_val = ExtractValue(batch_->column(col_idx), r);
+        bool match = false;
+
+        // 根据类型比较
+        std::visit([&](auto&& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
+                          std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+                int64_t lhs = static_cast<int64_t>(v);
+                int64_t rhs = 0;
+                try { rhs = std::stoll(value); } catch (...) { return; }
+                if (op == "=") match = (lhs == rhs);
+                else if (op == ">") match = (lhs > rhs);
+                else if (op == "<") match = (lhs < rhs);
+                else if (op == ">=") match = (lhs >= rhs);
+                else if (op == "<=") match = (lhs <= rhs);
+                else if (op == "!=") match = (lhs != rhs);
+            } else if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+                double lhs = static_cast<double>(v);
+                double rhs = 0;
+                try { rhs = std::stod(value); } catch (...) { return; }
+                if (op == "=") match = (lhs == rhs);
+                else if (op == ">") match = (lhs > rhs);
+                else if (op == "<") match = (lhs < rhs);
+                else if (op == ">=") match = (lhs >= rhs);
+                else if (op == "<=") match = (lhs <= rhs);
+                else if (op == "!=") match = (lhs != rhs);
+            } else if constexpr (std::is_same_v<T, std::string>) {
+                if (op == "=") match = (v == value);
+                else if (op == "!=") match = (v != value);
+                else if (op == ">") match = (v > value);
+                else if (op == "<") match = (v < value);
+                else if (op == ">=") match = (v >= value);
+                else if (op == "<=") match = (v <= value);
+            } else if constexpr (std::is_same_v<T, bool>) {
+                bool rhs = (value == "true" || value == "1");
+                if (op == "=") match = (v == rhs);
+                else if (op == "!=") match = (v != rhs);
+            }
+        }, row_val);
+
+        if (match) {
+            // 收集整行
+            std::vector<FieldValue> row;
+            for (int c = 0; c < batch_->num_columns(); ++c) {
+                row.push_back(ExtractValue(batch_->column(c), r));
+            }
+            kept_rows.push_back(std::move(row));
+        }
+    }
+
+    // 重建 DataFrame
+    auto saved_schema = schema_;
+    Clear();
+    SetSchema(saved_schema);
+    for (auto& row : kept_rows) {
+        AppendRow(row);
+    }
+
+    return 0;
+}
+
 }  // namespace flowsql

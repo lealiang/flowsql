@@ -69,8 +69,21 @@ static void WaitForSignal() {
 // 加载单个插件（封装 PluginLoader 调用）
 static int LoadPlugin(PluginLoader* loader, const std::string& path, const char* option) {
     std::string app_path = get_absolute_process_path();
-    const char* relapath[] = {path.c_str()};
-    const char* options[] = {option};
+
+    // 支持 "libxxx.so:key=val;..." 格式：冒号前为文件名，冒号后为插件 option
+    std::string lib_path = path;
+    std::string plugin_option;
+    auto colon = path.find(':');
+    if (colon != std::string::npos) {
+        lib_path = path.substr(0, colon);
+        plugin_option = path.substr(colon + 1);
+    }
+    // 命令行 option 与内嵌 option 合并（内嵌优先）
+    if (plugin_option.empty() && option) plugin_option = option;
+
+    const char* relapath[] = {lib_path.c_str()};
+    const char* opt_ptr = plugin_option.empty() ? nullptr : plugin_option.c_str();
+    const char* options[] = {opt_ptr};
     int ret = loader->Load(app_path.c_str(), relapath, options, 1);
     if (ret != 0) return ret;
     return loader->StartAll();

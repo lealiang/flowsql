@@ -80,6 +80,13 @@ int ChannelAdapter::ReadToDataFrame(IDatabaseChannel* db, const char* query,
             while (stream_reader->ReadNext(&batch).ok() && batch) {
                 AppendBatchToDataFrame(batch, result, schema_set);
             }
+        } else {
+            // IPC 反序列化失败，报错并终止读取
+            printf("ChannelAdapter::ReadToDataFrame: IPC deserialize failed: %s\n",
+                   stream_result.status().ToString().c_str());
+            reader->Close();
+            reader->Release();
+            return -1;
         }
     }
 

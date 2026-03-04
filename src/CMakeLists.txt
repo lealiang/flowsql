@@ -58,6 +58,10 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/services/web ${CMAKE_BINARY_DIR}/web)
 # Stage 2: Scheduler 调度服务
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/scheduler ${CMAKE_BINARY_DIR}/scheduler)
 
+# Stage 3: Database 数据库通道服务
+add_subdirectory(${CMAKE_SOURCE_DIR}/services/database ${CMAKE_BINARY_DIR}/database)
+add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_database ${CMAKE_BINARY_DIR}/test_database)
+
 # Stage 3: Gateway 服务
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/gateway ${CMAKE_BINARY_DIR}/gateway)
 

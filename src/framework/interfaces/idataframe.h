@@ -71,6 +71,11 @@ interface IDataFrame {
 
     // 清空
     virtual void Clear() = 0;
+
+    // 按条件过滤行（返回新的过滤后 DataFrame）
+    // condition 格式: "column=value", "column>value", "column<value" 等
+    // 返回: 0=成功, <0=错误（列不存在等）
+    virtual int Filter(const char* condition) = 0;
 };
 
 }  // namespace flowsql
