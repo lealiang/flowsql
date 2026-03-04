@@ -100,3 +100,7 @@
 - 2026-03-04: 修复 SqliteDriver::CreateReader 的 Schema 推断 bug：去掉 sqlite3_step+sqlite3_reset 推断类型，改用纯 sqlite3_column_decltype；修复 SqliteBatchReader 缺少 done_ 状态跟踪导致 auto-reset 重复读取的问题；14 个测试全部通过
 - 2026-03-04: 代码审查修复（P1×6 + P2×3）：sqlite_driver IPC序列化失败补writer->Close()、BindValue返回错误码+ROLLBACK、HandleRefreshOperators加querier_空检查、临时通道不注册channels_、channel_adapter IPC反序列化失败报错、test assert精确化；删除FindChannel第五层冗余、Filter去引号前后匹配、Tasks.vue错误信息默认值
 - 2026-03-04: 读取 design_database_channel.md 完整内容，找出所有 TODO/未完成/待实现/Phase/预留等任务项及未打勾的实施清单项
+- 2026-03-04: 提交 DatabaseChannel 实现到 main 分支（commit d446936）：多数据库通道能力、SQLite 驱动、WHERE 过滤、端到端测试
+- 2026-03-04: 建立 Scrum 任务管理体系：创建 product_backlog.md（6 个 Epic、40+ Story）、sprint1/2/3 的 planning/review/retrospective 文档，整理 stage1/2/3 的所有任务和经验教训
+- 2026-03-04: 补充 tasks/lessons.md：从 Sprint 回顾中提炼 7 条经验教训（接口设计、静态库单例、测试同步、依赖隔离、资源泄漏、架构问题、文档同步）
+- 2026-03-05: 清理文档目录：删除 tasks/todo.md（已完成的临时清单）；归档 7 个历史文档到 docs/archive/（stage1/2/3.md、design_database_channel.md、frontend_verification.md、operator_editor_*.md）
