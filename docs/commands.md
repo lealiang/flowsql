@@ -104,3 +104,4 @@
 - 2026-03-04: 建立 Scrum 任务管理体系：创建 product_backlog.md（6 个 Epic、40+ Story）、sprint1/2/3 的 planning/review/retrospective 文档，整理 stage1/2/3 的所有任务和经验教训
 - 2026-03-04: 补充 tasks/lessons.md：从 Sprint 回顾中提炼 7 条经验教训（接口设计、静态库单例、测试同步、依赖隔离、资源泄漏、架构问题、文档同步）
 - 2026-03-05: 清理文档目录：删除 tasks/todo.md（已完成的临时清单）；归档 7 个历史文档到 docs/archive/（stage1/2/3.md、design_database_channel.md、frontend_verification.md、operator_editor_*.md）
+- 2026-03-05: 提交 Scrum 任务管理体系到 main 分支（commit e379b6a）：产品待办列表、Sprint 1/2/3 文档、经验教训补充、文档清理
