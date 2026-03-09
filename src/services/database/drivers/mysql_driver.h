@@ -37,7 +37,7 @@ class __attribute__((visibility("default"))) MysqlDriver : public IDbDriver {
     // IDbDriver 实现
     int Connect(const std::unordered_map<std::string, std::string>& params) override;
     int Disconnect() override;
-    bool IsConnected() override { return pool_ != nullptr; }
+bool IsConnected() override { return pool_ != nullptr; }
     const char* DriverName() override { return "mysql"; }
     const char* LastError() override { return last_error_.c_str(); }
     bool Ping() override;
@@ -76,7 +76,9 @@ class __attribute__((visibility("default"))) MysqlDriver : public IDbDriver {
 // MySQL 结果集实现
 class MysqlResultSet : public IResultSet {
 public:
-    MysqlResultSet(MYSQL_RES* result, std::function<void(MYSQL_RES*)> free_func);
+    MysqlResultSet(MYSQL_RES* result,
+                   MYSQL_STMT* stmt,
+                   std::function<void()> return_connection);
     ~MysqlResultSet() override;
 
     int FieldCount() override;
@@ -93,7 +95,8 @@ public:
 
 private:
     MYSQL_RES* result_;
-    std::function<void(MYSQL_RES*)> free_func_;
+    MYSQL_STMT* stmt_;
+    std::function<void()> return_connection_;
     MYSQL_ROW current_row_;
     bool has_next_;
     bool fetched_;
@@ -119,7 +122,9 @@ protected:
 
     // 工厂方法
     IResultSet* CreateResultSet(MYSQL_RES* result,
-                                std::function<void(MYSQL_RES*)> free_func) override;
+                                MYSQL_STMT* stmt,
+                                std::function<void(MYSQL_RES*)> free_func,
+                                std::function<void()> return_connection) override;
     IBatchReader* CreateBatchReader(IResultSet* result,
                                     std::shared_ptr<arrow::Schema> schema) override;
     IBatchWriter* CreateBatchWriter(const char* table) override;

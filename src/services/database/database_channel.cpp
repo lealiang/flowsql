@@ -17,13 +17,12 @@ DatabaseChannel::~DatabaseChannel() {
 }
 
 int DatabaseChannel::Open() {
-    if (opened_) return 0;
     if (!driver_) return -1;
-
-    // 初始化连接（连接池在 Connect 中初始化）
-    int ret = driver_->Connect({});
-    if (ret == 0) opened_ = true;
-    return ret;
+    if (driver_->IsConnected()) {
+        opened_ = true;
+        return 0;
+    }
+    return -1;
 }
 
 int DatabaseChannel::Close() {

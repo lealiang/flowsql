@@ -13,12 +13,24 @@ namespace database {
 
 // ==================== MysqlResultSet 实现 ====================
 
-MysqlResultSet::MysqlResultSet(MYSQL_RES* result, std::function<void(MYSQL_RES*)> free_func)
-    : result_(result), free_func_(free_func), has_next_(true), fetched_(false) {}
+MysqlResultSet::MysqlResultSet(MYSQL_RES* result,
+                               MYSQL_STMT* stmt,
+                               std::function<void()> return_connection)
+    : result_(result), stmt_(stmt), return_connection_(return_connection),
+      has_next_(true), fetched_(false) {}
 
 MysqlResultSet::~MysqlResultSet() {
-    if (result_ && free_func_) {
-        free_func_(result_);
+    if (result_) {
+        mysql_free_result(result_);  // 1. 释放结果集
+        result_ = nullptr;
+    }
+    if (stmt_) {
+        mysql_stmt_close(stmt_);  // 2. 关闭 statement
+        stmt_ = nullptr;
+    }
+    if (return_connection_) {
+        return_connection_();  // 3. 归还连接到连接池
+        return_connection_ = nullptr;
     }
 }
 
@@ -193,8 +205,11 @@ void MysqlSession::ReturnConnection(MYSQL* conn) {
 }
 
 IResultSet* MysqlSession::CreateResultSet(MYSQL_RES* result,
-                                          std::function<void(MYSQL_RES*)> free_func) {
-    return new MysqlResultSet(result, free_func);
+                                          MYSQL_STMT* stmt,
+                                          std::function<void(MYSQL_RES*)> free_func,
+                                          std::function<void()> return_connection) {
+    (void)free_func;  // MySQL 中由 return_connection 统一处理
+    return new MysqlResultSet(result, stmt, return_connection);
 }
 
 // ==================== MysqlBatchReader 实现 ====================
@@ -547,6 +562,7 @@ bool MysqlDriver::Ping() {
 std::shared_ptr<IDbSession> MysqlDriver::CreateSession() {
     if (!pool_) {
         last_error_ = "Driver not connected";
+        printf("MysqlDriver::CreateSession: driver not connected\n");
         return nullptr;
     }
 
@@ -554,6 +570,7 @@ std::shared_ptr<IDbSession> MysqlDriver::CreateSession() {
     std::string error;
     if (!pool_->Acquire(&conn, &error)) {
         last_error_ = error;
+        printf("MysqlDriver::CreateSession: failed to acquire connection: %s\n", error.c_str());
         return nullptr;
     }
 

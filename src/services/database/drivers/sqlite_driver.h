@@ -33,7 +33,7 @@ class SqliteResultSet;
 class __attribute__((visibility("default"))) SqliteDriver : public IDbDriver {
  public:
     SqliteDriver() = default;
-    ~SqliteDriver() override;
+    ~SqliteDriver() override = default;
 
     // IDbDriver 实现
     int Connect(const std::unordered_map<std::string, std::string>& params) override;
@@ -70,7 +70,7 @@ class __attribute__((visibility("default"))) SqliteDriver : public IDbDriver {
 // SQLite 结果集实现
 class SqliteResultSet : public IResultSet {
 public:
-    SqliteResultSet(sqlite3_stmt* stmt, std::function<void(sqlite3_stmt*)> free_func);
+    SqliteResultSet(sqlite3_stmt* stmt, std::function<void()> return_connection);
     ~SqliteResultSet() override;
 
     int FieldCount() override;
@@ -87,7 +87,7 @@ public:
 
 private:
     sqlite3_stmt* stmt_;
-    std::function<void(sqlite3_stmt*)> free_func_;
+    std::function<void()> return_connection_;
     bool has_next_;
     bool fetched_;
 };
@@ -111,7 +111,9 @@ protected:
 
     // 工厂方法
     IResultSet* CreateResultSet(sqlite3_stmt* stmt,
-                                std::function<void(sqlite3_stmt*)> free_func) override;
+                                sqlite3_stmt* stmt_for_cleanup,
+                                std::function<void(sqlite3_stmt*)> free_func,
+                                std::function<void()> return_connection) override;
     IBatchReader* CreateBatchReader(IResultSet* result,
                                     std::shared_ptr<arrow::Schema> schema) override;
     IBatchWriter* CreateBatchWriter(const char* table) override;

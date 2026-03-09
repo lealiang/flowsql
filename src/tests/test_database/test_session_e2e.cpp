@@ -255,8 +255,8 @@ void test_batch_reader() {
         &error);
 
     // 创建 Reader
-    IBatchReader* reader = nullptr;
-    auto* batch_readable = dynamic_cast<IBatchReadable*>(session.get());
+    flowsql::IBatchReader* reader = nullptr;
+    auto* batch_readable = dynamic_cast<flowsql::database::IBatchReadable*>(session.get());
     assert(batch_readable != nullptr);
 
     int rc = batch_readable->CreateReader("SELECT * FROM products", &reader);
@@ -307,8 +307,8 @@ void test_batch_writer() {
     assert(session != nullptr);
 
     // 创建 Writer
-    IBatchWriter* writer = nullptr;
-    auto* batch_writable = dynamic_cast<IBatchWritable*>(session.get());
+    flowsql::IBatchWriter* writer = nullptr;
+    auto* batch_writable = dynamic_cast<flowsql::database::IBatchWritable*>(session.get());
     assert(batch_writable != nullptr);
 
     int rc = batch_writable->CreateWriter("test_writer", &writer);
@@ -348,7 +348,7 @@ void test_batch_writer() {
     printf("  Data written\n");
 
     // 关闭并获取统计
-    BatchWriteStats stats;
+    flowsql::BatchWriteStats stats;
     writer->Close(&stats);
     printf("  Rows written: %lld\n", stats.rows_written);
     assert(stats.rows_written == 3);

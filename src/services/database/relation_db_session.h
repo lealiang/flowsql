@@ -81,8 +81,12 @@ public:
         }
 
         // 创建结果集（由子类实现具体的 CreateResultSet）
-        *result = CreateResultSet(res, [this](typename Traits::ResultType r) {
+        // 资源清理（statement 和连接）由 CreateResultSet 返回的 IResultSet 析构函数负责
+        *result = CreateResultSet(res, stmt, [this](typename Traits::ResultType r) {
             FreeResult(r);
+        }, [this, conn = this->conn_]() {
+            // 归还连接到连接池
+            this->ReturnConnection(conn);
         });
         if (!*result) {
             FreeResult(res);
@@ -212,7 +216,9 @@ protected:
     // 创建结果集
     virtual IResultSet* CreateResultSet(
         typename Traits::ResultType result,
-        std::function<void(typename Traits::ResultType)> free_func) = 0;
+        typename Traits::StatementType stmt,
+        std::function<void(typename Traits::ResultType)> free_func,
+        std::function<void()> return_connection) = 0;
 
     // 批量读取器工厂
     virtual IBatchReader* CreateBatchReader(IResultSet* result,

@@ -13,12 +13,19 @@ namespace database {
 
 // ==================== SqliteResultSet 实现 ====================
 
-SqliteResultSet::SqliteResultSet(sqlite3_stmt* stmt, std::function<void(sqlite3_stmt*)> free_func)
-    : stmt_(stmt), free_func_(free_func), has_next_(true), fetched_(false) {}
+SqliteResultSet::SqliteResultSet(sqlite3_stmt* stmt, std::function<void()> return_connection)
+    : stmt_(stmt), return_connection_(return_connection), has_next_(true), fetched_(false) {}
 
 SqliteResultSet::~SqliteResultSet() {
-    if (stmt_ && free_func_) {
-        free_func_(stmt_);
+    // SQLite 中，stmt_ 本身就是结果集，finalize 会释放所有资源
+    // return_connection_ 只负责归还连接，不再重复释放 stmt
+    if (stmt_) {
+        sqlite3_finalize(stmt_);  // 释放 statement（也会释放结果集）
+        stmt_ = nullptr;
+    }
+    if (return_connection_) {
+        return_connection_();  // 归还连接到连接池（不再释放 stmt）
+        return_connection_ = nullptr;
     }
 }
 
@@ -177,8 +184,12 @@ void SqliteSession::ReturnConnection(sqlite3* db) {
 }
 
 IResultSet* SqliteSession::CreateResultSet(sqlite3_stmt* stmt,
-                                           std::function<void(sqlite3_stmt*)> free_func) {
-    return new SqliteResultSet(stmt, free_func);
+                                           sqlite3_stmt* stmt_for_cleanup,
+                                           std::function<void(sqlite3_stmt*)> free_func,
+                                           std::function<void()> return_connection) {
+    (void)stmt_for_cleanup;  // SQLite 中 stmt 本身就是 result
+    (void)free_func;  // 由 return_connection 统一处理
+    return new SqliteResultSet(stmt, return_connection);
 }
 
 // ==================== SqliteBatchReader 实现 ====================
@@ -479,8 +490,6 @@ IBatchWriter* SqliteSession::CreateBatchWriter(const char* table) {
 }
 
 // ==================== SqliteDriver 实现 ====================
-
-SqliteDriver::~SqliteDriver() = default;
 
 int SqliteDriver::Connect(const std::unordered_map<std::string, std::string>& params) {
     ConnectionPoolConfig config;

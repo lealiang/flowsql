@@ -169,6 +169,7 @@ private:
             if (conn) {
                 auto now = std::chrono::steady_clock::now();
                 pool_.push_back(conn);
+                
                 conn_info_[conn] = {now, now, false};
                 total_connections_++;
             } else {
