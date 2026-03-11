@@ -12,10 +12,10 @@
 | 测试目标 | 用例数 | 结果 |
 |---------|--------|------|
 | `test_framework` | 框架 + SQL 解析 + BuildQuery | ✅ 全部通过 |
-| `test_connection_pool` | 6 个连接池单元测试 | ✅ 全部通过 |
+| `test_connection_pool` | 7 个连接池单元测试 | ✅ 全部通过 |
 | `test_sqlite` | SQLite 驱动独立测试 | ✅ 全部通过 |
-| `test_mysql` | MySQL 驱动独立测试（17 个） | ✅ 全部通过 |
-| `test_database`（插件层 E2E） | 14 个端到端测试 | ✅ 全部通过 |
+| `test_mysql` | MySQL 驱动独立测试（19 个） | ✅ 全部通过 |
+| `test_database`（插件层 E2E） | 16 个端到端测试 | ✅ 全部通过 |
 
 ---
 
@@ -199,3 +199,60 @@
 [PASS] E2E: Error paths
 === All database plugin E2E tests passed ===
 ```
+
+---
+
+## 多线程测试补充（2026-03-11）
+
+### 背景
+
+原有测试全部为单线程，仅 `test_pool_concurrency()` 测试了连接池 Acquire/Return 的并发安全。`DatabaseChannel::CreateReader/CreateWriter` 无锁保护，多线程并发调用路径零覆盖。
+
+### 新增用例
+
+#### test_connection_pool（7 个，+1）
+
+| 用例 | 类型 | 验证目标 |
+|------|------|---------|
+| `test_pool_concurrent_stats` | 多线程 | 16 线程并发 Acquire/Return 时，后台线程持续读取 `GetStats()`，验证 `in_use + available == total` 始终成立，无数据竞争 |
+
+#### test_mysql（19 个，+2）
+
+| 用例 | 类型 | 验证目标 |
+|------|------|---------|
+| `test_concurrent_sessions` | 多线程 | 8 个线程各自独立建立 `MysqlDriver` + `CreateSession()`，并发读取同一张表，验证每个线程读到 10 行、互不干扰 |
+| `test_concurrent_writers` | 多线程 | 6 个线程各自独立建立 Session，并发写入不同表（每表 50 行），验证各表行数精确、无数据串扰 |
+
+#### test_database（16 个，+2）
+
+| 用例 | 类型 | 验证目标 |
+|------|------|---------|
+| `test_concurrent_readers` | 多线程 | 8 个线程同时对**同一个** `IDatabaseChannel` 调用 `CreateReader()`，并发读取同一张表，验证每线程读到 20 行、无 crash |
+| `test_concurrent_writers` | 多线程 | 6 个线程同时对**同一个** `IDatabaseChannel` 调用 `CreateWriter()`（各写不同表），验证各表行数精确、无 crash |
+
+### 执行结果
+
+```
+=== FlowSQL Connection Pool Tests ===
+[PASS] Connection pool: concurrent stats consistency
+  stat_errors=0, final in_use=0
+=== All connection pool tests passed ===
+
+=== FlowSQL MySQL Driver Tests ===
+[PASS] MySQL: concurrent sessions
+  threads=8 success=8 errors=0
+[PASS] MySQL: concurrent writers
+  threads=6 success=6 errors=0
+=== All MySQL tests passed (19/19) ===
+
+=== FlowSQL Database Plugin E2E Tests (MySQL) ===
+[PASS] Concurrent readers on same IDatabaseChannel
+  all 8 threads read 20 rows each, no crash
+[PASS] Concurrent writers on same IDatabaseChannel
+  table mt_writers_*_0~5: 30 rows OK (each)
+=== All database plugin E2E tests passed ===
+```
+
+### 结论
+
+`DatabaseChannel::CreateReader/CreateWriter` 在多线程并发调用下无 crash、无数据串扰。根本原因：每次调用都从连接池 `Acquire` 独立 Session，Session 之间天然隔离，`DatabaseChannel` 本身无可写共享状态（`type_`/`name_` 构造后只读，`session_factory_` 函数对象只读）。`opened_` 的 TOCTOU 在当前使用模式下不触发（Channel 生命周期内不会并发 Open/Close）。

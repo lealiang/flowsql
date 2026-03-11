@@ -348,6 +348,68 @@ void test_pool_concurrency() {
 }
 
 // ============================================================
+// Test 7: 并发时 GetStats() 数据一致性
+// ============================================================
+void test_pool_concurrent_stats() {
+    printf("[TEST] Connection pool: concurrent stats consistency...\n");
+
+    ConnectionPoolConfig config;
+    config.max_connections = 8;
+    config.min_connections = 0;
+    config.idle_timeout = std::chrono::seconds(300);
+    config.health_check_interval = std::chrono::seconds(60);
+
+    std::atomic<int> counter{0};
+    auto factory = [&counter](std::string* error) -> int { return ++counter; };
+    auto closer  = [](int conn) {};
+    auto pinger  = [](int conn) -> bool { return true; };
+
+    ConnectionPool<int> pool(config, factory, closer, pinger);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int>  stat_errors{0};
+
+    // 后台线程持续读取统计信息，验证 in_use + available == total
+    std::thread stat_thread([&pool, &stop, &stat_errors]() {
+        while (!stop.load()) {
+            auto s = pool.GetStats();
+            // 三个字段必须自洽
+            if (s.in_use_connections + s.available_connections != s.total_connections) {
+                stat_errors++;
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    // 主线程并发 Acquire/Return
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 16; ++i) {
+        workers.emplace_back([&pool]() {
+            for (int j = 0; j < 20; ++j) {
+                int conn;
+                if (pool.Acquire(&conn, nullptr)) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    pool.Return(conn);
+                }
+            }
+        });
+    }
+    for (auto& t : workers) t.join();
+
+    stop = true;
+    stat_thread.join();
+
+    assert(stat_errors == 0);
+    // 所有连接归还后 in_use 应为 0
+    auto final_stats = pool.GetStats();
+    assert(final_stats.in_use_connections == 0);
+    printf("  stat_errors=%d, final in_use=%d\n",
+           stat_errors.load(), final_stats.in_use_connections);
+
+    printf("[PASS] Connection pool: concurrent stats consistency\n");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -359,6 +421,7 @@ int main() {
     test_pool_health_check();
     test_pool_stats();
     test_pool_concurrency();
+    test_pool_concurrent_stats();
 
     printf("\n=== All connection pool tests passed ===\n");
     return 0;

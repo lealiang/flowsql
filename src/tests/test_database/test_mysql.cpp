@@ -16,7 +16,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arrow/api.h>
@@ -951,6 +954,202 @@ void test_quote_identifier() {
 }
 
 // ============================================================
+// Test 18: 多线程并发 Session — 各线程独立连接，互不干扰
+// ============================================================
+void test_concurrent_sessions() {
+    printf("[TEST] MySQL: concurrent sessions...\n");
+
+    const int N_THREADS = 8;
+    const char* TABLE = "mt_sessions_test";
+
+    // 建表并写入基础数据
+    {
+        MysqlDriver driver;
+        driver.Connect(GetMysqlParams());
+        auto session = driver.CreateSession();
+        assert(session);
+        DropTableIfExists(session.get(), TABLE);
+        session->ExecuteSql(
+            "CREATE TABLE mt_sessions_test (id INT, val INT)", nullptr);
+        for (int i = 0; i < 10; ++i) {
+            std::string sql = "INSERT INTO mt_sessions_test VALUES (" +
+                              std::to_string(i) + ", " + std::to_string(i * 10) + ")";
+            session->ExecuteSql(sql.c_str(), nullptr);
+        }
+        driver.Disconnect();
+    }
+
+    std::atomic<int> success{0};
+    std::atomic<int> errors{0};
+    std::mutex result_mutex;
+    std::vector<int> row_counts;
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N_THREADS; ++i) {
+        threads.emplace_back([&]() {
+            MysqlDriver driver;
+            if (driver.Connect(GetMysqlParams()) != 0) { errors++; return; }
+
+            auto session = driver.CreateSession();
+            if (!session) { errors++; driver.Disconnect(); return; }
+
+            // 每个线程独立读取全表
+            auto* readable = dynamic_cast<IBatchReadable*>(session.get());
+            if (!readable) { errors++; driver.Disconnect(); return; }
+
+            IBatchReader* reader = nullptr;
+            if (readable->CreateReader("SELECT * FROM mt_sessions_test", &reader) != 0) {
+                errors++; driver.Disconnect(); return;
+            }
+
+            int rows = 0;
+            const uint8_t* buf; size_t len;
+            while (reader->Next(&buf, &len) == 0) {
+                auto batch = [&]() -> std::shared_ptr<arrow::RecordBatch> {
+                    auto b = arrow::Buffer::Wrap(buf, static_cast<int64_t>(len));
+                    auto inp = std::make_shared<arrow::io::BufferReader>(b);
+                    auto s = arrow::ipc::RecordBatchStreamReader::Open(inp).ValueOrDie();
+                    std::shared_ptr<arrow::RecordBatch> rb;
+                    if (!s->ReadNext(&rb).ok() || !rb) return nullptr;
+                    return rb;
+                }();
+                if (batch) rows += static_cast<int>(batch->num_rows());
+            }
+            reader->Close();
+            reader->Release();
+
+            {
+                std::lock_guard<std::mutex> lk(result_mutex);
+                row_counts.push_back(rows);
+            }
+            success++;
+            driver.Disconnect();
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    printf("  threads=%d success=%d errors=%d\n",
+           N_THREADS, success.load(), errors.load());
+    assert(errors == 0);
+    assert(success == N_THREADS);
+    // 每个线程都应读到 10 行
+    for (int c : row_counts) {
+        assert(c == 10);
+    }
+    printf("  all %d threads read 10 rows each\n", N_THREADS);
+
+    // 清理
+    {
+        MysqlDriver driver;
+        driver.Connect(GetMysqlParams());
+        auto session = driver.CreateSession();
+        DropTableIfExists(session.get(), TABLE);
+        driver.Disconnect();
+    }
+
+    g_passed++;
+    printf("[PASS] MySQL: concurrent sessions\n");
+}
+
+// ============================================================
+// Test 19: 多线程并发写入 — 各线程写不同表，验证无数据串扰
+// ============================================================
+void test_concurrent_writers() {
+    printf("[TEST] MySQL: concurrent writers (different tables)...\n");
+
+    const int N_THREADS = 6;
+    const int ROWS_PER_THREAD = 50;
+
+    std::atomic<int> success{0};
+    std::atomic<int> errors{0};
+
+    // 每个线程写自己的表
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N_THREADS; ++i) {
+        threads.emplace_back([&, i]() {
+            std::string table = "mt_write_" + std::to_string(i);
+
+            MysqlDriver driver;
+            if (driver.Connect(GetMysqlParams()) != 0) { errors++; return; }
+            auto session = driver.CreateSession();
+            if (!session) { errors++; driver.Disconnect(); return; }
+
+            DropTableIfExists(session.get(), table.c_str());
+
+            auto* writable = dynamic_cast<IBatchWritable*>(session.get());
+            if (!writable) { errors++; driver.Disconnect(); return; }
+
+            // 构建 RecordBatch
+            auto schema = arrow::schema({arrow::field("id", arrow::int32()),
+                                         arrow::field("val", arrow::utf8())});
+            arrow::Int32Builder id_b;
+            arrow::StringBuilder val_b;
+            for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+                (void)id_b.Append(r);
+                (void)val_b.Append("thread_" + std::to_string(i) + "_row_" + std::to_string(r));
+            }
+            std::shared_ptr<arrow::Array> id_arr, val_arr;
+            (void)id_b.Finish(&id_arr);
+            (void)val_b.Finish(&val_arr);
+            auto batch = arrow::RecordBatch::Make(schema, ROWS_PER_THREAD, {id_arr, val_arr});
+
+            // 序列化并写入
+            auto buf = SerializeBatch(batch);
+            IBatchWriter* writer = nullptr;
+            if (writable->CreateWriter(table.c_str(), &writer) != 0) {
+                errors++; driver.Disconnect(); return;
+            }
+            if (writer->Write(buf->data(), static_cast<size_t>(buf->size())) != 0) {
+                writer->Close(nullptr); writer->Release();
+                errors++; driver.Disconnect(); return;
+            }
+            BatchWriteStats stats;
+            writer->Close(&stats);
+            writer->Release();
+
+            success++;
+            driver.Disconnect();
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    printf("  threads=%d success=%d errors=%d\n",
+           N_THREADS, success.load(), errors.load());
+    assert(errors == 0);
+    assert(success == N_THREADS);
+
+    // 验证每张表行数正确
+    MysqlDriver verifier;
+    verifier.Connect(GetMysqlParams());
+    auto vsession = verifier.CreateSession();
+    for (int i = 0; i < N_THREADS; ++i) {
+        std::string table = "mt_write_" + std::to_string(i);
+        auto* readable = dynamic_cast<IBatchReadable*>(vsession.get());
+        assert(readable);
+        IBatchReader* reader = nullptr;
+        std::string query = "SELECT COUNT(*) FROM " + table;
+        assert(readable->CreateReader(query.c_str(), &reader) == 0);
+        const uint8_t* buf; size_t len;
+        int count = 0;
+        if (reader->Next(&buf, &len) == 0) {
+            auto batch = DeserializeFirstBatch(buf, len);
+            if (batch && batch->num_rows() > 0) {
+                count = static_cast<int>(
+                    std::static_pointer_cast<arrow::Int64Array>(batch->column(0))->Value(0));
+            }
+        }
+        reader->Close(); reader->Release();
+        assert(count == ROWS_PER_THREAD);
+        printf("  table mt_write_%d: %d rows OK\n", i, count);
+        DropTableIfExists(vsession.get(), table.c_str());
+    }
+    verifier.Disconnect();
+
+    g_passed++;
+    printf("[PASS] MySQL: concurrent writers\n");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -986,6 +1185,8 @@ int main() {
     test_error_syntax();
     test_data_types();
     test_quote_identifier();
+    test_concurrent_sessions();
+    test_concurrent_writers();
 
     printf("\n=== All MySQL tests passed (%d/%d) ===\n",
            g_passed, g_passed + g_skipped);

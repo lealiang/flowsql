@@ -1,8 +1,11 @@
 #include <cassert>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arrow/api.h>
@@ -576,6 +579,166 @@ void test_e2e_error_paths() {
 }
 
 // ============================================================
+// Test 15: 多线程并发读 — 多线程同时对同一 IDatabaseChannel 调用 CreateReader
+// ============================================================
+void test_concurrent_readers() {
+    printf("[TEST] Concurrent readers on same IDatabaseChannel...\n");
+
+    PluginLoader* loader = PluginLoader::Single();
+    auto* factory = static_cast<IDatabaseFactory*>(loader->First(IID_DATABASE_FACTORY));
+    auto* db_ch = dynamic_cast<IDatabaseChannel*>(factory->Get("mysql", "testdb"));
+    assert(db_ch != nullptr);
+
+    // 准备数据表（使用全局后缀保证唯一）
+    std::string table = "mt_readers_" + g_suffix;
+    {
+        auto schema = arrow::schema({arrow::field("id", arrow::int32()),
+                                     arrow::field("name", arrow::utf8())});
+        arrow::Int32Builder id_b;
+        arrow::StringBuilder name_b;
+        for (int i = 0; i < 20; ++i) {
+            (void)id_b.Append(i);
+            (void)name_b.Append("row_" + std::to_string(i));
+        }
+        std::shared_ptr<arrow::Array> id_arr, name_arr;
+        (void)id_b.Finish(&id_arr);
+        (void)name_b.Finish(&name_arr);
+        auto batch = arrow::RecordBatch::Make(schema, 20, {id_arr, name_arr});
+        WriteTestData(db_ch, table.c_str(), batch);
+    }
+
+    const int N_THREADS = 8;
+    std::atomic<int> success{0};
+    std::atomic<int> errors{0};
+    std::mutex result_mutex;
+    std::vector<int> row_counts;
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N_THREADS; ++i) {
+        threads.emplace_back([&, table]() {
+            std::string query = "SELECT * FROM " + table;
+            IBatchReader* reader = nullptr;
+            // 多线程同时调用同一 db_ch 的 CreateReader
+            int rc = db_ch->CreateReader(query.c_str(), &reader);
+            if (rc != 0 || !reader) { errors++; return; }
+
+            int rows = 0;
+            const uint8_t* buf; size_t len;
+            while (reader->Next(&buf, &len) == 0) {
+                auto b = arrow::Buffer::Wrap(buf, static_cast<int64_t>(len));
+                auto inp = std::make_shared<arrow::io::BufferReader>(b);
+                auto s = arrow::ipc::RecordBatchStreamReader::Open(inp).ValueOrDie();
+                std::shared_ptr<arrow::RecordBatch> batch;
+                if (s->ReadNext(&batch).ok() && batch)
+                    rows += static_cast<int>(batch->num_rows());
+            }
+            reader->Close();
+            reader->Release();
+
+            {
+                std::lock_guard<std::mutex> lk(result_mutex);
+                row_counts.push_back(rows);
+            }
+            success++;
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    printf("  threads=%d success=%d errors=%d\n",
+           N_THREADS, success.load(), errors.load());
+    assert(errors == 0);
+    assert(success == N_THREADS);
+    for (int c : row_counts) {
+        assert(c == 20);
+    }
+    printf("  all %d threads read 20 rows each, no crash\n", N_THREADS);
+
+    printf("[PASS] Concurrent readers on same IDatabaseChannel\n");
+}
+
+// ============================================================
+// Test 16: 多线程并发写 — 多线程同时对同一 IDatabaseChannel 调用 CreateWriter（不同表）
+// ============================================================
+void test_concurrent_writers() {
+    printf("[TEST] Concurrent writers on same IDatabaseChannel...\n");
+
+    PluginLoader* loader = PluginLoader::Single();
+    auto* factory = static_cast<IDatabaseFactory*>(loader->First(IID_DATABASE_FACTORY));
+    auto* db_ch = dynamic_cast<IDatabaseChannel*>(factory->Get("mysql", "testdb"));
+    assert(db_ch != nullptr);
+
+    const int N_THREADS = 6;
+    const int ROWS_PER_THREAD = 30;
+    std::atomic<int> success{0};
+    std::atomic<int> errors{0};
+
+    std::vector<std::string> tables;
+    for (int i = 0; i < N_THREADS; ++i)
+        tables.push_back("mt_writers_" + g_suffix + "_" + std::to_string(i));
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N_THREADS; ++i) {
+        threads.emplace_back([&, i]() {
+            auto schema = arrow::schema({arrow::field("id", arrow::int32()),
+                                         arrow::field("val", arrow::utf8())});
+            arrow::Int32Builder id_b;
+            arrow::StringBuilder val_b;
+            for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+                (void)id_b.Append(r);
+                (void)val_b.Append("t" + std::to_string(i) + "_r" + std::to_string(r));
+            }
+            std::shared_ptr<arrow::Array> id_arr, val_arr;
+            (void)id_b.Finish(&id_arr);
+            (void)val_b.Finish(&val_arr);
+            auto batch = arrow::RecordBatch::Make(schema, ROWS_PER_THREAD, {id_arr, val_arr});
+            auto buf = SerializeBatch(batch);
+
+            IBatchWriter* writer = nullptr;
+            // 多线程同时调用同一 db_ch 的 CreateWriter（各写不同表）
+            int rc = db_ch->CreateWriter(tables[i].c_str(), &writer);
+            if (rc != 0 || !writer) { errors++; return; }
+
+            rc = writer->Write(buf->data(), static_cast<size_t>(buf->size()));
+            BatchWriteStats stats;
+            writer->Close(&stats);
+            writer->Release();
+
+            if (rc != 0) { errors++; return; }
+            success++;
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    printf("  threads=%d success=%d errors=%d\n",
+           N_THREADS, success.load(), errors.load());
+    assert(errors == 0);
+    assert(success == N_THREADS);
+
+    // 验证每张表行数正确
+    for (int i = 0; i < N_THREADS; ++i) {
+        std::string query = "SELECT COUNT(*) FROM " + tables[i];
+        IBatchReader* reader = nullptr;
+        assert(db_ch->CreateReader(query.c_str(), &reader) == 0);
+        const uint8_t* buf; size_t len;
+        int count = 0;
+        if (reader->Next(&buf, &len) == 0) {
+            auto b = arrow::Buffer::Wrap(buf, static_cast<int64_t>(len));
+            auto inp = std::make_shared<arrow::io::BufferReader>(b);
+            auto s = arrow::ipc::RecordBatchStreamReader::Open(inp).ValueOrDie();
+            std::shared_ptr<arrow::RecordBatch> batch;
+            if (s->ReadNext(&batch).ok() && batch && batch->num_rows() > 0)
+                count = static_cast<int>(
+                    std::static_pointer_cast<arrow::Int64Array>(batch->column(0))->Value(0));
+        }
+        reader->Close(); reader->Release();
+        assert(count == ROWS_PER_THREAD);
+        printf("  table %s: %d rows OK\n", tables[i].c_str(), count);
+    }
+
+    printf("[PASS] Concurrent writers on same IDatabaseChannel\n");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
@@ -638,6 +801,8 @@ int main(int argc, char* argv[]) {
     test_e2e_db_to_db();
     test_e2e_df_filter_to_db();
     test_e2e_error_paths();
+    test_concurrent_readers();
+    test_concurrent_writers();
 
     loader->StopAll();
     loader->Unload();
