@@ -4,6 +4,12 @@
 #include <common/log.h>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <unistd.h>
+
+#include <yaml-cpp/yaml.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 #include "drivers/sqlite_driver.h"
 #include "drivers/mysql_driver.h"
@@ -36,19 +42,27 @@ static std::string ExpandEnvVars(const std::string& input) {
 
 // 解析 "type=sqlite;name=mydb;path=/data/test.db" 格式的配置
 // 支持多个配置用 | 分隔：config1|config2|config3
+// 也支持 "config_file=/path/to/flowsql.yml" 格式
 int DatabasePlugin::Option(const char* arg) {
     LOG_INFO("DatabasePlugin::Option called with: %s", arg ? arg : "(null)");
 
     if (!arg || !*arg) return 0;
 
-    // 按 | 分隔多个配置
-    std::string all_configs(arg);
-    size_t start = 0;
-    while (start < all_configs.size()) {
-        size_t end = all_configs.find('|', start);
-        if (end == std::string::npos) end = all_configs.size();
+    // config_file 参数：指定 YAML 持久化文件路径
+    std::string s(arg);
+    if (s.find("config_file=") == 0) {
+        config_file_ = s.substr(12);
+        LOG_INFO("DatabasePlugin::Option: config_file=%s", config_file_.c_str());
+        return 0;
+    }
 
-        std::string single_config = all_configs.substr(start, end - start);
+    // 按 | 分隔多个配置
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t end = s.find('|', start);
+        if (end == std::string::npos) end = s.size();
+
+        std::string single_config = s.substr(start, end - start);
         if (!single_config.empty()) {
             if (ParseSingleConfig(single_config.c_str()) != 0) {
                 return -1;
@@ -101,6 +115,11 @@ int DatabasePlugin::Load(IQuerier* querier) {
     querier_ = querier;
     LOG_INFO("DatabasePlugin::Load: %zu database(s) configured", configs_.size());
     return 0;
+}
+
+int DatabasePlugin::Start() {
+    if (config_file_.empty()) return 0;
+    return LoadFromYaml();
 }
 
 int DatabasePlugin::Unload() {
@@ -190,14 +209,27 @@ IDatabaseChannel* DatabasePlugin::Get(const char* type, const char* name) {
     return channel.get();
 }
 
-void DatabasePlugin::List(std::function<void(const char* type, const char* name)> callback) {
+void DatabasePlugin::List(std::function<void(const char* type, const char* name,
+                                              const char* config_json)> callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [key, params] : configs_) {
         auto type_it = params.find("type");
         auto name_it = params.find("name");
-        if (type_it != params.end() && name_it != params.end()) {
-            callback(type_it->second.c_str(), name_it->second.c_str());
+        if (type_it == params.end() || name_it == params.end()) continue;
+
+        // 构造脱敏的 config JSON
+        std::string json = "{";
+        bool first = true;
+        for (const auto& [k, v] : params) {
+            if (!first) json += ",";
+            json += "\"" + k + "\":\"";
+            json += (k == "password") ? "****" : v;
+            json += "\"";
+            first = false;
         }
+        json += "}";
+
+        callback(type_it->second.c_str(), name_it->second.c_str(), json.c_str());
     }
 }
 
@@ -235,6 +267,362 @@ std::unique_ptr<IDbDriver> DatabasePlugin::CreateDriver(const std::string& type)
     // TODO: 未来添加 postgresql 等驱动
     last_error_ = "unsupported database type: " + type;
     return nullptr;
+}
+
+// ==================== Epic 6：动态管理方法 ====================
+
+int DatabasePlugin::AddChannel(const char* config_str) {
+    if (!config_str || !*config_str) {
+        last_error_ = "config_str is empty";
+        return -1;
+    }
+    if (config_file_.empty()) {
+        last_error_ = "config_file not set, cannot persist channel";
+        return -1;
+    }
+
+    // 解析 config_str，提取 type 和 name
+    std::unordered_map<std::string, std::string> params;
+    std::string opts(config_str);
+    size_t pos = 0;
+    while (pos < opts.size()) {
+        size_t eq = opts.find('=', pos);
+        if (eq == std::string::npos) break;
+        size_t end = opts.find(';', eq);
+        if (end == std::string::npos) end = opts.size();
+        params[opts.substr(pos, eq - pos)] = opts.substr(eq + 1, end - eq - 1);
+        pos = (end < opts.size()) ? end + 1 : opts.size();
+    }
+
+    auto type_it = params.find("type");
+    auto name_it = params.find("name");
+    if (type_it == params.end() || name_it == params.end()) {
+        last_error_ = "missing 'type' or 'name' in config_str";
+        return -1;
+    }
+
+    std::string key = type_it->second + "." + name_it->second;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (configs_.count(key)) {
+            last_error_ = "channel already exists: " + key + " (use UpdateChannel to modify)";
+            return -1;
+        }
+        configs_[key] = params;
+    }
+
+    if (SaveToYaml() != 0) {
+        // 回滚内存
+        std::lock_guard<std::mutex> lock(mutex_);
+        configs_.erase(key);
+        return -1;
+    }
+
+    LOG_INFO("DatabasePlugin::AddChannel: added %s", key.c_str());
+    return 0;
+}
+
+int DatabasePlugin::RemoveChannel(const char* type, const char* name) {
+    if (!type || !name) {
+        last_error_ = "type and name must not be null";
+        return -1;
+    }
+    if (config_file_.empty()) {
+        last_error_ = "config_file not set, cannot persist";
+        return -1;
+    }
+
+    std::string key = std::string(type) + "." + name;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!configs_.count(key)) {
+            last_error_ = "channel not found: " + key;
+            return -1;
+        }
+        // 关闭连接
+        auto ch_it = channels_.find(key);
+        if (ch_it != channels_.end()) {
+            ch_it->second->Close();
+            channels_.erase(ch_it);
+        }
+        driver_storage_.erase(key);
+        configs_.erase(key);
+    }
+
+    if (SaveToYaml() != 0) return -1;
+
+    LOG_INFO("DatabasePlugin::RemoveChannel: removed %s", key.c_str());
+    return 0;
+}
+
+int DatabasePlugin::UpdateChannel(const char* config_str) {
+    if (!config_str || !*config_str) {
+        last_error_ = "config_str is empty";
+        return -1;
+    }
+    if (config_file_.empty()) {
+        last_error_ = "config_file not set, cannot persist";
+        return -1;
+    }
+
+    std::unordered_map<std::string, std::string> params;
+    std::string opts(config_str);
+    size_t pos = 0;
+    while (pos < opts.size()) {
+        size_t eq = opts.find('=', pos);
+        if (eq == std::string::npos) break;
+        size_t end = opts.find(';', eq);
+        if (end == std::string::npos) end = opts.size();
+        params[opts.substr(pos, eq - pos)] = opts.substr(eq + 1, end - eq - 1);
+        pos = (end < opts.size()) ? end + 1 : opts.size();
+    }
+
+    auto type_it = params.find("type");
+    auto name_it = params.find("name");
+    if (type_it == params.end() || name_it == params.end()) {
+        last_error_ = "missing 'type' or 'name' in config_str";
+        return -1;
+    }
+
+    std::string key = type_it->second + "." + name_it->second;
+    std::unordered_map<std::string, std::string> old_params;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!configs_.count(key)) {
+            last_error_ = "channel not found: " + key + " (use AddChannel to create)";
+            return -1;
+        }
+        old_params = configs_[key];
+        // 关闭旧连接，下次 Get() 时重建
+        auto ch_it = channels_.find(key);
+        if (ch_it != channels_.end()) {
+            ch_it->second->Close();
+            channels_.erase(ch_it);
+        }
+        driver_storage_.erase(key);
+        configs_[key] = params;
+    }
+
+    if (SaveToYaml() != 0) {
+        // 回滚
+        std::lock_guard<std::mutex> lock(mutex_);
+        configs_[key] = old_params;
+        return -1;
+    }
+
+    LOG_INFO("DatabasePlugin::UpdateChannel: updated %s", key.c_str());
+    return 0;
+}
+
+// ==================== YAML 持久化 ====================
+
+int DatabasePlugin::LoadFromYaml() {
+    if (access(config_file_.c_str(), F_OK) != 0) {
+        LOG_INFO("DatabasePlugin::LoadFromYaml: %s not found, skipping", config_file_.c_str());
+        return 0;  // 首次启动，文件不存在
+    }
+
+    try {
+        YAML::Node root = YAML::LoadFile(config_file_);
+        auto db_channels = root["channels"]["database_channels"];
+        if (!db_channels || !db_channels.IsSequence()) return 0;
+
+        for (const auto& ch : db_channels) {
+            std::string config_str;
+            for (const auto& kv : ch) {
+                std::string key = kv.first.as<std::string>();
+                std::string val = kv.second.as<std::string>();
+                if (key == "password") val = DecryptPassword(val);
+                if (!config_str.empty()) config_str += ";";
+                config_str += key + "=" + val;
+            }
+            if (!config_str.empty()) {
+                ParseSingleConfig(config_str.c_str());
+            }
+        }
+        LOG_INFO("DatabasePlugin::LoadFromYaml: loaded %zu channel(s) from %s",
+                 configs_.size(), config_file_.c_str());
+    } catch (const std::exception& e) {
+        LOG_ERROR("DatabasePlugin::LoadFromYaml: failed to parse %s: %s",
+                  config_file_.c_str(), e.what());
+        return -1;
+    }
+    return 0;
+}
+
+int DatabasePlugin::SaveToYaml() {
+    // save_mutex_ 保证并发 Add/Remove/Update 时文件写入串行化
+    // 锁内重新快照 configs_，确保写入的是最新状态而非调用时的过期快照
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
+
+    YAML::Node root;
+    // 先读取现有文件，保留其他顶层节点（operators 等）
+    if (access(config_file_.c_str(), F_OK) == 0) {
+        try {
+            root = YAML::LoadFile(config_file_);
+        } catch (...) {
+            // 文件损坏，从空节点开始
+        }
+    }
+
+    // 重建 channels.database_channels 节点（在 save_mutex_ 内重新快照）
+    YAML::Node db_channels(YAML::NodeType::Sequence);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [key, params] : configs_) {
+            YAML::Node ch;
+            auto type_it = params.find("type");
+            auto name_it = params.find("name");
+            if (type_it != params.end()) ch["type"] = type_it->second;
+            if (name_it != params.end()) ch["name"] = name_it->second;
+            for (const auto& [k, v] : params) {
+                if (k == "type" || k == "name") continue;
+                ch[k] = (k == "password") ? EncryptPassword(v) : v;
+            }
+            db_channels.push_back(ch);
+        }
+    }
+    root["channels"]["database_channels"] = db_channels;
+
+    std::ofstream fout(config_file_);
+    if (!fout.is_open()) {
+        last_error_ = "failed to open " + config_file_ + " for writing";
+        return -1;
+    }
+    fout << root;
+    return fout.good() ? 0 : -1;
+}
+
+// ==================== 密码 AES-256-GCM 加解密 ====================
+// 密钥从环境变量 FLOWSQL_SECRET_KEY 读取（32字节），未设置时使用内置开发密钥
+// 存储格式：ENC:<base64(iv[12] + tag[16] + ciphertext)>
+
+static const unsigned char* GetSecretKey() {
+    static unsigned char key[32];
+    static bool initialized = false;
+    if (!initialized) {
+        const char* env_key = getenv("FLOWSQL_SECRET_KEY");
+        if (env_key && strlen(env_key) >= 32) {
+            memcpy(key, env_key, 32);
+        } else {
+            // 开发用固定密钥（生产环境必须设置 FLOWSQL_SECRET_KEY）
+            const char* dev_key = "flowsql_dev_key_0000000000000000";
+            memcpy(key, dev_key, 32);
+        }
+        initialized = true;
+    }
+    return key;
+}
+
+// base64 编码
+static std::string Base64Encode(const unsigned char* data, size_t len) {
+    static const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result;
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned int b = (data[i] << 16);
+        if (i + 1 < len) b |= (data[i+1] << 8);
+        if (i + 2 < len) b |= data[i+2];
+        result += table[(b >> 18) & 0x3f];
+        result += table[(b >> 12) & 0x3f];
+        result += (i + 1 < len) ? table[(b >> 6) & 0x3f] : '=';
+        result += (i + 2 < len) ? table[b & 0x3f] : '=';
+    }
+    return result;
+}
+
+// base64 解码
+static std::vector<unsigned char> Base64Decode(const std::string& s) {
+    static const int table[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+    };
+    std::vector<unsigned char> result;
+    int val = 0, bits = -8;
+    for (unsigned char c : s) {
+        if (c == '=') break;
+        int d = table[c];
+        if (d == -1) continue;
+        val = (val << 6) + d;
+        bits += 6;
+        if (bits >= 0) {
+            result.push_back((val >> bits) & 0xff);
+            bits -= 8;
+        }
+    }
+    return result;
+}
+
+std::string DatabasePlugin::EncryptPassword(const std::string& plain) {
+    if (plain.empty()) return plain;
+
+    const unsigned char* key = GetSecretKey();
+    unsigned char iv[12];
+    RAND_bytes(iv, sizeof(iv));
+
+    std::vector<unsigned char> ciphertext(plain.size() + 16);
+    unsigned char tag[16];
+    int out_len = 0, final_len = 0;
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
+    EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv);
+    EVP_EncryptUpdate(ctx, ciphertext.data(), &out_len,
+                      reinterpret_cast<const unsigned char*>(plain.data()), plain.size());
+    EVP_EncryptFinal_ex(ctx, ciphertext.data() + out_len, &final_len);
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag);
+    EVP_CIPHER_CTX_free(ctx);
+
+    // 拼接 iv + tag + ciphertext
+    std::vector<unsigned char> blob;
+    blob.insert(blob.end(), iv, iv + 12);
+    blob.insert(blob.end(), tag, tag + 16);
+    blob.insert(blob.end(), ciphertext.begin(), ciphertext.begin() + out_len + final_len);
+
+    return "ENC:" + Base64Encode(blob.data(), blob.size());
+}
+
+std::string DatabasePlugin::DecryptPassword(const std::string& cipher) {
+    if (cipher.substr(0, 4) != "ENC:") return cipher;  // 未加密，直接返回
+
+    auto blob = Base64Decode(cipher.substr(4));
+    if (blob.size() < 12 + 16) return "";  // 数据损坏
+
+    const unsigned char* key = GetSecretKey();
+    unsigned char iv[12];
+    unsigned char tag[16];
+    memcpy(iv, blob.data(), 12);
+    memcpy(tag, blob.data() + 12, 16);
+    size_t ct_len = blob.size() - 28;
+
+    std::vector<unsigned char> plain(ct_len);
+    int out_len = 0, final_len = 0;
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
+    EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, iv);
+    EVP_DecryptUpdate(ctx, plain.data(), &out_len, blob.data() + 28, ct_len);
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
+    int ok = EVP_DecryptFinal_ex(ctx, plain.data() + out_len, &final_len);
+    EVP_CIPHER_CTX_free(ctx);
+
+    if (ok <= 0) return "";  // 认证失败（密钥错误或数据篡改）
+    return std::string(reinterpret_cast<char*>(plain.data()), out_len + final_len);
 }
 
 }  // namespace database

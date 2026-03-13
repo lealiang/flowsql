@@ -577,6 +577,28 @@
 
 ---
 
+### Story 6.7: 数据库错误信息透传架构改造
+**状态**: 📋 待规划
+**优先级**: P1
+**背景**: `IBatchReadable::CreateReader` 接口无 `error*` 参数，底层驱动（MySQL/ClickHouse）的错误信息（如 `No database selected`、`Table doesn't exist`）在 `RelationDbSessionBase::CreateReader` 中被捕获后丢弃，调用方只能看到 `CreateReader failed`，调试成本高。
+**验收标准**:
+- `IBatchReadable::CreateReader` 接口增加错误输出参数（或等效机制），将底层错误字符串透传给调用方
+- MySQL / ClickHouse / SQLite 三个驱动均实现透传
+- Scheduler 层将具体错误信息返回给 HTTP 调用方（而非通用失败消息）
+- 新增测试：构造"数据库不存在"、"表不存在"场景，断言错误消息包含具体原因
+
+<details>
+<summary>设计要点（点击展开）</summary>
+
+- 方案 A：`CreateReader(error_out*)` 参数扩展——接口侵入性最小，但需修改所有实现
+- 方案 B：`thread_local` 错误槽（类似 `errno`）——零接口变更，但跨线程语义需谨慎
+- 方案 C：返回 `Result<Reader, Error>` 包装类型——最符合现代 C++ 风格，但改动面最大
+- 推荐在规划时评估三种方案的影响范围后决策
+
+</details>
+
+---
+
 ## Epic 7: Pipeline 增强与异步任务
 **优先级**: P1 | **状态**: 📋 待规划
 **价值**: 增强 Pipeline 编排能力，支持异步任务执行，提升系统易用性

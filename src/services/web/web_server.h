@@ -49,6 +49,12 @@ class WebServer {
     void HandleCreateTask(const httplib::Request& req, httplib::Response& res);
     void HandleGetTaskResult(const httplib::Request& req, httplib::Response& res);
 
+    // 数据库通道动态管理（Epic 6）
+    void HandleListDbChannels(const httplib::Request& req, httplib::Response& res);
+    void HandleAddDbChannel(const httplib::Request& req, httplib::Response& res);
+    void HandleRemoveDbChannel(const httplib::Request& req, httplib::Response& res);
+    void HandleUpdateDbChannel(const httplib::Request& req, httplib::Response& res);
+
     // 通知 Python Worker 重新加载算子
     void NotifyWorkerReload();
 

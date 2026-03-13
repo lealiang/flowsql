@@ -32,13 +32,29 @@ interface IDatabaseFactory {
     }
 
     // 列出所有已配置的数据库连接
-    virtual void List(std::function<void(const char* type, const char* name)> callback) = 0;
+    // config_json：该通道的配置 JSON（密码字段脱敏为 "****"），可为 nullptr
+    virtual void List(std::function<void(const char* type, const char* name,
+                                         const char* config_json)> callback) = 0;
 
     // 释放指定通道（关闭连接，从池中移除）
     virtual int Release(const char* type, const char* name) = 0;
 
     // 获取最近一次操作的错误信息（线程安全：thread_local 存储）
     virtual const char* LastError() = 0;
+
+    // ==================== 动态管理方法（Epic 6）====================
+
+    // 运行时新增通道（写 YAML，加入 configs_，懒加载连接）
+    // config_str 格式：type=xxx;name=xxx;host=xxx;...
+    // type+name 已存在时返回 -1（请用 UpdateChannel）
+    virtual int AddChannel(const char* config_str) { return -1; }
+
+    // 运行时删除通道（关闭连接，从 YAML 删除，从 configs_ 移除）
+    virtual int RemoveChannel(const char* type, const char* name) { return -1; }
+
+    // 运行时更新通道配置（原子覆盖写 YAML，不走 Remove+Add）
+    // config_str 格式同 AddChannel，type+name 不存在时返回 -1
+    virtual int UpdateChannel(const char* config_str) { return -1; }
 };
 
 }  // namespace flowsql

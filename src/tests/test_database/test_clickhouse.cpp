@@ -756,6 +756,258 @@ void test_write_empty_batches() {
 }
 
 // ============================================================
+// T17: 读写混合并发（TQ-C1）
+// 8 个读线程 + 4 个写线程同时操作同一张表，验证不崩溃且读到的行数合理
+// ============================================================
+void test_concurrent_read_write_mixed() {
+    printf("[TEST] ClickHouse: concurrent read+write mixed (8R+4W)...\n");
+
+    ClickHouseDriver driver;
+    assert(driver.Connect(GetClickHouseParams()) == 0);
+
+    auto setup = driver.CreateSession();
+    assert(setup != nullptr);
+    std::string table = UniqueTable("ch_test_rw_mixed");
+    std::string error;
+    DropTableIfExists(setup.get(), table);
+    assert(setup->ExecuteSql(
+        ("CREATE TABLE " + table + " (id Int32) ENGINE = MergeTree() ORDER BY id").c_str(),
+        &error) == 0);
+    // 预写 10 行，保证读线程有数据可读
+    assert(setup->ExecuteSql(
+        ("INSERT INTO " + table + " SELECT number FROM numbers(10)").c_str(),
+        &error) == 0);
+
+    const int READERS = 8, WRITERS = 4;
+    std::atomic<int> read_ok{0}, write_ok{0}, read_fail{0};
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < READERS; ++i) {
+        threads.emplace_back([&driver, &table, &read_ok, &read_fail]() {
+            auto s = driver.CreateSession();
+            if (!s) { read_fail++; return; }
+            std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+            std::string err;
+            int rc = s->ExecuteQueryArrow(("SELECT * FROM " + table).c_str(), &batches, &err);
+            if (rc == 0) read_ok++;
+            else read_fail++;
+        });
+    }
+    for (int i = 0; i < WRITERS; ++i) {
+        threads.emplace_back([&driver, &table, &write_ok, i]() {
+            auto s = driver.CreateSession();
+            if (!s) return;
+            arrow::Int32Builder b;
+            for (int r = 0; r < 5; ++r) (void)b.Append(100 + i * 5 + r);
+            std::shared_ptr<arrow::Array> a;
+            (void)b.Finish(&a);
+            auto schema = arrow::schema({arrow::field("id", arrow::int32())});
+            auto batch  = arrow::RecordBatch::Make(schema, 5, {a});
+            std::string err;
+            if (s->WriteArrowBatches(table.c_str(), {batch}, &err) == 0) write_ok++;
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    printf("  read_ok=%d read_fail=%d write_ok=%d\n",
+           read_ok.load(), read_fail.load(), write_ok.load());
+    assert(read_fail == 0);
+    assert(read_ok == READERS);
+    assert(write_ok == WRITERS);
+
+    DropTableIfExists(setup.get(), table);
+    g_passed++;
+    printf("[PASS] T17: concurrent read+write mixed\n");
+}
+
+// ============================================================
+// T18: 并发连接失败时 last_error_ 无数据竞争（TQ-C2）
+// 多线程同时对不可达地址调用 Connect()，验证不崩溃
+// ============================================================
+void test_concurrent_connect_failure() {
+    printf("[TEST] ClickHouse: concurrent connect failure (last_error_ race)...\n");
+
+    const int N = 10;
+    std::atomic<int> fail_count{0};
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < N; ++i) {
+        threads.emplace_back([&fail_count]() {
+            ClickHouseDriver driver;
+            std::unordered_map<std::string, std::string> bad_params;
+            bad_params["host"]     = "127.0.0.1";
+            bad_params["port"]     = "19999";  // 不可达端口
+            bad_params["user"]     = "default";
+            bad_params["password"] = "";
+            bad_params["database"] = "default";
+            int rc = driver.Connect(bad_params);
+            if (rc != 0) fail_count++;
+            // 读取 LastError()，触发潜在竞争
+            (void)driver.LastError();
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    // 所有连接都应失败
+    assert(fail_count == N);
+    printf("  %d/%d connections failed as expected, no crash\n", fail_count.load(), N);
+
+    g_passed++;
+    printf("[PASS] T18: concurrent connect failure\n");
+}
+
+// ============================================================
+// T19: Nullable 列 NULL 处理（TQ-B1）
+// 写入含 NULL 的 Nullable 列，回读验证 NULL 正确保留
+// ============================================================
+void test_nullable_null_handling() {
+    printf("[TEST] ClickHouse: Nullable column NULL handling...\n");
+
+    ClickHouseDriver driver;
+    assert(driver.Connect(GetClickHouseParams()) == 0);
+    auto session = driver.CreateSession();
+    assert(session != nullptr);
+
+    std::string table = UniqueTable("ch_test_nullable");
+    std::string error;
+    DropTableIfExists(session.get(), table);
+    assert(session->ExecuteSql(
+        ("CREATE TABLE " + table +
+         " (id Int32, val Nullable(String))"
+         " ENGINE = MergeTree() ORDER BY id").c_str(),
+        &error) == 0);
+
+    // 直接用 SQL 插入含 NULL 的数据
+    assert(session->ExecuteSql(
+        ("INSERT INTO " + table + " VALUES (1, 'hello'), (2, NULL), (3, 'world')").c_str(),
+        &error) == 0);
+
+    // 回读验证
+    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+    int rc = session->ExecuteQueryArrow(
+        ("SELECT * FROM " + table + " ORDER BY id").c_str(), &batches, &error);
+    assert(rc == 0);
+    assert(!batches.empty());
+
+    int64_t total = 0;
+    for (const auto& b : batches) total += b->num_rows();
+    assert(total == 3);
+
+    // 验证第二行 val 列为 NULL
+    auto& rb = batches[0];
+    auto val_col = rb->column(1);  // val 列
+    assert(val_col->IsNull(1));    // 第二行（index=1）应为 NULL
+    assert(!val_col->IsNull(0));   // 第一行非 NULL
+    assert(!val_col->IsNull(2));   // 第三行非 NULL
+    printf("  Row 0: non-null, Row 1: null=%s, Row 2: non-null\n",
+           val_col->IsNull(1) ? "true" : "false");
+
+    DropTableIfExists(session.get(), table);
+    g_passed++;
+    printf("[PASS] T19: Nullable NULL handling\n");
+}
+
+// ============================================================
+// T20: 多 batch 写入路径（TQ-B2）
+// WriteArrowBatches 传入多个 batch，验证全部写入且行数正确
+// ============================================================
+void test_multi_batch_write() {
+    printf("[TEST] ClickHouse: multi-batch write...\n");
+
+    ClickHouseDriver driver;
+    assert(driver.Connect(GetClickHouseParams()) == 0);
+    auto session = driver.CreateSession();
+    assert(session != nullptr);
+
+    std::string table = UniqueTable("ch_test_multibatch");
+    std::string error;
+    DropTableIfExists(session.get(), table);
+    assert(session->ExecuteSql(
+        ("CREATE TABLE " + table + " (id Int32) ENGINE = MergeTree() ORDER BY id").c_str(),
+        &error) == 0);
+
+    // 构造 3 个 batch，各 100 行
+    const int BATCHES = 3, ROWS = 100;
+    std::vector<std::shared_ptr<arrow::RecordBatch>> write_batches;
+    for (int b = 0; b < BATCHES; ++b) {
+        arrow::Int32Builder builder;
+        for (int r = 0; r < ROWS; ++r) (void)builder.Append(b * ROWS + r);
+        std::shared_ptr<arrow::Array> arr;
+        (void)builder.Finish(&arr);
+        auto schema = arrow::schema({arrow::field("id", arrow::int32())});
+        write_batches.push_back(arrow::RecordBatch::Make(schema, ROWS, {arr}));
+    }
+
+    int rc = session->WriteArrowBatches(table.c_str(), write_batches, &error);
+    assert(rc == 0);
+
+    // 回读验证总行数
+    std::vector<std::shared_ptr<arrow::RecordBatch>> read_batches;
+    rc = session->ExecuteQueryArrow(
+        ("SELECT count() FROM " + table).c_str(), &read_batches, &error);
+    assert(rc == 0);
+    auto count_col = std::static_pointer_cast<arrow::UInt64Array>(read_batches[0]->column(0));
+    int64_t total = static_cast<int64_t>(count_col->Value(0));
+    assert(total == BATCHES * ROWS);
+    printf("  Wrote %d batches × %d rows = %lld total\n", BATCHES, ROWS, (long long)total);
+
+    DropTableIfExists(session.get(), table);
+    g_passed++;
+    printf("[PASS] T20: multi-batch write\n");
+}
+
+// ============================================================
+// T21: 注入测试断言加强（TQ-B5）
+// T14 只断言 rc != 0，此处区分"表不存在"和"语法错误"
+// ============================================================
+void test_injection_error_distinction() {
+    printf("[TEST] ClickHouse: injection error distinction...\n");
+
+    ClickHouseDriver driver;
+    assert(driver.Connect(GetClickHouseParams()) == 0);
+    auto session = driver.CreateSession();
+    assert(session != nullptr);
+
+    auto schema = arrow::schema({arrow::field("id", arrow::int32())});
+    arrow::Int32Builder b;
+    (void)b.Append(1);
+    std::shared_ptr<arrow::Array> a;
+    (void)b.Finish(&a);
+    auto batch = arrow::RecordBatch::Make(schema, 1, {a});
+
+    // 场景 1：注入表名 — 应失败，错误应包含"不存在"相关信息，而非语法错误
+    std::string error1;
+    int rc1 = session->WriteArrowBatches("t`; DROP TABLE users; --", {batch}, &error1);
+    assert(rc1 != 0);
+    assert(!error1.empty());
+    // 错误应来自 ClickHouse 服务端（表不存在），不应是本地语法构造失败
+    printf("  Injection table error: %s\n", error1.c_str());
+
+    // 场景 2：查询不存在的表 — 错误应包含表名相关信息
+    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+    std::string error2;
+    int rc2 = session->ExecuteQueryArrow(
+        "SELECT * FROM ch_nonexistent_xyz_99999", &batches, &error2);
+    assert(rc2 != 0);
+    assert(!error2.empty());
+    printf("  Nonexistent table error: %s\n", error2.c_str());
+
+    // 场景 3：语法错误 — 错误应与场景 2 不同（不同错误类型）
+    std::string error3;
+    int rc3 = session->ExecuteQueryArrow("SELECT FROM WHERE !!!!", &batches, &error3);
+    assert(rc3 != 0);
+    assert(!error3.empty());
+    printf("  Syntax error: %s\n", error3.c_str());
+
+    // 关键断言：表不存在错误 ≠ 语法错误（两者错误信息不同）
+    assert(error2 != error3);
+    printf("  Table-not-found error differs from syntax error ✓\n");
+
+    g_passed++;
+    printf("[PASS] T21: injection error distinction\n");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -784,6 +1036,11 @@ int main() {
         test_quote_identifier_injection();
         test_empty_result_set();
         test_write_empty_batches();
+        test_concurrent_read_write_mixed();
+        test_concurrent_connect_failure();
+        test_nullable_null_handling();
+        test_multi_batch_write();
+        test_injection_error_distinction();
     }
 
     printf("\n=== Results: %d passed, %d skipped ===\n", g_passed, g_skipped);

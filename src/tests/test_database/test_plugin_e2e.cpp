@@ -803,6 +803,38 @@ void test_p3_add_channel_then_query(IDatabaseFactory* factory, const std::string
     printf("[PASS] P3\n");
 }
 
+// P4: 多线程同时 AddChannel 不同通道（TQ-C7）
+void test_p4_concurrent_add_channels(IDatabaseFactory* factory) {
+    printf("[TEST] P4: concurrent AddChannel for different channels...\n");
+
+    const int N = 8;
+    std::atomic<int> add_ok{0};
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < N; ++i) {
+        threads.emplace_back([factory, &add_ok, i]() {
+            std::string cfg = "type=sqlite;name=p4db" + std::to_string(i) + ";path=:memory:";
+            if (factory->AddChannel(cfg.c_str()) == 0) add_ok++;
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    assert(add_ok == N);
+    printf("  %d channels added concurrently\n", add_ok.load());
+
+    // 验证每个通道都可用
+    for (int i = 0; i < N; ++i) {
+        std::string name = "p4db" + std::to_string(i);
+        auto* ch = factory->Get("sqlite", name.c_str());
+        assert(ch != nullptr);
+        assert(ch->IsConnected());
+        factory->RemoveChannel("sqlite", name.c_str());
+    }
+    printf("  All channels reachable after concurrent add\n");
+
+    printf("[PASS] P4\n");
+}
+
 // ============================================================
 // ClickHouse E2E 辅助
 // ============================================================
@@ -1030,6 +1062,33 @@ void test_clickhouse_create_reader_unsupported(IDatabaseFactory* factory) {
 }
 
 // ============================================================
+// E5b: MySQL 通道调用列式接口 CreateArrowWriter/Reader 应返回 -1（TQ-F2）
+// E5 只验证 ClickHouse 不支持行式，此处补充 MySQL 不支持列式的反向验证
+// ============================================================
+void test_mysql_arrow_interface_unsupported(IDatabaseFactory* factory) {
+    printf("[TEST] E5b: MySQL CreateArrowWriter/Reader (columnar interface) should return -1...\n");
+
+    auto* ch = dynamic_cast<IDatabaseChannel*>(factory->Get("mysql", "testdb"));
+    assert(ch != nullptr);
+
+    // MySQL Session 不实现 IArrowWritable，CreateArrowWriter 应返回 -1
+    IArrowWriter* writer = nullptr;
+    int rc_w = ch->CreateArrowWriter("any_table", &writer);
+    assert(rc_w != 0);
+    assert(writer == nullptr);
+    printf("  CreateArrowWriter on MySQL channel returned %d (expected -1)\n", rc_w);
+
+    // MySQL Session 不实现 IArrowReadable，CreateArrowReader 应返回 -1
+    IArrowReader* reader = nullptr;
+    int rc_r = ch->CreateArrowReader("SELECT 1", &reader);
+    assert(rc_r != 0);
+    assert(reader == nullptr);
+    printf("  CreateArrowReader on MySQL channel returned %d (expected -1)\n", rc_r);
+
+    printf("[PASS] E5b: MySQL Arrow interface unsupported\n");
+}
+
+// ============================================================
 // E6: 8 线程并发 CreateArrowReader
 // ============================================================
 void test_concurrent_arrow_readers(IDatabaseFactory* factory) {
@@ -1216,6 +1275,7 @@ int main(int argc, char* argv[]) {
     test_e2e_error_paths();
     test_concurrent_readers();
     test_concurrent_writers();
+    test_mysql_arrow_interface_unsupported(factory);
 
     // 清理 MySQL 测试产生的所有临时表
     {
@@ -1256,9 +1316,10 @@ int main(int argc, char* argv[]) {
         test_p1_add_channel_then_get(p_factory, p_yml);
         test_p2_remove_channel_then_get(p_factory, p_yml);
         test_p3_add_channel_then_query(p_factory, p_yml);
+        test_p4_concurrent_add_channels(p_factory);
 
         remove(p_yml.c_str());
-        printf("\n=== P1-P3 passed ===\n");
+        printf("\n=== P1-P4 passed ===\n");
     }
 
     loader->StopAll();

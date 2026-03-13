@@ -40,12 +40,16 @@ int LoadConfig(const std::string& path, GatewayConfig* config) {
                         // 旧格式：字符串 "libflowsql_database.so:type=sqlite;name=testdb;path=:memory:"
                         svc.plugins.push_back(p.as<std::string>());
                     } else if (p.IsMap()) {
-                        // 新格式：对象 {name: "libflowsql_database.so", databases: [...]}
+                        // 新格式：对象 {name: "libflowsql_database.so", option: "...", databases: [...]}
                         if (!p["name"]) {
                             printf("LoadConfig: plugin map missing 'name' field\n");
                             continue;
                         }
                         std::string plugin_name = p["name"].as<std::string>();
+                        // 插件级 option 内嵌到插件名（"libxxx.so:key=val" 格式，LoadPlugin 会解析）
+                        if (p["option"]) {
+                            plugin_name += ":" + p["option"].as<std::string>();
+                        }
                         svc.plugins.push_back(plugin_name);
 
                         // 解析 databases 数组

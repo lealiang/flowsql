@@ -164,6 +164,20 @@ void WebServer::RegisterRoutes() {
             HandleGetTaskResult(req, res);
         });
 
+    // 数据库通道动态管理（Epic 6）
+    server_.Get("/api/db-channels", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleListDbChannels(req, res);
+    });
+    server_.Post("/api/db-channels/add", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleAddDbChannel(req, res);
+    });
+    server_.Post("/api/db-channels/remove", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleRemoveDbChannel(req, res);
+    });
+    server_.Post("/api/db-channels/update", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleUpdateDbChannel(req, res);
+    });
+
     // 静态文件（Vue.js 构建产物）— 基于可执行文件位置定位
     std::string static_dir = "static";
     char exe_path[1024];
@@ -516,6 +530,73 @@ void WebServer::HandleGetTaskResult(const httplib::Request& req, httplib::Respon
                                rapidjson::kArrayType);
     w.EndObject();
     res.set_content(buf.GetString(), "application/json");
+}
+
+// ==================== 数据库通道动态管理（Epic 6）====================
+
+// 辅助：转发请求到 Scheduler 的 /db-channels/* 端点
+static httplib::Result ForwardToScheduler(const std::string& host, int port,
+                                           const std::string& path,
+                                           const std::string& method,
+                                           const std::string& body = "") {
+    httplib::Client client(host, port);
+    client.set_connection_timeout(3);
+    client.set_read_timeout(10);
+    if (method == "GET") {
+        return client.Get(path);
+    }
+    return client.Post(path, body, "application/json");
+}
+
+void WebServer::HandleListDbChannels(const httplib::Request&, httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto result = ForwardToScheduler(scheduler_host_, scheduler_port_,
+                                     "/scheduler/db-channels", "GET");
+    if (result && result->status == 200) {
+        res.set_content(result->body, "application/json");
+    } else {
+        res.status = 502;
+        res.body = R"({"error":"failed to reach scheduler"})";
+    }
+}
+
+void WebServer::HandleAddDbChannel(const httplib::Request& req, httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto result = ForwardToScheduler(scheduler_host_, scheduler_port_,
+                                     "/scheduler/db-channels/add", "POST", req.body);
+    if (result) {
+        res.status = result->status;
+        res.body = result->body;
+    } else {
+        res.status = 502;
+        res.body = R"({"error":"failed to reach scheduler"})";
+    }
+}
+
+void WebServer::HandleRemoveDbChannel(const httplib::Request& req, httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto result = ForwardToScheduler(scheduler_host_, scheduler_port_,
+                                     "/scheduler/db-channels/remove", "POST", req.body);
+    if (result) {
+        res.status = result->status;
+        res.body = result->body;
+    } else {
+        res.status = 502;
+        res.body = R"({"error":"failed to reach scheduler"})";
+    }
+}
+
+void WebServer::HandleUpdateDbChannel(const httplib::Request& req, httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto result = ForwardToScheduler(scheduler_host_, scheduler_port_,
+                                     "/scheduler/db-channels/update", "POST", req.body);
+    if (result) {
+        res.status = result->status;
+        res.body = result->body;
+    } else {
+        res.status = 502;
+        res.body = R"({"error":"failed to reach scheduler"})";
+    }
 }
 
 }  // namespace web

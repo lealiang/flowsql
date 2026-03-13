@@ -36,5 +36,11 @@ export default {
   // 任务
   getTasks: () => api.get('/tasks'),
   createTask: (sql) => api.post('/tasks', { sql }),
-  getTaskResult: (id) => api.get(`/tasks/${id}/result`)
+  getTaskResult: (id) => api.get(`/tasks/${id}/result`),
+
+  // 数据库通道动态管理（Epic 6）
+  listDbChannels: () => api.get('/db-channels'),
+  addDbChannel: (config) => api.post('/db-channels/add', { config }),
+  removeDbChannel: (type, name) => api.post('/db-channels/remove', { type, name }),
+  updateDbChannel: (config) => api.post('/db-channels/update', { config })
 }

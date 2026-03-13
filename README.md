@@ -79,12 +79,49 @@ LD_LIBRARY_PATH=. ./flowsql --config ../../config/gateway.yaml
 
 启动后 Gateway(18800) 自动 spawn Web(8081) + Scheduler(18803) + PyWorker(18900)，浏览器访问 `http://127.0.0.1:8081` 进入管理界面。
 
+### 前端构建
+
+前端修改后需重新构建，构建产物由 C++ Web 服务器静态托管：
+
+```bash
+cd src/frontend
+
+# 首次安装依赖
+npm install
+
+# 构建生产包（输出到 src/frontend/dist/）
+npm run build
+```
+
+构建完成后重启 flowsql 进程，新页面即生效。
+
 ### 测试
 
 ```bash
 cd build/output
+
+# 框架 / 桥接基础测试
 ./test_framework
 ./test_bridge
+
+# SQLite 驱动测试（无需外部依赖）
+./test_sqlite
+
+# 连接池单元测试
+./test_connection_pool
+
+# DatabasePlugin 持久化管理测试（需设置密钥环境变量）
+export FLOWSQL_SECRET_KEY="your-32-byte-secret-key-here!!"
+./test_database_manager
+
+# MySQL 驱动测试（需运行中的 MySQL）
+./test_mysql
+
+# ClickHouse 驱动测试（需运行中的 ClickHouse）
+./test_clickhouse
+
+# 插件层端到端测试（通过 PluginLoader 动态加载 .so）
+./test_database
 ```
 
 ## 架构
@@ -196,10 +233,8 @@ flowSQL/
 
 ## 文档
 
+- [愿景](docs/vision.md) — 项目愿景
 - [架构演进方案](docs/framework.md) — 整体架构设计与实现状态
-- [Stage 1 设计文档](docs/stage1.md) — C++ 框架核心
-- [Stage 2 设计文档](docs/stage2.md) — C++ ↔ Python 桥接 + Web 管理系统
-- [Stage 3 设计文档](docs/stage3.md) — 数据库闭环 + 流式架构 + 平台增强
 
 ## 许可证
 

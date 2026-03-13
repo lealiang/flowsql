@@ -45,6 +45,12 @@ class SchedulerPlugin : public IPlugin {
     void HandleGetOperators(const httplib::Request& req, httplib::Response& res);
     void HandleRefreshOperators(httplib::Response& res);
 
+    // 数据库通道动态管理端点（Epic 6）
+    void HandleListDbChannels(const httplib::Request& req, httplib::Response& res);
+    void HandleAddDbChannel(const httplib::Request& req, httplib::Response& res);
+    void HandleRemoveDbChannel(const httplib::Request& req, httplib::Response& res);
+    void HandleUpdateDbChannel(const httplib::Request& req, httplib::Response& res);
+
     // 通道管理（原来在 PluginRegistry 里，现在内部维护）
     IChannel* FindChannel(const std::string& name);
     void RegisterChannel(const std::string& key, std::shared_ptr<IChannel> ch);

@@ -1,261 +1,192 @@
-# FlowSQL 架构演进方案
-
-## Context
-
-最近连续 3 个 bug 暴露了桥接层的架构复杂度问题（双通道、冗余消息类型、多层继承）。借此机会重新审视整体架构，形成统一的多服务通信方案。经过模块 A/B/C 的实施，架构已从 5 服务精简为 4 服务——Scheduler 吸收了 OperatorService 的职责，统一管理算子注册、执行和 Pipeline 调度。
-
-Gateway/Manager 服务架构已实现并验证通过。
+# FlowSQL 架构文档
 
 ## 核心设计原则
 
-1. **统一框架（Python Worker 例外）**：C++ 服务都是同一个框架程序加载不同 .so 运行起来的，彼此对等；Python Worker 是独立的 FastAPI 进程
-2. **IPlugin 机制保留**：这是架构的显著特点，所有功能模块继续以 .so 插件形式加载
-3. **控制面 HTTP 统一**：服务间控制面通信全部走 HTTP + URI 路由
-4. **数据面独立通道**：高吞吐数据传输走共享内存 / Arrow IPC，不经过 HTTP
-5. **Scheduler 统一屏蔽算子实现差异**：C++ 算子在 Scheduler 进程内直接函数调用，Python 算子通过 PythonOperatorBridge 代理执行，上层 Pipeline 无需感知差异
+1. **统一框架**：所有 C++ 服务都是同一个 `flowsql` 可执行文件加载不同 `.so` 插件运行，彼此对等；Python Worker 是独立的 FastAPI 进程
+2. **IPlugin 机制**：所有功能模块以 `.so` 插件形式加载，通过 `IPlugin` 接口统一生命周期管理
+3. **控制面 HTTP**：服务间控制面通信全部走 HTTP + URI 路由，Gateway 负责转发
+4. **数据面独立**：高吞吐数据传输走共享内存 / Arrow IPC，不经过 HTTP
+5. **Interface 思维**：Plugin 通过纯虚接口（`IID_*`）向进程内其他 Plugin 暴露能力，调用方通过 `IQuerier::Traverse` 按 IID 查找，不直接依赖具体实现类
 
-## 整体架构
+---
 
-### 服务拓扑：星型，Gateway + 管理服务合一
+## 服务拓扑
 
 ```
                     ┌─────────────────────┐
-                    │   Gateway/Manager   │
-                    │ (框架 + gateway.so)  │
-                    │  - 路由表（URI→地址） │
-                    │  - 服务注册/发现     │
-                    │  - 生命周期管理       │
+                    │       Gateway       │
+                    │  (flowsql_gateway)  │
+                    │  路由表 / 心跳监控   │
+                    │  子进程生命周期管理  │
                     └──────┬──────────────┘
-                           │
+                           │ posix_spawn + HTTP 转发
               ┌────────────┼────────────┐
               │            │            │
-     ┌────────▼───┐  ┌────▼─────┐  ┌───▼──────────┐
-     │ Web 服务   │  │Scheduler │  │ Python Worker │
-     │(框架+web.so)│  │(框架+    │  │  (FastAPI)    │
-     │ 前端+API   │  │sched.so+ │  │  算子执行     │
-     └────────────┘  │算子插件) │  └───────────────┘
-                     │SQL+执行  │
-                     └──────────┘
+     ┌────────▼───┐  ┌─────▼──────┐  ┌─▼─────────────┐
+     │    Web     │  │ Scheduler  │  │ Python Worker  │
+     │ web.so     │  │ sched.so   │  │   (FastAPI)    │
+     │ 前端 + API │  │ bridge.so  │  │  Python 算子   │
+     └────────────┘  │ database.so│  └────────────────┘
+                     │ example.so │
+                     └────────────┘
 ```
 
-### 通信方式
+**端口分配**：Gateway 18800 · Web 8081 · Scheduler 18803 · PyWorker 18900
 
-- **服务注册**：各服务启动后向 Gateway 注册两级 URI 前缀路由，声明自己的能力
-- **服务发现**：通过 `GET /gateway/routes` 查询路由表，确认目标服务就绪
-- **控制面**：服务间通过 Gateway 转发 HTTP 请求，Gateway 剥离匹配前缀后转发
-- **数据面**：Python 算子执行时，数据通过共享内存 / Arrow IPC 传输（C++ 算子直接操作 IChannel，不经过共享内存）
+---
 
-### Gateway/Manager 职责
+## Gateway
 
-- 维护 URI 路由表，提供注册、注销、查询接口
-- 转发 HTTP 请求到目标服务（剥离匹配前缀后转发）
-- 管理各服务进程的启动、停止、故障检测与重启
-- 启动时通过命令行参数将 Gateway 地址传递给各服务
-- 本身也是框架 + gateway.so，与其他服务对等
+### 职责
+- 维护 URI 前缀路由表（prefix → service address）
+- HTTP 请求转发：剥离匹配前缀后转发给目标服务
+- `posix_spawn` 管理子服务进程，心跳超时自动重启
+- 自身也是框架 + `gateway.so`，与其他服务对等
 
-### URI 路由机制
+### 路由机制
+路由匹配优先取前 2 级精确匹配，未命中回退到前 1 级。
 
-**路由注册**
+```
+请求 /scheduler/db-channels/add
+  → 匹配 /scheduler → 转发 /db-channels/add 给 Scheduler
+```
 
-- 各服务启动后主动向 Gateway 注册路由，声明自己提供的能力
-- 路由条目为两级 URI 前缀 → 服务地址的映射（级数可配置，默认 2 级）
-- 同一个服务注册多条路由，每条对应一个具体能力
-- 不允许重复注册：如果某个前缀已被其他服务注册，注册请求被拒绝
-
-**路由匹配与转发**
-
-- Gateway 收到请求后，取 URI 的前 N 级（默认 2 级）做精确匹配
-- 匹配成功后，剥离前缀，将剩余路径转发给目标服务
-- 示例：请求 `/pyworker/work/explore/chisquare`
-  - 取前两级 `/pyworker/work` 查路由表 → 匹配到 Python Worker 地址
-  - 剥离前缀，转发 `/explore/chisquare` 给 Python Worker
-
-**路由查询**
-
-- Gateway 提供 `GET /gateway/routes` 接口，返回当前所有已注册的路由条目
-- 服务间存在依赖时，通过查询路由表确认目标服务就绪后再发起调用
-- 示例：Scheduler 启动后轮询 `GET /gateway/routes`，确认 `/pyworker/operators` 已注册，再发 `GET /pyworker/operators`
-
-**Gateway 自身接口（不经过路由匹配）**
+### Gateway 内置接口
 
 | 接口 | 方法 | 说明 |
 |------|------|------|
-| `/gateway/register` | POST | 注册路由，body: `{ "prefix": "/pyworker/work", "address": "127.0.0.1:18900", "service": "pyworker" }` |
-| `/gateway/unregister` | POST | 注销路由，body: `{ "prefix": "/pyworker/work" }` |
+| `/gateway/register` | POST | 注册路由 `{ "prefix": "/scheduler", "address": "127.0.0.1:18803", "service": "scheduler" }` |
+| `/gateway/unregister` | POST | 注销路由 |
 | `/gateway/routes` | GET | 查询所有已注册路由 |
-| `/gateway/heartbeat` | POST | 服务心跳上报，body: `{ "service": "scheduler" }` |
+| `/gateway/heartbeat` | POST | 心跳上报 `{ "service": "scheduler" }` |
 
-**路由注册示例（实际实现）**
+### 心跳机制
+各服务定期 `POST /gateway/heartbeat`，超过 `heartbeat_timeout_count × heartbeat_interval_s`（默认 15s）未收到，Gateway 自动重启该服务。
 
-Web 服务启动后注册：
-```
-POST /gateway/register  { "prefix": "/web", "address": "127.0.0.1:18802", "service": "web" }
-```
+---
 
-Scheduler 启动后注册：
-```
-POST /gateway/register  { "prefix": "/scheduler", "address": "127.0.0.1:18803", "service": "scheduler" }
-```
+## Scheduler
 
-Python Worker 启动后注册（每个端点一条路由）：
-```
-POST /gateway/register  { "prefix": "/pyworker/health",    "address": "127.0.0.1:18900", "service": "pyworker" }
-POST /gateway/register  { "prefix": "/pyworker/operators",  "address": "127.0.0.1:18900", "service": "pyworker" }
-POST /gateway/register  { "prefix": "/pyworker/work",       "address": "127.0.0.1:18900", "service": "pyworker" }
-POST /gateway/register  { "prefix": "/pyworker/reload",     "address": "127.0.0.1:18900", "service": "pyworker" }
-POST /gateway/register  { "prefix": "/pyworker/configure",  "address": "127.0.0.1:18900", "service": "pyworker" }
-```
+Scheduler 进程加载多个插件，通过 `IQuerier` 进行进程内插件间通信：
 
-路由匹配优先取前 2 级精确匹配，未命中则回退到前 1 级。例如 `/web/api/health` 先查 `/web/api`（未注册），再查 `/web`（命中），剥离前缀后转发 `/api/health` 给 Web 服务。
+| 插件 | IID | 职责 |
+|------|-----|------|
+| `libflowsql_scheduler.so` | `IID_SCHEDULER` | SQL 解析、Pipeline 执行、任务管理、通道管理端点 |
+| `libflowsql_bridge.so` | `IID_BRIDGE` | C++ ↔ Python 算子桥接，发现并注册 Python 算子 |
+| `libflowsql_database.so` | `IID_DATABASE_FACTORY` | 数据库通道管理（MySQL / SQLite / ClickHouse） |
+| `libflowsql_example.so` | `IID_OPERATOR` | 示例 C++ 算子 |
 
-### 各服务角色
-
-| 服务 | 实现方式 | 注册路由 | 职责 |
-|------|---------|---------|------|
-| Gateway/Manager | 框架 + gateway.so | `/gateway/*`（内置） | 路由转发、服务注册/发现、心跳监控、生命周期管理 |
-| Web 服务 | 框架 + web.so | `/web/...` | 前端交互、用户 API，收到 SQL 转发给 Scheduler |
-| Scheduler | 框架 + scheduler.so + 算子插件 | `/scheduler/...` | SQL 解析、Pipeline 构建与执行、通道管理、算子注册/管理/执行、任务管理 |
-| Python Worker | FastAPI 进程 | `/pyworker/...` | Python 算子的实际执行环境 |
-
-### Pipeline 定义
-
-Pipeline 是 Scheduler 进程内的运行器，负责串联算子执行：
-
-- **接口**：`Pipeline::Run(operator, source_channel, sink_channel)`
-- **C++ 算子**：Pipeline 直接调用 `operator->Work(source, sink)`，纯进程内函数调用，无跨进程开销
-- **Python 算子**：Pipeline 调用的是 `PythonOperatorBridge->Work(source, sink)`，Bridge 内部完成：
-  1. 从 source IChannel 读取数据
-  2. Arrow IPC memcpy 写入共享内存 `flowsql_<uuid>_in`
-  3. HTTP 控制指令发给 Python Worker：`POST /pyworker/work/<category>/<name> { "input": "路径" }`
-  4. Python Worker 零拷贝读取 → 执行 → 写入 `flowsql_<uuid>_out`
-  5. Bridge 从共享内存读取结果，写入 sink IChannel
-
-Pipeline 不感知算子是 C++ 还是 Python，统一面向 IOperator 接口。差异由 PythonOperatorBridge 在内部屏蔽。
-
-### 数据面设计
-
-**设计目标**
-
-C++ 算子直接操作 IChannel，零开销。Python 算子执行时通过共享内存实现跨进程零拷贝，HTTP 只传控制信息。
-
-**两条数据路径**
+### SQL 执行流程
 
 ```
-C++ 算子路径（进程内，零开销）：
-  Pipeline → operator->Work(source_channel, sink_channel)
-  算子直接从 source IChannel 读取数据，处理后写入 sink IChannel
-  无共享内存、无 memcpy、无 HTTP
-
-Python 算子路径（跨进程，共享内存零拷贝）：
-  Pipeline → PythonOperatorBridge->Work(source, sink)
-    → 从 source IChannel 读取 Arrow RecordBatch
-    → Arrow IPC memcpy 写入 /dev/shm/flowsql_<uuid>_in
-    → HTTP 控制指令（仅传文件路径，几十字节）
-    → Python Worker: pa.memory_map() → Arrow Table（零拷贝）
-    → Arrow Table → Polars DataFrame（零拷贝）
-    → 算子 operator.work(df_in) → df_out
-    → Polars DataFrame → Arrow Table（零拷贝）
-    → Arrow IPC memcpy 写入 flowsql_<uuid>_out
-    → HTTP 响应返回输出路径
-    → Bridge: memory_map 读取 → Arrow RecordBatch → 写入 sink IChannel
+用户 SQL → Web → Gateway → Scheduler
+  → SqlParser 解析（source / operator / dest）
+  → FindChannel(source)  ← 支持三段式 type.name.table
+  → ExecuteTransfer / ExecuteWithOperator
+  → 返回结果 JSON
 ```
 
-**关于 Arrow IPC "序列化"**
+**三段式寻址**：`mysql.prod.test_users`
+- `mysql` → 通道类型（type）
+- `prod` → 通道逻辑名（name，由用户添加通道时指定）
+- `test_users` → 表名（BuildQuery 替换 FROM 子句）
 
-Arrow IPC 写入共享内存的过程本质是 memcpy（内存布局直接拷贝），不涉及编解码。读取端通过 memory_map 直接映射，实现零拷贝访问。这与 JSON/Protobuf 等需要编解码的序列化有本质区别。
+### 数据库通道管理
 
-**传输策略：共享内存 + 磁盘回退**
+`IDatabaseFactory`（由 `database.so` 实现）提供：
+- `Get(type, name)` → 懒加载连接，断线自动重连
+- `AddChannel / RemoveChannel / UpdateChannel` → 运行时动态管理
+- `List` → 枚举通道，密码字段脱敏
 
-PythonOperatorBridge 根据数据量自动选择传输方式：
-- 数据量 ≤ 阈值（可配置，默认如 256MB）：写入 `/dev/shm/flowsql_<uuid>_in`（共享内存，零拷贝）
-- 数据量 > 阈值：写入 `/tmp/flowsql_<uuid>_in`（磁盘 Arrow IPC 文件）
+通道配置持久化到 `config/flowsql.yml`，密码 AES-256-GCM 加密（`ENC:` 前缀）。Scheduler 重启后自动从 YAML 恢复通道。
 
-Python Worker 侧不需要区分——都是通过 `pa.memory_map()` 打开路径读取，逻辑一致。区别只在于底层是内存映射还是磁盘 IO。
+支持的数据库类型：
 
-控制指令中传的是完整路径，Python Worker 按路径读取即可，无需感知传输策略。
+| 类型 | 驱动 | 连接方式 |
+|------|------|---------|
+| `sqlite` | SqliteDriver | 文件 / `:memory:` |
+| `mysql` | MysqlDriver | 连接池（libmysqlclient） |
+| `clickhouse` | ClickHouseDriver | HTTP 无状态（httplib，无连接池） |
 
-**控制指令格式**
+### Scheduler 端点
 
-请求：
+| 端点 | 说明 |
+|------|------|
+| `POST /scheduler/execute` | 执行 SQL |
+| `GET /scheduler/db-channels` | 列出数据库通道 |
+| `POST /scheduler/db-channels/add` | 添加通道 |
+| `POST /scheduler/db-channels/remove` | 删除通道 |
+| `POST /scheduler/db-channels/update` | 更新通道 |
+| `POST /scheduler/refresh-operators` | 刷新算子列表 |
+
+---
+
+## Python 算子
+
+### 注册流程
+
 ```
-POST /pyworker/work/explore/chisquare
-{ "input": "/dev/shm/flowsql_<uuid>_in" }
+Gateway spawn Scheduler 和 PyWorker
+  ↓
+BridgePlugin::Load（Scheduler 进程内）：
+  轮询 GET /gateway/routes（最多 10 次，间隔 1s）
+  → 找到 /pyworker 前缀对应的地址，记录 PyWorker host:port
+  ↓
+BridgePlugin::Start：
+  直连 PyWorker，GET /operators（最多 30 次重试，间隔 1s）
+  → 解析算子元数据列表
+  → 为每个算子创建 PythonOperatorBridge，存入内部 registered_operators_
+  （不注册到 PluginLoader，不走 IQuerier）
 ```
 
-成功响应：
+Scheduler 查找算子时两条路径：
+1. `IQuerier::Traverse(IID_OPERATOR)` → C++ 算子（进程内）
+2. `IBridge::FindOperator(catelog, name)` → Python 算子（Bridge 内部查找）
+
+**Reload**：用户在 Web 触发 → `POST /scheduler/refresh-operators` → Bridge 重新调用 `DiscoverOperators()` → 更新 `registered_operators_`。
+
+### 执行数据面
+
+**C++ 算子**：进程内直接函数调用，零开销。
+
+**Python 算子**：跨进程，共享内存传数据，HTTP 只传控制指令。
+
 ```
-200 OK
-{ "output": "/dev/shm/flowsql_<uuid>_out" }
+Pipeline → operator->Work(source, sink)
+  （实际调用 PythonOperatorProxy → PythonOperatorBridge）
+  1. 从 source IChannel 读取 Arrow RecordBatch
+  2. Arrow IPC 序列化写入 /dev/shm/flowsql_<uuid>_in
+     （数据量超阈值时回退到 /tmp，Python 侧无感知）
+  3. POST /pyworker/work/<catelog>/<name>  { "input": "/dev/shm/..." }
+  4. Python Worker:
+       pa.memory_map(path) → Arrow Table（零拷贝）
+       → Polars DataFrame → operator.work(df) → df_out
+       → Arrow IPC 写入 /dev/shm/flowsql_<uuid>_out
+       → 返回 200 { "output": "/dev/shm/..." }
+  5. Bridge: memory_map 读取 _out → Arrow RecordBatch → 写入 sink IChannel
+  6. SharedMemoryGuard 析构，自动 unlink _in / _out
 ```
 
-失败响应（算子执行出错，不生成 `_out` 文件）：
-```
-500
-{ "detail": "错误信息" }
-```
+Pipeline 统一面向 `IOperator` 接口，不感知算子是 C++ 还是 Python。
 
-**共享内存生命周期**
+**共享内存生命周期**：所有权归 Bridge（创建 _in，读取 _out，清理两者）；PyWorker 无状态，只读写不清理。Scheduler 启动时扫描 `/dev/shm/flowsql_*` 清理上次残留。
 
-- 所有权归 PythonOperatorBridge（调用方）：它创建 `_in`，读取 `_out`，最终清理两者
-- Python Worker 无状态：只读 `_in`，写 `_out`，不负责清理
-- 命名规则：`/dev/shm/flowsql_<uuid>_in`、`/dev/shm/flowsql_<uuid>_out`，uuid 保证并发安全
+---
 
-**泄露防护（RAII + 启动清理）**
+## 部署配置
 
-- RAII：PythonOperatorBridge 内部用 SharedMemoryGuard 对象持有文件路径，析构时自动 unlink，覆盖正常流程和 C++ 异常退出（栈展开）
-- 启动清理：Scheduler 启动时扫描 `/dev/shm/flowsql_*`，清理上次残留文件，兜底 SIGKILL 等无法析构的场景
-
-### Python 算子完整流程
-
-**启动阶段：**
-1. Gateway/Manager 启动，监听端口
-2. Gateway/Manager spawn 各服务进程（包括 Python Worker），带上 Gateway 地址参数
-3. 各服务启动后向 Gateway 注册路由
-4. Scheduler 轮询 `GET /gateway/routes`，确认 `/pyworker/operators` 已注册
-5. Scheduler 通过 Gateway 调用 `GET /pyworker/operators` 获取 Python 算子列表
-6. Scheduler 将 Python 算子注册到 PluginRegistry（类型标记为 Python，关联 PythonOperatorBridge）
-
-**执行阶段：**
-1. 用户通过 Web 服务提交 SQL
-2. Web 服务转发给 Scheduler：`POST /scheduler/execute { "sql": "..." }`
-3. Scheduler 解析 SQL，构建 Pipeline（确定算子、source 通道、sink 通道）
-4. Pipeline 调用 `operator->Work(source, sink)`：
-   - 若为 C++ 算子：直接函数调用，算子操作 IChannel 完成计算
-   - 若为 Python 算子（实际调用 PythonOperatorBridge）：
-     a. Bridge 从 source IChannel 读取 Arrow RecordBatch
-     b. Arrow IPC memcpy 写入共享内存 `flowsql_<uuid>_in`
-     c. Bridge 发送 HTTP 控制指令：`POST /pyworker/work/<category>/<name> { "input": "路径" }`
-     d. Python Worker 从共享内存零拷贝读取 → Polars DataFrame → 算子处理 → 结果写入 `flowsql_<uuid>_out`
-     e. Bridge 从共享内存读取结果 → 写入 sink IChannel
-     f. SharedMemoryGuard 析构，清理共享内存文件
-5. Scheduler 返回执行结果给 Web 服务
-
-**Reload 阶段：**
-1. 用户在 Web 界面触发 reload
-2. Web 服务 → Gateway → Scheduler：`POST /scheduler/reload`
-3. Scheduler → Gateway → Python Worker：`POST /pyworker/reload`
-4. Python Worker 重新扫描算子目录，返回变更列表
-5. Scheduler 更新 PluginRegistry 中的 Python 算子元数据（新增/移除）
-
-### 多服务部署与编排
-
-**框架程序定位**
-
-框架程序是通用的插件容器，本身不包含业务逻辑。启动时通过配置决定加载哪些 .so，一个服务进程可以加载多个插件（且是常见情况，单个插件应聚焦、尽可能小）。
-
-**部署配置（config/gateway.yaml）**
+**`config/gateway.yaml`**（启动入口）：
 
 ```yaml
 gateway:
   host: 127.0.0.1
   port: 18800
-  heartbeat_interval_s: 5     # 心跳周期
-  heartbeat_timeout_count: 3  # 超时判定次数
+  heartbeat_interval_s: 5
+  heartbeat_timeout_count: 3
 
 services:
   - name: web
-    plugins:
-      - libflowsql_web.so
+    plugins: [libflowsql_web.so]
     port: 8081
 
   - name: scheduler
@@ -263,6 +194,8 @@ services:
       - libflowsql_scheduler.so
       - libflowsql_bridge.so
       - libflowsql_example.so
+      - name: libflowsql_database.so
+        option: "config_file=config/flowsql.yml"
     port: 18803
 
   - name: pyworker
@@ -271,126 +204,73 @@ services:
     port: 18900
 ```
 
-**启动编排（已实现）**
+**`config/flowsql.yml`**（运行时通道配置，由 Web 动态管理）：
 
+```yaml
+channels:
+  database_channels:
+    - type: mysql
+      name: prod
+      host: 127.0.0.1
+      port: 3306
+      user: flowsql_user
+      password: "ENC:..."
+      database: flowsql_db
 ```
-flowsql --config config/gateway.yaml
-```
 
-1. Gateway 进程启动，加载 `libflowsql_gateway.so`，Option 传入配置文件路径
-2. GatewayPlugin 解析 YAML 配置，启动 HTTP 服务线程（监听 18800）
-3. ServiceManager 按配置 `posix_spawn` 各子服务：
-   - C++ 服务：`flowsql --role web --gateway 127.0.0.1:18800 --port 8081 --plugins libflowsql_web.so`
-   - Python 服务：`python3 -m flowsql.worker --port 18900`（环境变量 `FLOWSQL_GATEWAY_ADDR=127.0.0.1:18800`）
-4. 各子服务启动后：
-   - C++ 服务：加载插件 → ServiceClient 向 Gateway 注册路由 → 启动心跳线程
-   - Python Worker：发现算子 → 向 Gateway 注册路由 → 启动心跳线程
-5. Scheduler（BridgePlugin）通过 `GET /gateway/routes` 发现 PyWorker 地址，再 `GET /pyworker/operators` 获取算子列表并注册到 PluginRegistry
-6. Gateway 启动心跳检测线程，定期检查各服务心跳超时
+---
 
-**心跳机制**
-
-- 各服务定期向 Gateway 发送心跳：`POST /gateway/heartbeat { "service": "scheduler" }`
-- Gateway 维护每个服务的最后心跳时间
-- 超过 N 个心跳周期未收到（默认 3 × 5s = 15s），判定服务异常
-- 服务异常时 Gateway/Manager 自动重启该服务进程
-- 心跳周期和超时次数均可通过配置文件设置
-
-**停止编排（已实现）**
-
-Gateway 收到 SIGINT/SIGTERM 后：
-1. ServiceManager 逐个停止子服务：SIGTERM → 等待 2s → SIGKILL
-2. 各子服务收到 SIGTERM 后：停止心跳 → StopModules（逆序停止插件）→ UnloadAll → 退出
-3. Gateway HTTP 服务停止
-4. Gateway 进程退出
-
-## 当前实现状态
-
-### 已实现
-
-- **Gateway/Manager 服务**：`libflowsql_gateway.so`（配置解析、路由表、服务管理、HTTP 转发、心跳检测）
-- **通用入口**：`flowsql` 可执行文件（Gateway 模式 `--config` / Service 模式 `--role`）
-- **Web 插件化**：`libflowsql_web.so`（WebServer 包装为 IPlugin）
-- **ServiceClient**：子服务向 Gateway 注册路由 + 心跳
-- **BridgePlugin 适配**：移除 PythonProcessManager/ControlServer，改为通过 Gateway 路由发现 PyWorker
-- **Python Worker 适配**：移除 ControlClient，改为向 Gateway 注册路由 + 心跳
-- **PluginRegistry 增强**：LoadPlugin 支持 option 参数传递
-- **IModule 合并到 IPlugin**：IPlugin 新增默认空 Start()/Stop()，删除 IModule/IID_MODULE，简化插件接口
-
-### 项目目录结构
+## 项目结构
 
 ```
 flowSQL/
-├── thirdparts/                 # 第三方依赖构建配置（非源码）
-│   ├── arrow/
-│   ├── gflags/
-│   ├── glog/
-│   ├── httplib/
-│   ├── hyperscan/
-│   ├── rapidjson/
-│   ├── sqlite/
-│   └── yaml-cpp/
-│
-├── build/                      # cmake 构建产物（可随时 rm -rf）
-│   └── output/                 # 编译产物（.so、可执行文件）
-│
-├── .thirdparts_installed/      # 第三方依赖安装缓存（独立于 build）
-├── .thirdparts_prefix/         # 第三方依赖编译缓存（独立于 build）
-│
 ├── src/
-│   ├── CMakeLists.txt          # project(flowsql)
-│   ├── subjects.cmake          # 构建宏定义
-│   ├── .clang-format
-│   │
-│   ├── common/                 # 公共头文件（define.h、loader.hpp 等）
-│   ├── framework/              # 框架核心（IPlugin、PluginRegistry、Pipeline 等）
-│   │
-│   ├── services/               # 服务插件
-│   │   ├── bridge/             # C++ ↔ Python 桥接（libflowsql_bridge.so）
-│   │   ├── scheduler/          # 调度服务（libflowsql_scheduler.so）
-│   │   ├── gateway/            # 网关服务（libflowsql_gateway.so）
-│   │   └── web/                # Web 管理系统（libflowsql_web.so + flowsql 可执行文件）
-│   │
+│   ├── common/             # 公共头文件（define.h、loader.hpp、toolkit.hpp 等）
+│   ├── framework/          # 框架核心（IPlugin、PluginLoader、SqlParser、Pipeline 等）
+│   │   └── interfaces/     # 跨插件接口（IDatabaseFactory、IDatabaseChannel 等）
+│   ├── services/
+│   │   ├── gateway/        # libflowsql_gateway.so
+│   │   ├── scheduler/      # libflowsql_scheduler.so
+│   │   ├── database/       # libflowsql_database.so（含 MySQL/SQLite/ClickHouse 驱动）
+│   │   ├── bridge/         # libflowsql_bridge.so
+│   │   └── web/            # libflowsql_web.so + 前端静态文件
 │   ├── plugins/
-│   │   ├── example/            # 示例插件（libflowsql_example.so）
-│   │   └── npi/                # NPI 协议解析插件（libflowsql_npi.so）
-│   │
-│   ├── python/                 # Python Worker（FastAPI + 算子运行时）
-│   ├── frontend/               # Vue.js 前端项目
-│   │
+│   │   └── example/        # libflowsql_example.so
+│   ├── python/             # Python Worker（FastAPI + 算子运行时）
+│   ├── frontend/           # Vue.js 前端
+│   ├── app/                # flowsql 可执行文件入口（main.cpp）
 │   └── tests/
 │       ├── test_framework/
+│       ├── test_database/  # test_sqlite / test_mysql / test_clickhouse / test_database / test_database_manager
 │       ├── test_bridge/
-│       ├── test_npi/
-│       └── data/               # 测试数据（NPI pcap 文件等）
-│           └── packets/
-│
-├── config/                     # 运行配置（gateway.yaml）
-├── docs/                       # 文档
-└── ...
+│       └── test_npi/
+├── config/
+│   ├── gateway.yaml        # 服务编排配置
+│   └── flowsql.yml         # 运行时通道配置（自动生成）
+├── build/output/           # 编译产物
+├── .thirdparts_installed/  # 第三方依赖安装缓存
+└── docs/
 ```
 
-### 构建与运行
+---
+
+## 构建与运行
 
 ```bash
-# 构建（从项目根目录）
+# 构建
 cmake -B build src && cmake --build build -j$(nproc)
 
-# 运行
-cd build/output
-LD_LIBRARY_PATH=. ./flowsql --config ../../config/gateway.yaml
+# 启动（从项目根目录）
+cd build/output && LD_LIBRARY_PATH=. ./flowsql --config ../../config/gateway.yaml
+
+# 调试 Scheduler（VSCode launch.json: "flowsql:scheduler (direct)"）
+./flowsql --role scheduler --gateway 127.0.0.1:18800 --port 18803 \
+  --plugins "libflowsql_scheduler.so,libflowsql_bridge.so,libflowsql_example.so,libflowsql_database.so:config_file=config/flowsql.yml"
 
 # 测试
-./test_framework
-./test_bridge
+cd build/output
+./test_database        # 插件层 E2E（需 MySQL 环境）
+./test_database_manager
+./test_sqlite
+./test_clickhouse      # ClickHouse 不可达时自动 SKIP
 ```
-
-### 验证结果
-
-1. `flowsql --config config/gateway.yaml` 启动成功
-2. Gateway(18800) 自动 spawn Web(8081) + Scheduler(18803) + PyWorker(18900)
-3. `GET /gateway/routes` 返回 7 条路由
-4. `GET /web/api/health` 通过 Gateway 转发成功
-5. `GET /pyworker/operators` 通过 Gateway 转发返回 4 个 Python 算子
-6. BridgePlugin 通过 Gateway 路由发现 PyWorker 并注册算子
-7. Ctrl+C 优雅停止所有子服务

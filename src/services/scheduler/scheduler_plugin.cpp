@@ -148,6 +148,20 @@ void SchedulerPlugin::RegisterRoutes() {
     server_.Post("/refresh-operators", [this](const httplib::Request&, httplib::Response& res) {
         HandleRefreshOperators(res);
     });
+
+    // 数据库通道动态管理（Epic 6）
+    server_.Get("/db-channels", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleListDbChannels(req, res);
+    });
+    server_.Post("/db-channels/add", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleAddDbChannel(req, res);
+    });
+    server_.Post("/db-channels/remove", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleRemoveDbChannel(req, res);
+    });
+    server_.Post("/db-channels/update", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleUpdateDbChannel(req, res);
+    });
 }
 
 // --- 通道查找辅助 ---
@@ -580,7 +594,7 @@ void SchedulerPlugin::HandleGetChannels(const httplib::Request&, httplib::Respon
         // 数据库通道（通过 IDatabaseFactory）
         auto* factory = static_cast<IDatabaseFactory*>(querier_->First(IID_DATABASE_FACTORY));
         if (factory) {
-            factory->List([&w](const char* type, const char* name) {
+            factory->List([&w](const char* type, const char* name, const char* /*config_json*/) {
                 w.StartObject();
                 w.Key("catelog"); w.String(type);
                 w.Key("name"); w.String(name);
@@ -657,6 +671,129 @@ void SchedulerPlugin::HandleRefreshOperators(httplib::Response& res) {
         res.status = 404;
         res.set_content(R"({"error":"bridge not available"})", "application/json");
     }
+}
+
+// ==================== 数据库通道动态管理端点（Epic 6）====================
+
+// 辅助：从 IQuerier 获取 IDatabaseFactory
+static IDatabaseFactory* GetDbFactory(IQuerier* querier) {
+    if (!querier) return nullptr;
+    return static_cast<IDatabaseFactory*>(querier->First(IID_DATABASE_FACTORY));
+}
+
+// GET /db-channels — 列出所有已配置的数据库通道（含脱敏配置）
+void SchedulerPlugin::HandleListDbChannels(const httplib::Request&, httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto* factory = GetDbFactory(querier_);
+    if (!factory) {
+        res.status = 503;
+        res.body = R"({"error":"DatabasePlugin not available"})";
+        return;
+    }
+
+    std::string body = "[";
+    bool first = true;
+    factory->List([&](const char* type, const char* name, const char* config_json) {
+        if (!first) body += ",";
+        body += config_json ? config_json : "{}";
+        first = false;
+    });
+    body += "]";
+    res.status = 200;
+    res.body = body;
+}
+
+// POST /db-channels/add — 新增数据库通道
+// Body: {"config":"type=mysql;name=mydb;host=...;..."}
+void SchedulerPlugin::HandleAddDbChannel(const httplib::Request& req, httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto* factory = GetDbFactory(querier_);
+    if (!factory) {
+        res.status = 503;
+        res.body = R"({"error":"DatabasePlugin not available"})";
+        return;
+    }
+
+    // 解析 JSON body
+    rapidjson::Document doc;
+    doc.Parse(req.body.c_str());
+    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("config")) {
+        res.status = 400;
+        res.body = R"({"error":"invalid request body, expected {\"config\":\"...\"}"})" ;
+        return;
+    }
+    std::string config = doc["config"].GetString();
+
+    if (factory->AddChannel(config.c_str()) != 0) {
+        res.status = 400;
+        std::string err = factory->LastError();
+        res.body = "{\"error\":\"" + err + "\"}";
+        return;
+    }
+    res.status = 200;
+    res.body = R"({"ok":true})";
+}
+
+// POST /db-channels/remove — 删除数据库通道
+// Body: {"type":"mysql","name":"mydb"}
+void SchedulerPlugin::HandleRemoveDbChannel(const httplib::Request& req, httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto* factory = GetDbFactory(querier_);
+    if (!factory) {
+        res.status = 503;
+        res.body = R"({"error":"DatabasePlugin not available"})";
+        return;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(req.body.c_str());
+    if (doc.HasParseError() || !doc.IsObject() ||
+        !doc.HasMember("type") || !doc.HasMember("name")) {
+        res.status = 400;
+        res.body = R"({"error":"invalid request body, expected {\"type\":\"...\",\"name\":\"...\"}"})" ;
+        return;
+    }
+    std::string type = doc["type"].GetString();
+    std::string name = doc["name"].GetString();
+
+    if (factory->RemoveChannel(type.c_str(), name.c_str()) != 0) {
+        res.status = 400;
+        std::string err = factory->LastError();
+        res.body = "{\"error\":\"" + err + "\"}";
+        return;
+    }
+    res.status = 200;
+    res.body = R"({"ok":true})";
+}
+
+// POST /db-channels/update — 更新数据库通道配置
+// Body: {"config":"type=mysql;name=mydb;host=...;..."}
+void SchedulerPlugin::HandleUpdateDbChannel(const httplib::Request& req, httplib::Response& res) {
+    SetCorsHeaders(res);
+    auto* factory = GetDbFactory(querier_);
+    if (!factory) {
+        res.status = 503;
+        res.body = R"({"error":"DatabasePlugin not available"})";
+        return;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(req.body.c_str());
+    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("config")) {
+        res.status = 400;
+        res.body = R"({"error":"invalid request body, expected {\"config\":\"...\"}"})" ;
+        return;
+    }
+    std::string config = doc["config"].GetString();
+
+    if (factory->UpdateChannel(config.c_str()) != 0) {
+        res.status = 400;
+        std::string err = factory->LastError();
+        res.body = "{\"error\":\"" + err + "\"}";
+        return;
+    }
+    res.status = 200;
+    res.body = R"({"ok":true})";
 }
 
 }  // namespace scheduler
