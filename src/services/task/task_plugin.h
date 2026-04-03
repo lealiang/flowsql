@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include <set>
+#include <unordered_map>
 
 namespace flowsql {
 namespace task {
@@ -68,14 +69,30 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
                            int sql_count,
                            int timeout_s,
                            std::string* task_id,
-                           bool enqueue);
+                           bool enqueue,
+                           const std::string& task_kind = "batch",
+                           const std::string& runtime_task_id = "");
     void CleanupIntermediateChannels(const std::set<std::string>& channels);
     std::string BuildDbPath() const;
     static const char* StatusName(TaskStatus s);
     static TaskStatus ParseStatus(const std::string& s);
+    static const char* RuntimeStatusName(TaskStatus s);
+    static TaskStatus MapStreamRuntimeStatus(const std::string& runtime_status);
     static bool IsTerminal(TaskStatus s);
     static std::string MakeNowTaskId(uint64_t seq);
     static std::string JsonError(const std::string& error);
+    fnRouterHandler FindRoute(const char* method, const char* uri);
+    int32_t ProxySchedulerPost(const char* uri, const std::string& req, std::string* rsp);
+    int UpdateRuntimeTaskId(const std::string& task_id, const std::string& runtime_task_id);
+    int UpdateTaskKindAndRuntimeId(const std::string& task_id,
+                                   const std::string& task_kind,
+                                   const std::string& runtime_task_id);
+    int ListTasksByKind(const std::string& task_kind,
+                        int page,
+                        int page_size,
+                        const std::string& status_filter,
+                        std::vector<TaskRecord>* items,
+                        int64_t* total);
     std::string DequeueTask();
     void WorkerLoop();
     void TimeoutLoop();
@@ -86,6 +103,10 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     int32_t HandleDelete(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleCancel(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleDiagnostics(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamExecute(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamStop(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamStatus(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamList(const std::string& uri, const std::string& req, std::string& rsp);
 
     IQuerier* querier_ = nullptr;
     sqlite3* db_ = nullptr;

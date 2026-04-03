@@ -51,6 +51,7 @@ class TcpSessionMockStreamChannel : public IStreamChannel {
     std::shared_ptr<arrow::Schema> GetOutputSchema() override;
     int SetFilter(const char* condition_json,
                   std::vector<std::string>* unsupported_out) override;
+    StreamChannelCapabilities Capabilities() const override;
 
     bool IsFull() const override;
     bool IsEmpty() const override;

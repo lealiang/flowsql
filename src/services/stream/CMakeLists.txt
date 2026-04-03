@@ -6,7 +6,7 @@ add_library(${PROJECT_NAME} SHARED ${DIR_SRCS})
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
 
-add_thirddepen(${PROJECT_NAME} arrow yaml-cpp)
+add_thirddepen(${PROJECT_NAME} arrow yaml-cpp sqlite)
 
 add_dependencies(${PROJECT_NAME} flowsql_common)
 target_link_libraries(${PROJECT_NAME} flowsql_common)

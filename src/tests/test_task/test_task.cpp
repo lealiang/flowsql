@@ -286,7 +286,7 @@ int main() {
         const std::string async_db_path = async_dir + "/task_store.db";
 
         MockRouterHandle scheduler({
-            {"POST", "/tasks/instant/execute",
+            {"POST", "/scheduler/batch/execute",
              [](const std::string&, const std::string&, std::string& rsp) {
                  std::this_thread::sleep_for(std::chrono::milliseconds(120));
                  rsp = R"({"status":"completed","result_row_count":7,"result_col_count":2,"result_target":"dataframe.async_out","data":[]})";
@@ -356,7 +356,7 @@ int main() {
         const std::string async_fail_db_path = async_fail_dir + "/task_store.db";
 
         MockRouterHandle scheduler({
-            {"POST", "/tasks/instant/execute",
+            {"POST", "/scheduler/batch/execute",
              [](const std::string&, const std::string&, std::string& rsp) {
                  std::this_thread::sleep_for(std::chrono::milliseconds(80));
                  rsp = R"({"error":"operator builtin.mock execution failed","error_code":"OP_EXEC_FAIL","error_stage":"mock"})";
@@ -411,7 +411,7 @@ int main() {
         MockChannelRegistry channel_registry;
 
         MockRouterHandle scheduler({
-            {"POST", "/tasks/instant/execute",
+            {"POST", "/scheduler/batch/execute",
              [&captured_sqls](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
                  d.Parse(req.c_str());
@@ -486,7 +486,7 @@ int main() {
         const std::string diag_dir = MakeTempDir("diagnostics");
         std::atomic<int> call_no{0};
         MockRouterHandle scheduler({
-            {"POST", "/tasks/instant/execute",
+            {"POST", "/scheduler/batch/execute",
              [&call_no](const std::string&, const std::string&, std::string& rsp) {
                  int n = call_no.fetch_add(1);
                  if (n == 0) {
@@ -559,7 +559,7 @@ int main() {
         MockChannelRegistry channel_registry;
 
         MockRouterHandle scheduler({
-            {"POST", "/tasks/instant/execute",
+            {"POST", "/scheduler/batch/execute",
              [&captured_sqls](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
                  d.Parse(req.c_str());
@@ -629,7 +629,7 @@ int main() {
         std::atomic<int> max_in_flight{0};
 
         MockRouterHandle scheduler({
-            {"POST", "/tasks/instant/execute",
+            {"POST", "/scheduler/batch/execute",
              [&in_flight, &max_in_flight](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
                  d.Parse(req.c_str());
@@ -759,7 +759,7 @@ int main() {
         std::atomic<int> exec_count{0};
 
         MockRouterHandle scheduler({
-            {"POST", "/tasks/instant/execute",
+            {"POST", "/scheduler/batch/execute",
              [&exec_count](const std::string&, const std::string&, std::string& rsp) {
                  exec_count.fetch_add(1);
                  std::this_thread::sleep_for(std::chrono::milliseconds(280));
@@ -829,7 +829,7 @@ int main() {
     {
         const std::string timeout_dir = MakeTempDir("timeout_task");
         MockRouterHandle scheduler({
-            {"POST", "/tasks/instant/execute",
+            {"POST", "/scheduler/batch/execute",
              [](const std::string&, const std::string&, std::string& rsp) {
                  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
                  rsp = R"({"status":"completed","result_row_count":1,"result_col_count":1,"result_target":"dataframe.timeout","data":[]})";
@@ -877,6 +877,143 @@ int main() {
         ASSERT_TRUE(timed_out);
 
         ASSERT_EQ(local_routes["POST:/tasks/delete"]("/tasks/delete", MakeTaskIdReq(task_id), rsp), error::OK);
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
+        const std::string stream_dir = MakeTempDir("stream_routes");
+        std::atomic<int> stream_execute_calls{0};
+        std::atomic<int> stream_status_calls{0};
+        std::atomic<int> stream_stop_calls{0};
+
+        MockRouterHandle scheduler({
+            {"POST", "/scheduler/stream/execute",
+             [&stream_execute_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("sql") && d["sql"].IsString());
+                 stream_execute_calls.fetch_add(1);
+                 rsp = R"({"runtime_task_id":"stream_task_1001"})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/status",
+             [&stream_status_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
+                 ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_task_1001");
+                 const int n = stream_status_calls.fetch_add(1);
+                 if (n == 0) {
+                     rsp = R"({"task_id":"stream_task_1001","status":"running","processed_rows":12,"output_rows":8,"op_stats":{"shards":2}})";
+                 } else {
+                     rsp = R"({"task_id":"stream_task_1001","status":"stopped","processed_rows":12,"output_rows":8,"op_stats":{"shards":2}})";
+                 }
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/stop",
+             [&stream_stop_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
+                 ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_task_1001");
+                 stream_stop_calls.fetch_add(1);
+                 rsp = R"({"task_id":"stream_task_1001","status":"stopped"})";
+                 return error::OK;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + stream_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        std::unordered_map<std::string, fnRouterHandler> local_routes;
+        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/execute") == 1);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/stop") == 1);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/status") == 1);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/list") == 1);
+
+        std::string rsp;
+
+        // 非法 timeout 参数应在调度前拦截。
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","timeout_s":-1})",
+                      rsp),
+                  error::BAD_REQUEST);
+        ASSERT_EQ(stream_execute_calls.load(), 0);
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","timeout_s":30})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document exec_ret;
+        exec_ret.Parse(rsp.c_str());
+        ASSERT_TRUE(!exec_ret.HasParseError() && exec_ret.IsObject());
+        ASSERT_TRUE(exec_ret.HasMember("task_id") && exec_ret["task_id"].IsString());
+        ASSERT_TRUE(exec_ret.HasMember("runtime_task_id") && exec_ret["runtime_task_id"].IsString());
+        ASSERT_TRUE(exec_ret.HasMember("status") && exec_ret["status"].IsString());
+        ASSERT_EQ(std::string(exec_ret["runtime_task_id"].GetString()), "stream_task_1001");
+        ASSERT_EQ(std::string(exec_ret["status"].GetString()), "submitted");
+        const std::string local_stream_task_id = exec_ret["task_id"].GetString();
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/list"]("/tasks/stream/list", "{}", rsp), error::OK);
+        rapidjson::Document list_ret;
+        list_ret.Parse(rsp.c_str());
+        ASSERT_TRUE(!list_ret.HasParseError() && list_ret.IsObject());
+        ASSERT_TRUE(list_ret.HasMember("tasks") && list_ret["tasks"].IsArray());
+        ASSERT_EQ(list_ret["tasks"].Size(), rapidjson::SizeType(1));
+        ASSERT_TRUE(list_ret["tasks"][0].HasMember("runtime_task_id"));
+        ASSERT_EQ(std::string(list_ret["tasks"][0]["runtime_task_id"].GetString()), "stream_task_1001");
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/status"](
+                      "/tasks/stream/status", MakeTaskIdReq(local_stream_task_id), rsp),
+                  error::OK);
+        rapidjson::Document status_ret_1;
+        status_ret_1.Parse(rsp.c_str());
+        ASSERT_TRUE(!status_ret_1.HasParseError() && status_ret_1.IsObject());
+        ASSERT_EQ(std::string(status_ret_1["status"].GetString()), "running");
+        ASSERT_EQ(std::string(status_ret_1["runtime_status"].GetString()), "running");
+        ASSERT_EQ(status_ret_1["processed_rows"].GetInt64(), 12);
+        ASSERT_EQ(status_ret_1["output_rows"].GetInt64(), 8);
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/stop"](
+                      "/tasks/stream/stop", MakeTaskIdReq(local_stream_task_id), rsp),
+                  error::OK);
+        rapidjson::Document stop_ret;
+        stop_ret.Parse(rsp.c_str());
+        ASSERT_TRUE(!stop_ret.HasParseError() && stop_ret.IsObject());
+        ASSERT_EQ(std::string(stop_ret["status"].GetString()), "stopped");
+        ASSERT_EQ(std::string(stop_ret["runtime_status"].GetString()), "stopped");
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/status"](
+                      "/tasks/stream/status", MakeTaskIdReq(local_stream_task_id), rsp),
+                  error::OK);
+        rapidjson::Document status_ret_2;
+        status_ret_2.Parse(rsp.c_str());
+        ASSERT_TRUE(!status_ret_2.HasParseError() && status_ret_2.IsObject());
+        ASSERT_EQ(std::string(status_ret_2["status"].GetString()), "stopped");
+        ASSERT_EQ(std::string(status_ret_2["runtime_status"].GetString()), "stopped");
+
+        ASSERT_EQ(local_routes["POST:/tasks/cancel"](
+                      "/tasks/cancel", MakeTaskIdReq(local_stream_task_id), rsp),
+                  error::CONFLICT);
+
+        ASSERT_EQ(stream_execute_calls.load(), 1);
+        ASSERT_TRUE(stream_status_calls.load() >= 2);
+        ASSERT_EQ(stream_stop_calls.load(), 1);
+
+        ASSERT_EQ(local_routes["POST:/tasks/delete"](
+                      "/tasks/delete", MakeTaskIdReq(local_stream_task_id), rsp),
+                  error::OK);
         ASSERT_EQ(p.Stop(), 0);
     }
 

@@ -43,7 +43,7 @@ class IRing {
     virtual size_t capacity() const = 0;
 };
 
-// AtomicRing — C++17 原子实现，当前支持 SPSC/SPMC。
+// AtomicRing — C++17 原子实现，支持 SPSC/SPMC/MPSC/MPMC。
 class AtomicRing : public IRing {
  public:
     AtomicRing(size_t capacity, RingMode mode);
@@ -63,6 +63,7 @@ class AtomicRing : public IRing {
     };
 
     int EnqueueSingleProducer(StreamBatch batch);
+    int EnqueueMultiProducer(StreamBatch batch);
     int DequeueSingleConsumer(StreamBatch* out);
     int DequeueMultiConsumer(StreamBatch* out);
 
@@ -101,6 +102,7 @@ class RingStreamChannel : public IStreamChannel {
     std::shared_ptr<arrow::Schema> GetOutputSchema() override;
     int SetFilter(const char* condition_json,
                   std::vector<std::string>* unsupported_out) override;
+    StreamChannelCapabilities Capabilities() const override;
 
     bool IsFull() const override;
     bool IsEmpty() const override;

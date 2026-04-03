@@ -26,7 +26,8 @@ AtomicRing::AtomicRing(size_t capacity, RingMode mode)
       mask_(capacity > 0 ? (capacity - 1) : 0),
       mode_(mode),
       valid_capacity_(IsPowerOfTwo(capacity)),
-      mode_supported_(mode == RingMode::SPSC || mode == RingMode::SPMC) {
+      mode_supported_(mode == RingMode::SPSC || mode == RingMode::SPMC ||
+                      mode == RingMode::MPSC || mode == RingMode::MPMC) {
     if (slots_) {
         for (size_t i = 0; i < capacity_; ++i) {
             slots_[i].seq.store(i, std::memory_order_relaxed);
@@ -49,6 +50,34 @@ int AtomicRing::EnqueueSingleProducer(StreamBatch batch) {
     return 0;
 }
 
+int AtomicRing::EnqueueMultiProducer(StreamBatch batch) {
+    size_t spin = 0;
+    size_t head = head_.load(std::memory_order_relaxed);
+    while (true) {
+        Slot& slot = slots_[head & mask_];
+        size_t seq = slot.seq.load(std::memory_order_acquire);
+        std::intptr_t diff = static_cast<std::intptr_t>(seq) - static_cast<std::intptr_t>(head);
+        if (diff < 0) {
+            return EAGAIN;
+        }
+        if (diff > 0) {
+            head = head_.load(std::memory_order_relaxed);
+            continue;
+        }
+        if (head_.compare_exchange_weak(
+                head, head + 1,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            slot.batch = std::move(batch);
+            slot.seq.store(head + 1, std::memory_order_release);
+            return 0;
+        }
+        if ((++spin & 0x3F) == 0) {
+            std::this_thread::yield();
+        }
+    }
+}
+
 int AtomicRing::DequeueSingleConsumer(StreamBatch* out) {
     if (!out) return EINVAL;
 
@@ -69,6 +98,7 @@ int AtomicRing::DequeueSingleConsumer(StreamBatch* out) {
 int AtomicRing::DequeueMultiConsumer(StreamBatch* out) {
     if (!out) return EINVAL;
 
+    size_t spin = 0;
     while (true) {
         size_t tail = tail_.load(std::memory_order_acquire);
         Slot& slot = slots_[tail & mask_];
@@ -88,19 +118,25 @@ int AtomicRing::DequeueMultiConsumer(StreamBatch* out) {
             slot.seq.store(tail + capacity_, std::memory_order_release);
             return 0;
         }
+        if ((++spin & 0x3F) == 0) {
+            std::this_thread::yield();
+        }
     }
 }
 
 int AtomicRing::enqueue(StreamBatch batch) {
     if (!mode_supported_) return ENOTSUP;
     if (!valid_capacity_) return EINVAL;
-    return EnqueueSingleProducer(std::move(batch));
+    if (mode_ == RingMode::SPSC || mode_ == RingMode::SPMC) {
+        return EnqueueSingleProducer(std::move(batch));
+    }
+    return EnqueueMultiProducer(std::move(batch));
 }
 
 int AtomicRing::dequeue(StreamBatch* out) {
     if (!mode_supported_) return ENOTSUP;
     if (!valid_capacity_) return EINVAL;
-    if (mode_ == RingMode::SPSC) {
+    if (mode_ == RingMode::SPSC || mode_ == RingMode::MPSC) {
         return DequeueSingleConsumer(out);
     }
     return DequeueMultiConsumer(out);
@@ -257,6 +293,54 @@ int RingStreamChannel::SetFilter(const char* /* condition_json */,
         unsupported_out->clear();
     }
     return 0;
+}
+
+StreamChannelCapabilities RingStreamChannel::Capabilities() const {
+    StreamChannelCapabilities caps;
+    caps.channel_type = ChannelType::kStream;
+    caps.semantics.finite = options_.finite;
+    caps.semantics.supports_timeout_poll = true;
+    caps.semantics.supports_filter_pushdown = false;
+    caps.semantics.filter_requires_full_match = true;
+    caps.semantics.eof_reliable = true;
+    caps.semantics.backpressure = (options_.overflow == OverflowPolicy::kBlock)
+        ? BackpressurePolicy::BLOCK_ONLY
+        : BackpressurePolicy::DROP_ONLY;
+
+    switch (options_.ring_mode) {
+        case RingMode::SPSC:
+            caps.concurrency.put_mode = ProducerMode::SINGLE;
+            caps.concurrency.poll_mode = ConsumerMode::SINGLE;
+            caps.concurrency.max_producers = 1;
+            caps.concurrency.max_consumers = 1;
+            caps.semantics.ordering = OrderGuarantee::GLOBAL_FIFO;
+            break;
+        case RingMode::SPMC:
+            caps.concurrency.put_mode = ProducerMode::SINGLE;
+            caps.concurrency.poll_mode = ConsumerMode::MULTI;
+            caps.concurrency.max_producers = 1;
+            caps.concurrency.max_consumers = 0;
+            caps.semantics.ordering = OrderGuarantee::GLOBAL_FIFO;
+            break;
+        case RingMode::MPSC:
+            caps.concurrency.put_mode = ProducerMode::MULTI;
+            caps.concurrency.poll_mode = ConsumerMode::SINGLE;
+            caps.concurrency.max_producers = 0;
+            caps.concurrency.max_consumers = 1;
+            caps.semantics.ordering = OrderGuarantee::PER_PRODUCER_FIFO;
+            break;
+        case RingMode::MPMC:
+            caps.concurrency.put_mode = ProducerMode::MULTI;
+            caps.concurrency.poll_mode = ConsumerMode::MULTI;
+            caps.concurrency.max_producers = 0;
+            caps.concurrency.max_consumers = 0;
+            caps.semantics.ordering = OrderGuarantee::PER_PRODUCER_FIFO;
+            break;
+    }
+    caps.concurrency.lock_free_put = true;
+    caps.concurrency.lock_free_poll = true;
+    caps.concurrency.cancel_wakeup_guaranteed = true;
+    return caps;
 }
 
 bool RingStreamChannel::IsFull() const {

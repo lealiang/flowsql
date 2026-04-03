@@ -741,7 +741,7 @@ void TestT10StreamTaskLifecycleCancel() {
     task->Join();
 
     TaskSnapshot s = task->Snapshot();
-    ASSERT_EQ(s.status, StreamTaskStatus::kCancelled);
+    ASSERT_EQ(s.status, StreamTaskStatus::kStopped);
     ASSERT_TRUE(s.joined);
     ASSERT_EQ(s.active_shards, 0);
 
@@ -1153,6 +1153,139 @@ void TestT20StreamChannelAdapterOutputOnlyContract() {
     ASSERT_TRUE(adapter->IsFinished());
 }
 
+void TestT21RingMpscConcurrency() {
+    constexpr int kProducers = 4;
+    constexpr int kPerProducer = 400;
+    constexpr int kTotal = kProducers * kPerProducer;
+
+    RingStreamChannelOptions opts;
+    opts.ring_size = 1024;
+    opts.ring_mode = RingMode::MPSC;
+    opts.overflow = OverflowPolicy::kBlock;
+    opts.finite = true;
+
+    RingStreamChannel ch("ring", "t21_mpsc", opts);
+    ASSERT_EQ(ch.Open(), 0);
+
+    StreamChannelCapabilities caps = ch.Capabilities();
+    ASSERT_EQ(caps.concurrency.put_mode, ProducerMode::MULTI);
+    ASSERT_EQ(caps.concurrency.poll_mode, ConsumerMode::SINGLE);
+    ASSERT_EQ(caps.concurrency.max_consumers, uint32_t(1));
+
+    std::unordered_set<int64_t> seen;
+    std::mutex seen_mu;
+    std::atomic<int> consumed{0};
+
+    std::thread consumer([&]() {
+        while (true) {
+            PollEvent ev = ch.PollNext(50);
+            if (ev.kind == PollEventKind::kTimeout) continue;
+            if (ev.kind == PollEventKind::kEof || ev.kind == PollEventKind::kDrainedAfterCancel) break;
+            ASSERT_EQ(ev.kind, PollEventKind::kData);
+            ASSERT_TRUE(ev.batch.data != nullptr);
+            ASSERT_EQ(ev.batch.data->num_columns(), 1);
+            auto arr = std::static_pointer_cast<arrow::Int64Array>(ev.batch.data->column(0));
+            ASSERT_TRUE(arr != nullptr);
+            for (int64_t i = 0; i < ev.batch.data->num_rows(); ++i) {
+                const int64_t v = arr->Value(i);
+                {
+                    std::lock_guard<std::mutex> lock(seen_mu);
+                    seen.insert(v);
+                }
+                consumed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    std::vector<std::thread> producers;
+    producers.reserve(kProducers);
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([&ch, p]() {
+            for (int i = 0; i < kPerProducer; ++i) {
+                const int64_t v = static_cast<int64_t>(p) * 1000000 + i;
+                ASSERT_EQ(ch.Put(MakeBatch(v), v), 0);
+            }
+        });
+    }
+    for (auto& t : producers) t.join();
+
+    ch.CloseStream();
+    consumer.join();
+
+    ASSERT_EQ(consumed.load(std::memory_order_relaxed), kTotal);
+    ASSERT_EQ(static_cast<int>(seen.size()), kTotal);
+    ASSERT_EQ(ch.Close(), 0);
+}
+
+void TestT22RingMpmcConcurrency() {
+    constexpr int kProducers = 4;
+    constexpr int kConsumers = 3;
+    constexpr int kPerProducer = 400;
+    constexpr int kTotal = kProducers * kPerProducer;
+
+    RingStreamChannelOptions opts;
+    opts.ring_size = 1024;
+    opts.ring_mode = RingMode::MPMC;
+    opts.overflow = OverflowPolicy::kBlock;
+    opts.finite = true;
+
+    RingStreamChannel ch("ring", "t22_mpmc", opts);
+    ASSERT_EQ(ch.Open(), 0);
+
+    StreamChannelCapabilities caps = ch.Capabilities();
+    ASSERT_EQ(caps.concurrency.put_mode, ProducerMode::MULTI);
+    ASSERT_EQ(caps.concurrency.poll_mode, ConsumerMode::MULTI);
+    ASSERT_EQ(caps.concurrency.max_producers, uint32_t(0));
+    ASSERT_EQ(caps.concurrency.max_consumers, uint32_t(0));
+
+    std::unordered_set<int64_t> seen;
+    std::mutex seen_mu;
+    std::atomic<int> consumed{0};
+
+    std::vector<std::thread> consumers;
+    consumers.reserve(kConsumers);
+    for (int c = 0; c < kConsumers; ++c) {
+        consumers.emplace_back([&]() {
+            while (true) {
+                PollEvent ev = ch.PollNext(50);
+                if (ev.kind == PollEventKind::kTimeout) continue;
+                if (ev.kind == PollEventKind::kEof || ev.kind == PollEventKind::kDrainedAfterCancel) break;
+                ASSERT_EQ(ev.kind, PollEventKind::kData);
+                ASSERT_TRUE(ev.batch.data != nullptr);
+                auto arr = std::static_pointer_cast<arrow::Int64Array>(ev.batch.data->column(0));
+                ASSERT_TRUE(arr != nullptr);
+                for (int64_t i = 0; i < ev.batch.data->num_rows(); ++i) {
+                    const int64_t v = arr->Value(i);
+                    {
+                        std::lock_guard<std::mutex> lock(seen_mu);
+                        seen.insert(v);
+                    }
+                    consumed.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    std::vector<std::thread> producers;
+    producers.reserve(kProducers);
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([&ch, p]() {
+            for (int i = 0; i < kPerProducer; ++i) {
+                const int64_t v = static_cast<int64_t>(p) * 1000000 + i;
+                ASSERT_EQ(ch.Put(MakeBatch(v), v), 0);
+            }
+        });
+    }
+    for (auto& t : producers) t.join();
+
+    ch.CloseStream();
+    for (auto& t : consumers) t.join();
+
+    ASSERT_EQ(consumed.load(std::memory_order_relaxed), kTotal);
+    ASSERT_EQ(static_cast<int>(seen.size()), kTotal);
+    ASSERT_EQ(ch.Close(), 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1238,6 +1371,14 @@ int main() {
     std::puts("[TEST] T20 StreamChannelAdapter 输出侧契约");
     TestT20StreamChannelAdapterOutputOnlyContract();
     std::puts("[PASS] T20");
+
+    std::puts("[TEST] T21 Ring MPSC 并发正确性");
+    TestT21RingMpscConcurrency();
+    std::puts("[PASS] T21");
+
+    std::puts("[TEST] T22 Ring MPMC 并发正确性");
+    TestT22RingMpmcConcurrency();
+    std::puts("[PASS] T22");
 
     std::puts("=== All stream tests passed ===");
     return 0;

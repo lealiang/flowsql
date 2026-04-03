@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <regex>
 #include <sstream>
@@ -39,6 +40,7 @@
 #include "framework/interfaces/ioperator_registry.h"
 #include "framework/interfaces/istream_channel.h"
 #include "framework/interfaces/istream_factory.h"
+#include "framework/interfaces/istream_manager.h"
 
 namespace flowsql {
 namespace scheduler {
@@ -124,6 +126,19 @@ static bool IsQualifiedDestination(const std::string& dest) {
     if (second == first + 1) return false;
     if (second != std::string::npos && second == dest.size() - 1) return false;
     return true;
+}
+
+static int32_t MapStreamManagerErrorToStatus(int rc) {
+    if (rc == 0) return error::OK;
+    if (rc == EEXIST || rc == EBUSY) return error::CONFLICT;
+    if (rc == ENOENT) return error::NOT_FOUND;
+    if (rc == EINVAL) return error::BAD_REQUEST;
+    if (rc == ENOTSUP) return error::BAD_REQUEST;
+    return error::INTERNAL_ERROR;
+}
+
+static std::string MakeStreamChannelKey(const std::string& type, const std::string& name) {
+    return ToLowerAscii(type) + "." + name;
 }
 
 // --- JSON 辅助 ---
@@ -222,6 +237,77 @@ static const char* StreamTaskStatusName(StreamTaskStatus status) {
     }
 }
 
+static bool IsTerminalStreamTaskStatus(StreamTaskStatus status) {
+    return status == StreamTaskStatus::kStopped ||
+           status == StreamTaskStatus::kCancelled ||
+           status == StreamTaskStatus::kFailed;
+}
+
+static const char* ProducerModeName(ProducerMode mode) {
+    return mode == ProducerMode::MULTI ? "MULTI" : "SINGLE";
+}
+
+static const char* ConsumerModeName(ConsumerMode mode) {
+    return mode == ConsumerMode::MULTI ? "MULTI" : "SINGLE";
+}
+
+static void WriteCapabilitiesObject(rapidjson::Writer<rapidjson::StringBuffer>* w,
+                                    const StreamChannelCapabilities& caps) {
+    if (!w) return;
+    w->StartObject();
+    w->Key("channel_type");
+    w->String(caps.channel_type.c_str());
+    w->Key("concurrency");
+    w->StartObject();
+    w->Key("put_mode");
+    w->String(ProducerModeName(caps.concurrency.put_mode));
+    w->Key("poll_mode");
+    w->String(ConsumerModeName(caps.concurrency.poll_mode));
+    w->Key("max_producers");
+    w->Uint(caps.concurrency.max_producers);
+    w->Key("max_consumers");
+    w->Uint(caps.concurrency.max_consumers);
+    w->Key("lock_free_put");
+    w->Bool(caps.concurrency.lock_free_put);
+    w->Key("lock_free_poll");
+    w->Bool(caps.concurrency.lock_free_poll);
+    w->Key("cancel_wakeup_guaranteed");
+    w->Bool(caps.concurrency.cancel_wakeup_guaranteed);
+    w->EndObject();
+    w->EndObject();
+}
+
+static std::string MakeCapabilityMismatchJson(const std::string& error_message,
+                                              const std::string& error_code,
+                                              const StreamChannelCapabilities* source_caps,
+                                              const StreamChannelCapabilities* sink_caps) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("error");
+    w.String(error_message.c_str());
+    w.Key("error_code");
+    w.String(error_code.c_str());
+    w.Key("error_stage");
+    w.String("capability_check");
+    w.Key("details");
+    w.StartObject();
+    w.Key("capabilities");
+    w.StartObject();
+    if (source_caps) {
+        w.Key("source");
+        WriteCapabilitiesObject(&w, *source_caps);
+    }
+    if (sink_caps) {
+        w.Key("sink");
+        WriteCapabilitiesObject(&w, *sink_caps);
+    }
+    w.EndObject();
+    w.EndObject();
+    w.EndObject();
+    return buf.GetString();
+}
+
 static void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
                                   const TaskSnapshot& s) {
     if (!w) return;
@@ -289,206 +375,85 @@ static void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
     w->EndObject();
 }
 
-class SharedSpmcState final : public std::enable_shared_from_this<SharedSpmcState> {
+class SharedSourceState final : public std::enable_shared_from_this<SharedSourceState> {
  public:
-    SharedSpmcState(std::string category,
-                    std::string name,
-                    std::shared_ptr<IStreamChannel> source,
-                    size_t ring_size)
-        : category_(std::move(category)),
-          name_(std::move(name)),
-          source_(std::move(source)) {
-        RingStreamChannelOptions opts;
-        opts.ring_mode = RingMode::SPMC;
-        opts.overflow = OverflowPolicy::kBlock;
-        opts.finite = source_ ? source_->IsFinite() : false;
-        opts.ring_size = NextPowerOfTwo(std::max<size_t>(64, ring_size));
-        queue_ = std::make_shared<RingStreamChannel>("spmc", name_, opts);
-        (void)queue_->Open();
-    }
-
-    ~SharedSpmcState() {
-        Stop();
-    }
-
-    int Start() {
-        bool expected = false;
-        if (!started_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            return 0;
-        }
-        if (!source_) return EINVAL;
-        producer_finished_.store(false, std::memory_order_release);
-        stop_requested_.store(false, std::memory_order_release);
-        dispatch_thread_ = std::thread([self = shared_from_this()]() { self->DispatchLoop(); });
-        return 0;
-    }
-
-    void Stop() {
-        stop_requested_.store(true, std::memory_order_release);
-        std::call_once(cancel_once_, [this]() {
-            if (source_) source_->Cancel();
-        });
-        {
-            std::lock_guard<std::mutex> lock(dispatch_join_mu_);
-            if (dispatch_thread_.joinable() &&
-                dispatch_thread_.get_id() != std::this_thread::get_id()) {
-                dispatch_thread_.join();
-            }
-        }
-        producer_finished_.store(true, std::memory_order_release);
-        if (queue_) {
-            queue_->Close();
-        }
-    }
+    explicit SharedSourceState(std::shared_ptr<IStreamChannel> source)
+        : source_(std::move(source)) {}
 
     PollEvent PollNext(int timeout_ms) {
-        if (timeout_ms < 0) timeout_ms = 0;
-        const PollEvent ev = queue_->PollNext(timeout_ms);
-        if (ev.kind == PollEventKind::kData) {
-            return ev;
-        }
-        const int err = error_code_.load(std::memory_order_acquire);
-        if (err != 0) {
-            return PollEvent::Error(err, error_message_);
-        }
-        if (producer_finished_.load(std::memory_order_acquire) && queue_->IsEmpty()) {
-            JoinDispatchThreadIfFinished();
-            return PollEvent::Eof();
-        }
-        if (ev.kind == PollEventKind::kError &&
-            ev.err != -EBADF && ev.err != -ECANCELED) {
-            return ev;
-        }
-        return PollEvent::Timeout();
+        if (!source_) return PollEvent::Error(-EINVAL, "shared source unavailable");
+        return source_->PollNext(timeout_ms);
     }
 
     void Cancel() {
         std::call_once(cancel_once_, [this]() {
             if (source_) source_->Cancel();
         });
-        stop_requested_.store(true, std::memory_order_release);
-        std::lock_guard<std::mutex> lock(dispatch_join_mu_);
-        if (dispatch_thread_.joinable() &&
-            dispatch_thread_.get_id() != std::this_thread::get_id()) {
-            dispatch_thread_.join();
-        }
     }
 
     int CloseView() {
+        const int remain = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (remain == 0 && source_) {
+            return source_->Close();
+        }
         return 0;
     }
 
     bool IsFinished() const {
-        const bool done = producer_finished_.load(std::memory_order_acquire) && queue_ && queue_->IsEmpty();
-        if (done) {
-            const_cast<SharedSpmcState*>(this)->JoinDispatchThreadIfFinished();
-        }
-        return done;
+        return source_ ? source_->IsFinished() : true;
     }
 
     bool IsFull() const {
-        return queue_ && queue_->IsFull();
+        return source_ && source_->IsFull();
     }
 
     bool IsEmpty() const {
-        return !queue_ || queue_->IsEmpty();
+        return !source_ || source_->IsEmpty();
     }
 
     size_t Capacity() const {
-        return queue_ ? queue_->Capacity() : 0;
+        return source_ ? source_->Capacity() : 0;
     }
 
     size_t Size() const {
-        return queue_ ? queue_->Size() : 0;
+        return source_ ? source_->Size() : 0;
     }
 
     std::shared_ptr<arrow::Schema> GetOutputSchema() {
         return source_ ? source_->GetOutputSchema() : nullptr;
     }
 
-    const char* Category() const { return category_.c_str(); }
-    const char* Name() const { return name_.c_str(); }
-    const char* Schema() const { return schema_cache_.c_str(); }
-    bool IsFinite() const { return source_ ? source_->IsFinite() : false; }
+    StreamChannelCapabilities Capabilities() const {
+        return source_ ? source_->Capabilities() : StreamChannelCapabilities{};
+    }
+
+    const char* Category() const { return source_ ? source_->Category() : "stateless"; }
+    const char* Name() const { return source_ ? source_->Name() : "stateless"; }
+    const char* Schema() const { return source_ ? source_->Schema() : "[]"; }
+    bool IsFinite() const { return source_ && source_->IsFinite(); }
 
  private:
-    void JoinDispatchThreadIfFinished() {
-        if (!producer_finished_.load(std::memory_order_acquire)) return;
-        std::lock_guard<std::mutex> lock(dispatch_join_mu_);
-        if (dispatch_thread_.joinable()) {
-            dispatch_thread_.join();
-        }
-    }
-
-    void SetErrorOnce(int code, const std::string& msg) {
-        int expected = 0;
-        if (error_code_.compare_exchange_strong(expected, code, std::memory_order_acq_rel)) {
-            error_message_ = msg;
-        }
-    }
-
-    void DispatchLoop() {
-        while (!stop_requested_.load(std::memory_order_acquire)) {
-            PollEvent ev = source_->PollNext(100);
-            if (ev.kind == PollEventKind::kTimeout) {
-                if (source_->IsFinished() && source_->IsEmpty()) {
-                    producer_finished_.store(true, std::memory_order_release);
-                    return;
-                }
-                continue;
-            }
-            if (ev.kind == PollEventKind::kData) {
-                while (!stop_requested_.load(std::memory_order_acquire)) {
-                    int rc = queue_->Put(ev.batch.data, ev.batch.ts_ms);
-                    if (rc == 0) break;
-                    if (rc == EAGAIN) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                        continue;
-                    }
-                    SetErrorOnce(-EIO, "shared spmc dispatch put failed");
-                    producer_finished_.store(true, std::memory_order_release);
-                    return;
-                }
-                continue;
-            }
-            if (ev.kind == PollEventKind::kEof || ev.kind == PollEventKind::kDrainedAfterCancel) {
-                producer_finished_.store(true, std::memory_order_release);
-                return;
-            }
-            if (ev.kind == PollEventKind::kError) {
-                SetErrorOnce(ev.err == 0 ? -EIO : ev.err,
-                             ev.err_msg.empty() ? "shared spmc source poll failed" : ev.err_msg);
-                producer_finished_.store(true, std::memory_order_release);
-                return;
-            }
-        }
-        producer_finished_.store(true, std::memory_order_release);
-    }
-
-    std::string category_;
-    std::string name_;
-    std::string schema_cache_ = "[]";
     std::shared_ptr<IStreamChannel> source_;
-    std::shared_ptr<RingStreamChannel> queue_;
-    std::atomic<bool> started_{false};
-    std::atomic<bool> stop_requested_{false};
-    std::atomic<bool> producer_finished_{false};
+    std::atomic<int> refs_{0};
     std::once_flag cancel_once_;
-    std::atomic<int> error_code_{0};
-    std::string error_message_;
-    std::mutex dispatch_join_mu_;
-    std::thread dispatch_thread_;
+
+    friend class StatelessSourceView;
 };
 
-class SharedSpmcInputView final : public IStreamChannel {
+class StatelessSourceView final : public IStreamChannel {
  public:
-    SharedSpmcInputView(std::shared_ptr<SharedSpmcState> state, uint32_t view_id)
+    StatelessSourceView(std::shared_ptr<SharedSourceState> state, uint32_t view_id)
         : state_(std::move(state)),
-          view_name_(state_ ? std::string(state_->Name()) + ".v" + std::to_string(view_id)
-                            : ("spmc.v" + std::to_string(view_id))) {}
+          view_name_(state_ ? std::string(state_->Name()) + ".sv" + std::to_string(view_id)
+                            : ("stateless.sv" + std::to_string(view_id))) {
+        if (state_) {
+            state_->refs_.fetch_add(1, std::memory_order_release);
+        }
+    }
+    ~StatelessSourceView() override { (void)Close(); }
 
     const char* Category() override {
-        return state_ ? state_->Category() : "spmc";
+        return state_ ? state_->Category() : "stateless";
     }
 
     const char* Name() override {
@@ -504,7 +469,13 @@ class SharedSpmcInputView final : public IStreamChannel {
     }
 
     int Open() override { return 0; }
-    int Close() override { return state_ ? state_->CloseView() : 0; }
+    int Close() override {
+        bool expected = false;
+        if (!closed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return 0;
+        }
+        return state_ ? state_->CloseView() : 0;
+    }
     bool IsOpened() const override { return true; }
     int Flush() override { return 0; }
 
@@ -526,6 +497,10 @@ class SharedSpmcInputView final : public IStreamChannel {
         return 0;
     }
 
+    StreamChannelCapabilities Capabilities() const override {
+        return state_ ? state_->Capabilities() : StreamChannelCapabilities{};
+    }
+
     bool IsFull() const override { return state_ && state_->IsFull(); }
     bool IsEmpty() const override { return !state_ || state_->IsEmpty(); }
     size_t Capacity() const override { return state_ ? state_->Capacity() : 0; }
@@ -540,8 +515,9 @@ class SharedSpmcInputView final : public IStreamChannel {
     }
 
  private:
-    std::shared_ptr<SharedSpmcState> state_;
+    std::shared_ptr<SharedSourceState> state_;
     std::string view_name_;
+    std::atomic<bool> closed_{false};
 };
 
 class FanOutPartitionView final : public IStreamChannel {
@@ -742,6 +718,13 @@ int SchedulerPlugin::Stop() {
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
         stream_tasks_.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
+        stream_task_leases_.clear();
+        stream_source_leases_.clear();
+        stream_channel_ref_counts_.clear();
+        stream_channel_mutating_.clear();
+    }
     channels_.clear();
     LOG_INFO("SchedulerPlugin::Stop: done");
     return 0;
@@ -750,23 +733,23 @@ int SchedulerPlugin::Stop() {
 // --- IRouterHandle ---
 void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
     // 任务执行
-    cb({"POST", "/tasks/instant/execute",
+    cb({"POST", "/scheduler/batch/execute",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleExecute(u, req, rsp);
         }});
-    cb({"POST", "/tasks/stream/execute",
+    cb({"POST", "/scheduler/stream/execute",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleStreamExecute(u, req, rsp);
         }});
-    cb({"POST", "/tasks/stream/stop",
+    cb({"POST", "/scheduler/stream/stop",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleStreamStop(u, req, rsp);
         }});
-    cb({"POST", "/tasks/stream/status",
+    cb({"POST", "/scheduler/stream/status",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleStreamStatus(u, req, rsp);
         }});
-    cb({"GET", "/tasks/stream/list",
+    cb({"POST", "/scheduler/stream/list",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleStreamList(u, req, rsp);
         }});
@@ -774,6 +757,18 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
     cb({"POST", "/channels/stream/query",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleQueryStreamChannels(u, req, rsp);
+        }});
+    cb({"POST", "/channels/stream/add",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleAddStreamChannel(u, req, rsp);
+        }});
+    cb({"POST", "/channels/stream/modify",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleModifyStreamChannel(u, req, rsp);
+        }});
+    cb({"POST", "/channels/stream/remove",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleRemoveStreamChannel(u, req, rsp);
         }});
     // 内存通道查询
     cb({"POST", "/channels/dataframe/query",
@@ -1321,6 +1316,120 @@ int32_t SchedulerPlugin::ResolveStreamSink(
     return error::OK;
 }
 
+int SchedulerPlugin::TryAcquireStreamTaskLeases(const std::string& runtime_task_id,
+                                                const std::vector<std::string>& source_keys,
+                                                const std::vector<std::string>& sink_keys,
+                                                std::string* conflict_key_out,
+                                                bool* blocked_by_mutation_out) {
+    if (runtime_task_id.empty()) return EINVAL;
+    if (blocked_by_mutation_out) *blocked_by_mutation_out = false;
+    std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
+
+    std::unordered_set<std::string> unique_all;
+    for (const auto& key : source_keys) unique_all.insert(key);
+    for (const auto& key : sink_keys) unique_all.insert(key);
+
+    for (const auto& key : unique_all) {
+        if (stream_channel_mutating_.count(key) > 0) {
+            if (conflict_key_out) *conflict_key_out = key;
+            if (blocked_by_mutation_out) *blocked_by_mutation_out = true;
+            return EBUSY;
+        }
+    }
+
+    for (const auto& key : source_keys) {
+        auto lease_it = stream_source_leases_.find(key);
+        if (lease_it != stream_source_leases_.end() && lease_it->second != runtime_task_id) {
+            if (conflict_key_out) *conflict_key_out = key;
+            return EBUSY;
+        }
+    }
+
+    StreamTaskLeaseInfo info;
+    info.all_keys.assign(unique_all.begin(), unique_all.end());
+    info.source_keys = source_keys;
+
+    for (const auto& key : info.all_keys) {
+        stream_channel_ref_counts_[key] += 1;
+    }
+    for (const auto& key : source_keys) {
+        stream_source_leases_[key] = runtime_task_id;
+    }
+    stream_task_leases_[runtime_task_id] = std::move(info);
+    return 0;
+}
+
+int SchedulerPlugin::TryBeginStreamChannelMutation(const std::string& key, std::string* reason_out) {
+    if (reason_out) reason_out->clear();
+    if (key.empty()) return EINVAL;
+
+    std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
+    auto it = stream_channel_ref_counts_.find(key);
+    if (it != stream_channel_ref_counts_.end() && it->second > 0) {
+        if (reason_out) *reason_out = "in_use";
+        return EBUSY;
+    }
+    if (stream_source_leases_.find(key) != stream_source_leases_.end()) {
+        if (reason_out) *reason_out = "source_in_use";
+        return EBUSY;
+    }
+    if (stream_channel_mutating_.count(key) > 0) {
+        if (reason_out) *reason_out = "mutating";
+        return EBUSY;
+    }
+    stream_channel_mutating_.insert(key);
+    return 0;
+}
+
+void SchedulerPlugin::EndStreamChannelMutation(const std::string& key) {
+    if (key.empty()) return;
+    std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
+    stream_channel_mutating_.erase(key);
+}
+
+void SchedulerPlugin::ReleaseStreamTaskLeases(const std::string& runtime_task_id) {
+    if (runtime_task_id.empty()) return;
+    std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
+    auto it = stream_task_leases_.find(runtime_task_id);
+    if (it == stream_task_leases_.end()) return;
+
+    for (const auto& key : it->second.all_keys) {
+        auto cnt_it = stream_channel_ref_counts_.find(key);
+        if (cnt_it == stream_channel_ref_counts_.end()) continue;
+        if (cnt_it->second <= 1) {
+            stream_channel_ref_counts_.erase(cnt_it);
+        } else {
+            --cnt_it->second;
+        }
+    }
+    for (const auto& key : it->second.source_keys) {
+        auto lease_it = stream_source_leases_.find(key);
+        if (lease_it != stream_source_leases_.end() && lease_it->second == runtime_task_id) {
+            stream_source_leases_.erase(lease_it);
+        }
+    }
+    stream_task_leases_.erase(it);
+}
+
+void SchedulerPlugin::SweepFinishedTaskLeases() {
+    std::vector<std::string> to_release;
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        for (const auto& [task_id, task] : stream_tasks_) {
+            if (!task) {
+                to_release.push_back(task_id);
+                continue;
+            }
+            if (IsTerminalStreamTaskStatus(task->Status())) {
+                to_release.push_back(task_id);
+            }
+        }
+    }
+    for (const auto& task_id : to_release) {
+        ReleaseStreamTaskLeases(task_id);
+    }
+}
+
 int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string& rsp) {
     if (!querier_) {
         rsp = MakeErrorJson("querier not initialized");
@@ -1367,11 +1476,20 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
 
     std::vector<std::shared_ptr<IStreamChannel>> source_channels;
     source_channels.reserve(stmt.sources.size());
+    std::vector<std::string> source_keys;
+    source_keys.reserve(stmt.sources.size());
     for (const auto& source_name : stmt.sources) {
         IChannel* raw = FindChannel(source_name);
         if (!raw) {
             rsp = MakeErrorJson("source channel not found: " + source_name);
             return error::NOT_FOUND;
+        }
+        if (std::string(raw->Type()) == ChannelType::kBlockStream) {
+            rsp = MakeExecutionErrorJson(
+                "block stream source is not implemented in current release",
+                "BLOCK_STREAM_NOT_IMPLEMENTED",
+                "source_resolve");
+            return error::BAD_REQUEST;
         }
         if (std::string(raw->Type()) != ChannelType::kStream) {
             rsp = MakeErrorJson("source channel is not stream type: " + source_name);
@@ -1382,8 +1500,8 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
             rsp = MakeErrorJson("source channel cast to IStreamChannel failed: " + source_name);
             return error::BAD_REQUEST;
         }
-        source_channels.push_back(
-            std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {}));
+        source_channels.push_back(std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {}));
+        source_keys.push_back(MakeStreamChannelKey(raw->Category(), raw->Name()));
     }
     if (source_channels.empty()) {
         rsp = MakeErrorJson("source channel not found");
@@ -1420,9 +1538,66 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     sink_ctx.table_name = sink_binding.table_name;
 
     const std::string task_id = NextStreamTaskId();
+    std::vector<std::string> sink_keys;
+    if (sink_ctx.sink_type == ChannelType::kStream) {
+        auto* sink_stream = dynamic_cast<IStreamChannel*>(output.get());
+        if (sink_stream) {
+            sink_keys.push_back(MakeStreamChannelKey(sink_stream->Category(), sink_stream->Name()));
+        }
+    }
+
+    SweepFinishedTaskLeases();
+    std::string conflict_key;
+    bool blocked_by_mutation = false;
+    const int lease_rc =
+        TryAcquireStreamTaskLeases(task_id, source_keys, sink_keys, &conflict_key, &blocked_by_mutation);
+    if (lease_rc != 0) {
+        if (lease_rc == EBUSY) {
+            if (blocked_by_mutation) {
+                rsp = MakeExecutionErrorJson(
+                    "stream channel is being modified: " + conflict_key,
+                    "STREAM_CHANNEL_MUTATING",
+                    "lease");
+                return error::CONFLICT;
+            }
+            rsp = MakeExecutionErrorJson(
+                "stream source is in use: " + conflict_key,
+                "STREAM_SOURCE_IN_USE",
+                "lease");
+            return error::CONFLICT;
+        }
+        rsp = MakeExecutionErrorJson(
+            "stream channel lease acquire failed",
+            "STREAM_LEASE_FAILED",
+            "lease");
+        return MapStreamManagerErrorToStatus(lease_rc);
+    }
+    bool release_lease_on_fail = true;
+    auto lease_guard = std::unique_ptr<void, std::function<void(void*)>>(
+        reinterpret_cast<void*>(1),
+        [this, task_id, &release_lease_on_fail](void*) {
+            if (release_lease_on_fail) {
+                ReleaseStreamTaskLeases(task_id);
+            }
+        });
+
     std::shared_ptr<FanInStreamChannel> fanin;
     std::shared_ptr<IStreamChannel> source = source_channels[0];
     if (source_channels.size() > 1) {
+        for (size_t i = 0; i < source_channels.size(); ++i) {
+            const auto& sc = source_channels[i];
+            StreamChannelCapabilities caps = sc ? sc->Capabilities() : StreamChannelCapabilities{};
+            if (!sc || !caps.semantics.supports_timeout_poll || !caps.concurrency.lock_free_poll) {
+                const std::string src_name = (sc ? (std::string(sc->Category()) + "." + sc->Name())
+                                                 : source_keys[i]);
+                rsp = MakeExecutionErrorJson(
+                    "stream fanin capability mismatch: source=" + src_name +
+                    ", reason=source must support timeout poll and lock-free poll",
+                    "STREAM_FANIN_CAPABILITY_MISMATCH",
+                    "fanin");
+                return error::BAD_REQUEST;
+            }
+        }
         fanin = std::make_shared<FanInStreamChannel>(
             "fanin", task_id + ".fanin", source_channels);
         source = fanin;
@@ -1462,18 +1637,63 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     if (strategy == ParallelStrategy::NONE) {
         parallelism = 1;
     }
-    if (sink_ctx.sink_type != ChannelType::kStream) {
-        if (strategy != ParallelStrategy::NONE || parallelism != 1) {
-            LOG_WARN("ExecuteStreamTask: sink=%s(type=%s) forces single-writer, downgrade strategy=%d parallelism=%d -> NONE/1",
-                     stmt.dest.c_str(), sink_ctx.sink_type.c_str(),
-                     static_cast<int>(strategy), parallelism);
+    if (parallelism < 1) parallelism = 1;
+
+    StreamChannelCapabilities source_caps = source->Capabilities();
+    StreamChannelCapabilities sink_caps;
+    if (sink_ctx.sink_type == ChannelType::kStream) {
+        auto* sink_stream = dynamic_cast<IStreamChannel*>(output.get());
+        if (!sink_stream) {
+            rsp = MakeErrorJson("stream sink cast to IStreamChannel failed");
+            return error::BAD_REQUEST;
         }
-        strategy = ParallelStrategy::NONE;
-        parallelism = 1;
+        sink_caps = sink_stream->Capabilities();
+    } else {
+        sink_caps.channel_type = sink_ctx.sink_type;
+        sink_caps.concurrency.put_mode = ProducerMode::SINGLE;
+        sink_caps.concurrency.poll_mode = ConsumerMode::SINGLE;
+        sink_caps.concurrency.max_producers = 1;
+        sink_caps.concurrency.max_consumers = 1;
+        sink_caps.concurrency.lock_free_put = false;
+        sink_caps.concurrency.lock_free_poll = false;
+        sink_caps.concurrency.cancel_wakeup_guaranteed = false;
+    }
+
+    if (strategy == ParallelStrategy::STATELESS && parallelism > 1) {
+        const bool poll_mode_ok = source_caps.concurrency.poll_mode == ConsumerMode::MULTI;
+        const bool consumers_ok = source_caps.concurrency.max_consumers == 0 ||
+                                  source_caps.concurrency.max_consumers >= static_cast<uint32_t>(parallelism);
+        if (!poll_mode_ok || !consumers_ok) {
+            rsp = MakeCapabilityMismatchJson(
+                "stream source capability mismatch: strategy=STATELESS, parallelism=" + std::to_string(parallelism) +
+                ", required.poll_mode=MULTI, actual.poll_mode=" + std::string(ConsumerModeName(source_caps.concurrency.poll_mode)) +
+                ", actual.max_consumers=" + std::to_string(source_caps.concurrency.max_consumers),
+                "STREAM_SOURCE_CAPABILITY_MISMATCH",
+                &source_caps,
+                &sink_caps);
+            return error::BAD_REQUEST;
+        }
+    }
+
+    if (parallelism > 1) {
+        const bool put_mode_ok = sink_caps.concurrency.put_mode == ProducerMode::MULTI;
+        const bool producers_ok = sink_caps.concurrency.max_producers == 0 ||
+                                  sink_caps.concurrency.max_producers >= static_cast<uint32_t>(parallelism);
+        if (!put_mode_ok || !producers_ok) {
+            rsp = MakeCapabilityMismatchJson(
+                "stream sink capability mismatch: strategy=" + std::to_string(static_cast<int>(strategy)) +
+                ", parallelism=" + std::to_string(parallelism) +
+                ", required.put_mode=MULTI, actual.put_mode=" + std::string(ProducerModeName(sink_caps.concurrency.put_mode)) +
+                ", actual.max_producers=" + std::to_string(sink_caps.concurrency.max_producers),
+                "STREAM_SINK_CAPABILITY_MISMATCH",
+                &source_caps,
+                &sink_caps);
+            return error::BAD_REQUEST;
+        }
     }
 
     std::shared_ptr<FanOutStreamChannel> fanout;
-    std::shared_ptr<SharedSpmcState> spmc_state;
+    std::shared_ptr<SharedSourceState> shared_source_state;
     std::vector<std::shared_ptr<IStreamChannel>> input_ports;
     input_ports.reserve(static_cast<size_t>(parallelism));
     std::shared_ptr<IStreamChannel> open_target = source;
@@ -1481,13 +1701,9 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     if (strategy == ParallelStrategy::NONE) {
         input_ports.push_back(source);
     } else if (strategy == ParallelStrategy::STATELESS) {
-        const size_t source_cap = source->Capacity();
-        const size_t ring_size = std::max<size_t>(source_cap > 0 ? source_cap : 64,
-                                                  static_cast<size_t>(parallelism) * 64);
-        spmc_state = std::make_shared<SharedSpmcState>(
-            "spmc", task_id + ".spmc", source, ring_size);
+        shared_source_state = std::make_shared<SharedSourceState>(source);
         for (int i = 0; i < parallelism; ++i) {
-            input_ports.push_back(std::make_shared<SharedSpmcInputView>(spmc_state, static_cast<uint32_t>(i)));
+            input_ports.push_back(std::make_shared<StatelessSourceView>(shared_source_state, static_cast<uint32_t>(i)));
         }
     } else if (strategy == ParallelStrategy::KEYED) {
         RingStreamChannelOptions partition_opts;
@@ -1580,14 +1796,6 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
         rsp = MakeErrorJson("open stream source failed");
         return error::INTERNAL_ERROR;
     }
-    if (spmc_state) {
-        const int spmc_rc = spmc_state->Start();
-        if (spmc_rc != 0) {
-            open_target->Cancel();
-            rsp = MakeErrorJson("start shared spmc forwarder failed");
-            return error::INTERNAL_ERROR;
-        }
-    }
 
     {
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
@@ -1596,13 +1804,15 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     for (const auto& shard : task->Shards()) {
         stream_runtime_.TrySchedule(shard);
     }
+    release_lease_on_fail = false;
+    lease_guard.reset();
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
     w.StartObject();
     w.Key("status");
     w.String("submitted");
-    w.Key("stream_task_id");
+    w.Key("runtime_task_id");
     w.String(task->Id().c_str());
     w.EndObject();
     rsp = buf.GetString();
@@ -1614,6 +1824,10 @@ int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::stri
     doc.Parse(req_body.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("sql") || !doc["sql"].IsString()) {
         rsp = MakeErrorJson("invalid request, expected {\"sql\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+    if (doc.HasMember("task_id")) {
+        rsp = MakeErrorJson("external task_id is not allowed");
         return error::BAD_REQUEST;
     }
 
@@ -1635,6 +1849,7 @@ int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::stri
 }
 
 int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string& req, std::string& rsp) {
+    SweepFinishedTaskLeases();
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
@@ -1656,6 +1871,7 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
 
     task->RequestStop();
     task->Join();
+    ReleaseStreamTaskLeases(task_id);
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
@@ -1665,6 +1881,7 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
 }
 
 int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::string& req, std::string& rsp) {
+    SweepFinishedTaskLeases();
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
@@ -1684,21 +1901,36 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
         task = it->second;
     }
 
+    TaskSnapshot snapshot = task->Snapshot();
+    if (IsTerminalStreamTaskStatus(snapshot.status)) {
+        ReleaseStreamTaskLeases(task_id);
+    }
+
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    WriteTaskSnapshotJson(&w, task->Snapshot());
+    WriteTaskSnapshotJson(&w, snapshot);
     rsp = buf.GetString();
     return error::OK;
 }
 
 int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&, std::string& rsp) {
+    SweepFinishedTaskLeases();
     std::vector<TaskSnapshot> snapshots;
+    std::vector<std::string> terminal_tasks;
     {
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
         snapshots.reserve(stream_tasks_.size());
         for (const auto& kv : stream_tasks_) {
-            if (kv.second) snapshots.push_back(kv.second->Snapshot());
+            if (!kv.second) continue;
+            TaskSnapshot s = kv.second->Snapshot();
+            if (IsTerminalStreamTaskStatus(s.status)) {
+                terminal_tasks.push_back(kv.first);
+            }
+            snapshots.push_back(std::move(s));
         }
+    }
+    for (const auto& task_id : terminal_tasks) {
+        ReleaseStreamTaskLeases(task_id);
     }
 
     rapidjson::StringBuffer buf;
@@ -1756,6 +1988,16 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
             return IsDataFrameRef(name) ? error::NOT_FOUND : error::BAD_REQUEST;
         }
         input_channels.push_back(ch);
+    }
+
+    for (auto* ch : input_channels) {
+        if (ch && std::string(ch->Type()) == ChannelType::kBlockStream) {
+            rsp = MakeExecutionErrorJson(
+                "block stream source is not implemented in current release",
+                "BLOCK_STREAM_NOT_IMPLEMENTED",
+                "source_resolve");
+            return error::BAD_REQUEST;
+        }
     }
 
     bool has_stream_source = false;
@@ -2051,30 +2293,38 @@ int32_t SchedulerPlugin::HandleGetChannels(const std::string&, const std::string
 int32_t SchedulerPlugin::HandleQueryStreamChannels(const std::string&,
                                                    const std::string&,
                                                    std::string& rsp) {
+    SweepFinishedTaskLeases();
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
     w.StartObject();
     w.Key("channels");
     w.StartArray();
 
-    auto* stream_factory = querier_ ? static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY)) : nullptr;
-    if (stream_factory) {
-        stream_factory->List([&w](const char* type, const char* name, IStreamChannel* stream_ch) {
-            if (!type || !name || !stream_ch) return;
-            const char* status = "running";
-            if (stream_ch->IsFinished() && stream_ch->IsEmpty()) {
-                status = "stopped";
-            } else if (stream_ch->IsFinished()) {
-                status = "draining";
+    auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
+    if (stream_manager) {
+        stream_manager->QueryChannels([this, &w](const std::string& type,
+                                                 const std::string& name,
+                                                 const std::string& option,
+                                                 const std::string& status) {
+            const std::string key = MakeStreamChannelKey(type, name);
+            uint32_t in_use_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
+                auto it = stream_channel_ref_counts_.find(key);
+                if (it != stream_channel_ref_counts_.end()) in_use_count = it->second;
             }
 
             w.StartObject();
             w.Key("type");
-            w.String(type);
+            w.String(type.c_str());
             w.Key("name");
-            w.String(name);
+            w.String(name.c_str());
+            w.Key("option");
+            w.String(option.c_str());
             w.Key("status");
-            w.String(status);
+            w.String(status.c_str());
+            w.Key("in_use");
+            w.Bool(in_use_count > 0);
             w.EndObject();
         });
     }
@@ -2082,6 +2332,175 @@ int32_t SchedulerPlugin::HandleQueryStreamChannels(const std::string&,
     w.EndArray();
     w.EndObject();
     rsp = buf.GetString();
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
+                                                const std::string& req,
+                                                std::string& rsp) {
+    auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
+    if (!stream_manager) {
+        rsp = MakeErrorJson("stream manager unavailable");
+        return error::UNAVAILABLE;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(req.c_str());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        rsp = MakeErrorJson("invalid request body");
+        return error::BAD_REQUEST;
+    }
+
+    auto parse_field = [&doc](const char* key, std::string* out) {
+        if (!out) return;
+        out->clear();
+        if (!doc.HasMember(key) || !doc[key].IsString()) return;
+        *out = doc[key].GetString();
+    };
+
+    std::string type;
+    std::string name;
+    std::string option;
+    parse_field("type", &type);
+    parse_field("name", &name);
+    parse_field("option", &option);
+    if ((type.empty() || name.empty()) && doc.HasMember("config") && doc["config"].IsObject()) {
+        const auto& cfg = doc["config"];
+        if (type.empty() && cfg.HasMember("type") && cfg["type"].IsString()) type = cfg["type"].GetString();
+        if (name.empty() && cfg.HasMember("name") && cfg["name"].IsString()) name = cfg["name"].GetString();
+        if (option.empty() && cfg.HasMember("option") && cfg["option"].IsString()) option = cfg["option"].GetString();
+    }
+    if (type.empty() || name.empty()) {
+        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"option\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+
+    const int rc = stream_manager->AddChannel(ToLowerAscii(type), name, option);
+    if (rc != 0) {
+        rsp = MakeErrorJson("add stream channel failed: " + type + "." + name);
+        return MapStreamManagerErrorToStatus(rc);
+    }
+    rsp = R"({"ok":true})";
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
+                                                   const std::string& req,
+                                                   std::string& rsp) {
+    auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
+    if (!stream_manager) {
+        rsp = MakeErrorJson("stream manager unavailable");
+        return error::UNAVAILABLE;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(req.c_str());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        rsp = MakeErrorJson("invalid request body");
+        return error::BAD_REQUEST;
+    }
+
+    auto parse_field = [&doc](const char* key, std::string* out) {
+        if (!out) return;
+        out->clear();
+        if (!doc.HasMember(key) || !doc[key].IsString()) return;
+        *out = doc[key].GetString();
+    };
+
+    std::string type;
+    std::string name;
+    std::string option;
+    parse_field("type", &type);
+    parse_field("name", &name);
+    parse_field("option", &option);
+    if ((type.empty() || name.empty()) && doc.HasMember("config") && doc["config"].IsObject()) {
+        const auto& cfg = doc["config"];
+        if (type.empty() && cfg.HasMember("type") && cfg["type"].IsString()) type = cfg["type"].GetString();
+        if (name.empty() && cfg.HasMember("name") && cfg["name"].IsString()) name = cfg["name"].GetString();
+        if (option.empty() && cfg.HasMember("option") && cfg["option"].IsString()) option = cfg["option"].GetString();
+    }
+    if (type.empty() || name.empty()) {
+        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"option\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+
+    SweepFinishedTaskLeases();
+    const std::string key = MakeStreamChannelKey(type, name);
+    std::string mutation_reason;
+    const int mutation_rc = TryBeginStreamChannelMutation(key, &mutation_reason);
+    if (mutation_rc != 0) {
+        if (mutation_reason == "source_in_use") {
+            rsp = MakeExecutionErrorJson("stream source is in use", "STREAM_SOURCE_IN_USE", "modify");
+            return error::CONFLICT;
+        }
+        if (mutation_reason == "mutating") {
+            rsp = MakeExecutionErrorJson("stream channel is mutating", "STREAM_CHANNEL_MUTATING", "modify");
+            return error::CONFLICT;
+        }
+        rsp = MakeExecutionErrorJson("stream channel is in use", "STREAM_CHANNEL_IN_USE", "modify");
+        return error::CONFLICT;
+    }
+    auto mutation_guard = std::unique_ptr<void, std::function<void(void*)>>(
+        reinterpret_cast<void*>(1),
+        [this, key](void*) { EndStreamChannelMutation(key); });
+
+    const int rc = stream_manager->ModifyChannel(ToLowerAscii(type), name, option);
+    if (rc != 0) {
+        rsp = MakeErrorJson("modify stream channel failed: " + type + "." + name);
+        return MapStreamManagerErrorToStatus(rc);
+    }
+    mutation_guard.reset();
+    rsp = R"({"ok":true})";
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
+                                                   const std::string& req,
+                                                   std::string& rsp) {
+    auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
+    if (!stream_manager) {
+        rsp = MakeErrorJson("stream manager unavailable");
+        return error::UNAVAILABLE;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(req.c_str());
+    if (doc.HasParseError() || !doc.IsObject() ||
+        !doc.HasMember("type") || !doc["type"].IsString() ||
+        !doc.HasMember("name") || !doc["name"].IsString()) {
+        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+    const std::string type = doc["type"].GetString();
+    const std::string name = doc["name"].GetString();
+
+    SweepFinishedTaskLeases();
+    const std::string key = MakeStreamChannelKey(type, name);
+    std::string mutation_reason;
+    const int mutation_rc = TryBeginStreamChannelMutation(key, &mutation_reason);
+    if (mutation_rc != 0) {
+        if (mutation_reason == "source_in_use") {
+            rsp = MakeExecutionErrorJson("stream source is in use", "STREAM_SOURCE_IN_USE", "remove");
+            return error::CONFLICT;
+        }
+        if (mutation_reason == "mutating") {
+            rsp = MakeExecutionErrorJson("stream channel is mutating", "STREAM_CHANNEL_MUTATING", "remove");
+            return error::CONFLICT;
+        }
+        rsp = MakeExecutionErrorJson("stream channel is in use", "STREAM_CHANNEL_IN_USE", "remove");
+        return error::CONFLICT;
+    }
+    auto mutation_guard = std::unique_ptr<void, std::function<void(void*)>>(
+        reinterpret_cast<void*>(1),
+        [this, key](void*) { EndStreamChannelMutation(key); });
+
+    const int rc = stream_manager->RemoveChannel(ToLowerAscii(type), name);
+    if (rc != 0) {
+        rsp = MakeErrorJson("remove stream channel failed: " + type + "." + name);
+        return MapStreamManagerErrorToStatus(rc);
+    }
+    mutation_guard.reset();
+    rsp = R"({"ok":true})";
     return error::OK;
 }
 

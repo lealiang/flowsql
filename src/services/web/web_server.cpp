@@ -167,9 +167,9 @@ int WebServer::Init(const std::string& db_path) {
         std::string rsp; HandleGetChannels("", "", rsp);
         res.set_content(rsp, "application/json");
     });
-    server_.Get("/api/channels/stream/list", [this](const httplib::Request&, httplib::Response& res) {
+    server_.Post("/api/channels/stream/query", [this](const httplib::Request& req, httplib::Response& res) {
         std::string rsp;
-        int32_t rc = HandleGetStreamChannels("", "", rsp);
+        int32_t rc = HandleQueryStreamChannels("", req.body.empty() ? "{}" : req.body, rsp);
         if (rc == error::OK) {
             res.status = 200;
         } else if (rc == error::BAD_REQUEST) {
@@ -183,6 +183,33 @@ int WebServer::Init(const std::string& db_path) {
         } else {
             res.status = 500;
         }
+        res.set_content(rsp, "application/json");
+    });
+    server_.Post("/api/channels/stream/add", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp;
+        int32_t rc = HandleAddStreamChannel("", req.body, rsp);
+        res.status = (rc == error::OK) ? 200 :
+                     (rc == error::CONFLICT ? 409 :
+                     (rc == error::NOT_FOUND ? 404 :
+                     (rc == error::UNAVAILABLE ? 503 : 400)));
+        res.set_content(rsp, "application/json");
+    });
+    server_.Post("/api/channels/stream/modify", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp;
+        int32_t rc = HandleModifyStreamChannel("", req.body, rsp);
+        res.status = (rc == error::OK) ? 200 :
+                     (rc == error::CONFLICT ? 409 :
+                     (rc == error::NOT_FOUND ? 404 :
+                     (rc == error::UNAVAILABLE ? 503 : 400)));
+        res.set_content(rsp, "application/json");
+    });
+    server_.Post("/api/channels/stream/remove", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp;
+        int32_t rc = HandleRemoveStreamChannel("", req.body, rsp);
+        res.status = (rc == error::OK) ? 200 :
+                     (rc == error::CONFLICT ? 409 :
+                     (rc == error::NOT_FOUND ? 404 :
+                     (rc == error::UNAVAILABLE ? 503 : 400)));
         res.set_content(rsp, "application/json");
     });
     server_.Get("/api/operators/list", [this](const httplib::Request& req, httplib::Response& res) {
@@ -297,6 +324,26 @@ int WebServer::Init(const std::string& db_path) {
     server_.Post("/api/tasks/diagnostics", [this](const httplib::Request& req, httplib::Response& res) {
         std::string rsp; int32_t rc = HandleTaskDiagnostics("", req.body, rsp);
         res.status = (rc == error::OK) ? 200 : (rc == error::NOT_FOUND ? 404 : 400);
+        res.set_content(rsp, "application/json");
+    });
+    server_.Post("/api/tasks/stream/execute", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp; int32_t rc = HandleStreamExecuteTask("", req.body, rsp);
+        res.status = (rc == error::OK) ? 200 : (rc == error::CONFLICT ? 409 : (rc == error::NOT_FOUND ? 404 : (rc == error::UNAVAILABLE ? 503 : 400)));
+        res.set_content(rsp, "application/json");
+    });
+    server_.Post("/api/tasks/stream/stop", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp; int32_t rc = HandleStreamStopTask("", req.body, rsp);
+        res.status = (rc == error::OK) ? 200 : (rc == error::CONFLICT ? 409 : (rc == error::NOT_FOUND ? 404 : (rc == error::UNAVAILABLE ? 503 : 400)));
+        res.set_content(rsp, "application/json");
+    });
+    server_.Post("/api/tasks/stream/status", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp; int32_t rc = HandleStreamStatusTask("", req.body, rsp);
+        res.status = (rc == error::OK) ? 200 : (rc == error::CONFLICT ? 409 : (rc == error::NOT_FOUND ? 404 : (rc == error::UNAVAILABLE ? 503 : 400)));
+        res.set_content(rsp, "application/json");
+    });
+    server_.Post("/api/tasks/stream/list", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp; int32_t rc = HandleStreamListTask("", req.body.empty() ? "{}" : req.body, rsp);
+        res.status = (rc == error::OK) ? 200 : (rc == error::CONFLICT ? 409 : (rc == error::NOT_FOUND ? 404 : (rc == error::UNAVAILABLE ? 503 : 400)));
         res.set_content(rsp, "application/json");
     });
 
@@ -452,9 +499,21 @@ void WebServer::EnumApiRoutes(std::function<void(const RouteItem&)> cb) {
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleGetChannels(u, req, rsp);
         }});
-    cb({"GET", "/api/channels/stream/list",
+    cb({"POST", "/api/channels/stream/query",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
-            return HandleGetStreamChannels(u, req, rsp);
+            return HandleQueryStreamChannels(u, req, rsp);
+        }});
+    cb({"POST", "/api/channels/stream/add",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleAddStreamChannel(u, req, rsp);
+        }});
+    cb({"POST", "/api/channels/stream/modify",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleModifyStreamChannel(u, req, rsp);
+        }});
+    cb({"POST", "/api/channels/stream/remove",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleRemoveStreamChannel(u, req, rsp);
         }});
     cb({"GET",  "/api/operators/list",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
@@ -511,6 +570,22 @@ void WebServer::EnumApiRoutes(std::function<void(const RouteItem&)> cb) {
     cb({"POST", "/api/tasks/diagnostics",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleTaskDiagnostics(u, req, rsp);
+        }});
+    cb({"POST", "/api/tasks/stream/execute",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleStreamExecuteTask(u, req, rsp);
+        }});
+    cb({"POST", "/api/tasks/stream/stop",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleStreamStopTask(u, req, rsp);
+        }});
+    cb({"POST", "/api/tasks/stream/status",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleStreamStatusTask(u, req, rsp);
+        }});
+    cb({"POST", "/api/tasks/stream/list",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleStreamListTask(u, req, rsp);
         }});
 
     // 代理 /api/channels/database/* → Gateway /channels/database/*
@@ -650,8 +725,21 @@ int32_t WebServer::HandleGetChannels(const std::string&, const std::string&, std
     return error::OK;
 }
 
-int32_t WebServer::HandleGetStreamChannels(const std::string&, const std::string&, std::string& rsp) {
-    return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/query", "{}", &rsp);
+int32_t WebServer::HandleQueryStreamChannels(const std::string&, const std::string& req, std::string& rsp) {
+    const std::string body = req.empty() ? "{}" : req;
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/query", body, &rsp);
+}
+
+int32_t WebServer::HandleAddStreamChannel(const std::string&, const std::string& req, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/add", req, &rsp);
+}
+
+int32_t WebServer::HandleModifyStreamChannel(const std::string&, const std::string& req, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/modify", req, &rsp);
+}
+
+int32_t WebServer::HandleRemoveStreamChannel(const std::string&, const std::string& req, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/remove", req, &rsp);
 }
 
 int32_t WebServer::HandleGetOperators(const std::string&, const std::string& req, std::string& rsp) {
@@ -840,6 +928,23 @@ int32_t WebServer::HandleCancelTask(const std::string&, const std::string& req, 
 
 int32_t WebServer::HandleTaskDiagnostics(const std::string&, const std::string& req, std::string& rsp) {
     return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/diagnostics", req, &rsp);
+}
+
+int32_t WebServer::HandleStreamExecuteTask(const std::string&, const std::string& req, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/stream/execute", req, &rsp);
+}
+
+int32_t WebServer::HandleStreamStopTask(const std::string&, const std::string& req, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/stream/stop", req, &rsp);
+}
+
+int32_t WebServer::HandleStreamStatusTask(const std::string&, const std::string& req, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/stream/status", req, &rsp);
+}
+
+int32_t WebServer::HandleStreamListTask(const std::string&, const std::string& req, std::string& rsp) {
+    const std::string body = req.empty() ? "{}" : req;
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/stream/list", body, &rsp);
 }
 
 }  // namespace web

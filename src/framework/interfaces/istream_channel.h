@@ -63,6 +63,62 @@ struct PollEvent {
     }
 };
 
+enum class ProducerMode {
+    SINGLE,
+    MULTI,
+};
+
+enum class ConsumerMode {
+    SINGLE,
+    MULTI,
+};
+
+enum class OrderGuarantee {
+    GLOBAL_FIFO,
+    PER_PRODUCER_FIFO,
+    PER_PARTITION_FIFO,
+    NONE,
+};
+
+enum class BackpressurePolicy {
+    DROP_ONLY,
+    BLOCK_ONLY,
+    DROP_OR_BLOCK,
+};
+
+struct StreamConcurrencyCaps {
+    ProducerMode put_mode = ProducerMode::SINGLE;
+    ConsumerMode poll_mode = ConsumerMode::SINGLE;
+    uint32_t max_producers = 1;  // 0 means unbounded
+    uint32_t max_consumers = 1;  // 0 means unbounded
+    bool lock_free_put = false;
+    bool lock_free_poll = false;
+    bool cancel_wakeup_guaranteed = false;
+};
+
+struct StreamSemanticCaps {
+    bool finite = false;
+    bool supports_timeout_poll = true;
+    bool supports_filter_pushdown = false;
+    bool filter_requires_full_match = true;
+    bool eof_reliable = true;
+    OrderGuarantee ordering = OrderGuarantee::NONE;
+    BackpressurePolicy backpressure = BackpressurePolicy::DROP_OR_BLOCK;
+};
+
+struct StreamPartitionCaps {
+    bool has_partition_id = false;
+    bool supports_route_by_partition_id = false;
+    bool preserves_partition_order = false;
+};
+
+struct StreamChannelCapabilities {
+    std::string channel_type = ChannelType::kStream;
+    StreamConcurrencyCaps concurrency;
+    StreamSemanticCaps semantics;
+    StreamPartitionCaps partition;
+};
+
 // IStreamChannel — 流式通道接口（路径 A）
 interface IStreamChannel : public IChannel {
     virtual ~IStreamChannel() = default;
@@ -99,6 +155,30 @@ interface IStreamChannel : public IChannel {
 
     // true 表示生产/转发侧已结束
     virtual bool IsFinished() const = 0;
+
+    // 并发与语义能力声明
+    virtual StreamChannelCapabilities Capabilities() const {
+        StreamChannelCapabilities caps;
+        caps.channel_type = ChannelType::kStream;
+        caps.concurrency.put_mode = ProducerMode::SINGLE;
+        caps.concurrency.poll_mode = ConsumerMode::SINGLE;
+        caps.concurrency.max_producers = 1;
+        caps.concurrency.max_consumers = 1;
+        caps.concurrency.lock_free_put = false;
+        caps.concurrency.lock_free_poll = false;
+        caps.concurrency.cancel_wakeup_guaranteed = false;
+        caps.semantics.finite = false;
+        caps.semantics.supports_timeout_poll = true;
+        caps.semantics.supports_filter_pushdown = false;
+        caps.semantics.filter_requires_full_match = true;
+        caps.semantics.eof_reliable = true;
+        caps.semantics.ordering = OrderGuarantee::NONE;
+        caps.semantics.backpressure = BackpressurePolicy::DROP_OR_BLOCK;
+        caps.partition.has_partition_id = false;
+        caps.partition.supports_route_by_partition_id = false;
+        caps.partition.preserves_partition_order = false;
+        return caps;
+    }
 };
 
 }  // namespace flowsql

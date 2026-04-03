@@ -36,7 +36,7 @@ services:
       - name: libflowsql_database.so
         option: "config_file=config/flowsql.yml"
       - name: libflowsql_stream.so
-        option: "config_file=config/flowsql.yml"
+        option: "config_file=config/flowsql.yml;db_path=./meta/flowsql_meta.db"
 
   # ---- Python Worker：Python 算子执行 ----
   - name: pyworker

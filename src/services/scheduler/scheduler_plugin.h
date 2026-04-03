@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <common/error_code.h>
@@ -43,6 +44,8 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     void EnumRoutes(std::function<void(const RouteItem&)> callback) override;
 
  private:
+    friend struct SchedulerPluginTestAccessor;
+
     // 路由处理（fnRouterHandler 签名）
     int32_t HandleExecute(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamExecute(const std::string& uri, const std::string& req, std::string& rsp);
@@ -51,6 +54,9 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     int32_t HandleStreamList(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetChannels(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleQueryStreamChannels(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleAddStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleModifyStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleRemoveStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleRefreshOperators(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandlePreviewDataframe(const std::string& uri, const std::string& req, std::string& rsp);
 
@@ -91,6 +97,15 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     int32_t ResolveStreamSink(const SqlStatement& stmt,
                               SinkBinding* binding,
                               std::string* err_out);
+    int TryAcquireStreamTaskLeases(const std::string& runtime_task_id,
+                                   const std::vector<std::string>& source_keys,
+                                   const std::vector<std::string>& sink_keys,
+                                   std::string* conflict_key_out,
+                                   bool* blocked_by_mutation_out = nullptr);
+    int TryBeginStreamChannelMutation(const std::string& key, std::string* reason_out);
+    void EndStreamChannelMutation(const std::string& key);
+    void ReleaseStreamTaskLeases(const std::string& runtime_task_id);
+    void SweepFinishedTaskLeases();
 
     IQuerier* querier_ = nullptr;
 
@@ -109,6 +124,16 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     std::atomic<uint64_t> stream_task_seq_{0};
     mutable std::mutex stream_tasks_mu_;
     std::unordered_map<std::string, std::shared_ptr<StreamTask>> stream_tasks_;
+
+    struct StreamTaskLeaseInfo {
+        std::vector<std::string> all_keys;
+        std::vector<std::string> source_keys;
+    };
+    std::mutex stream_channel_refs_mu_;
+    std::unordered_map<std::string, uint32_t> stream_channel_ref_counts_;
+    std::unordered_map<std::string, std::string> stream_source_leases_;
+    std::unordered_set<std::string> stream_channel_mutating_;
+    std::unordered_map<std::string, StreamTaskLeaseInfo> stream_task_leases_;
 };
 
 }  // namespace scheduler

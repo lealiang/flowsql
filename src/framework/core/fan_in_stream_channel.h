@@ -4,12 +4,8 @@
 #include <framework/interfaces/istream_channel.h>
 
 #include <atomic>
-#include <condition_variable>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace flowsql {
@@ -36,6 +32,7 @@ class FanInStreamChannel : public IStreamChannel {
     PollEvent PollNext(int timeout_ms = 100) override;
     std::shared_ptr<arrow::Schema> GetOutputSchema() override;
     int SetFilter(const char* condition_json, std::vector<std::string>* unsupported_out) override;
+    StreamChannelCapabilities Capabilities() const override;
 
     bool IsFull() const override;
     bool IsEmpty() const override;
@@ -48,22 +45,16 @@ class FanInStreamChannel : public IStreamChannel {
     bool IsFinished() const override { return finished_.load(std::memory_order_acquire); }
 
  private:
-    void ForwardLoop(size_t index);
-    void PushMerged(StreamBatch batch);
-    void MarkForwarderDone();
+    bool AllSourcesDone() const;
+    bool PollOneRound(PollEvent* out_event);
 
     std::string category_;
     std::string name_;
     std::string schema_cache_ = "[]";
     std::vector<std::shared_ptr<IStreamChannel>> sources_;
-
-    mutable std::mutex queue_mu_;
-    std::condition_variable queue_cv_;
-    std::deque<StreamBatch> merged_queue_;
-    std::string last_error_;
-
-    std::vector<std::thread> forward_threads_;
-    std::atomic<int> active_forwarders_{0};
+    std::vector<bool> source_done_;
+    std::atomic<size_t> rr_cursor_{0};
+    std::string first_error_;
 
     std::atomic<bool> opened_{false};
     std::atomic<bool> cancel_requested_{false};

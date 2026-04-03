@@ -76,6 +76,10 @@ export default {
   deleteTask: (id) => api.post('/api/tasks/delete', { task_id: id }),
   cancelTask: (id) => api.post('/api/tasks/cancel', { task_id: id }),
   getTaskDiagnostics: (id) => api.post('/api/tasks/diagnostics', { task_id: id }),
+  executeStreamTask: (sql, timeout_s = 0) => api.post('/api/tasks/stream/execute', { sql, timeout_s }),
+  stopStreamTask: (taskId) => api.post('/api/tasks/stream/stop', { task_id: taskId }),
+  getStreamTaskStatus: (taskId) => api.post('/api/tasks/stream/status', { task_id: taskId }),
+  listStreamTasks: (params = {}) => api.post('/api/tasks/stream/list', params),
 
   // 数据库通道管理（WebPlugin 内部转发给 DatabasePlugin）
   listDbChannels: () => api.post('/api/channels/database/query', {}),
@@ -90,7 +94,10 @@ export default {
 
   // dataframe 通道管理
   listDfChannels: () => api.get('/api/channels/dataframe'),
-  listStreamChannels: () => api.get('/api/channels/stream/list'),
+  listStreamChannels: () => api.post('/api/channels/stream/query', {}),
+  addStreamChannel: (type, name, option = '') => api.post('/api/channels/stream/add', { type, name, option }),
+  modifyStreamChannel: (type, name, option = '') => api.post('/api/channels/stream/modify', { type, name, option }),
+  removeStreamChannel: (type, name) => api.post('/api/channels/stream/remove', { type, name }),
   importCsv: (file) => {
     const form = new FormData()
     form.append('file', file)

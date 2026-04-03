@@ -114,10 +114,10 @@ static std::string ParseStatus(const std::string& rsp) {
 static std::string ParseTaskId(const std::string& rsp) {
     rapidjson::Document d;
     d.Parse(rsp.c_str());
-    if (d.HasParseError() || !d.IsObject() || !d.HasMember("stream_task_id") || !d["stream_task_id"].IsString()) {
+    if (d.HasParseError() || !d.IsObject() || !d.HasMember("runtime_task_id") || !d["runtime_task_id"].IsString()) {
         return "";
     }
-    return d["stream_task_id"].GetString();
+    return d["runtime_task_id"].GetString();
 }
 
 static int ParseShardCount(const std::string& rsp) {
@@ -318,7 +318,7 @@ static fnRouterHandler FindRouteHandler(PluginLoader* loader, const char* method
 }
 
 static fnRouterHandler FindExecuteHandler(PluginLoader* loader) {
-    return FindRouteHandler(loader, "POST", "/tasks/instant/execute");
+    return FindRouteHandler(loader, "POST", "/scheduler/batch/execute");
 }
 
 static void SeedSourceTable(IDatabaseChannel* db, const char* table) {
@@ -407,6 +407,9 @@ int main() {
         out << "    - type: tcp_session_mock\n";
         out << "      name: tcp_src\n";
         out << "      option: \"mode=keyed;total_records=64;batch_rows=8;partition_count=4;emit_interval_ms=0;ring_size=256;overflow=drop\"\n";
+        out << "    - type: tcp_session_mock\n";
+        out << "      name: tcp_src_stateless\n";
+        out << "      option: \"mode=stateless;total_records=64;batch_rows=8;emit_interval_ms=0;ring_size=256;overflow=drop\"\n";
         out.flush();
     }
 
@@ -435,10 +438,10 @@ int main() {
     SeedSourceTable(db, "src");
     std::puts("[INFO] source table seeded");
     auto exec = FindExecuteHandler(loader);
-    auto stream_exec = FindRouteHandler(loader, "POST", "/tasks/stream/execute");
-    auto stream_stop = FindRouteHandler(loader, "POST", "/tasks/stream/stop");
-    auto stream_status = FindRouteHandler(loader, "POST", "/tasks/stream/status");
-    auto stream_list = FindRouteHandler(loader, "GET", "/tasks/stream/list");
+    auto stream_exec = FindRouteHandler(loader, "POST", "/scheduler/stream/execute");
+    auto stream_stop = FindRouteHandler(loader, "POST", "/scheduler/stream/stop");
+    auto stream_status = FindRouteHandler(loader, "POST", "/scheduler/stream/status");
+    auto stream_list = FindRouteHandler(loader, "POST", "/scheduler/stream/list");
     auto activate = FindRouteHandler(loader, "POST", "/operators/activate");
     auto deactivate = FindRouteHandler(loader, "POST", "/operators/deactivate");
     auto upsert_batch = FindRouteHandler(loader, "POST", "/operators/upsert_batch");
@@ -455,7 +458,7 @@ int main() {
     // T18: INTO dataframe.result 后可通过 Registry 读取
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM sqlite.local.src INTO dataframe.result"), rsp);
         ASSERT_EQ(rc, error::OK);
         auto ch = std::dynamic_pointer_cast<IDataFrameChannel>(registry->Get("result"));
@@ -467,7 +470,7 @@ int main() {
     // T19: FROM dataframe.result INTO sqlite.local.t2
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.result INTO sqlite.local.t2"), rsp);
         ASSERT_EQ(rc, error::OK);
         ASSERT_EQ(QueryCount(db, "SELECT * FROM t2"), 3);
@@ -477,7 +480,7 @@ int main() {
     // T20: FROM dataframe.<不存在> 返回 NOT_FOUND
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.not_exists INTO sqlite.local.t3"), rsp);
         ASSERT_EQ(rc, error::NOT_FOUND);
     }
@@ -486,13 +489,13 @@ int main() {
     // T21: INTO dataframe.result 覆盖语义（第二次覆盖第一次）
     {
         std::string rsp;
-        ASSERT_EQ(exec("/tasks/instant/execute",
+        ASSERT_EQ(exec("/scheduler/batch/execute",
                        MakeReq("SELECT * FROM sqlite.local.src WHERE id <= 2 INTO dataframe.result"), rsp),
                   error::OK);
         auto ch1 = std::dynamic_pointer_cast<IDataFrameChannel>(registry->Get("result"));
         ASSERT_TRUE(ch1 != nullptr);
 
-        ASSERT_EQ(exec("/tasks/instant/execute",
+        ASSERT_EQ(exec("/scheduler/batch/execute",
                        MakeReq("SELECT * FROM sqlite.local.src WHERE id > 2 INTO dataframe.result"), rsp),
                   error::OK);
         auto ch2 = std::dynamic_pointer_cast<IDataFrameChannel>(registry->Get("result"));
@@ -509,7 +512,7 @@ int main() {
         std::string rsp;
         size_t before = 0;
         registry->List([&](const char*, std::shared_ptr<IChannel>) { ++before; });
-        ASSERT_EQ(exec("/tasks/instant/execute", MakeReq("SELECT * FROM sqlite.local.src"), rsp), error::OK);
+        ASSERT_EQ(exec("/scheduler/batch/execute", MakeReq("SELECT * FROM sqlite.local.src"), rsp), error::OK);
         rapidjson::Document doc;
         doc.Parse(rsp.c_str());
         ASSERT_TRUE(!doc.HasParseError() && doc.IsObject());
@@ -529,11 +532,11 @@ int main() {
         ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough"})", activate_rsp), error::OK);
 
         std::string rsp;
-        ASSERT_EQ(exec("/tasks/instant/execute",
+        ASSERT_EQ(exec("/scheduler/batch/execute",
                        MakeReq("SELECT * FROM sqlite.local.src USING builtin.passthrough INTO dataframe.out"), rsp),
                   error::OK);
         ASSERT_TRUE(std::dynamic_pointer_cast<IDataFrameChannel>(registry->Get("out")) != nullptr);
-        ASSERT_EQ(exec("/tasks/instant/execute",
+        ASSERT_EQ(exec("/scheduler/batch/execute",
                        MakeReq("SELECT * FROM dataframe.out INTO sqlite.local.t_passthrough"), rsp),
                   error::OK);
         ASSERT_EQ(QueryCount(db, "SELECT * FROM t_passthrough"), 3);
@@ -548,7 +551,7 @@ int main() {
         int32_t running_rc = error::INTERNAL_ERROR;
         std::thread worker([&]() {
             std::string local_rsp;
-            running_rc = exec("/tasks/instant/execute",
+            running_rc = exec("/scheduler/batch/execute",
                               MakeReq("SELECT * FROM sqlite.local.src USING builtin.passthrough "
                                       "WITH delay_ms=800 INTO dataframe.running_out"),
                               local_rsp);
@@ -561,7 +564,7 @@ int main() {
         ASSERT_EQ(running_rc, error::OK);
         ASSERT_TRUE(std::dynamic_pointer_cast<IDataFrameChannel>(registry->Get("running_out")) != nullptr);
 
-        ASSERT_EQ(exec("/tasks/instant/execute",
+        ASSERT_EQ(exec("/scheduler/batch/execute",
                        MakeReq("SELECT * FROM sqlite.local.src USING builtin.passthrough INTO dataframe.blocked"), rsp),
                   error::CONFLICT);
     }
@@ -571,7 +574,7 @@ int main() {
     {
         std::string rsp;
         ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough"})", rsp), error::OK);
-        ASSERT_EQ(exec("/tasks/instant/execute",
+        ASSERT_EQ(exec("/scheduler/batch/execute",
                        MakeReq("SELECT * FROM sqlite.local.src "
                                "USING builtin.passthrough WITH delay_ms=10 "
                                "THEN builtin.passthrough WITH delay_ms=0 "
@@ -592,7 +595,7 @@ int main() {
         ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough"})", rsp), error::OK);
         size_t before_cnt = 0;
         registry->List([&](const char*, std::shared_ptr<IChannel>) { ++before_cnt; });
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM sqlite.local.src "
                                   "USING builtin.passthrough WITH force_fail=0 "
                                   "THEN builtin.passthrough WITH force_fail=1 "
@@ -606,7 +609,7 @@ int main() {
         ASSERT_EQ(after_cnt, before_cnt);  // 失败后不应新增/泄漏具名通道
 
         // 失败后再次执行，验证执行器状态未污染
-        ASSERT_EQ(exec("/tasks/instant/execute",
+        ASSERT_EQ(exec("/scheduler/batch/execute",
                        MakeReq("SELECT * FROM sqlite.local.src "
                                "USING builtin.passthrough WITH force_fail=0 "
                                "THEN builtin.passthrough WITH force_fail=0 "
@@ -620,7 +623,7 @@ int main() {
     // T27: 多源 + USING builtin.passthrough 走统一多输入入口（默认回退到首输入）
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.result,dataframe.out "
                                   "USING builtin.passthrough INTO dataframe.multi_ok"),
                           rsp);
@@ -638,7 +641,7 @@ int main() {
     // T28: 多源无 USING 算子应报 BAD_REQUEST
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.result,dataframe.out INTO dataframe.multi_no_op"),
                           rsp);
         ASSERT_EQ(rc, error::BAD_REQUEST);
@@ -649,7 +652,7 @@ int main() {
     // T29: 多源包含非 dataframe.* 应报 BAD_REQUEST
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM sqlite.local.src,dataframe.result "
                                   "USING builtin.passthrough INTO dataframe.multi_mixed"),
                           rsp);
@@ -661,7 +664,7 @@ int main() {
     // T30: 多源 + WHERE（Sprint10 V1）应报 BAD_REQUEST
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.result,dataframe.out "
                                   "WHERE id > 1 USING builtin.passthrough INTO dataframe.multi_where"),
                           rsp);
@@ -673,7 +676,7 @@ int main() {
     // T31: INTO 非法目标（未限定名）应报 BAD_REQUEST
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM sqlite.local.src INTO t2"),
                           rsp);
         ASSERT_EQ(rc, error::BAD_REQUEST);
@@ -692,7 +695,7 @@ int main() {
     // T33: concat 成功（按行合并）
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.out,dataframe.chain_ok "
                                   "USING builtin.concat INTO dataframe.concat_ok"),
                           rsp);
@@ -710,12 +713,12 @@ int main() {
     // T34: concat schema 不兼容应失败
     {
         std::string rsp;
-        ASSERT_EQ(exec("/tasks/instant/execute",
+        ASSERT_EQ(exec("/scheduler/batch/execute",
                        MakeReq("SELECT id FROM sqlite.local.src INTO dataframe.only_id"),
                        rsp),
                   error::OK);
 
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.out,dataframe.only_id "
                                   "USING builtin.concat INTO dataframe.concat_bad"),
                           rsp);
@@ -727,7 +730,7 @@ int main() {
     // T35: hstack 成功（按列合并）
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.out,dataframe.chain_ok "
                                   "USING builtin.hstack INTO dataframe.hstack_ok"),
                           rsp);
@@ -745,7 +748,7 @@ int main() {
     // T36: hstack 行数不一致应失败
     {
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.result,dataframe.out "
                                   "USING builtin.hstack INTO dataframe.hstack_bad"),
                           rsp);
@@ -781,7 +784,7 @@ int main() {
         build_typed_channel("typed_b", 20);
 
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.typed_a,dataframe.typed_b "
                                   "USING builtin.concat INTO dataframe.concat_types"),
                           rsp);
@@ -842,7 +845,7 @@ int main() {
         ASSERT_EQ(registry->Register("hright", std::static_pointer_cast<IChannel>(right)), 0);
 
         std::string rsp;
-        int32_t rc = exec("/tasks/instant/execute",
+        int32_t rc = exec("/scheduler/batch/execute",
                           MakeReq("SELECT * FROM dataframe.hleft,dataframe.hright "
                                   "USING builtin.hstack INTO dataframe.hstack_types"),
                           rsp);
@@ -886,7 +889,7 @@ int main() {
             if (ev.kind != PollEventKind::kData) break;
         }
 
-        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
                               MakeReq("SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out"),
                               rsp),
                   error::OK);
@@ -902,7 +905,7 @@ int main() {
         bool done = false;
         for (int i = 0; i < 300; ++i) {
             std::string s_rsp;
-            ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
             final_status = ParseStatus(s_rsp);
             if (final_status == "stopped" || final_status == "cancelled" || final_status == "failed") {
                 done = true;
@@ -923,7 +926,7 @@ int main() {
         ASSERT_EQ(rows, 3);
 
         std::string list_rsp;
-        ASSERT_EQ(stream_list("/tasks/stream/list", "", list_rsp), error::OK);
+        ASSERT_EQ(stream_list("/scheduler/stream/list", "{}", list_rsp), error::OK);
         ASSERT_TRUE(ListContainsTaskId(list_rsp, task_id));
     }
     std::puts("[PASS] T39");
@@ -941,7 +944,7 @@ int main() {
             if (ev.kind != PollEventKind::kData) break;
         }
 
-        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
                               MakeReq("SELECT * FROM ring.stop_in USING builtin.passthrough_stream INTO stream.stop_out"),
                               rsp),
                   error::OK);
@@ -951,7 +954,7 @@ int main() {
         bool seen_running = false;
         for (int i = 0; i < 100; ++i) {
             std::string s_rsp;
-            ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
             const std::string st = ParseStatus(s_rsp);
             if (st == "running" || st == "stopping") {
                 seen_running = true;
@@ -962,17 +965,17 @@ int main() {
         ASSERT_TRUE(seen_running);
 
         std::string stop_rsp;
-        ASSERT_EQ(stream_stop("/tasks/stream/stop", MakeTaskReq(task_id), stop_rsp), error::OK);
+        ASSERT_EQ(stream_stop("/scheduler/stream/stop", MakeTaskReq(task_id), stop_rsp), error::OK);
         const std::string stop_status = ParseStatus(stop_rsp);
-        ASSERT_TRUE(stop_status == "cancelled" || stop_status == "failed" || stop_status == "stopped");
+        ASSERT_EQ(stop_status, "stopped");
 
         std::string status_rsp;
-        ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), status_rsp), error::OK);
+        ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(task_id), status_rsp), error::OK);
         const std::string final_status = ParseStatus(status_rsp);
-        ASSERT_TRUE(final_status == "cancelled" || final_status == "failed" || final_status == "stopped");
+        ASSERT_EQ(final_status, "stopped");
 
         std::string list_rsp;
-        ASSERT_EQ(stream_list("/tasks/stream/list", "", list_rsp), error::OK);
+        ASSERT_EQ(stream_list("/scheduler/stream/list", "{}", list_rsp), error::OK);
         ASSERT_TRUE(ListContainsTaskId(list_rsp, task_id));
     }
     std::puts("[PASS] T40");
@@ -992,7 +995,7 @@ int main() {
             if (ev.kind != PollEventKind::kData) break;
         }
 
-        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
                               MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.tcp_service_merge_stream INTO stream.svc_out"),
                               rsp),
@@ -1004,7 +1007,7 @@ int main() {
         bool done = false;
         for (int i = 0; i < 300; ++i) {
             std::string s_rsp;
-            ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
             final_status = ParseStatus(s_rsp);
             if (final_status == "stopped" || final_status == "cancelled" || final_status == "failed") {
                 done = true;
@@ -1037,45 +1040,32 @@ int main() {
     }
     std::puts("[PASS] T41");
 
-    // T42: INTO dataframe.* 强制单写者降级（算子声明并行=4，实际 shard_count=1）
+    // T42: 非 stream sink 在并行写能力不足时直接失败（无隐式降级）
     {
         std::string rsp;
-        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
-        ASSERT_EQ(op_registry->Register("builtin.passthrough_stream", []() -> IOperator* {
+        ASSERT_EQ(op_registry->Register("custom.parallel_passthrough_stream", []() -> IOperator* {
             return new ParallelPassthroughStreamOperator();
         }), 0);
+        ASSERT_EQ(upsert_batch("/operators/upsert_batch", R"({
+            "operators":[
+                {
+                    "category":"custom",
+                    "name":"parallel_passthrough_stream",
+                    "type":"cpp",
+                    "source":"e2e",
+                    "description":"e2e parallel passthrough stream",
+                    "position":"DATA"
+                }
+            ]
+        })", rsp), error::OK);
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"custom.parallel_passthrough_stream"})", rsp), error::OK);
 
-        ASSERT_EQ(stream_exec("/tasks/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
-                                      "USING builtin.passthrough_stream INTO dataframe.stream_single_writer"),
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src_stateless "
+                                      "USING custom.parallel_passthrough_stream INTO dataframe.stream_single_writer"),
                               rsp),
-                  error::OK);
-        const std::string task_id = ParseTaskId(rsp);
-        ASSERT_TRUE(!task_id.empty());
-
-        std::string final_status_rsp;
-        std::string final_status;
-        bool done = false;
-        for (int i = 0; i < 300; ++i) {
-            std::string s_rsp;
-            ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
-            final_status = ParseStatus(s_rsp);
-            if (final_status == "stopped" || final_status == "cancelled" || final_status == "failed") {
-                final_status_rsp = s_rsp;
-                done = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        ASSERT_TRUE(done);
-        ASSERT_EQ(final_status, "stopped");
-        ASSERT_EQ(ParseShardCount(final_status_rsp), 1);
-
-        auto df_ch = std::dynamic_pointer_cast<IDataFrameChannel>(registry->Get("stream_single_writer"));
-        ASSERT_TRUE(df_ch != nullptr);
-        DataFrame out;
-        ASSERT_EQ(df_ch->Read(&out), 0);
-        ASSERT_TRUE(out.RowCount() > 0);
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_SINK_CAPABILITY_MISMATCH") != std::string::npos);
     }
     std::puts("[PASS] T42");
 
@@ -1103,7 +1093,7 @@ int main() {
         auto wait_stream_terminal = [&](const std::string& task_id, std::string* final_status) -> bool {
             for (int i = 0; i < 400; ++i) {
                 std::string s_rsp;
-                if (stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp) != error::OK) {
+                if (stream_status("/scheduler/stream/status", MakeTaskReq(task_id), s_rsp) != error::OK) {
                     return false;
                 }
                 const std::string st = ParseStatus(s_rsp);
@@ -1119,7 +1109,7 @@ int main() {
         // case 1: builtin + 三段式目标成功
         const int64_t src_rows_before = QueryCount(db, "SELECT * FROM src");
         ASSERT_EQ(src_rows_before, 3);
-        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
                               MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream "
                                       "INTO sqlite.local.t44_into"),
@@ -1134,7 +1124,7 @@ int main() {
         ASSERT_EQ(QueryCount(db, "SELECT * FROM src"), src_rows_before);
 
         // case 2: WITH sink_table 不再作为框架兜底语义
-        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
                               MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream WITH sink_table=t44_with "
                                       "INTO sqlite.local"),
@@ -1143,7 +1133,7 @@ int main() {
         ASSERT_TRUE(rsp.find("sink_table") != std::string::npos);
 
         // case 3: builtin + 两段式 DB 目标失败（要求显式三段式）
-        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
                               MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream INTO sqlite.local"),
                               rsp),
@@ -1151,7 +1141,7 @@ int main() {
         ASSERT_TRUE(rsp.find("requires explicit table") != std::string::npos);
 
         // case 4: 普通算子可接收两段式 DB 通道并自行写入
-        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
                               MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING custom.db_direct_writer_stream INTO sqlite.local"),
                               rsp),
@@ -1178,12 +1168,12 @@ int main() {
         const char* web_opts[] = {web_opt.c_str()};
         ASSERT_EQ(loader->Load(get_absolute_process_path(), web_libs, web_opts, 1), 0);
 
-        fnRouterHandler web_stream_list = nullptr;
-        web_stream_list = FindRouteHandler(loader, "GET", "/api/channels/stream/list");
-        ASSERT_TRUE(web_stream_list != nullptr);
+        fnRouterHandler web_stream_query = nullptr;
+        web_stream_query = FindRouteHandler(loader, "POST", "/api/channels/stream/query");
+        ASSERT_TRUE(web_stream_query != nullptr);
 
         std::string rsp;
-        ASSERT_EQ(web_stream_list("/api/channels/stream/list", "", rsp), error::UNAVAILABLE);
+        ASSERT_EQ(web_stream_query("/api/channels/stream/query", "{}", rsp), error::UNAVAILABLE);
         ASSERT_TRUE(rsp.find("service unreachable") != std::string::npos);
         std::filesystem::remove(web_db_path);
     }

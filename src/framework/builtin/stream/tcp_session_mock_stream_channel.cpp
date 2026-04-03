@@ -102,6 +102,27 @@ int TcpSessionMockStreamChannel::SetFilter(const char*,
     return 0;
 }
 
+StreamChannelCapabilities TcpSessionMockStreamChannel::Capabilities() const {
+    if (queue_) {
+        StreamChannelCapabilities caps = queue_->Capabilities();
+        caps.channel_type = ChannelType::kStream;
+        caps.semantics.finite = true;
+        caps.semantics.supports_filter_pushdown = false;
+        caps.semantics.filter_requires_full_match = true;
+        caps.partition.has_partition_id = (options_.mode == TcpSessionMockMode::kKeyed);
+        caps.partition.supports_route_by_partition_id = (options_.mode == TcpSessionMockMode::kKeyed);
+        caps.partition.preserves_partition_order = (options_.mode == TcpSessionMockMode::kKeyed);
+        return caps;
+    }
+    StreamChannelCapabilities caps;
+    caps.channel_type = ChannelType::kStream;
+    caps.semantics.finite = true;
+    caps.partition.has_partition_id = (options_.mode == TcpSessionMockMode::kKeyed);
+    caps.partition.supports_route_by_partition_id = (options_.mode == TcpSessionMockMode::kKeyed);
+    caps.partition.preserves_partition_order = (options_.mode == TcpSessionMockMode::kKeyed);
+    return caps;
+}
+
 bool TcpSessionMockStreamChannel::IsFull() const {
     return queue_ && queue_->IsFull();
 }

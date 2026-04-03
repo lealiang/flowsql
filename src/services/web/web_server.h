@@ -47,7 +47,10 @@ class WebServer {
     // 管理 API handler（fnRouterHandler 签名）
     int32_t HandleHealth(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetChannels(const std::string& uri, const std::string& req, std::string& rsp);
-    int32_t HandleGetStreamChannels(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleQueryStreamChannels(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleAddStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleModifyStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleRemoveStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetOperators(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleUploadOperator(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleActivateOperator(const std::string& uri, const std::string& req, std::string& rsp);
@@ -61,6 +64,10 @@ class WebServer {
     int32_t HandleDeleteTask(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleCancelTask(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleTaskDiagnostics(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamExecuteTask(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamStopTask(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamStatusTask(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamListTask(const std::string& uri, const std::string& req, std::string& rsp);
 
     // 通知 Python Worker 重新加载算子
     void NotifyWorkerReload();

@@ -218,11 +218,10 @@ void StreamTask::OnShardDone() {
     if (remain != 0) return;
 
     if (status_.load(std::memory_order_acquire) != StreamTaskStatus::kFailed) {
-        status_.store(
-            stop_requested_.load(std::memory_order_relaxed)
-                ? StreamTaskStatus::kCancelled
-                : StreamTaskStatus::kStopped,
-            std::memory_order_release);
+        const auto current = status_.load(std::memory_order_acquire);
+        if (current != StreamTaskStatus::kCancelled) {
+            status_.store(StreamTaskStatus::kStopped, std::memory_order_release);
+        }
     }
     finished_ms_.store(CurrentTimeMs(), std::memory_order_relaxed);
     done_cv_.notify_all();

@@ -50,7 +50,7 @@ static std::vector<std::pair<std::string, void(*)()>> tests;
 TEST(trie_basic_register_match) {
     RouteTable rt;
     rt.Register("/channels", "127.0.0.1:18803");
-    rt.Register("/tasks", "127.0.0.1:18803");
+    rt.Register("/scheduler", "127.0.0.1:18803");
     rt.Register("/operators", "127.0.0.1:18803");
 
     RouteEntry out;
@@ -58,8 +58,8 @@ TEST(trie_basic_register_match) {
     ASSERT_EQ(out.prefix, "/channels");
     ASSERT_EQ(out.address, "127.0.0.1:18803");
 
-    ASSERT_TRUE(rt.Match("/tasks/instant/execute", &out));
-    ASSERT_EQ(out.prefix, "/tasks");
+    ASSERT_TRUE(rt.Match("/scheduler/batch/execute", &out));
+    ASSERT_EQ(out.prefix, "/scheduler");
 
     ASSERT_TRUE(rt.Match("/operators/list", &out));
     ASSERT_EQ(out.prefix, "/operators");
@@ -96,15 +96,15 @@ TEST(trie_longest_prefix_match) {
 // ============================================================
 TEST(trie_idempotent_register) {
     RouteTable rt;
-    rt.Register("/tasks", "old-addr:18803");
+    rt.Register("/scheduler", "old-addr:18803");
 
     RouteEntry out;
-    ASSERT_TRUE(rt.Match("/tasks/instant/execute", &out));
+    ASSERT_TRUE(rt.Match("/scheduler/batch/execute", &out));
     ASSERT_EQ(out.address, "old-addr:18803");
 
     // 重新注册，更新地址
-    rt.Register("/tasks", "new-addr:18803");
-    ASSERT_TRUE(rt.Match("/tasks/instant/execute", &out));
+    rt.Register("/scheduler", "new-addr:18803");
+    ASSERT_TRUE(rt.Match("/scheduler/batch/execute", &out));
     ASSERT_EQ(out.address, "new-addr:18803");
 
     printf("[PASS] trie_idempotent_register\n");
@@ -116,13 +116,13 @@ TEST(trie_idempotent_register) {
 TEST(trie_unregister) {
     RouteTable rt;
     rt.Register("/channels", "127.0.0.1:18803");
-    rt.Register("/tasks", "127.0.0.1:18803");
+    rt.Register("/scheduler", "127.0.0.1:18803");
 
     rt.Unregister("/channels");
 
     RouteEntry out;
     ASSERT_FALSE(rt.Match("/channels/database/add", &out));
-    ASSERT_TRUE(rt.Match("/tasks/instant/execute", &out));
+    ASSERT_TRUE(rt.Match("/scheduler/batch/execute", &out));
 
     printf("[PASS] trie_unregister\n");
 }
@@ -133,7 +133,7 @@ TEST(trie_unregister) {
 TEST(trie_remove_expired) {
     RouteTable rt;
     rt.Register("/channels", "127.0.0.1:18803");
-    rt.Register("/tasks", "127.0.0.1:18803");
+    rt.Register("/scheduler", "127.0.0.1:18803");
 
     // 等待 50ms，然后设置过期时间为 now（清理所有）
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -142,7 +142,7 @@ TEST(trie_remove_expired) {
 
     RouteEntry out;
     ASSERT_FALSE(rt.Match("/channels/database/add", &out));
-    ASSERT_FALSE(rt.Match("/tasks/instant/execute", &out));
+    ASSERT_FALSE(rt.Match("/scheduler/batch/execute", &out));
 
     printf("[PASS] trie_remove_expired\n");
 }
@@ -175,7 +175,7 @@ TEST(trie_expire_then_reregister) {
 TEST(trie_get_all) {
     RouteTable rt;
     rt.Register("/channels", "127.0.0.1:18803");
-    rt.Register("/tasks", "127.0.0.1:18803");
+    rt.Register("/scheduler", "127.0.0.1:18803");
     rt.Register("/operators", "127.0.0.1:18803");
 
     auto all = rt.GetAll();
@@ -220,7 +220,7 @@ private:
 
 TEST(route_collect_basic) {
     MockRouterHandle h1({
-        {"POST", "/tasks/instant/execute",   [](auto&, auto&, auto&) { return error::OK; }},
+        {"POST", "/scheduler/batch/execute",   [](auto&, auto&, auto&) { return error::OK; }},
         {"POST", "/channels/dataframe/query",[](auto&, auto&, auto&) { return error::OK; }},
     });
     MockRouterHandle h2({
@@ -245,10 +245,10 @@ TEST(route_collect_basic) {
 // ============================================================
 TEST(route_collect_conflict) {
     MockRouterHandle h1({
-        {"POST", "/tasks/instant/execute", [](auto&, auto&, auto&) { return error::OK; }},
+        {"POST", "/scheduler/batch/execute", [](auto&, auto&, auto&) { return error::OK; }},
     });
     MockRouterHandle h2({
-        {"POST", "/tasks/instant/execute", [](auto&, auto&, auto&) { return error::OK; }},  // 重复
+        {"POST", "/scheduler/batch/execute", [](auto&, auto&, auto&) { return error::OK; }},  // 重复
     });
 
     MockQuerier q;

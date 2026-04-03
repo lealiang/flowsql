@@ -22,11 +22,14 @@ enum class TaskStatus : int32_t {
     kFailed = 3,
     kCancelled = 4,
     kTimeout = 5,
+    kStopped = 6,
 };
 
 struct TaskRecord {
     std::string task_id;
     std::string request_sql;
+    std::string task_kind = "batch";
+    std::string runtime_task_id;
     TaskStatus status = TaskStatus::kPending;
     int64_t result_row_count = 0;
     int64_t result_col_count = 0;

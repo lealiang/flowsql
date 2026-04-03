@@ -20,3 +20,16 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 )
 
 add_test(NAME test_stream COMMAND ${CMAKE_BINARY_DIR}/output/test_stream)
+
+add_executable(benchmark_stream_ring
+    benchmark_ring_modes.cpp
+)
+
+target_include_directories(benchmark_stream_ring PUBLIC ${CMAKE_SOURCE_DIR})
+add_thirddepen(benchmark_stream_ring arrow rapidjson)
+add_dependencies(benchmark_stream_ring flowsql_common)
+target_link_libraries(benchmark_stream_ring flowsql_common)
+
+set_target_properties(benchmark_stream_ring PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
