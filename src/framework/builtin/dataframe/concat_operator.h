@@ -1,14 +1,13 @@
-#ifndef _FLOWSQL_SERVICES_CATALOG_BUILTIN_CONCAT_OPERATOR_H_
-#define _FLOWSQL_SERVICES_CATALOG_BUILTIN_CONCAT_OPERATOR_H_
+#ifndef _FLOWSQL_FRAMEWORK_BUILTIN_DATAFRAME_CONCAT_OPERATOR_H_
+#define _FLOWSQL_FRAMEWORK_BUILTIN_DATAFRAME_CONCAT_OPERATOR_H_
 
-#include <framework/interfaces/ioperator.h>
 #include <framework/interfaces/idataframe.h>
+#include <framework/interfaces/ioperator.h>
 
 #include <string>
 #include <vector>
 
 namespace flowsql {
-namespace catalog {
 
 // ConcatOperator：按行拼接多个 DataFrame（schema 必须一致）
 class ConcatOperator : public IOperator {
@@ -32,7 +31,6 @@ class ConcatOperator : public IOperator {
     std::string last_error_;
 };
 
-}  // namespace catalog
 }  // namespace flowsql
 
-#endif  // _FLOWSQL_SERVICES_CATALOG_BUILTIN_CONCAT_OPERATOR_H_
+#endif  // _FLOWSQL_FRAMEWORK_BUILTIN_DATAFRAME_CONCAT_OPERATOR_H_

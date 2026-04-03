@@ -29,7 +29,7 @@
           <div
             class="channel-type-item"
             :class="{ active: activeChannelType === 'dataframe' }"
-            @click="activeChannelType = 'dataframe'"
+            @click="switchChannelType('dataframe')"
           >
             <span>DataFrame 通道</span>
             <el-tag size="small" effect="plain">{{ dfChannels.length }}</el-tag>
@@ -37,15 +37,23 @@
           <div
             class="channel-type-item"
             :class="{ active: activeChannelType === 'database' }"
-            @click="activeChannelType = 'database'"
+            @click="switchChannelType('database')"
           >
             <span>数据库通道</span>
             <el-tag size="small" effect="plain">{{ dbChannels.length }}</el-tag>
           </div>
+          <div
+            class="channel-type-item"
+            :class="{ active: activeChannelType === 'stream' }"
+            @click="switchChannelType('stream')"
+          >
+            <span>Stream 通道</span>
+            <el-tag size="small" effect="plain">{{ streamChannels.length }}</el-tag>
+          </div>
         </div>
 
         <div class="channel-main">
-          <div class="section-title">{{ activeChannelType === 'dataframe' ? 'DataFrame 通道' : '数据库通道' }}</div>
+          <div class="section-title">{{ sectionTitle }}</div>
 
           <el-table v-if="activeChannelType === 'dataframe'" :data="filteredDfChannels" style="width: 100%" v-loading="loadingDf">
             <el-table-column prop="name" label="名称" min-width="220" />
@@ -74,7 +82,7 @@
             </el-table-column>
           </el-table>
 
-          <el-table v-else :data="filteredDbChannels" style="width: 100%" v-loading="loadingDb">
+          <el-table v-else-if="activeChannelType === 'database'" :data="filteredDbChannels" style="width: 100%" v-loading="loadingDb">
             <el-table-column prop="name" label="名称" width="180" />
             <el-table-column prop="type" label="类型" width="140" />
             <el-table-column prop="schema" label="Schema" min-width="200" />
@@ -82,6 +90,18 @@
               <template #default="scope">
                 <el-button type="primary" size="small" text @click="openDbBrowser(scope.row)">浏览</el-button>
                 <el-button type="danger" size="small" text @click="handleRemoveDb(scope.row)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <el-table v-else :data="filteredStreamChannels" style="width: 100%" v-loading="loadingStream">
+            <el-table-column prop="type" label="类型" width="180" />
+            <el-table-column prop="name" label="名称" min-width="260" />
+            <el-table-column prop="status" label="状态" width="160">
+              <template #default="scope">
+                <el-tag :type="streamStatusTagType(scope.row.status)">
+                  {{ scope.row.status || 'unknown' }}
+                </el-tag>
               </template>
             </el-table-column>
           </el-table>
@@ -255,8 +275,10 @@ const csvInput = ref(null)
 
 const dbChannels = ref([])
 const dfChannels = ref([])
+const streamChannels = ref([])
 const loadingDb = ref(false)
 const loadingDf = ref(false)
+const loadingStream = ref(false)
 
 const form = ref({
   type: 'mysql', name: '', host: '127.0.0.1', port: '',
@@ -276,6 +298,22 @@ const filteredDfChannels = computed(() => {
   const s = searchText.value.trim().toLowerCase()
   if (!s) return dfChannels.value
   return dfChannels.value.filter(ch => (ch.name || '').toLowerCase().includes(s))
+})
+
+const filteredStreamChannels = computed(() => {
+  const s = searchText.value.trim().toLowerCase()
+  if (!s) return streamChannels.value
+  return streamChannels.value.filter(ch =>
+    (ch.name || '').toLowerCase().includes(s) ||
+    (ch.type || '').toLowerCase().includes(s) ||
+    (ch.status || '').toLowerCase().includes(s)
+  )
+})
+
+const sectionTitle = computed(() => {
+  if (activeChannelType.value === 'dataframe') return 'DataFrame 通道'
+  if (activeChannelType.value === 'database') return '数据库通道'
+  return 'Stream 通道'
 })
 
 const getTypeName = (typeId) => {
@@ -338,8 +376,37 @@ const loadDfChannels = async () => {
   }
 }
 
+const loadStreamChannels = async () => {
+  loadingStream.value = true
+  try {
+    const res = await api.listStreamChannels()
+    const list = Array.isArray(res.data) ? res.data : (res.data.channels || [])
+    streamChannels.value = list.map(ch => ({
+      type: ch.type || '',
+      name: ch.name || '',
+      status: ch.status || 'unknown'
+    }))
+  } catch (error) {
+    ElMessage.error('加载 Stream 通道失败: ' + (error.response?.data?.error || error.message))
+  } finally {
+    loadingStream.value = false
+  }
+}
+
 const reloadAll = async () => {
-  await Promise.all([loadDbChannels(), loadDfChannels()])
+  await Promise.all([loadDbChannels(), loadDfChannels(), loadStreamChannels()])
+}
+
+const switchChannelType = async (nextType) => {
+  if (activeChannelType.value === nextType) return
+  activeChannelType.value = nextType
+  if (nextType === 'stream') {
+    await loadStreamChannels()
+  } else if (nextType === 'database') {
+    await loadDbChannels()
+  } else if (nextType === 'dataframe') {
+    await loadDfChannels()
+  }
 }
 
 const triggerCsvUpload = () => {
@@ -501,6 +568,13 @@ const onDfPageSizeChange = async (s) => {
   dfPreviewPageSize.value = s
   dfPreviewPage.value = 1
   await loadDfPreview()
+}
+
+const streamStatusTagType = (status) => {
+  if (status === 'running') return 'success'
+  if (status === 'draining') return 'warning'
+  if (status === 'stopped') return 'info'
+  return ''
 }
 
 const openDbBrowser = async (row) => {

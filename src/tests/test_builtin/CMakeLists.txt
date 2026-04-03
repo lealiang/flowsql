@@ -22,8 +22,8 @@ add_executable(${PROJECT_NAME}
     test_builtin.cpp
     ${CMAKE_SOURCE_DIR}/services/catalog/catalog_plugin.cpp
     ${CMAKE_SOURCE_DIR}/services/binaddon/binaddon_host_plugin.cpp
-    ${CMAKE_SOURCE_DIR}/services/catalog/builtin/concat_operator.cpp
-    ${CMAKE_SOURCE_DIR}/services/catalog/builtin/hstack_operator.cpp
+    ${CMAKE_SOURCE_DIR}/framework/builtin/dataframe/concat_operator.cpp
+    ${CMAKE_SOURCE_DIR}/framework/builtin/dataframe/hstack_operator.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})

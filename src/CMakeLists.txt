@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.12)
 
 project(flowsql)
+include(CTest)
 
 # 设置编译参数
 set(CMAKE_CXX_STANDARD 17)
@@ -61,6 +62,10 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_scheduler_e2e ${CMAKE_BINARY_DIR
 # Stage 3: Database 数据库通道服务
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/database ${CMAKE_BINARY_DIR}/database)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_database ${CMAKE_BINARY_DIR}/test_database)
+
+# Stage 12: Stream 流式通道服务
+add_subdirectory(${CMAKE_SOURCE_DIR}/services/stream ${CMAKE_BINARY_DIR}/stream)
+add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_stream ${CMAKE_BINARY_DIR}/test_stream)
 
 # Stage 8: Catalog 目录服务
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/catalog ${CMAKE_BINARY_DIR}/catalog)

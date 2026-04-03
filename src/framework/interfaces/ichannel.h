@@ -13,6 +13,8 @@ const Guid IID_CHANNEL = {0xc1d2e3f4, 0xabcd, 0xef01, {0x23, 0x45, 0x67, 0x89, 0
 namespace ChannelType {
     constexpr const char* kDataFrame = "dataframe";
     constexpr const char* kDatabase  = "database";
+    constexpr const char* kStream = "stream";
+    constexpr const char* kBlockStream = "block_stream";
 }  // namespace ChannelType
 
 // IChannel — 数据通道基类（纯接口，不继承 IPlugin）

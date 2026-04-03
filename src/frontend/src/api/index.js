@@ -90,6 +90,7 @@ export default {
 
   // dataframe 通道管理
   listDfChannels: () => api.get('/api/channels/dataframe'),
+  listStreamChannels: () => api.get('/api/channels/stream/list'),
   importCsv: (file) => {
     const form = new FormData()
     form.append('file', file)

@@ -1,13 +1,13 @@
 #include "passthrough_operator.h"
 
+#include <framework/core/dataframe.h>
+#include <framework/interfaces/idataframe_channel.h>
+
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <thread>
-
-#include <framework/core/dataframe.h>
-#include <framework/interfaces/idataframe_channel.h>
 
 namespace flowsql {
 

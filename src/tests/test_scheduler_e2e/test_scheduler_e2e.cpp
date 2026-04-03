@@ -2,10 +2,12 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <unistd.h>
 
+#include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 #include <rapidjson/document.h>
@@ -15,12 +17,18 @@
 #include <common/error_code.h>
 #include <common/loader.hpp>
 #include <framework/core/dataframe.h>
+#include <framework/core/stream_channel_adapter.h>
 #include <framework/core/dataframe_channel.h>
 #include <framework/interfaces/idatabase_channel.h>
 #include <framework/interfaces/idatabase_factory.h>
 #include <framework/interfaces/ichannel_registry.h>
 #include <framework/interfaces/idataframe_channel.h>
+#include <framework/interfaces/ioperator.h>
+#include <framework/interfaces/ioperator_registry.h>
 #include <framework/interfaces/irouter_handle.h>
+#include <framework/interfaces/istream_channel.h>
+#include <framework/interfaces/istream_factory.h>
+#include <framework/interfaces/istream_operator.h>
 
 using namespace flowsql;
 
@@ -72,6 +80,227 @@ static std::string MakeReq(const std::string& sql) {
     w.String(sql.c_str());
     w.EndObject();
     return buf.GetString();
+}
+
+static std::string MakeTaskReq(const std::string& task_id) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("task_id");
+    w.String(task_id.c_str());
+    w.EndObject();
+    return buf.GetString();
+}
+
+static std::shared_ptr<arrow::RecordBatch> MakeStreamBatch(int64_t base, int64_t rows = 1) {
+    auto schema = arrow::schema({arrow::field("v", arrow::int64())});
+    arrow::Int64Builder b;
+    for (int64_t i = 0; i < rows; ++i) {
+        (void)b.Append(base + i);
+    }
+    auto arr = b.Finish().ValueOrDie();
+    return arrow::RecordBatch::Make(schema, rows, {arr});
+}
+
+static std::string ParseStatus(const std::string& rsp) {
+    rapidjson::Document d;
+    d.Parse(rsp.c_str());
+    if (d.HasParseError() || !d.IsObject() || !d.HasMember("status") || !d["status"].IsString()) {
+        return "";
+    }
+    return d["status"].GetString();
+}
+
+static std::string ParseTaskId(const std::string& rsp) {
+    rapidjson::Document d;
+    d.Parse(rsp.c_str());
+    if (d.HasParseError() || !d.IsObject() || !d.HasMember("stream_task_id") || !d["stream_task_id"].IsString()) {
+        return "";
+    }
+    return d["stream_task_id"].GetString();
+}
+
+static int ParseShardCount(const std::string& rsp) {
+    rapidjson::Document d;
+    d.Parse(rsp.c_str());
+    if (d.HasParseError() || !d.IsObject() || !d.HasMember("shard_count") || !d["shard_count"].IsUint()) {
+        return -1;
+    }
+    return static_cast<int>(d["shard_count"].GetUint());
+}
+
+static bool IsValidStreamChannelList(const std::string& rsp) {
+    rapidjson::Document d;
+    d.Parse(rsp.c_str());
+    if (d.HasParseError() || !d.IsObject() || !d.HasMember("channels") || !d["channels"].IsArray()) {
+        return false;
+    }
+    const auto& arr = d["channels"].GetArray();
+    for (auto it = arr.Begin(); it != arr.End(); ++it) {
+        if (!it->IsObject()) return false;
+        if (!it->HasMember("type") || !(*it)["type"].IsString()) return false;
+        if (!it->HasMember("name") || !(*it)["name"].IsString()) return false;
+        if (!it->HasMember("status") || !(*it)["status"].IsString()) return false;
+    }
+    return true;
+}
+
+class ParallelPassthroughStreamOperator final : public IOperator, public IStreamOperator {
+ public:
+    std::string Category() override { return "builtin"; }
+    std::string Name() override { return "passthrough_stream"; }
+    std::string Description() override { return "test parallel passthrough stream op"; }
+    OperatorPosition Position() override { return OperatorPosition::DATA; }
+
+    int Work(IChannel*, IChannel*) override { return -1; }
+    int Configure(const char*, const char*) override { return 0; }
+
+    int Init(const char*, const StreamSinkContext& sink_ctx) override {
+        last_error_.clear();
+        output_.reset();
+        if (!sink_ctx.sink_channel) {
+            last_error_ = "sink channel is null";
+            return -1;
+        }
+        if (sink_ctx.sink_type == ChannelType::kStream) {
+            auto* out = dynamic_cast<IStreamChannel*>(sink_ctx.sink_channel);
+            if (!out) {
+                last_error_ = "stream sink cast failed";
+                return -1;
+            }
+            output_ = std::shared_ptr<IStreamChannel>(out, [](IStreamChannel*) {});
+            return 0;
+        }
+        if (sink_ctx.sink_type == ChannelType::kDataFrame) {
+            auto* appendable = dynamic_cast<IAppendableDataFrameChannel*>(sink_ctx.sink_channel);
+            if (!appendable) {
+                last_error_ = "dataframe sink must be appendable";
+                return -1;
+            }
+            output_ = StreamChannelAdapter::MakeDataFrameAppend(
+                "stream_adapter",
+                sink_ctx.into_raw,
+                std::shared_ptr<IAppendableDataFrameChannel>(appendable, [](IAppendableDataFrameChannel*) {}));
+            return output_ ? 0 : -1;
+        }
+        if (sink_ctx.sink_type == ChannelType::kDatabase) {
+            auto* db = dynamic_cast<IDatabaseChannel*>(sink_ctx.sink_channel);
+            if (!db) {
+                last_error_ = "database sink cast failed";
+                return -1;
+            }
+            if (sink_ctx.table_name.empty()) {
+                last_error_ = "builtin stream operator requires explicit table, use INTO <db_type>.<db_name>.<table>";
+                return -1;
+            }
+            output_ = StreamChannelAdapter::MakeDatabaseWriter(
+                "stream_adapter",
+                sink_ctx.into_raw,
+                std::shared_ptr<IDatabaseChannel>(db, [](IDatabaseChannel*) {}),
+                sink_ctx.table_name);
+            return output_ ? 0 : -1;
+        }
+        last_error_ = "unsupported sink type";
+        return -1;
+    }
+
+    int OnSchemaReady(std::shared_ptr<arrow::Schema>) override { return 0; }
+
+    int Process(const arrow::RecordBatch& batch, int64_t ts_ms) override {
+        if (!output_) return -1;
+        return output_->Put(batch.Slice(0, batch.num_rows()), ts_ms);
+    }
+
+    int Tick(int64_t) override { return 0; }
+    int Flush() override { return 0; }
+    std::string GetStats() override { return "{}"; }
+    std::string LastError() override { return last_error_; }
+
+    ParallelStrategy GetParallelStrategy() const override {
+        return ParallelStrategy::STATELESS;
+    }
+    int GetParallelism() const override {
+        return 4;
+    }
+
+ private:
+    std::shared_ptr<IStreamChannel> output_;
+    std::string last_error_;
+};
+
+class DbDirectWriterStreamOperator final : public IOperator, public IStreamOperator {
+ public:
+    std::string Category() override { return "custom"; }
+    std::string Name() override { return "db_direct_writer_stream"; }
+    std::string Description() override { return "test stream op writes to database channel directly"; }
+    OperatorPosition Position() override { return OperatorPosition::DATA; }
+
+    int Work(IChannel*, IChannel*) override { return -1; }
+    int Configure(const char*, const char*) override { return 0; }
+
+    int Init(const char*, const StreamSinkContext& sink_ctx) override {
+        last_error_.clear();
+        auto* db = dynamic_cast<IDatabaseChannel*>(sink_ctx.sink_channel);
+        if (!db) {
+            last_error_ = "output must be IDatabaseChannel";
+            return -1;
+        }
+        db_ = std::shared_ptr<IDatabaseChannel>(db, [](IDatabaseChannel*) {});
+        total_rows_ = 0;
+        return 0;
+    }
+
+    int OnSchemaReady(std::shared_ptr<arrow::Schema>) override {
+        if (!db_) return -1;
+        if (db_->ExecuteSql("CREATE TABLE IF NOT EXISTS t44_two_segment_custom(total_rows INTEGER)") != 0) {
+            last_error_ = "create table failed";
+            return -1;
+        }
+        return 0;
+    }
+
+    int Process(const arrow::RecordBatch& batch, int64_t) override {
+        total_rows_ += batch.num_rows();
+        return 0;
+    }
+
+    int Tick(int64_t) override { return 0; }
+
+    int Flush() override {
+        if (!db_) return 0;
+        if (total_rows_ <= 0) return 0;
+        const std::string sql =
+            "INSERT INTO t44_two_segment_custom(total_rows) VALUES (" + std::to_string(total_rows_) + ")";
+        if (db_->ExecuteSql(sql.c_str()) != 0) {
+            last_error_ = "insert failed";
+            return -1;
+        }
+        return 0;
+    }
+
+    std::string GetStats() override { return "{}"; }
+    std::string LastError() override { return last_error_; }
+
+ private:
+    std::shared_ptr<IDatabaseChannel> db_;
+    int64_t total_rows_ = 0;
+    std::string last_error_;
+};
+
+static bool ListContainsTaskId(const std::string& rsp, const std::string& task_id) {
+    rapidjson::Document d;
+    d.Parse(rsp.c_str());
+    if (d.HasParseError() || !d.IsObject() || !d.HasMember("tasks") || !d["tasks"].IsArray()) {
+        return false;
+    }
+    const auto& arr = d["tasks"];
+    for (rapidjson::SizeType i = 0; i < arr.Size(); ++i) {
+        const auto& item = arr[i];
+        if (!item.IsObject()) continue;
+        if (!item.HasMember("task_id") || !item["task_id"].IsString()) continue;
+        if (task_id == item["task_id"].GetString()) return true;
+    }
+    return false;
 }
 
 static fnRouterHandler FindRouteHandler(PluginLoader* loader, const char* method, const char* uri) {
@@ -149,35 +378,78 @@ int main() {
     const std::filesystem::path db_path = std::filesystem::temp_directory_path() / ("flowsql_s9_3_" + suffix + ".db");
     const std::filesystem::path data_dir = std::filesystem::temp_directory_path() / ("flowsql_s9_3_df_" + suffix);
     const std::filesystem::path operator_db_dir = std::filesystem::temp_directory_path() / ("flowsql_s9_3_catalog_" + suffix);
+    const std::filesystem::path stream_cfg = std::filesystem::temp_directory_path() / ("flowsql_s9_3_stream_" + suffix + ".yml");
     std::filesystem::remove(db_path);
+    std::filesystem::remove(stream_cfg);
     std::filesystem::create_directories(data_dir);
     std::filesystem::create_directories(operator_db_dir);
 
+    {
+        std::ofstream out(stream_cfg);
+        ASSERT_TRUE(out.is_open());
+        out << "channels:\n";
+        out << "  stream_channels:\n";
+        out << "    - type: ring\n";
+        out << "      name: in\n";
+        out << "      option: \"ring_size=256;batch_rows=128;overflow=drop;ring_mode=spsc;finite=false\"\n";
+        out << "    - type: ring\n";
+        out << "      name: out\n";
+        out << "      option: \"ring_size=256;batch_rows=128;overflow=drop;ring_mode=spsc;finite=false\"\n";
+        out << "    - type: ring\n";
+        out << "      name: stop_in\n";
+        out << "      option: \"ring_size=256;batch_rows=128;overflow=drop;ring_mode=spsc;finite=false\"\n";
+        out << "    - type: ring\n";
+        out << "      name: stop_out\n";
+        out << "      option: \"ring_size=256;batch_rows=128;overflow=drop;ring_mode=spsc;finite=false\"\n";
+        out << "    - type: ring\n";
+        out << "      name: svc_out\n";
+        out << "      option: \"ring_size=256;batch_rows=128;overflow=drop;ring_mode=spsc;finite=false\"\n";
+        out << "    - type: tcp_session_mock\n";
+        out << "      name: tcp_src\n";
+        out << "      option: \"mode=keyed;total_records=64;batch_rows=8;partition_count=4;emit_interval_ms=0;ring_size=256;overflow=drop\"\n";
+        out.flush();
+    }
+
     PluginLoader* loader = PluginLoader::Single();
-    const char* libs[] = {"libflowsql_database.so", "libflowsql_catalog.so", "libflowsql_scheduler.so"};
+    const char* libs[] = {"libflowsql_database.so", "libflowsql_catalog.so", "libflowsql_scheduler.so", "libflowsql_stream.so"};
     std::string db_opt = "type=sqlite;name=local;path=" + db_path.string();
     std::string catalog_opt = "data_dir=" + data_dir.string() + ";operator_db_dir=" + operator_db_dir.string();
-    const char* opts[] = {db_opt.c_str(), catalog_opt.c_str(), nullptr};
-    ASSERT_EQ(loader->Load(get_absolute_process_path(), libs, opts, 3), 0);
+    std::string stream_opt = "config_file=" + stream_cfg.string();
+    const char* opts[] = {db_opt.c_str(), catalog_opt.c_str(), nullptr, stream_opt.c_str()};
+    ASSERT_EQ(loader->Load(get_absolute_process_path(), libs, opts, 4), 0);
     std::puts("[INFO] plugins loaded");
     ASSERT_EQ(loader->StartAll(), 0);
     std::puts("[INFO] plugins started");
 
     auto* factory = static_cast<IDatabaseFactory*>(loader->First(IID_DATABASE_FACTORY));
     auto* registry = static_cast<IChannelRegistry*>(loader->First(IID_CHANNEL_REGISTRY));
+    auto* stream_factory = static_cast<IStreamFactory*>(loader->First(IID_STREAM_FACTORY));
+    auto* op_registry = static_cast<IOperatorRegistry*>(loader->First(IID_OPERATOR_REGISTRY));
     ASSERT_TRUE(factory != nullptr);
     ASSERT_TRUE(registry != nullptr);
+    ASSERT_TRUE(stream_factory != nullptr);
+    ASSERT_TRUE(op_registry != nullptr);
     auto* db = dynamic_cast<IDatabaseChannel*>(factory->Get("sqlite", "local"));
     ASSERT_TRUE(db != nullptr);
 
     SeedSourceTable(db, "src");
     std::puts("[INFO] source table seeded");
     auto exec = FindExecuteHandler(loader);
+    auto stream_exec = FindRouteHandler(loader, "POST", "/tasks/stream/execute");
+    auto stream_stop = FindRouteHandler(loader, "POST", "/tasks/stream/stop");
+    auto stream_status = FindRouteHandler(loader, "POST", "/tasks/stream/status");
+    auto stream_list = FindRouteHandler(loader, "GET", "/tasks/stream/list");
     auto activate = FindRouteHandler(loader, "POST", "/operators/activate");
     auto deactivate = FindRouteHandler(loader, "POST", "/operators/deactivate");
+    auto upsert_batch = FindRouteHandler(loader, "POST", "/operators/upsert_batch");
     ASSERT_TRUE(exec != nullptr);
+    ASSERT_TRUE(stream_exec != nullptr);
+    ASSERT_TRUE(stream_stop != nullptr);
+    ASSERT_TRUE(stream_status != nullptr);
+    ASSERT_TRUE(stream_list != nullptr);
     ASSERT_TRUE(activate != nullptr);
     ASSERT_TRUE(deactivate != nullptr);
+    ASSERT_TRUE(upsert_batch != nullptr);
     std::puts("[INFO] execute handler ready");
 
     // T18: INTO dataframe.result 后可通过 Registry 读取
@@ -598,10 +870,336 @@ int main() {
     }
     std::puts("[PASS] T38");
 
+    // T39: 流式 execute/status/list + 数据流转
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+
+        auto* stream_in = stream_factory->Get("ring", "in");
+        auto* stream_out = stream_factory->Get("ring", "out");
+        ASSERT_TRUE(stream_in != nullptr);
+        ASSERT_TRUE(stream_out != nullptr);
+
+        // 清理输出通道残留数据
+        while (true) {
+            PollEvent ev = stream_out->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+
+        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+                              MakeReq("SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out"),
+                              rsp),
+                  error::OK);
+        const std::string task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!task_id.empty());
+
+        ASSERT_EQ(stream_in->Put(MakeStreamBatch(1), 1001), 0);
+        ASSERT_EQ(stream_in->Put(MakeStreamBatch(2), 1002), 0);
+        ASSERT_EQ(stream_in->Put(MakeStreamBatch(3), 1003), 0);
+        stream_in->CloseStream();
+
+        std::string final_status;
+        bool done = false;
+        for (int i = 0; i < 300; ++i) {
+            std::string s_rsp;
+            ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
+            final_status = ParseStatus(s_rsp);
+            if (final_status == "stopped" || final_status == "cancelled" || final_status == "failed") {
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(done);
+        ASSERT_EQ(final_status, "stopped");
+
+        int rows = 0;
+        for (int i = 0; i < 200 && rows < 3; ++i) {
+            PollEvent ev = stream_out->PollNext(10);
+            if (ev.kind == PollEventKind::kData && ev.batch.data) {
+                rows += static_cast<int>(ev.batch.data->num_rows());
+            }
+        }
+        ASSERT_EQ(rows, 3);
+
+        std::string list_rsp;
+        ASSERT_EQ(stream_list("/tasks/stream/list", "", list_rsp), error::OK);
+        ASSERT_TRUE(ListContainsTaskId(list_rsp, task_id));
+    }
+    std::puts("[PASS] T39");
+
+    // T40: 流式 stop 终止运行中任务
+    {
+        std::string rsp;
+        auto* stop_in = stream_factory->Get("ring", "stop_in");
+        auto* stop_out = stream_factory->Get("ring", "stop_out");
+        ASSERT_TRUE(stop_in != nullptr);
+        ASSERT_TRUE(stop_out != nullptr);
+
+        while (true) {
+            PollEvent ev = stop_out->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+
+        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+                              MakeReq("SELECT * FROM ring.stop_in USING builtin.passthrough_stream INTO stream.stop_out"),
+                              rsp),
+                  error::OK);
+        const std::string task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!task_id.empty());
+
+        bool seen_running = false;
+        for (int i = 0; i < 100; ++i) {
+            std::string s_rsp;
+            ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
+            const std::string st = ParseStatus(s_rsp);
+            if (st == "running" || st == "stopping") {
+                seen_running = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(seen_running);
+
+        std::string stop_rsp;
+        ASSERT_EQ(stream_stop("/tasks/stream/stop", MakeTaskReq(task_id), stop_rsp), error::OK);
+        const std::string stop_status = ParseStatus(stop_rsp);
+        ASSERT_TRUE(stop_status == "cancelled" || stop_status == "failed" || stop_status == "stopped");
+
+        std::string status_rsp;
+        ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), status_rsp), error::OK);
+        const std::string final_status = ParseStatus(status_rsp);
+        ASSERT_TRUE(final_status == "cancelled" || final_status == "failed" || final_status == "stopped");
+
+        std::string list_rsp;
+        ASSERT_EQ(stream_list("/tasks/stream/list", "", list_rsp), error::OK);
+        ASSERT_TRUE(ListContainsTaskId(list_rsp, task_id));
+    }
+    std::puts("[PASS] T40");
+
+    // T41: 内置 tcp_session_mock 通道 + tcp_service_merge_stream 算子链路
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.tcp_service_merge_stream"})", rsp), error::OK);
+
+        auto* tcp_src = stream_factory->Get("tcp_session_mock", "tcp_src");
+        auto* svc_out = stream_factory->Get("ring", "svc_out");
+        ASSERT_TRUE(tcp_src != nullptr);
+        ASSERT_TRUE(svc_out != nullptr);
+
+        while (true) {
+            PollEvent ev = svc_out->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+
+        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING builtin.tcp_service_merge_stream INTO stream.svc_out"),
+                              rsp),
+                  error::OK);
+        const std::string task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!task_id.empty());
+
+        std::string final_status;
+        bool done = false;
+        for (int i = 0; i < 300; ++i) {
+            std::string s_rsp;
+            ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
+            final_status = ParseStatus(s_rsp);
+            if (final_status == "stopped" || final_status == "cancelled" || final_status == "failed") {
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(done);
+        ASSERT_EQ(final_status, "stopped");
+
+        int out_rows = 0;
+        bool schema_ok = false;
+        for (int i = 0; i < 200; ++i) {
+            PollEvent ev = svc_out->PollNext(20);
+            if (ev.kind != PollEventKind::kData || !ev.batch.data) continue;
+            out_rows += static_cast<int>(ev.batch.data->num_rows());
+            auto schema = ev.batch.data->schema();
+            ASSERT_TRUE(schema != nullptr);
+            ASSERT_TRUE(schema->GetFieldIndex("clientIP") >= 0);
+            ASSERT_TRUE(schema->GetFieldIndex("serverIP") >= 0);
+            ASSERT_TRUE(schema->GetFieldIndex("serverPort") >= 0);
+            ASSERT_TRUE(schema->GetFieldIndex("bps") >= 0);
+            ASSERT_TRUE(schema->GetFieldIndex("pps") >= 0);
+            ASSERT_TRUE(schema->GetFieldIndex("clientPort") < 0);
+            schema_ok = true;
+            if (out_rows > 0) break;
+        }
+        ASSERT_TRUE(schema_ok);
+        ASSERT_TRUE(out_rows > 0);
+    }
+    std::puts("[PASS] T41");
+
+    // T42: INTO dataframe.* 强制单写者降级（算子声明并行=4，实际 shard_count=1）
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+        ASSERT_EQ(op_registry->Register("builtin.passthrough_stream", []() -> IOperator* {
+            return new ParallelPassthroughStreamOperator();
+        }), 0);
+
+        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING builtin.passthrough_stream INTO dataframe.stream_single_writer"),
+                              rsp),
+                  error::OK);
+        const std::string task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!task_id.empty());
+
+        std::string final_status_rsp;
+        std::string final_status;
+        bool done = false;
+        for (int i = 0; i < 300; ++i) {
+            std::string s_rsp;
+            ASSERT_EQ(stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp), error::OK);
+            final_status = ParseStatus(s_rsp);
+            if (final_status == "stopped" || final_status == "cancelled" || final_status == "failed") {
+                final_status_rsp = s_rsp;
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(done);
+        ASSERT_EQ(final_status, "stopped");
+        ASSERT_EQ(ParseShardCount(final_status_rsp), 1);
+
+        auto df_ch = std::dynamic_pointer_cast<IDataFrameChannel>(registry->Get("stream_single_writer"));
+        ASSERT_TRUE(df_ch != nullptr);
+        DataFrame out;
+        ASSERT_EQ(df_ch->Read(&out), 0);
+        ASSERT_TRUE(out.RowCount() > 0);
+    }
+    std::puts("[PASS] T42");
+
+    // T43: INTO 数据库目标规则（builtin 两段式报错；普通算子可接收两段式 DB 通道）
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+        ASSERT_EQ(op_registry->Register("custom.db_direct_writer_stream", []() -> IOperator* {
+            return new DbDirectWriterStreamOperator();
+        }), 0);
+        ASSERT_EQ(upsert_batch("/operators/upsert_batch", R"({
+            "operators":[
+                {
+                    "category":"custom",
+                    "name":"db_direct_writer_stream",
+                    "type":"cpp",
+                    "source":"e2e",
+                    "description":"e2e custom stream db writer",
+                    "position":"DATA"
+                }
+            ]
+        })", rsp), error::OK);
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"custom.db_direct_writer_stream"})", rsp), error::OK);
+
+        auto wait_stream_terminal = [&](const std::string& task_id, std::string* final_status) -> bool {
+            for (int i = 0; i < 400; ++i) {
+                std::string s_rsp;
+                if (stream_status("/tasks/stream/status", MakeTaskReq(task_id), s_rsp) != error::OK) {
+                    return false;
+                }
+                const std::string st = ParseStatus(s_rsp);
+                if (st == "stopped" || st == "cancelled" || st == "failed") {
+                    if (final_status) *final_status = st;
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            return false;
+        };
+
+        // case 1: builtin + 三段式目标成功
+        const int64_t src_rows_before = QueryCount(db, "SELECT * FROM src");
+        ASSERT_EQ(src_rows_before, 3);
+        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING builtin.passthrough_stream "
+                                      "INTO sqlite.local.t44_into"),
+                              rsp),
+                  error::OK);
+        std::string task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!task_id.empty());
+        std::string terminal_status;
+        ASSERT_TRUE(wait_stream_terminal(task_id, &terminal_status));
+        ASSERT_EQ(terminal_status, "stopped");
+        ASSERT_TRUE(QueryCount(db, "SELECT * FROM t44_into") > 0);
+        ASSERT_EQ(QueryCount(db, "SELECT * FROM src"), src_rows_before);
+
+        // case 2: WITH sink_table 不再作为框架兜底语义
+        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING builtin.passthrough_stream WITH sink_table=t44_with "
+                                      "INTO sqlite.local"),
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("sink_table") != std::string::npos);
+
+        // case 3: builtin + 两段式 DB 目标失败（要求显式三段式）
+        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING builtin.passthrough_stream INTO sqlite.local"),
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("requires explicit table") != std::string::npos);
+
+        // case 4: 普通算子可接收两段式 DB 通道并自行写入
+        ASSERT_EQ(stream_exec("/tasks/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING custom.db_direct_writer_stream INTO sqlite.local"),
+                              rsp),
+                  error::OK);
+        task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!task_id.empty());
+        terminal_status.clear();
+        ASSERT_TRUE(wait_stream_terminal(task_id, &terminal_status));
+        ASSERT_EQ(terminal_status, "stopped");
+        ASSERT_TRUE(QueryCount(db, "SELECT * FROM t44_two_segment_custom") > 0);
+    }
+    std::puts("[PASS] T43");
+
+    // T44: Web 代理流式通道查询接口（严格语义：上游不可达时返回 UNAVAILABLE）
+    {
+        const std::filesystem::path web_db_path = std::filesystem::temp_directory_path() /
+                                                  ("flowsql_s9_3_web_" + suffix + ".db");
+        std::filesystem::remove(web_db_path);
+
+        // 当前 e2e 用例未加载 Gateway/Router 网络服务，Web 代理请求应返回 UNAVAILABLE。
+        std::string web_opt = "host=127.0.0.1;port=18081;db_path=" + web_db_path.string() +
+                              ";gateway=127.0.0.1:18803";
+        const char* web_libs[] = {"libflowsql_web.so"};
+        const char* web_opts[] = {web_opt.c_str()};
+        ASSERT_EQ(loader->Load(get_absolute_process_path(), web_libs, web_opts, 1), 0);
+
+        fnRouterHandler web_stream_list = nullptr;
+        web_stream_list = FindRouteHandler(loader, "GET", "/api/channels/stream/list");
+        ASSERT_TRUE(web_stream_list != nullptr);
+
+        std::string rsp;
+        ASSERT_EQ(web_stream_list("/api/channels/stream/list", "", rsp), error::UNAVAILABLE);
+        ASSERT_TRUE(rsp.find("service unreachable") != std::string::npos);
+        std::filesystem::remove(web_db_path);
+    }
+    std::puts("[PASS] T44");
+
     exec = fnRouterHandler();
+    stream_exec = fnRouterHandler();
+    stream_stop = fnRouterHandler();
+    stream_status = fnRouterHandler();
+    stream_list = fnRouterHandler();
+    activate = fnRouterHandler();
+    deactivate = fnRouterHandler();
     loader->StopAll();
     loader->Unload();
     std::filesystem::remove(db_path);
+    std::filesystem::remove(stream_cfg);
     std::filesystem::remove_all(data_dir);
     std::filesystem::remove_all(operator_db_dir);
 

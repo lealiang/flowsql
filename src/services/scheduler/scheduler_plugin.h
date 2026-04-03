@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -12,6 +13,9 @@
 #include <common/span.h>
 #include <framework/interfaces/irouter_handle.h>
 #include <framework/interfaces/ibridge.h>
+#include <framework/interfaces/istream_channel.h>
+
+#include "stream_runtime.h"
 
 namespace flowsql {
 
@@ -41,7 +45,12 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
  private:
     // 路由处理（fnRouterHandler 签名）
     int32_t HandleExecute(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamExecute(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamStop(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamStatus(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleStreamList(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetChannels(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleQueryStreamChannels(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleRefreshOperators(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandlePreviewDataframe(const std::string& uri, const std::string& req, std::string& rsp);
 
@@ -51,6 +60,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
 
     // 算子查找
     std::shared_ptr<IOperator> FindOperator(const std::string& category, const std::string& name);
+    std::shared_ptr<IOperator> CreateOperator(const std::string& category, const std::string& name);
 
     // 执行路径
     int ExecuteTransfer(IChannel* source, IChannel* sink,
@@ -66,6 +76,22 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
                                  const std::string& sink_type,
                                  const SqlStatement& stmt, int64_t* rows_affected = nullptr,
                                  std::string* error = nullptr);
+
+    int32_t ExecuteStreamTask(const SqlStatement& stmt, std::string& rsp);
+    std::string NextStreamTaskId();
+
+    struct SinkBinding {
+        std::shared_ptr<IChannel> sink_channel;
+        std::string sink_type;
+        std::string db_type;
+        std::string db_name;
+        std::string table_name;
+    };
+
+    int32_t ResolveStreamSink(const SqlStatement& stmt,
+                              SinkBinding* binding,
+                              std::string* err_out);
+
     IQuerier* querier_ = nullptr;
 
     // 通道表
@@ -76,6 +102,13 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
 
     // 用于生成唯一临时通道名
     std::atomic<uint64_t> tmp_channel_seq_{0};
+
+    // 流式任务调度
+    size_t stream_worker_count_ = 0;
+    StreamRuntime stream_runtime_;
+    std::atomic<uint64_t> stream_task_seq_{0};
+    mutable std::mutex stream_tasks_mu_;
+    std::unordered_map<std::string, std::shared_ptr<StreamTask>> stream_tasks_;
 };
 
 }  // namespace scheduler

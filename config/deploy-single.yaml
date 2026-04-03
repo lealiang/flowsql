@@ -20,6 +20,8 @@ services:
         option: "operator_db_path=./meta/flowsql_meta.db;upload_dir=./uploads/binaddon"
       - name: libflowsql_database.so
         option: "config_file=config/flowsql.yml"
+      - name: libflowsql_stream.so
+        option: "config_file=config/flowsql.yml"
 
   - name: pyworker
     type: python

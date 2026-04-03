@@ -5,29 +5,40 @@
 #include <rapidjson/writer.h>
 
 #include <cstdio>
+#include <chrono>
 #include <common/error_code.h>
 #include <common/log.h>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <regex>
+#include <sstream>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
 
 #include "framework/core/channel_adapter.h"
 #include "framework/core/dataframe.h"
 #include "framework/core/dataframe_channel.h"
+#include "framework/core/fan_in_stream_channel.h"
+#include "framework/core/fan_out_stream_channel.h"
 #include "framework/core/pipeline.h"
+#include "framework/core/ring_stream_channel.h"
 #include "framework/core/sql_parser.h"
 #include "framework/interfaces/ichannel.h"
 #include "framework/interfaces/ichannel_registry.h"
 #include "framework/interfaces/idatabase_channel.h"
 #include "framework/interfaces/idatabase_factory.h"
 #include "framework/interfaces/idataframe_channel.h"
+#include "framework/interfaces/ibridge.h"
 #include "framework/interfaces/ioperator.h"
 #include "framework/interfaces/ioperator_catalog.h"
 #include "framework/interfaces/ioperator_registry.h"
+#include "framework/interfaces/istream_channel.h"
+#include "framework/interfaces/istream_factory.h"
 
 namespace flowsql {
 namespace scheduler {
@@ -61,6 +72,44 @@ static bool IsDataFrameRef(const std::string& name) {
 static std::string DataFrameNamePart(const std::string& name) {
     if (!IsDataFrameRef(name)) return "";
     return name.substr(strlen("dataframe."));
+}
+
+static bool IsStreamRef(const std::string& name) {
+    return StartsWithIgnoreCase(name, "stream.") && name.size() > strlen("stream.");
+}
+
+static std::string StreamNamePart(const std::string& name) {
+    if (!IsStreamRef(name)) return "";
+    return name.substr(strlen("stream."));
+}
+
+static bool ParseDatabaseDestination(const std::string& dest,
+                                     std::string* db_type,
+                                     std::string* db_name,
+                                     std::string* table_name) {
+    if (!db_type || !db_name || !table_name) return false;
+    db_type->clear();
+    db_name->clear();
+    table_name->clear();
+
+    const auto first = dest.find('.');
+    if (first == std::string::npos || first == 0 || first >= dest.size() - 1) {
+        return false;
+    }
+    *db_type = ToLowerAscii(dest.substr(0, first));
+
+    const auto second = dest.find('.', first + 1);
+    if (second == std::string::npos) {
+        *db_name = dest.substr(first + 1);
+        return !db_name->empty();
+    }
+
+    if (second == first + 1 || second >= dest.size() - 1) {
+        return false;
+    }
+    *db_name = dest.substr(first + 1, second - first - 1);
+    *table_name = dest.substr(second + 1);
+    return !db_name->empty() && !table_name->empty();
 }
 
 static bool IsQualifiedDestination(const std::string& dest) {
@@ -130,6 +179,436 @@ static const char* DataTypeName(DataType t) {
     }
 }
 
+static int64_t CurrentTimeMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string MakeWithParamsJson(const std::unordered_map<std::string, std::string>& params) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    for (const auto& kv : params) {
+        w.Key(kv.first.c_str());
+        w.String(kv.second.c_str());
+    }
+    w.EndObject();
+    return buf.GetString();
+}
+
+static size_t NextPowerOfTwo(size_t value) {
+    if (value <= 1) return 1;
+    size_t v = value - 1;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    if (sizeof(size_t) >= 8) {
+        v |= v >> 32;
+    }
+    return v + 1;
+}
+
+static const char* StreamTaskStatusName(StreamTaskStatus status) {
+    switch (status) {
+        case StreamTaskStatus::kCreated: return "created";
+        case StreamTaskStatus::kRunning: return "running";
+        case StreamTaskStatus::kStopping: return "stopping";
+        case StreamTaskStatus::kStopped: return "stopped";
+        case StreamTaskStatus::kCancelled: return "cancelled";
+        case StreamTaskStatus::kFailed: return "failed";
+        default: return "unknown";
+    }
+}
+
+static void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
+                                  const TaskSnapshot& s) {
+    if (!w) return;
+    w->StartObject();
+    w->Key("task_id");
+    w->String(s.task_id.c_str());
+    w->Key("status");
+    w->String(StreamTaskStatusName(s.status));
+    w->Key("stop_requested");
+    w->Bool(s.stop_requested);
+    w->Key("joined");
+    w->Bool(s.joined);
+    w->Key("shard_count");
+    w->Uint(s.shard_count);
+    w->Key("active_shards");
+    w->Uint(s.active_shards);
+
+    w->Key("processed_batches");
+    w->Uint64(s.processed_batches);
+    w->Key("processed_rows");
+    w->Uint64(s.processed_rows);
+    w->Key("processed_bytes");
+    w->Uint64(s.processed_bytes);
+    w->Key("output_rows");
+    w->Uint64(s.output_rows);
+    w->Key("output_batches");
+    w->Uint64(s.output_batches);
+    w->Key("dropped_batches");
+    w->Uint64(s.dropped_batches);
+    w->Key("poll_timeouts");
+    w->Uint64(s.poll_timeouts);
+    w->Key("poll_errors");
+    w->Uint64(s.poll_errors);
+    w->Key("queue_depth");
+    w->Uint64(s.queue_depth);
+    w->Key("queue_depth_peak");
+    w->Uint64(s.queue_depth_peak);
+    w->Key("uptime_ms");
+    w->Int64(s.uptime_ms);
+    w->Key("started_ms");
+    w->Int64(s.started_ms);
+    w->Key("last_active_ms");
+    w->Int64(s.last_active_ms);
+    w->Key("finished_ms");
+    w->Int64(s.finished_ms);
+    w->Key("error_code");
+    w->Int(s.error_code);
+    w->Key("error_message");
+    w->String(s.error_message.c_str());
+
+    rapidjson::Document stats_doc;
+    if (!s.op_stats_json.empty()) {
+        stats_doc.Parse(s.op_stats_json.c_str());
+    }
+    w->Key("op_stats");
+    if (stats_doc.HasParseError()) {
+        w->String(s.op_stats_json.c_str());
+    } else {
+        rapidjson::StringBuffer stats_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> stats_writer(stats_buf);
+        stats_doc.Accept(stats_writer);
+        w->RawValue(stats_buf.GetString(), stats_buf.GetSize(),
+                    stats_doc.IsArray() ? rapidjson::kArrayType : rapidjson::kObjectType);
+    }
+    w->EndObject();
+}
+
+class SharedSpmcState final : public std::enable_shared_from_this<SharedSpmcState> {
+ public:
+    SharedSpmcState(std::string category,
+                    std::string name,
+                    std::shared_ptr<IStreamChannel> source,
+                    size_t ring_size)
+        : category_(std::move(category)),
+          name_(std::move(name)),
+          source_(std::move(source)) {
+        RingStreamChannelOptions opts;
+        opts.ring_mode = RingMode::SPMC;
+        opts.overflow = OverflowPolicy::kBlock;
+        opts.finite = source_ ? source_->IsFinite() : false;
+        opts.ring_size = NextPowerOfTwo(std::max<size_t>(64, ring_size));
+        queue_ = std::make_shared<RingStreamChannel>("spmc", name_, opts);
+        (void)queue_->Open();
+    }
+
+    ~SharedSpmcState() {
+        Stop();
+    }
+
+    int Start() {
+        bool expected = false;
+        if (!started_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return 0;
+        }
+        if (!source_) return EINVAL;
+        producer_finished_.store(false, std::memory_order_release);
+        stop_requested_.store(false, std::memory_order_release);
+        dispatch_thread_ = std::thread([self = shared_from_this()]() { self->DispatchLoop(); });
+        return 0;
+    }
+
+    void Stop() {
+        stop_requested_.store(true, std::memory_order_release);
+        std::call_once(cancel_once_, [this]() {
+            if (source_) source_->Cancel();
+        });
+        {
+            std::lock_guard<std::mutex> lock(dispatch_join_mu_);
+            if (dispatch_thread_.joinable() &&
+                dispatch_thread_.get_id() != std::this_thread::get_id()) {
+                dispatch_thread_.join();
+            }
+        }
+        producer_finished_.store(true, std::memory_order_release);
+        if (queue_) {
+            queue_->Close();
+        }
+    }
+
+    PollEvent PollNext(int timeout_ms) {
+        if (timeout_ms < 0) timeout_ms = 0;
+        const PollEvent ev = queue_->PollNext(timeout_ms);
+        if (ev.kind == PollEventKind::kData) {
+            return ev;
+        }
+        const int err = error_code_.load(std::memory_order_acquire);
+        if (err != 0) {
+            return PollEvent::Error(err, error_message_);
+        }
+        if (producer_finished_.load(std::memory_order_acquire) && queue_->IsEmpty()) {
+            JoinDispatchThreadIfFinished();
+            return PollEvent::Eof();
+        }
+        if (ev.kind == PollEventKind::kError &&
+            ev.err != -EBADF && ev.err != -ECANCELED) {
+            return ev;
+        }
+        return PollEvent::Timeout();
+    }
+
+    void Cancel() {
+        std::call_once(cancel_once_, [this]() {
+            if (source_) source_->Cancel();
+        });
+        stop_requested_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(dispatch_join_mu_);
+        if (dispatch_thread_.joinable() &&
+            dispatch_thread_.get_id() != std::this_thread::get_id()) {
+            dispatch_thread_.join();
+        }
+    }
+
+    int CloseView() {
+        return 0;
+    }
+
+    bool IsFinished() const {
+        const bool done = producer_finished_.load(std::memory_order_acquire) && queue_ && queue_->IsEmpty();
+        if (done) {
+            const_cast<SharedSpmcState*>(this)->JoinDispatchThreadIfFinished();
+        }
+        return done;
+    }
+
+    bool IsFull() const {
+        return queue_ && queue_->IsFull();
+    }
+
+    bool IsEmpty() const {
+        return !queue_ || queue_->IsEmpty();
+    }
+
+    size_t Capacity() const {
+        return queue_ ? queue_->Capacity() : 0;
+    }
+
+    size_t Size() const {
+        return queue_ ? queue_->Size() : 0;
+    }
+
+    std::shared_ptr<arrow::Schema> GetOutputSchema() {
+        return source_ ? source_->GetOutputSchema() : nullptr;
+    }
+
+    const char* Category() const { return category_.c_str(); }
+    const char* Name() const { return name_.c_str(); }
+    const char* Schema() const { return schema_cache_.c_str(); }
+    bool IsFinite() const { return source_ ? source_->IsFinite() : false; }
+
+ private:
+    void JoinDispatchThreadIfFinished() {
+        if (!producer_finished_.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lock(dispatch_join_mu_);
+        if (dispatch_thread_.joinable()) {
+            dispatch_thread_.join();
+        }
+    }
+
+    void SetErrorOnce(int code, const std::string& msg) {
+        int expected = 0;
+        if (error_code_.compare_exchange_strong(expected, code, std::memory_order_acq_rel)) {
+            error_message_ = msg;
+        }
+    }
+
+    void DispatchLoop() {
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            PollEvent ev = source_->PollNext(100);
+            if (ev.kind == PollEventKind::kTimeout) {
+                if (source_->IsFinished() && source_->IsEmpty()) {
+                    producer_finished_.store(true, std::memory_order_release);
+                    return;
+                }
+                continue;
+            }
+            if (ev.kind == PollEventKind::kData) {
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    int rc = queue_->Put(ev.batch.data, ev.batch.ts_ms);
+                    if (rc == 0) break;
+                    if (rc == EAGAIN) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
+                    }
+                    SetErrorOnce(-EIO, "shared spmc dispatch put failed");
+                    producer_finished_.store(true, std::memory_order_release);
+                    return;
+                }
+                continue;
+            }
+            if (ev.kind == PollEventKind::kEof || ev.kind == PollEventKind::kDrainedAfterCancel) {
+                producer_finished_.store(true, std::memory_order_release);
+                return;
+            }
+            if (ev.kind == PollEventKind::kError) {
+                SetErrorOnce(ev.err == 0 ? -EIO : ev.err,
+                             ev.err_msg.empty() ? "shared spmc source poll failed" : ev.err_msg);
+                producer_finished_.store(true, std::memory_order_release);
+                return;
+            }
+        }
+        producer_finished_.store(true, std::memory_order_release);
+    }
+
+    std::string category_;
+    std::string name_;
+    std::string schema_cache_ = "[]";
+    std::shared_ptr<IStreamChannel> source_;
+    std::shared_ptr<RingStreamChannel> queue_;
+    std::atomic<bool> started_{false};
+    std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> producer_finished_{false};
+    std::once_flag cancel_once_;
+    std::atomic<int> error_code_{0};
+    std::string error_message_;
+    std::mutex dispatch_join_mu_;
+    std::thread dispatch_thread_;
+};
+
+class SharedSpmcInputView final : public IStreamChannel {
+ public:
+    SharedSpmcInputView(std::shared_ptr<SharedSpmcState> state, uint32_t view_id)
+        : state_(std::move(state)),
+          view_name_(state_ ? std::string(state_->Name()) + ".v" + std::to_string(view_id)
+                            : ("spmc.v" + std::to_string(view_id))) {}
+
+    const char* Category() override {
+        return state_ ? state_->Category() : "spmc";
+    }
+
+    const char* Name() override {
+        return view_name_.c_str();
+    }
+
+    const char* Type() override {
+        return ChannelType::kStream;
+    }
+
+    const char* Schema() override {
+        return state_ ? state_->Schema() : "[]";
+    }
+
+    int Open() override { return 0; }
+    int Close() override { return state_ ? state_->CloseView() : 0; }
+    bool IsOpened() const override { return true; }
+    int Flush() override { return 0; }
+
+    int Put(std::shared_ptr<arrow::RecordBatch>, int64_t) override {
+        return ENOTSUP;
+    }
+
+    PollEvent PollNext(int timeout_ms = 100) override {
+        if (!state_) return PollEvent::Error(-EINVAL, "invalid shared spmc state");
+        return state_->PollNext(timeout_ms);
+    }
+
+    std::shared_ptr<arrow::Schema> GetOutputSchema() override {
+        return state_ ? state_->GetOutputSchema() : nullptr;
+    }
+
+    int SetFilter(const char*, std::vector<std::string>* unsupported_out) override {
+        if (unsupported_out) unsupported_out->clear();
+        return 0;
+    }
+
+    bool IsFull() const override { return state_ && state_->IsFull(); }
+    bool IsEmpty() const override { return !state_ || state_->IsEmpty(); }
+    size_t Capacity() const override { return state_ ? state_->Capacity() : 0; }
+    size_t Size() const override { return state_ ? state_->Size() : 0; }
+    bool IsFinite() const override { return state_ && state_->IsFinite(); }
+    void CloseStream() override {}
+    void Cancel() override {
+        if (state_) state_->Cancel();
+    }
+    bool IsFinished() const override {
+        return state_ && state_->IsFinished();
+    }
+
+ private:
+    std::shared_ptr<SharedSpmcState> state_;
+    std::string view_name_;
+};
+
+class FanOutPartitionView final : public IStreamChannel {
+ public:
+    FanOutPartitionView(std::shared_ptr<FanOutStreamChannel> parent,
+                        std::shared_ptr<IStreamChannel> partition)
+        : parent_(std::move(parent)),
+          partition_(std::move(partition)) {}
+
+    const char* Category() override {
+        return partition_ ? partition_->Category() : "fanout";
+    }
+
+    const char* Name() override {
+        return partition_ ? partition_->Name() : "fanout.partition";
+    }
+
+    const char* Type() override {
+        return ChannelType::kStream;
+    }
+
+    const char* Schema() override {
+        return partition_ ? partition_->Schema() : "[]";
+    }
+
+    int Open() override { return 0; }
+    int Close() override { return partition_ ? partition_->Close() : 0; }
+    bool IsOpened() const override { return partition_ && partition_->IsOpened(); }
+    int Flush() override { return partition_ ? partition_->Flush() : 0; }
+
+    int Put(std::shared_ptr<arrow::RecordBatch> batch, int64_t ts_ms) override {
+        return partition_ ? partition_->Put(std::move(batch), ts_ms) : EINVAL;
+    }
+
+    PollEvent PollNext(int timeout_ms = 100) override {
+        if (!partition_) return PollEvent::Error(-EINVAL, "fanout partition unavailable");
+        return partition_->PollNext(timeout_ms);
+    }
+
+    std::shared_ptr<arrow::Schema> GetOutputSchema() override {
+        return partition_ ? partition_->GetOutputSchema() : nullptr;
+    }
+
+    int SetFilter(const char* condition_json,
+                  std::vector<std::string>* unsupported_out) override {
+        return partition_ ? partition_->SetFilter(condition_json, unsupported_out) : EINVAL;
+    }
+
+    bool IsFull() const override { return partition_ && partition_->IsFull(); }
+    bool IsEmpty() const override { return !partition_ || partition_->IsEmpty(); }
+    size_t Capacity() const override { return partition_ ? partition_->Capacity() : 0; }
+    size_t Size() const override { return partition_ ? partition_->Size() : 0; }
+    bool IsFinite() const override { return partition_ && partition_->IsFinite(); }
+    void CloseStream() override {
+        if (partition_) partition_->CloseStream();
+    }
+    void Cancel() override {
+        if (partition_) partition_->Cancel();
+        if (parent_) parent_->Cancel();
+    }
+    bool IsFinished() const override { return partition_ && partition_->IsFinished(); }
+
+ private:
+    std::shared_ptr<FanOutStreamChannel> parent_;
+    std::shared_ptr<IStreamChannel> partition_;
+};
+
 // --- IPlugin ---
 int SchedulerPlugin::Option(const char* arg) {
     if (!arg) return 0;
@@ -147,6 +626,7 @@ int SchedulerPlugin::Option(const char* arg) {
 
         if (key == "host") host_ = val;
         else if (key == "port") port_ = std::stoi(val);
+        else if (key == "stream_workers") stream_worker_count_ = static_cast<size_t>(std::stoull(val));
 
         pos = (end < opts.size()) ? end + 1 : opts.size();
     }
@@ -223,11 +703,45 @@ int SchedulerPlugin::Start() {
     } else {
         LOG_ERROR("SchedulerPlugin::Start: IOperatorCatalog not found");
     }
-    LOG_INFO("SchedulerPlugin::Start: ready");
+
+    size_t workers = stream_worker_count_;
+    if (workers == 0) {
+        workers = static_cast<size_t>(std::thread::hardware_concurrency());
+    }
+    if (workers == 0) workers = 1;
+    stream_runtime_.Start(workers);
+
+    LOG_INFO("SchedulerPlugin::Start: ready, stream_workers=%zu", workers);
     return 0;
 }
 
 int SchedulerPlugin::Stop() {
+    std::vector<std::shared_ptr<StreamTask>> tasks;
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        tasks.reserve(stream_tasks_.size());
+        for (const auto& kv : stream_tasks_) {
+            if (kv.second) tasks.push_back(kv.second);
+        }
+    }
+
+    for (const auto& task : tasks) {
+        const StreamTaskStatus st = task->Status();
+        if (st == StreamTaskStatus::kRunning ||
+            st == StreamTaskStatus::kStopping ||
+            st == StreamTaskStatus::kCreated) {
+            task->RequestStop();
+        }
+    }
+    for (const auto& task : tasks) {
+        task->Join();
+    }
+    stream_runtime_.Stop();
+
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        stream_tasks_.clear();
+    }
     channels_.clear();
     LOG_INFO("SchedulerPlugin::Stop: done");
     return 0;
@@ -239,6 +753,27 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
     cb({"POST", "/tasks/instant/execute",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleExecute(u, req, rsp);
+        }});
+    cb({"POST", "/tasks/stream/execute",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleStreamExecute(u, req, rsp);
+        }});
+    cb({"POST", "/tasks/stream/stop",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleStreamStop(u, req, rsp);
+        }});
+    cb({"POST", "/tasks/stream/status",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleStreamStatus(u, req, rsp);
+        }});
+    cb({"GET", "/tasks/stream/list",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleStreamList(u, req, rsp);
+        }});
+    // 流式通道查询（管理面最小字段）
+    cb({"POST", "/channels/stream/query",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleQueryStreamChannels(u, req, rsp);
         }});
     // 内存通道查询
     cb({"POST", "/channels/dataframe/query",
@@ -314,6 +849,22 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
         }
     }
 
+    // 尝试通过 IStreamFactory 获取流式通道（type.name）
+    if (!found && querier_) {
+        auto* stream_factory = static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY));
+        if (stream_factory) {
+            auto pos = name.find('.');
+            if (pos != std::string::npos) {
+                const std::string type = ToLowerAscii(name.substr(0, pos));
+                const std::string rest = name.substr(pos + 1);
+                const auto pos2 = rest.find('.');
+                const std::string stream_name = (pos2 != std::string::npos) ? rest.substr(0, pos2) : rest;
+                auto* stream_ch = stream_factory->Get(type.c_str(), stream_name.c_str());
+                if (stream_ch) found = stream_ch;
+            }
+        }
+    }
+
     return found;
 }
 
@@ -352,6 +903,29 @@ std::shared_ptr<IOperator> SchedulerPlugin::FindOperator(const std::string& cate
     if (IEquals(category, "builtin") && op_registry) {
         IOperator* op = op_registry->Create(name.c_str());
         if (op) return std::shared_ptr<IOperator>(op, [](IOperator* p) { delete p; });
+    }
+    return nullptr;
+}
+
+std::shared_ptr<IOperator> SchedulerPlugin::CreateOperator(const std::string& category,
+                                                           const std::string& name) {
+    if (!querier_) return nullptr;
+    auto* op_registry = static_cast<IOperatorRegistry*>(querier_->First(IID_OPERATOR_REGISTRY));
+    if (op_registry) {
+        const std::string key = category + "." + name;
+        if (IOperator* op = op_registry->Create(key.c_str())) {
+            return std::shared_ptr<IOperator>(op, [](IOperator* p) { delete p; });
+        }
+        if (IEquals(category, "builtin")) {
+            if (IOperator* op = op_registry->Create(name.c_str())) {
+                return std::shared_ptr<IOperator>(op, [](IOperator* p) { delete p; });
+            }
+        }
+    }
+
+    auto* bridge = static_cast<IBridge*>(querier_->First(IID_BRIDGE));
+    if (bridge) {
+        return bridge->FindOperator(category, name);
     }
     return nullptr;
 }
@@ -592,6 +1166,555 @@ int SchedulerPlugin::ExecuteWithOperatorChain(Span<IChannel*> inputs, IChannel* 
     return 0;
 }
 
+std::string SchedulerPlugin::NextStreamTaskId() {
+    const uint64_t seq = stream_task_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::ostringstream oss;
+    oss << "stream_task_" << CurrentTimeMs() << "_" << seq;
+    return oss.str();
+}
+
+int32_t SchedulerPlugin::ResolveStreamSink(
+    const SqlStatement& stmt,
+    SinkBinding* binding,
+    std::string* err_out) {
+    if (!binding) {
+        if (err_out) *err_out = "invalid sink binding target";
+        return error::BAD_REQUEST;
+    }
+    binding->sink_channel.reset();
+    binding->sink_type.clear();
+    binding->db_type.clear();
+    binding->db_name.clear();
+    binding->table_name.clear();
+
+    if (stmt.dest.empty()) {
+        if (err_out) *err_out = "stream task requires INTO destination";
+        return error::BAD_REQUEST;
+    }
+
+    if (IsStreamRef(stmt.dest)) {
+        auto* stream_factory = querier_
+            ? static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY))
+            : nullptr;
+        if (!stream_factory) {
+            if (err_out) *err_out = "stream factory unavailable";
+            return error::UNAVAILABLE;
+        }
+
+        const std::string sink_name = StreamNamePart(stmt.dest);
+        IStreamChannel* matched = nullptr;
+        bool ambiguous = false;
+        stream_factory->List([&](const char*, const char* name, IStreamChannel* ch) {
+            if (!name || !ch) return;
+            if (sink_name != name) return;
+            if (matched && matched != ch) {
+                ambiguous = true;
+                return;
+            }
+            matched = ch;
+        });
+        if (ambiguous) {
+            if (err_out) *err_out = "ambiguous stream sink name: " + sink_name;
+            return error::CONFLICT;
+        }
+        if (!matched) {
+            if (err_out) *err_out = "stream sink not found: " + stmt.dest;
+            return error::NOT_FOUND;
+        }
+
+        auto output = std::shared_ptr<IStreamChannel>(matched, [](IStreamChannel*) {});
+        if (output && !output->IsOpened()) {
+            (void)output->Open();
+        }
+        binding->sink_channel = std::static_pointer_cast<IChannel>(output);
+        binding->sink_type = ChannelType::kStream;
+        return error::OK;
+    }
+
+    if (IsDataFrameRef(stmt.dest)) {
+        auto* ch_registry = querier_
+            ? static_cast<IChannelRegistry*>(querier_->First(IID_CHANNEL_REGISTRY))
+            : nullptr;
+        if (!ch_registry) {
+            if (err_out) *err_out = "channel registry unavailable";
+            return error::UNAVAILABLE;
+        }
+
+        const std::string df_name = DataFrameNamePart(stmt.dest);
+        std::shared_ptr<IChannel> df_holder = ch_registry->Get(df_name.c_str());
+        if (!df_holder) {
+            auto created = std::make_shared<DataFrameChannel>("dataframe", df_name);
+            (void)created->Open();
+            if (ch_registry->Register(df_name.c_str(), std::static_pointer_cast<IChannel>(created)) != 0) {
+                // 处理并发注册：重查一次
+                df_holder = ch_registry->Get(df_name.c_str());
+                if (!df_holder) {
+                    if (err_out) *err_out = "register dataframe sink failed: " + stmt.dest;
+                    return error::INTERNAL_ERROR;
+                }
+            } else {
+                df_holder = std::static_pointer_cast<IChannel>(created);
+            }
+        }
+
+        auto appendable = std::dynamic_pointer_cast<IAppendableDataFrameChannel>(df_holder);
+        if (!appendable) {
+            if (err_out) *err_out = "dataframe sink is not appendable: " + stmt.dest;
+            return error::BAD_REQUEST;
+        }
+        if (!appendable->IsOpened()) {
+            (void)appendable->Open();
+        }
+
+        binding->sink_channel = std::static_pointer_cast<IChannel>(appendable);
+        binding->sink_type = ChannelType::kDataFrame;
+        return error::OK;
+    }
+
+    std::string db_type;
+    std::string db_name;
+    std::string table_from_dest;
+    if (!ParseDatabaseDestination(stmt.dest, &db_type, &db_name, &table_from_dest)) {
+        if (err_out) *err_out = "invalid INTO destination: " + stmt.dest +
+            ", expected stream.<name>, dataframe.<name>, or <db_type>.<db_name>[.<table>]";
+        return error::BAD_REQUEST;
+    }
+
+    if (IChannel* existing = FindChannel(stmt.dest); existing) {
+        if (!existing->IsOpened()) {
+            (void)existing->Open();
+        }
+        binding->sink_channel = std::shared_ptr<IChannel>(existing, [](IChannel*) {});
+        binding->sink_type = existing->Type() ? existing->Type() : "";
+        if (binding->sink_type == ChannelType::kDatabase) {
+            binding->db_type = db_type;
+            binding->db_name = db_name;
+            binding->table_name = table_from_dest;
+        }
+        return error::OK;
+    }
+
+    auto* db_factory = querier_
+        ? static_cast<IDatabaseFactory*>(querier_->First(IID_DATABASE_FACTORY))
+        : nullptr;
+    if (!db_factory) {
+        if (err_out) *err_out = "database factory unavailable";
+        return error::UNAVAILABLE;
+    }
+
+    IDatabaseChannel* db_raw = db_factory->Get(db_type.c_str(), db_name.c_str());
+    if (!db_raw) {
+        if (err_out) *err_out = "database channel not found: " + db_type + "." + db_name;
+        return error::NOT_FOUND;
+    }
+
+    auto db_sink = std::shared_ptr<IDatabaseChannel>(db_raw, [](IDatabaseChannel*) {});
+    if (!db_sink->IsOpened()) {
+        (void)db_sink->Open();
+    }
+
+    binding->sink_channel = std::static_pointer_cast<IChannel>(db_sink);
+    binding->sink_type = ChannelType::kDatabase;
+    binding->db_type = db_type;
+    binding->db_name = db_name;
+    binding->table_name = table_from_dest;
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string& rsp) {
+    if (!querier_) {
+        rsp = MakeErrorJson("querier not initialized");
+        return error::INTERNAL_ERROR;
+    }
+
+    if (stmt.dest.empty()) {
+        rsp = MakeErrorJson("stream task requires INTO destination");
+        return error::BAD_REQUEST;
+    }
+    if (!IsQualifiedDestination(stmt.dest)) {
+        rsp = MakeErrorJson("invalid INTO destination: " + stmt.dest);
+        return error::BAD_REQUEST;
+    }
+
+    std::vector<OperatorRef> parsed_ops = stmt.operators;
+    if (parsed_ops.empty() && !stmt.op_category.empty() && !stmt.op_name.empty()) {
+        parsed_ops.push_back({stmt.op_category, stmt.op_name});
+    }
+    if (parsed_ops.empty()) {
+        rsp = MakeErrorJson("stream task requires USING stream operator");
+        return error::BAD_REQUEST;
+    }
+    if (parsed_ops.size() != 1) {
+        rsp = MakeErrorJson("stream task currently supports single USING operator");
+        return error::BAD_REQUEST;
+    }
+    const OperatorRef& op_ref = parsed_ops[0];
+
+    auto* catalog = static_cast<IOperatorCatalog*>(querier_->First(IID_OPERATOR_CATALOG));
+    if (!catalog) {
+        rsp = MakeErrorJson("operator catalog unavailable");
+        return error::UNAVAILABLE;
+    }
+    OperatorStatus status = catalog->QueryStatus(op_ref.category, op_ref.name);
+    if (status == OperatorStatus::kNotFound) {
+        rsp = MakeErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
+        return error::NOT_FOUND;
+    }
+    if (status == OperatorStatus::kDeactivated) {
+        rsp = MakeErrorJson("operator is deactivated: " + op_ref.category + "." + op_ref.name);
+        return error::CONFLICT;
+    }
+
+    std::vector<std::shared_ptr<IStreamChannel>> source_channels;
+    source_channels.reserve(stmt.sources.size());
+    for (const auto& source_name : stmt.sources) {
+        IChannel* raw = FindChannel(source_name);
+        if (!raw) {
+            rsp = MakeErrorJson("source channel not found: " + source_name);
+            return error::NOT_FOUND;
+        }
+        if (std::string(raw->Type()) != ChannelType::kStream) {
+            rsp = MakeErrorJson("source channel is not stream type: " + source_name);
+            return error::BAD_REQUEST;
+        }
+        auto* stream_ch = dynamic_cast<IStreamChannel*>(raw);
+        if (!stream_ch) {
+            rsp = MakeErrorJson("source channel cast to IStreamChannel failed: " + source_name);
+            return error::BAD_REQUEST;
+        }
+        source_channels.push_back(
+            std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {}));
+    }
+    if (source_channels.empty()) {
+        rsp = MakeErrorJson("source channel not found");
+        return error::BAD_REQUEST;
+    }
+
+    const std::unordered_map<std::string, std::string> with_params =
+        !stmt.operator_with_params.empty()
+            ? stmt.operator_with_params[0]
+            : stmt.with_params;
+    if (with_params.find("sink_table") != with_params.end()) {
+        rsp = MakeErrorJson("sink_table is not supported for stream tasks; use INTO <db_type>.<db_name>.<table>");
+        return error::BAD_REQUEST;
+    }
+
+    SinkBinding sink_binding;
+    std::string sink_error;
+    const int32_t sink_rc = ResolveStreamSink(stmt, &sink_binding, &sink_error);
+    if (sink_rc != error::OK) {
+        rsp = MakeErrorJson(sink_error);
+        return sink_rc;
+    }
+    auto output = sink_binding.sink_channel;
+    if (!output) {
+        rsp = MakeErrorJson("resolve stream sink failed: output channel is null");
+        return error::INTERNAL_ERROR;
+    }
+    StreamSinkContext sink_ctx;
+    sink_ctx.sink_channel = output.get();
+    sink_ctx.sink_type = sink_binding.sink_type;
+    sink_ctx.into_raw = stmt.dest;
+    sink_ctx.db_type = sink_binding.db_type;
+    sink_ctx.db_name = sink_binding.db_name;
+    sink_ctx.table_name = sink_binding.table_name;
+
+    const std::string task_id = NextStreamTaskId();
+    std::shared_ptr<FanInStreamChannel> fanin;
+    std::shared_ptr<IStreamChannel> source = source_channels[0];
+    if (source_channels.size() > 1) {
+        fanin = std::make_shared<FanInStreamChannel>(
+            "fanin", task_id + ".fanin", source_channels);
+        source = fanin;
+    }
+
+    if (!stmt.where_clause.empty()) {
+        std::vector<std::string> unsupported;
+        const int filter_rc = source->SetFilter(stmt.where_clause.c_str(), &unsupported);
+        if (filter_rc != 0) {
+            rsp = MakeErrorJson("stream source SetFilter failed");
+            return error::BAD_REQUEST;
+        }
+        if (!unsupported.empty()) {
+            std::ostringstream oss;
+            oss << "WHERE pushdown not fully supported:";
+            for (size_t i = 0; i < unsupported.size(); ++i) {
+                oss << (i == 0 ? " " : ", ") << unsupported[i];
+            }
+            rsp = MakeErrorJson(oss.str());
+            return error::BAD_REQUEST;
+        }
+    }
+
+    auto first_holder = CreateOperator(op_ref.category, op_ref.name);
+    if (!first_holder) {
+        rsp = MakeErrorJson("operator create failed: " + op_ref.category + "." + op_ref.name);
+        return error::NOT_FOUND;
+    }
+    auto first_stream_op = std::dynamic_pointer_cast<IStreamOperator>(first_holder);
+    if (!first_stream_op) {
+        rsp = MakeErrorJson("operator is not stream operator: " + op_ref.category + "." + op_ref.name);
+        return error::BAD_REQUEST;
+    }
+
+    ParallelStrategy strategy = first_stream_op->GetParallelStrategy();
+    int parallelism = std::max(1, first_stream_op->GetParallelism());
+    if (strategy == ParallelStrategy::NONE) {
+        parallelism = 1;
+    }
+    if (sink_ctx.sink_type != ChannelType::kStream) {
+        if (strategy != ParallelStrategy::NONE || parallelism != 1) {
+            LOG_WARN("ExecuteStreamTask: sink=%s(type=%s) forces single-writer, downgrade strategy=%d parallelism=%d -> NONE/1",
+                     stmt.dest.c_str(), sink_ctx.sink_type.c_str(),
+                     static_cast<int>(strategy), parallelism);
+        }
+        strategy = ParallelStrategy::NONE;
+        parallelism = 1;
+    }
+
+    std::shared_ptr<FanOutStreamChannel> fanout;
+    std::shared_ptr<SharedSpmcState> spmc_state;
+    std::vector<std::shared_ptr<IStreamChannel>> input_ports;
+    input_ports.reserve(static_cast<size_t>(parallelism));
+    std::shared_ptr<IStreamChannel> open_target = source;
+
+    if (strategy == ParallelStrategy::NONE) {
+        input_ports.push_back(source);
+    } else if (strategy == ParallelStrategy::STATELESS) {
+        const size_t source_cap = source->Capacity();
+        const size_t ring_size = std::max<size_t>(source_cap > 0 ? source_cap : 64,
+                                                  static_cast<size_t>(parallelism) * 64);
+        spmc_state = std::make_shared<SharedSpmcState>(
+            "spmc", task_id + ".spmc", source, ring_size);
+        for (int i = 0; i < parallelism; ++i) {
+            input_ports.push_back(std::make_shared<SharedSpmcInputView>(spmc_state, static_cast<uint32_t>(i)));
+        }
+    } else if (strategy == ParallelStrategy::KEYED) {
+        RingStreamChannelOptions partition_opts;
+        const size_t source_cap = source->Capacity();
+        if (source_cap > 0) {
+            partition_opts.ring_size = NextPowerOfTwo(std::max<size_t>(64, source_cap));
+        }
+        fanout = std::make_shared<FanOutStreamChannel>(
+            "fanout",
+            task_id + ".fanout",
+            source,
+            static_cast<size_t>(parallelism),
+            FanOutMode::ROUTE_BY_PARTITION_ID,
+            first_stream_op->GetPartitionSpec(),
+            partition_opts);
+        open_target = fanout;
+        for (int i = 0; i < parallelism; ++i) {
+            auto part = fanout->GetPartition(static_cast<size_t>(i));
+            if (!part) {
+                rsp = MakeErrorJson("fanout partition create failed");
+                return error::INTERNAL_ERROR;
+            }
+            input_ports.push_back(std::make_shared<FanOutPartitionView>(fanout, part));
+        }
+    } else {
+        rsp = MakeErrorJson("unsupported stream parallel strategy");
+        return error::BAD_REQUEST;
+    }
+
+    if (input_ports.empty()) {
+        rsp = MakeErrorJson("stream input ports build failed");
+        return error::INTERNAL_ERROR;
+    }
+
+    const std::string with_params_json = MakeWithParamsJson(with_params);
+    const std::shared_ptr<arrow::Schema> static_schema = source->GetOutputSchema();
+
+    auto task = std::make_shared<StreamTask>(task_id, &stream_runtime_);
+
+    for (size_t i = 0; i < input_ports.size(); ++i) {
+        std::shared_ptr<IOperator> op_holder;
+        if (i == 0) {
+            op_holder = first_holder;
+        } else {
+            op_holder = CreateOperator(op_ref.category, op_ref.name);
+        }
+        if (!op_holder) {
+            rsp = MakeErrorJson("operator create failed for shard");
+            return error::INTERNAL_ERROR;
+        }
+
+        auto stream_op = std::dynamic_pointer_cast<IStreamOperator>(op_holder);
+        if (!stream_op) {
+            rsp = MakeErrorJson("stream operator cast failed for shard");
+            return error::INTERNAL_ERROR;
+        }
+
+        int init_rc = stream_op->Init(with_params_json.c_str(), sink_ctx);
+        if (init_rc != 0) {
+            const std::string err = stream_op->LastError().empty()
+                ? "stream operator Init failed"
+                : stream_op->LastError();
+            rsp = MakeErrorJson(err);
+            return error::BAD_REQUEST;
+        }
+
+        if (static_schema) {
+            int schema_rc = stream_op->OnSchemaReady(static_schema);
+            if (schema_rc != 0) {
+                const std::string err = stream_op->LastError().empty()
+                    ? "stream operator OnSchemaReady failed"
+                    : stream_op->LastError();
+                rsp = MakeErrorJson(err);
+                return error::BAD_REQUEST;
+            }
+        }
+
+        task->AddShard(std::make_shared<ShardRunner>(
+            static_cast<uint32_t>(i),
+            input_ports[i],
+            stream_op,
+            output,
+            task.get(),
+            static_schema != nullptr));
+    }
+    task->PrepareForRun(static_cast<uint32_t>(input_ports.size()), CurrentTimeMs());
+
+    const int open_rc = open_target->Open();
+    if (open_rc != 0) {
+        rsp = MakeErrorJson("open stream source failed");
+        return error::INTERNAL_ERROR;
+    }
+    if (spmc_state) {
+        const int spmc_rc = spmc_state->Start();
+        if (spmc_rc != 0) {
+            open_target->Cancel();
+            rsp = MakeErrorJson("start shared spmc forwarder failed");
+            return error::INTERNAL_ERROR;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        stream_tasks_[task->Id()] = task;
+    }
+    for (const auto& shard : task->Shards()) {
+        stream_runtime_.TrySchedule(shard);
+    }
+
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("status");
+    w.String("submitted");
+    w.Key("stream_task_id");
+    w.String(task->Id().c_str());
+    w.EndObject();
+    rsp = buf.GetString();
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::string& req_body, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req_body.c_str());
+    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("sql") || !doc["sql"].IsString()) {
+        rsp = MakeErrorJson("invalid request, expected {\"sql\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+
+    const std::string sql_text = doc["sql"].GetString();
+    SqlParser parser;
+    SqlStatement stmt = parser.Parse(sql_text);
+    if (!stmt.error.empty()) {
+        rsp = MakeErrorJson(stmt.error);
+        return error::BAD_REQUEST;
+    }
+    if (stmt.sources.empty() && !stmt.source.empty()) {
+        stmt.sources.push_back(stmt.source);
+    }
+    if (stmt.sources.empty()) {
+        rsp = MakeErrorJson("source channel not found");
+        return error::BAD_REQUEST;
+    }
+    return ExecuteStreamTask(stmt, rsp);
+}
+
+int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string& req, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req.c_str());
+    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
+        rsp = MakeErrorJson("invalid request, expected {\"task_id\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+    const std::string task_id = doc["task_id"].GetString();
+
+    std::shared_ptr<StreamTask> task;
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        auto it = stream_tasks_.find(task_id);
+        if (it == stream_tasks_.end()) {
+            rsp = MakeErrorJson("stream task not found: " + task_id);
+            return error::NOT_FOUND;
+        }
+        task = it->second;
+    }
+
+    task->RequestStop();
+    task->Join();
+
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    WriteTaskSnapshotJson(&w, task->Snapshot());
+    rsp = buf.GetString();
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::string& req, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req.c_str());
+    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
+        rsp = MakeErrorJson("invalid request, expected {\"task_id\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+    const std::string task_id = doc["task_id"].GetString();
+
+    std::shared_ptr<StreamTask> task;
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        auto it = stream_tasks_.find(task_id);
+        if (it == stream_tasks_.end()) {
+            rsp = MakeErrorJson("stream task not found: " + task_id);
+            return error::NOT_FOUND;
+        }
+        task = it->second;
+    }
+
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    WriteTaskSnapshotJson(&w, task->Snapshot());
+    rsp = buf.GetString();
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&, std::string& rsp) {
+    std::vector<TaskSnapshot> snapshots;
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        snapshots.reserve(stream_tasks_.size());
+        for (const auto& kv : stream_tasks_) {
+            if (kv.second) snapshots.push_back(kv.second->Snapshot());
+        }
+    }
+
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("tasks");
+    w.StartArray();
+    for (const auto& s : snapshots) {
+        WriteTaskSnapshotJson(&w, s);
+    }
+    w.EndArray();
+    w.EndObject();
+    rsp = buf.GetString();
+    return error::OK;
+}
+
 // --- HandleExecute ---
 int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& req_body, std::string& rsp) {
     auto* ch_registry = querier_ ? static_cast<IChannelRegistry*>(querier_->First(IID_CHANNEL_REGISTRY)) : nullptr;
@@ -633,6 +1756,24 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
             return IsDataFrameRef(name) ? error::NOT_FOUND : error::BAD_REQUEST;
         }
         input_channels.push_back(ch);
+    }
+
+    bool has_stream_source = false;
+    bool has_non_stream_source = false;
+    for (auto* ch : input_channels) {
+        if (!ch) continue;
+        if (std::string(ch->Type()) == ChannelType::kStream) {
+            has_stream_source = true;
+        } else {
+            has_non_stream_source = true;
+        }
+    }
+    if (has_stream_source) {
+        if (has_non_stream_source) {
+            rsp = MakeErrorJson("mixed stream and non-stream sources are not supported");
+            return error::BAD_REQUEST;
+        }
+        return ExecuteStreamTask(stmt, rsp);
     }
 
     std::vector<std::shared_ptr<IOperator>> op_holders;
@@ -885,9 +2026,61 @@ int32_t SchedulerPlugin::HandleGetChannels(const std::string&, const std::string
                 w.EndObject();
             });
         }
+
+        // 流式通道（通过 IStreamFactory）
+        auto* stream_factory = static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY));
+        if (stream_factory) {
+            stream_factory->List([&w](const char* type, const char* name, IStreamChannel* stream_ch) {
+                if (!stream_ch || !type || !name) return;
+                w.StartObject();
+                w.Key("category"); w.String(type);
+                w.Key("name"); w.String(name);
+                w.Key("type"); w.String(stream_ch->Type());
+                w.Key("schema"); w.String(stream_ch->Schema());
+                w.EndObject();
+            });
+        }
     }
 
     w.EndArray();
+    rsp = buf.GetString();
+    return error::OK;
+}
+
+// --- HandleQueryStreamChannels ---
+int32_t SchedulerPlugin::HandleQueryStreamChannels(const std::string&,
+                                                   const std::string&,
+                                                   std::string& rsp) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("channels");
+    w.StartArray();
+
+    auto* stream_factory = querier_ ? static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY)) : nullptr;
+    if (stream_factory) {
+        stream_factory->List([&w](const char* type, const char* name, IStreamChannel* stream_ch) {
+            if (!type || !name || !stream_ch) return;
+            const char* status = "running";
+            if (stream_ch->IsFinished() && stream_ch->IsEmpty()) {
+                status = "stopped";
+            } else if (stream_ch->IsFinished()) {
+                status = "draining";
+            }
+
+            w.StartObject();
+            w.Key("type");
+            w.String(type);
+            w.Key("name");
+            w.String(name);
+            w.Key("status");
+            w.String(status);
+            w.EndObject();
+        });
+    }
+
+    w.EndArray();
+    w.EndObject();
     rsp = buf.GetString();
     return error::OK;
 }

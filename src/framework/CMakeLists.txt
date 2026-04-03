@@ -3,10 +3,20 @@ project(flowsql_common)
 # 公共基础设施：DataFrame、DataFrameChannel、SqlParser
 # 不含 PluginRegistry（已删除）、Pipeline/ChannelAdapter（移入 scheduler.so）
 add_library(${PROJECT_NAME} SHARED
+    builtin/dataframe/concat_operator.cpp
+    builtin/dataframe/hstack_operator.cpp
+    builtin/dataframe/passthrough_operator.cpp
+    builtin/stream/count_window_stream_operator.cpp
+    builtin/stream/passthrough_stream_operator.cpp
+    builtin/stream/tcp_service_merge_stream_operator.cpp
+    builtin/stream/tcp_session_mock_stream_channel.cpp
     core/dataframe.cpp
     core/dataframe_channel.cpp
+    core/fan_in_stream_channel.cpp
+    core/fan_out_stream_channel.cpp
     core/memory_channel.cpp
-    core/passthrough_operator.cpp
+    core/ring_stream_channel.cpp
+    core/stream_channel_adapter.cpp
     core/sql_parser.cpp
 )
 

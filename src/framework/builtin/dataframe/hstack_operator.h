@@ -1,12 +1,11 @@
-#ifndef _FLOWSQL_SERVICES_CATALOG_BUILTIN_HSTACK_OPERATOR_H_
-#define _FLOWSQL_SERVICES_CATALOG_BUILTIN_HSTACK_OPERATOR_H_
+#ifndef _FLOWSQL_FRAMEWORK_BUILTIN_DATAFRAME_HSTACK_OPERATOR_H_
+#define _FLOWSQL_FRAMEWORK_BUILTIN_DATAFRAME_HSTACK_OPERATOR_H_
 
 #include <framework/interfaces/ioperator.h>
 
 #include <string>
 
 namespace flowsql {
-namespace catalog {
 
 // HstackOperator：按列拼接多个 DataFrame（行数必须一致）
 class HstackOperator : public IOperator {
@@ -28,7 +27,6 @@ class HstackOperator : public IOperator {
     std::string last_error_;
 };
 
-}  // namespace catalog
 }  // namespace flowsql
 
-#endif  // _FLOWSQL_SERVICES_CATALOG_BUILTIN_HSTACK_OPERATOR_H_
+#endif  // _FLOWSQL_FRAMEWORK_BUILTIN_DATAFRAME_HSTACK_OPERATOR_H_

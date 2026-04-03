@@ -167,6 +167,24 @@ int WebServer::Init(const std::string& db_path) {
         std::string rsp; HandleGetChannels("", "", rsp);
         res.set_content(rsp, "application/json");
     });
+    server_.Get("/api/channels/stream/list", [this](const httplib::Request&, httplib::Response& res) {
+        std::string rsp;
+        int32_t rc = HandleGetStreamChannels("", "", rsp);
+        if (rc == error::OK) {
+            res.status = 200;
+        } else if (rc == error::BAD_REQUEST) {
+            res.status = 400;
+        } else if (rc == error::NOT_FOUND) {
+            res.status = 404;
+        } else if (rc == error::CONFLICT) {
+            res.status = 409;
+        } else if (rc == error::UNAVAILABLE) {
+            res.status = 503;
+        } else {
+            res.status = 500;
+        }
+        res.set_content(rsp, "application/json");
+    });
     server_.Get("/api/operators/list", [this](const httplib::Request& req, httplib::Response& res) {
         const std::string type = req.has_param("type") ? req.get_param_value("type") : "python";
         std::string req_json = std::string("{\"type\":\"") + type + "\"}";
@@ -434,6 +452,10 @@ void WebServer::EnumApiRoutes(std::function<void(const RouteItem&)> cb) {
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleGetChannels(u, req, rsp);
         }});
+    cb({"GET", "/api/channels/stream/list",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleGetStreamChannels(u, req, rsp);
+        }});
     cb({"GET",  "/api/operators/list",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleGetOperators(u, req, rsp);
@@ -626,6 +648,10 @@ int32_t WebServer::HandleGetChannels(const std::string&, const std::string&, std
         rsp = RowsToJson(rows);
     }
     return error::OK;
+}
+
+int32_t WebServer::HandleGetStreamChannels(const std::string&, const std::string&, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/query", "{}", &rsp);
 }
 
 int32_t WebServer::HandleGetOperators(const std::string&, const std::string& req, std::string& rsp) {

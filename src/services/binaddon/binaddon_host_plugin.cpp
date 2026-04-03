@@ -2,6 +2,7 @@
 
 #include <common/error_code.h>
 #include <common/log.h>
+#include <framework/interfaces/istream_operator.h>
 
 #include <openssl/evp.h>
 #include <rapidjson/document.h>
@@ -641,6 +642,10 @@ int BinAddonHostPlugin::ActivateCppPlugin(const std::string& plugin_id, std::str
     using FnOperatorCount = int (*)();
     using FnCreateOperator = IOperator* (*)(int);
     using FnDestroyOperator = void (*)(IOperator*);
+    using FnStreamAbiVersion = int (*)();
+    using FnStreamOperatorCount = int (*)();
+    using FnCreateStreamOperator = IStreamOperator* (*)(int);
+    using FnDestroyStreamOperator = void (*)(IStreamOperator*);
 
     void* handle = dlopen(row.file_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
@@ -655,11 +660,26 @@ int BinAddonHostPlugin::ActivateCppPlugin(const std::string& plugin_id, std::str
     auto* count_fn = reinterpret_cast<FnOperatorCount>(dlsym(handle, "flowsql_operator_count"));
     auto* create_fn = reinterpret_cast<FnCreateOperator>(dlsym(handle, "flowsql_create_operator"));
     auto* destroy_fn = reinterpret_cast<FnDestroyOperator>(dlsym(handle, "flowsql_destroy_operator"));
+    auto* stream_abi_fn = reinterpret_cast<FnStreamAbiVersion>(dlsym(handle, "flowsql_stream_abi_version"));
+    auto* stream_count_fn = reinterpret_cast<FnStreamOperatorCount>(dlsym(handle, "flowsql_stream_operator_count"));
+    auto* stream_create_fn = reinterpret_cast<FnCreateStreamOperator>(dlsym(handle, "flowsql_create_stream_operator"));
+    auto* stream_destroy_fn = reinterpret_cast<FnDestroyStreamOperator>(dlsym(handle, "flowsql_destroy_stream_operator"));
     if (!abi_fn || !count_fn || !create_fn || !destroy_fn) {
         dlclose(handle);
         std::lock_guard<std::mutex> lock(mu_);
         (void)UpdatePluginStatusLocked(plugin_id, "broken", "missing required symbols", -1, -1, "");
         rsp = R"({"error":"missing required symbols"})";
+        return error::BAD_REQUEST;
+    }
+
+    const bool has_any_stream_symbols =
+        stream_abi_fn || stream_count_fn || stream_create_fn || stream_destroy_fn;
+    if (has_any_stream_symbols &&
+        (!stream_abi_fn || !stream_count_fn || !stream_create_fn || !stream_destroy_fn)) {
+        dlclose(handle);
+        std::lock_guard<std::mutex> lock(mu_);
+        (void)UpdatePluginStatusLocked(plugin_id, "broken", "missing stream operator symbols", -1, -1, "");
+        rsp = R"({"error":"missing stream operator symbols"})";
         return error::BAD_REQUEST;
     }
 
@@ -679,6 +699,52 @@ int BinAddonHostPlugin::ActivateCppPlugin(const std::string& plugin_id, std::str
         (void)UpdatePluginStatusLocked(plugin_id, "broken", "operator_count must > 0", abi, -1, "");
         rsp = R"({"error":"operator_count must > 0"})";
         return error::BAD_REQUEST;
+    }
+
+    int stream_count = 0;
+    if (has_any_stream_symbols) {
+        constexpr int kFlowSqlStreamAbiVersion = 1;
+        const int stream_abi = stream_abi_fn();
+        if (stream_abi != kFlowSqlStreamAbiVersion) {
+            dlclose(handle);
+            std::lock_guard<std::mutex> lock(mu_);
+            (void)UpdatePluginStatusLocked(plugin_id, "broken", "stream abi version mismatch", abi, -1, "");
+            rsp = R"({"error":"stream abi version mismatch"})";
+            return error::BAD_REQUEST;
+        }
+        stream_count = stream_count_fn();
+        if (stream_count < 0) {
+            dlclose(handle);
+            std::lock_guard<std::mutex> lock(mu_);
+            (void)UpdatePluginStatusLocked(plugin_id, "broken", "stream_operator_count must >= 0", abi, -1, "");
+            rsp = R"({"error":"stream_operator_count must >= 0"})";
+            return error::BAD_REQUEST;
+        }
+        for (int i = 0; i < stream_count; ++i) {
+            IStreamOperator* op = nullptr;
+            try {
+                op = stream_create_fn(i);
+            } catch (...) {
+                op = nullptr;
+            }
+            if (!op) {
+                dlclose(handle);
+                std::lock_guard<std::mutex> lock(mu_);
+                (void)UpdatePluginStatusLocked(plugin_id, "broken", "create stream operator failed", abi, -1, "");
+                rsp = R"({"error":"create stream operator failed"})";
+                return error::BAD_REQUEST;
+            }
+            const std::string category = op->Category();
+            const std::string name = op->Name();
+            stream_destroy_fn(op);
+            if (category.empty() || name.empty()) {
+                dlclose(handle);
+                std::lock_guard<std::mutex> lock(mu_);
+                (void)UpdatePluginStatusLocked(plugin_id, "broken", "empty category/name in stream operator", abi, -1, "");
+                rsp = R"({"error":"empty category/name in stream operator"})";
+                return error::BAD_REQUEST;
+            }
+        }
     }
 
     std::vector<OperatorMeta> metas;
@@ -845,6 +911,10 @@ int BinAddonHostPlugin::ActivateCppPlugin(const std::string& plugin_id, std::str
     w.Int(abi);
     w.Key("operator_count");
     w.Int(count);
+    if (has_any_stream_symbols) {
+        w.Key("stream_operator_count");
+        w.Int(stream_count);
+    }
     w.Key("operators");
     w.StartArray();
     for (const auto& key : keys) w.String(key.c_str());

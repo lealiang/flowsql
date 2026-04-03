@@ -7,7 +7,6 @@
 #include <vector>
 
 namespace flowsql {
-namespace catalog {
 
 int HstackOperator::Configure(const char*, const char*) {
     return 0;
@@ -88,5 +87,4 @@ int HstackOperator::Work(Span<IChannel*> inputs, IChannel* out) {
     return 0;
 }
 
-}  // namespace catalog
 }  // namespace flowsql

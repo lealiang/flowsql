@@ -1033,51 +1033,67 @@
 ---
 
 ## Epic 14: 流式架构
-**优先级**: P2 | **状态**: 📋 设计阶段
+**优先级**: P2 | **状态**: 🚧 开发中（Sprint 12，2026-04-01）
 **价值**: 支持流式数据处理，满足网络性能分析等实时场景
 
-### Story 14.1: IStreamChannel 接口设计
-**状态**: 📋 设计阶段
+**当前迭代边界（Sprint 12）**:
+- In Scope：Story 14.0 ~ 14.3（路径 A：结构化列式流）
+- Out of Scope：Story 14.5/14.6（路径 B：DPDK 数据面）、Story 14.7（路径 B 接口占位）、多主机分布式编排
+
+**下个迭代补充项（Sprint 13 候选）**:
+- Story 14.7（路径 B 接口占位）从 Sprint 12 延后到下个迭代落地
+- Story 14.8（跨进程流通道 + TaskPlugin 统一入口）补齐控制面接入
+- Story 14.9（Web 流式管理完整化）补齐 Stream 通道与 Stream 任务的完整管理页面
+- Story 14.10（Ring 并发模式补齐）补齐 `MPSC/MPMC` 实现与验证（当前为 `ENOTSUP`）
+
+### Story 14.0: StreamPlugin 流式通道生命周期管理
+**状态**: ✅ 已完成（Sprint 12，2026-04-02）
 **验收标准**:
-- 定义 IStreamChannel 接口（基于描述符）
-- 支持 DPDK 大页内存零拷贝
-- 支持背压机制
-- 支持流式数据分片
+- 新增 `StreamPlugin`（`libflowsql_stream.so`），解析 `stream_channels` 配置并注册流式通道
+- 定义 `IStreamFactory`，支持按 `type.name` 查找流式通道
+- Scheduler `FindChannel()` 可通过 `IStreamFactory` 解析流式 source
 
 ---
 
-### Story 14.2: IStreamOperator 接口设计
-**状态**: 📋 设计阶段
+### Story 14.1: IStreamChannel（路径 A）接口与通道实现
+**状态**: ✅ 已完成（Sprint 12，2026-04-02）
 **验收标准**:
-- 定义 IStreamOperator 接口
-- 支持流式数据处理
-- 支持窗口操作（滑动窗口/滚动窗口）
-- 支持状态管理
+- 定义 `IStreamChannel`、`StreamBatch`、`PollEvent` 协议
+- 实现 `RingStreamChannel`（`Open/Put/PollNext/Cancel/Close`）
+- 实现 `FanInStreamChannel` / `FanOutStreamChannel`（`ROUND_ROBIN` + `ROUTE_BY_PARTITION_ID`）
+- `AtomicRing` 本 Sprint 实现 `SPSC/SPMC`；`MPSC/MPMC` 返回 `ENOTSUP`
 
 ---
 
-### Story 14.3: StreamWorker 通用容器
-**状态**: 📋 设计阶段
+### Story 14.2: IStreamOperator（路径 A）接口与算子生命周期
+**状态**: ✅ 已完成（Sprint 12，2026-04-02）
 **验收标准**:
-- 实现 StreamWorker 容器
-- 支持算子动态加载
-- 支持算子生命周期管理
-- 支持算子间通信
+- 定义 `IStreamOperator` 生命周期：`Configure/Init/OnSchemaReady/Process/Tick/Flush`
+- 支持流式算子插件导出符号与 ABI 校验（`flowsql_stream_operator_*`）
+- 提供内置示例流式算子，覆盖基础链路
+- 内置算子目录规范统一：DataFrame 内置算子归 `src/framework/builtin/dataframe/`，流式内置算子归 `src/framework/builtin/stream/`
 
 ---
 
-### Story 14.4: Scheduler 流式调度
-**状态**: 📋 设计阶段
+### Story 14.3: StreamRuntime 通用执行容器 + Scheduler 流式调度
+**状态**: ✅ 已完成（Sprint 12，2026-04-02）
 **验收标准**:
-- Scheduler 支持流式任务调度
-- 支持三种角色（执行者/宿主/编排者）
-- 支持任务拓扑管理
-- 支持故障恢复
+- 实现 `StreamTask + ShardRunner + StreamRuntime`（线程池 + timer）
+- 支持三种执行场景：`NONE`、`STATELESS`、`KEYED`
+- 提供流式任务管理接口：`/tasks/stream/execute|stop|status|list`
+- `TaskSnapshot`、`Stop/Join`、状态机迁移满足测试计划（T1~T15）
 
 ---
 
-### Story 14.5: DPDK 网卡采集插件
-**状态**: 📋 设计阶段
+### Story 14.4: Scheduler 流式调度（旧拆分项）
+**状态**: 🔁 已并入 Story 14.3（2026-04-01）
+**验收标准**:
+- 本 Story 不再单列交付，统一按 Story 14.3 验收
+
+---
+
+### Story 14.5: DPDK 网卡采集插件（路径 B）
+**状态**: 📋 待规划（后续 Sprint）
 **验收标准**:
 - 实现 netcard 插件（基于 DPDK）
 - 支持网卡数据包采集
@@ -1086,13 +1102,52 @@
 
 ---
 
-### Story 14.6: 网络性能分析算子
-**状态**: 📋 设计阶段
+### Story 14.6: 网络性能分析算子（路径 B）
+**状态**: 📋 待规划（后续 Sprint）
 **验收标准**:
 - 实现 npm 算子（网络性能分析）
 - 支持流量统计
 - 支持协议解析
 - 支持异常检测
+
+---
+
+### Story 14.7: 路径 B 接口占位（`IBlockStream*`）
+**状态**: 📋 待规划（下个迭代）
+**验收标准**:
+- 新增 `IBlockStreamChannel` / `IBlockStreamOperator` 接口头文件（仅契约占位，不含数据面实现）
+- 明确 `block_stream` 的调度入口契约和生命周期边界
+- 提供最小编译与加载验证，确保占位接口不会影响路径 A 现有能力
+
+---
+
+### Story 14.8: 跨进程流通道与 TaskPlugin 统一入口
+**状态**: 📋 待规划（下个迭代）
+**验收标准**:
+- 补齐跨进程流式任务提交与管理链路（Web → Gateway → Scheduler/TaskPlugin）
+- 统一 Stream 任务的提交、停止、状态、列表入口，减少与批处理入口割裂
+- 补齐跨进程错误透传与诊断字段，保证失败原因在 Web 端可定位
+- 新增端到端回归测试，覆盖跨进程流式任务的 execute/stop/status/list 主链路
+
+---
+
+### Story 14.9: Web 流式管理页面完整化
+**状态**: 📋 待规划（下个迭代）
+**验收标准**:
+- 在现有只读基础上补齐 Stream 通道管理能力（增删改与配置编辑）
+- 新增流式任务管理页面，支持 `execute/stop/status/list` 的可视化操作
+- 展示流式任务核心指标与失败信息（如 `status/error/op_stats`），支持快速定位
+- 补齐前后端联调与 E2E 冒烟用例，覆盖主流程
+
+---
+
+### Story 14.10: Ring 并发模式补齐（`MPSC/MPMC`）
+**状态**: 📋 待规划（下个迭代）
+**验收标准**:
+- 将 `ring_mode=mpsc/mpmc` 从 `ENOTSUP` 升级为可用实现
+- 覆盖并发正确性测试（无丢失、无重复、可收敛）
+- 覆盖 Stop/Cancel 场景下的稳定性测试
+- 补充性能基线数据，与现有 `SPSC/SPMC` 路径对比
 
 ---
 

@@ -11,6 +11,22 @@ set_target_properties(flowsql PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 
+# 构建后同步运行时配置到 output/config，避免使用旧副本导致行为与仓库配置不一致。
+add_custom_command(TARGET flowsql POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        ${CMAKE_BINARY_DIR}/output/config
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/../config/flowsql.yml
+        ${CMAKE_BINARY_DIR}/output/config/flowsql.yml
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/../config/deploy-single.yaml
+        ${CMAKE_BINARY_DIR}/output/config/deploy-single.yaml
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/../config/deploy-multi.yaml
+        ${CMAKE_BINARY_DIR}/output/config/deploy-multi.yaml
+    COMMENT "Syncing runtime config files to output/config"
+)
+
 # 构建后将 web/static 复制到 output/static（前端静态文件）
 # flowsql_web 目标已负责同步静态资源；这里避免并发 copy_directory 造成竞态失败。
 if(NOT TARGET flowsql_web)

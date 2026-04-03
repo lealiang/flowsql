@@ -67,12 +67,26 @@
 
         <div class="operator-main">
           <div class="section-title">{{ operatorTypeLabel }}</div>
+          <div v-if="operatorType === 'builtin'" class="builtin-kind-filter">
+            <el-radio-group v-model="builtinKind" size="small">
+              <el-radio-button label="all">全部（{{ builtinKindCount.all }}）</el-radio-button>
+              <el-radio-button label="batch">批处理（{{ builtinKindCount.batch }}）</el-radio-button>
+              <el-radio-button label="stream">流式（{{ builtinKindCount.stream }}）</el-radio-button>
+            </el-radio-group>
+          </div>
 
           <el-table v-if="operatorType !== 'cpp'" :data="filteredOperators" style="width: 100%" v-loading="loading">
             <el-table-column prop="name" label="名称" width="250" />
             <el-table-column label="类别" width="150">
               <template #default="scope">
                 {{ scope.row.category }}
+              </template>
+            </el-table-column>
+            <el-table-column v-if="operatorType === 'builtin'" label="模式" width="120">
+              <template #default="scope">
+                <el-tag :type="isStreamBuiltin(scope.row) ? 'success' : 'info'">
+                  {{ isStreamBuiltin(scope.row) ? '流式' : '批处理' }}
+                </el-tag>
               </template>
             </el-table-column>
             <el-table-column prop="position" label="位置" width="150">
@@ -482,6 +496,7 @@ const operators = ref([])
 const searchText = ref('')
 const operatorType = ref('python')
 const operatorCounts = ref({ builtin: null, python: null, cpp: null })
+const builtinKind = ref('all')
 const loading = ref(false)
 const fileInputRef = ref(null)
 const createDialogVisible = ref(false)
@@ -655,11 +670,43 @@ const operatorTypeLabel = computed(() => {
 })
 const uploadAccept = computed(() => (operatorType.value === 'cpp' ? '.so' : '.py'))
 
+const isStreamBuiltin = (op) => {
+  if (!op) return false
+  const n = String(op.name || '').toLowerCase()
+  const full = String(op.full_name || '').toLowerCase()
+  return n.endsWith('_stream') || full.includes('_stream')
+}
+
+const builtinKindCount = computed(() => {
+  const list = Array.isArray(operators.value) ? operators.value : []
+  let stream = 0
+  let batch = 0
+  for (const op of list) {
+    if (isStreamBuiltin(op)) {
+      stream += 1
+    } else {
+      batch += 1
+    }
+  }
+  return {
+    all: stream + batch,
+    batch,
+    stream
+  }
+})
+
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const OPERATOR_TYPES = ['builtin', 'python', 'cpp']
 
 const filteredOperators = computed(() => {
-  const list = Array.isArray(operators.value) ? operators.value : []
+  let list = Array.isArray(operators.value) ? operators.value : []
+  if (operatorType.value === 'builtin') {
+    if (builtinKind.value === 'stream') {
+      list = list.filter((op) => isStreamBuiltin(op))
+    } else if (builtinKind.value === 'batch') {
+      list = list.filter((op) => !isStreamBuiltin(op))
+    }
+  }
   const keyword = searchText.value.trim().toLowerCase()
   if (!keyword) return list
 
@@ -796,6 +843,9 @@ const refreshOperatorCounts = async () => {
 const switchOperatorType = async (nextType) => {
   if (nextType === operatorType.value) return
   operatorType.value = nextType
+  if (nextType !== 'builtin') {
+    builtinKind.value = 'all'
+  }
   await loadOperators()
 }
 
@@ -1287,6 +1337,10 @@ onMounted(async () => {
   margin: 10px 0;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+.builtin-kind-filter {
+  margin: 0 0 12px 0;
 }
 
 .mono {

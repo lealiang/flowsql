@@ -8,6 +8,7 @@
         <div class="card-header">
           <span>SQL 编辑器</span>
           <div class="header-actions">
+            <el-button @click="fillStreamDemoSql">流式示例 SQL</el-button>
             <el-radio-group v-model="executeMode" size="small">
               <el-radio-button label="sync">同步</el-radio-button>
               <el-radio-button label="async">异步</el-radio-button>
@@ -166,6 +167,9 @@ const resultLoadingId = ref('')
 const currentTaskId = ref('')
 let pollTimer = null
 const POLL_INTERVAL_MS = 2000
+const STREAM_DEMO_SQL = `SELECT * FROM tcp_session_mock.tcp_src
+USING builtin.tcp_service_merge_stream
+INTO dataframe.serviceaccess`
 
 const isTerminal = (status) => ['completed', 'failed', 'cancelled', 'timeout'].includes(status)
 
@@ -278,6 +282,10 @@ const executeSQL = async () => {
   } finally {
     executing.value = false
   }
+}
+
+const fillStreamDemoSql = () => {
+  sqlText.value = STREAM_DEMO_SQL
 }
 
 const loadTasks = async () => {

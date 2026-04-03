@@ -15,7 +15,7 @@
 #include <framework/core/dataframe.h>
 #include <framework/core/dataframe_channel.h>
 #include <framework/core/memory_channel.h>
-#include <framework/core/passthrough_operator.h>
+#include <framework/builtin/dataframe/passthrough_operator.h>
 #include <framework/core/pipeline.h>
 #include <framework/core/sql_parser.h>
 #include <framework/interfaces/ichannel.h>
@@ -30,6 +30,7 @@ void test_dataframe_arrow();
 void test_dataframe_json();
 void test_dataframe_clear();
 void test_dataframe_channel();
+void test_dataframe_channel_append();
 void test_sql_parser();
 void test_operator_multi_input_fallback();
 void test_span_safety();
@@ -241,6 +242,73 @@ void test_dataframe_channel() {
 
     ch.Close();
     printf("[PASS] DataFrameChannel read/write semantics\n");
+}
+
+// ============================================================
+// Test 6.1: DataFrameChannel Append 追加语义
+// ============================================================
+void test_dataframe_channel_append() {
+    printf("[TEST] DataFrameChannel append semantics...\n");
+
+    DataFrameChannel ch("test", "append_channel");
+    ch.Open();
+
+    auto* appendable = dynamic_cast<IAppendableDataFrameChannel*>(&ch);
+    assert(appendable != nullptr);
+
+    DataFrame base;
+    base.SetSchema({{"x", DataType::INT32, 0, ""}});
+    base.AppendRow({int32_t(1)});
+    base.AppendRow({int32_t(2)});
+    assert(ch.Write(&base) == 0);
+
+    DataFrame inc;
+    inc.SetSchema({{"x", DataType::INT32, 0, ""}});
+    inc.AppendRow({int32_t(3)});
+    assert(appendable->Append(&inc) == 0);
+
+    DataFrame out;
+    assert(ch.Read(&out) == 0);
+    assert(out.RowCount() == 3);
+    assert(std::get<int32_t>(out.GetRow(0)[0]) == 1);
+    assert(std::get<int32_t>(out.GetRow(1)[0]) == 2);
+    assert(std::get<int32_t>(out.GetRow(2)[0]) == 3);
+
+    DataFrame bad;
+    bad.SetSchema({{"y", DataType::STRING, 0, ""}});
+    bad.AppendRow({std::string("bad")});
+    assert(appendable->Append(&bad) != 0);
+
+    DataFrame out_after_bad;
+    assert(ch.Read(&out_after_bad) == 0);
+    assert(out_after_bad.RowCount() == 3);
+
+    ch.Close();
+
+    MemoryChannel mem;
+    mem.SetIdentity("test", "append_memory");
+    mem.Open();
+    auto* mem_appendable = dynamic_cast<IAppendableDataFrameChannel*>(&mem);
+    assert(mem_appendable != nullptr);
+
+    DataFrame mem_base;
+    mem_base.SetSchema({{"k", DataType::INT32, 0, ""}});
+    mem_base.AppendRow({int32_t(10)});
+    assert(mem.Write(&mem_base) == 0);
+
+    DataFrame mem_inc;
+    mem_inc.SetSchema({{"k", DataType::INT32, 0, ""}});
+    mem_inc.AppendRow({int32_t(20)});
+    assert(mem_appendable->Append(&mem_inc) == 0);
+
+    DataFrame mem_out;
+    assert(mem.Read(&mem_out) == 0);
+    assert(mem_out.RowCount() == 2);
+    assert(std::get<int32_t>(mem_out.GetRow(0)[0]) == 10);
+    assert(std::get<int32_t>(mem_out.GetRow(1)[0]) == 20);
+    mem.Close();
+
+    printf("[PASS] DataFrameChannel append semantics\n");
 }
 
 // ============================================================
@@ -639,6 +707,7 @@ int main(int argc, char* argv[]) {
     test_dataframe_json();
     test_dataframe_clear();
     test_dataframe_channel();
+    test_dataframe_channel_append();
     test_sql_parser();
     test_operator_multi_input_fallback();
     test_span_safety();

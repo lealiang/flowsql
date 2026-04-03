@@ -1,10 +1,13 @@
 #include "catalog_plugin.h"
-#include "builtin/concat_operator.h"
-#include "builtin/hstack_operator.h"
 
+#include <framework/builtin/dataframe/concat_operator.h>
+#include <framework/builtin/dataframe/hstack_operator.h>
+#include <framework/builtin/dataframe/passthrough_operator.h>
+#include <framework/builtin/stream/count_window_stream_operator.h>
+#include <framework/builtin/stream/passthrough_stream_operator.h>
+#include <framework/builtin/stream/tcp_service_merge_stream_operator.h>
 #include <framework/core/dataframe.h>
 #include <framework/core/dataframe_channel.h>
-#include <framework/core/passthrough_operator.h>
 
 #include <common/error_code.h>
 #include <common/log.h>
@@ -104,6 +107,12 @@ int CatalogPlugin::Load(IQuerier* querier) {
     if (Register("builtin.passthrough", []() -> IOperator* { return new PassthroughOperator(); }) != 0) return -1;
     if (Register("builtin.concat", []() -> IOperator* { return new ConcatOperator(); }) != 0) return -1;
     if (Register("builtin.hstack", []() -> IOperator* { return new HstackOperator(); }) != 0) return -1;
+    if (Register("passthrough_stream", []() -> IOperator* { return new PassthroughStreamOperator(); }) != 0) return -1;
+    if (Register("count_window_stream", []() -> IOperator* { return new CountWindowStreamOperator(); }) != 0) return -1;
+    if (Register("tcp_service_merge_stream", []() -> IOperator* { return new TcpServiceMergeStreamOperator(); }) != 0) return -1;
+    if (Register("builtin.passthrough_stream", []() -> IOperator* { return new PassthroughStreamOperator(); }) != 0) return -1;
+    if (Register("builtin.count_window_stream", []() -> IOperator* { return new CountWindowStreamOperator(); }) != 0) return -1;
+    if (Register("builtin.tcp_service_merge_stream", []() -> IOperator* { return new TcpServiceMergeStreamOperator(); }) != 0) return -1;
     return 0;
 }
 

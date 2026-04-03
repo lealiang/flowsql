@@ -7,7 +7,6 @@
 #include <vector>
 
 namespace flowsql {
-namespace catalog {
 
 bool ConcatOperator::SchemaCompatible(const std::vector<Field>& lhs, const std::vector<Field>& rhs) {
     if (lhs.size() != rhs.size()) return false;
@@ -90,5 +89,4 @@ int ConcatOperator::Work(Span<IChannel*> inputs, IChannel* out) {
     return 0;
 }
 
-}  // namespace catalog
 }  // namespace flowsql
