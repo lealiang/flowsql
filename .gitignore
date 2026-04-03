@@ -80,6 +80,9 @@ build/output/static/
 # Claude Code
 .claude/
 
+# Codex
+.codex/
+
 # Python
 *.egg-info/
 __pycache__/
