@@ -35,7 +35,7 @@ Sprint 13 目标是围绕 Story 14.7/14.8/14.9/14.10，完成控制面收敛和�
 当前状态：
 
 1. `Scheduler` 已直接暴露 `/tasks/stream/execute|stop|status|list`。
-2. `TaskPlugin` 只管理批任务路由（`/tasks/submit|list|detail|cancel|delete|diagnostics`）。
+2. `TaskPlugin` 只管理批任务路由（`/tasks/batch/execute|sql/classify|list|detail|cancel|delete|diagnostics`）。
 3. Web 端无 `/api/tasks/stream/*`。
 
 差距：

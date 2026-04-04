@@ -1190,7 +1190,7 @@ int main() {
 
         // 当前 e2e 用例未加载 Gateway/Router 网络服务，Web 代理请求应返回 UNAVAILABLE。
         std::string web_opt = "host=127.0.0.1;port=18081;db_path=" + web_db_path.string() +
-                              ";gateway=127.0.0.1:18803";
+                              ";gateway=127.0.0.1:59883";
         const char* web_libs[] = {"libflowsql_web.so"};
         const char* web_opts[] = {web_opt.c_str()};
         ASSERT_EQ(loader->Load(get_absolute_process_path(), web_libs, web_opts, 1), 0);
@@ -1211,8 +1211,10 @@ int main() {
     stream_stop = fnRouterHandler();
     stream_status = fnRouterHandler();
     stream_list = fnRouterHandler();
+    sql_classify = fnRouterHandler();
     activate = fnRouterHandler();
     deactivate = fnRouterHandler();
+    upsert_batch = fnRouterHandler();
     loader->StopAll();
     loader->Unload();
     std::filesystem::remove(db_path);

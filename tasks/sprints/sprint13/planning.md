@@ -194,7 +194,7 @@ npm --prefix src/frontend run build
 - [x] 并发一致性：`execute` 与 `modify/remove` 竞态无 TOCTOU，失败路径无脏状态
 - [x] Web/前端冒烟：Stream 通道增删改 + 流式任务可视化主流程
 - [x] 线程池影响观测：`poll_timeouts`、`poll_errors`、`queue_depth_peak`、线程数量变化
-- [ ] SQL 工作台回归：粘贴 SQL 后立即点击执行仍可正确分流；`batch/execute` 与 `stream/execute` 误路由返回预期错误码
+- [x] SQL 工作台回归：粘贴 SQL 后立即点击执行仍可正确分流；`batch/execute` 与 `stream/execute` 误路由返回预期错误码
 
 ---
 
