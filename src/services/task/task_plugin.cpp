@@ -164,6 +164,18 @@ static std::string BuildOperatorChainFromSql(const std::string& sql) {
     return out;
 }
 
+static std::string JsonErrorWithCode(const std::string& error_text, const std::string& error_code) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("error");
+    w.String(error_text.c_str());
+    w.Key("error_code");
+    w.String(error_code.c_str());
+    w.EndObject();
+    return buf.GetString();
+}
+
 }  // namespace
 
 int TaskPlugin::Option(const char* arg) {
@@ -1159,7 +1171,7 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
     return urc;
 }
 
-int32_t TaskPlugin::HandleSubmit(const std::string&, const std::string& req, std::string& rsp) {
+int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& req, std::string& rsp) {
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject()) {
@@ -1186,6 +1198,58 @@ int32_t TaskPlugin::HandleSubmit(const std::string&, const std::string& req, std
     } else {
         rsp = JsonError("invalid request, expected {\"sql\":\"...\"} or {\"sqls\":[...]}");
         return error::BAD_REQUEST;
+    }
+
+    auto classify_sql = [this](const std::string& sql, std::string* task_kind_out, std::string* err_rsp) -> int32_t {
+        if (task_kind_out) task_kind_out->clear();
+        if (err_rsp) err_rsp->clear();
+
+        rapidjson::StringBuffer classify_req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> classify_req_w(classify_req_buf);
+        classify_req_w.StartObject();
+        classify_req_w.Key("sql");
+        classify_req_w.String(sql.c_str());
+        classify_req_w.EndObject();
+
+        std::string classify_rsp;
+        const int32_t classify_rc = ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &classify_rsp);
+        if (classify_rc != error::OK) {
+            if (err_rsp) {
+                *err_rsp = classify_rsp.empty() ? JsonError("scheduler sql classify failed") : classify_rsp;
+            }
+            return classify_rc;
+        }
+
+        rapidjson::Document classify_doc;
+        classify_doc.Parse(classify_rsp.c_str());
+        if (classify_doc.HasParseError() || !classify_doc.IsObject() ||
+            !classify_doc.HasMember("task_kind") || !classify_doc["task_kind"].IsString()) {
+            if (err_rsp) *err_rsp = JsonError("invalid scheduler classify response");
+            return error::INTERNAL_ERROR;
+        }
+        const std::string task_kind = classify_doc["task_kind"].GetString();
+        if (task_kind != "batch" && task_kind != "stream") {
+            if (err_rsp) *err_rsp = JsonError("invalid scheduler classify task_kind");
+            return error::INTERNAL_ERROR;
+        }
+        if (task_kind_out) *task_kind_out = task_kind;
+        return error::OK;
+    };
+
+    for (const auto& sql : sqls) {
+        std::string task_kind;
+        std::string classify_err_rsp;
+        const int32_t classify_rc = classify_sql(sql, &task_kind, &classify_err_rsp);
+        if (classify_rc != error::OK) {
+            rsp = classify_err_rsp.empty() ? JsonError("sql classify failed") : classify_err_rsp;
+            return classify_rc;
+        }
+        if (task_kind == "stream") {
+            rsp = JsonErrorWithCode(
+                "stream SQL must use /tasks/stream/execute",
+                "STREAM_SQL_USE_STREAM_API");
+            return error::BAD_REQUEST;
+        }
     }
 
     std::string mode = "async";
@@ -1303,6 +1367,52 @@ int32_t TaskPlugin::HandleSubmit(const std::string&, const std::string& req, std
     }
     w.EndObject();
     rsp = buf.GetString();
+    return error::OK;
+}
+
+int32_t TaskPlugin::HandleSqlClassify(const std::string&, const std::string& req, std::string& rsp) {
+    rapidjson::Document d;
+    d.Parse(req.c_str());
+    if (d.HasParseError() || !d.IsObject() || !d.HasMember("sql") || !d["sql"].IsString() ||
+        std::string(d["sql"].GetString()).empty()) {
+        rsp = JsonError("invalid request, expected {\"sql\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+
+    rapidjson::StringBuffer classify_req_buf;
+    rapidjson::Writer<rapidjson::StringBuffer> classify_req_w(classify_req_buf);
+    classify_req_w.StartObject();
+    classify_req_w.Key("sql");
+    classify_req_w.String(d["sql"].GetString());
+    classify_req_w.EndObject();
+
+    std::string scheduler_rsp;
+    const int32_t rc = ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &scheduler_rsp);
+    if (rc != error::OK) {
+        rsp = scheduler_rsp.empty() ? JsonError("scheduler sql classify failed") : scheduler_rsp;
+        return rc;
+    }
+
+    rapidjson::Document scheduler_doc;
+    scheduler_doc.Parse(scheduler_rsp.c_str());
+    if (scheduler_doc.HasParseError() || !scheduler_doc.IsObject() ||
+        !scheduler_doc.HasMember("task_kind") || !scheduler_doc["task_kind"].IsString()) {
+        rsp = JsonError("invalid scheduler classify response");
+        return error::INTERNAL_ERROR;
+    }
+    const std::string task_kind = scheduler_doc["task_kind"].GetString();
+    if (task_kind != "batch" && task_kind != "stream") {
+        rsp = JsonError("invalid scheduler classify task_kind");
+        return error::INTERNAL_ERROR;
+    }
+
+    rapidjson::StringBuffer out;
+    rapidjson::Writer<rapidjson::StringBuffer> w(out);
+    w.StartObject();
+    w.Key("task_kind");
+    w.String(task_kind.c_str());
+    w.EndObject();
+    rsp = out.GetString();
     return error::OK;
 }
 
@@ -1579,6 +1689,33 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
             rsp = JsonError("invalid request, timeout_s must be >= 0");
             return error::BAD_REQUEST;
         }
+    }
+
+    rapidjson::StringBuffer classify_req_buf;
+    rapidjson::Writer<rapidjson::StringBuffer> classify_req_w(classify_req_buf);
+    classify_req_w.StartObject();
+    classify_req_w.Key("sql");
+    classify_req_w.String(doc["sql"].GetString());
+    classify_req_w.EndObject();
+
+    std::string classify_rsp;
+    const int32_t classify_rc = ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &classify_rsp);
+    if (classify_rc != error::OK) {
+        rsp = classify_rsp.empty() ? JsonError("scheduler sql classify failed") : classify_rsp;
+        return classify_rc;
+    }
+    rapidjson::Document classify_doc;
+    classify_doc.Parse(classify_rsp.c_str());
+    if (classify_doc.HasParseError() || !classify_doc.IsObject() ||
+        !classify_doc.HasMember("task_kind") || !classify_doc["task_kind"].IsString()) {
+        rsp = JsonError("invalid scheduler classify response");
+        return error::INTERNAL_ERROR;
+    }
+    if (std::string(classify_doc["task_kind"].GetString()) != "stream") {
+        rsp = JsonErrorWithCode(
+            "batch SQL must use /tasks/batch/execute",
+            "BATCH_SQL_USE_BATCH_API");
+        return error::BAD_REQUEST;
     }
 
     std::string scheduler_rsp;
@@ -1916,9 +2053,13 @@ int32_t TaskPlugin::HandleStreamList(const std::string&, const std::string& req,
 }
 
 void TaskPlugin::EnumRoutes(std::function<void(const RouteItem&)> callback) {
-    callback({"POST", "/tasks/submit",
+    callback({"POST", "/tasks/batch/execute",
               [this](const std::string& u, const std::string& req, std::string& rsp) {
-                  return HandleSubmit(u, req, rsp);
+                  return HandleBatchExecute(u, req, rsp);
+              }});
+    callback({"POST", "/tasks/sql/classify",
+              [this](const std::string& u, const std::string& req, std::string& rsp) {
+                  return HandleSqlClassify(u, req, rsp);
               }});
     callback({"POST", "/tasks/list",
               [this](const std::string& u, const std::string& req, std::string& rsp) {

@@ -97,7 +97,8 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     void WorkerLoop();
     void TimeoutLoop();
     int ExecuteOneTask(const std::string& task_id, std::string* execute_rsp = nullptr);
-    int32_t HandleSubmit(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleBatchExecute(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleSqlClassify(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleList(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleDetail(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleDelete(const std::string& uri, const std::string& req, std::string& rsp);

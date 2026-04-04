@@ -48,6 +48,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
 
     // 路由处理（fnRouterHandler 签名）
     int32_t HandleExecute(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleSqlClassify(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamExecute(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamStop(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamStatus(const std::string& uri, const std::string& req, std::string& rsp);
@@ -84,6 +85,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
                                  std::string* error = nullptr);
 
     int32_t ExecuteStreamTask(const SqlStatement& stmt, std::string& rsp);
+    int32_t ClassifySqlTaskKind(const std::string& sql_text, std::string* task_kind, std::string* err_rsp);
     std::string NextStreamTaskId();
 
     struct SinkBinding {

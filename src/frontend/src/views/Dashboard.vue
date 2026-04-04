@@ -78,21 +78,33 @@ const stats = ref({
 
 const recentTasks = ref([])
 
+const parseOperatorActive = (op) => {
+  if (!op || typeof op !== 'object') return false
+  const v = op.active
+  return v === 1 || v === '1' || v === true
+}
+
 const loadData = async () => {
   try {
-    const [channelsRes, operatorsRes, tasksRes] = await Promise.all([
+    const [channelsRes, builtinRes, pythonRes, cppRes, tasksRes] = await Promise.all([
       api.getChannels(),
-      api.getOperators(),
+      api.getOperators('builtin'),
+      api.getOperators('python'),
+      api.getOperators('cpp'),
       api.getTasks()
     ])
 
     const channels = Array.isArray(channelsRes.data) ? channelsRes.data : []
-    const operators = Array.isArray(operatorsRes.data) ? operatorsRes.data : []
+    const operators = [
+      ...(Array.isArray(builtinRes.data) ? builtinRes.data : []),
+      ...(Array.isArray(pythonRes.data) ? pythonRes.data : []),
+      ...(Array.isArray(cppRes.data) ? cppRes.data : [])
+    ]
     const tasks = Array.isArray(tasksRes.data) ? tasksRes.data : []
 
     stats.value.channels = channels.length
     stats.value.totalOperators = operators.length
-    stats.value.activeOperators = operators.filter(op => op.active == '1').length
+    stats.value.activeOperators = operators.filter(parseOperatorActive).length
 
     stats.value.totalTasks = tasks.length
     stats.value.successTasks = tasks.filter(t => t.status === 'completed').length

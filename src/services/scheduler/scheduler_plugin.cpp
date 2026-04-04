@@ -737,6 +737,10 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleExecute(u, req, rsp);
         }});
+    cb({"POST", "/scheduler/sql/classify",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleSqlClassify(u, req, rsp);
+        }});
     cb({"POST", "/scheduler/stream/execute",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleStreamExecute(u, req, rsp);
@@ -1814,6 +1818,91 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     w.String("submitted");
     w.Key("runtime_task_id");
     w.String(task->Id().c_str());
+    w.EndObject();
+    rsp = buf.GetString();
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::ClassifySqlTaskKind(const std::string& sql_text,
+                                             std::string* task_kind,
+                                             std::string* err_rsp) {
+    if (!task_kind || !err_rsp) return error::INTERNAL_ERROR;
+    task_kind->clear();
+    err_rsp->clear();
+
+    static constexpr size_t kMaxSqlLength = 64 * 1024;
+    if (sql_text.size() > kMaxSqlLength) {
+        *err_rsp = MakeErrorJson("SQL too long (max 64KB)");
+        return error::BAD_REQUEST;
+    }
+
+    SqlParser parser;
+    SqlStatement stmt = parser.Parse(sql_text);
+    if (!stmt.error.empty()) {
+        *err_rsp = MakeErrorJson(stmt.error);
+        return error::BAD_REQUEST;
+    }
+    if (stmt.sources.empty() && !stmt.source.empty()) {
+        stmt.sources.push_back(stmt.source);
+    }
+    if (stmt.sources.empty()) {
+        *err_rsp = MakeErrorJson("source channel not found");
+        return error::BAD_REQUEST;
+    }
+
+    bool has_stream_source = false;
+    bool has_non_stream_source = false;
+    for (const auto& source_name : stmt.sources) {
+        IChannel* ch = FindChannel(source_name);
+        if (!ch) {
+            *err_rsp = MakeErrorJson("source channel not found: " + source_name);
+            return IsDataFrameRef(source_name) ? error::NOT_FOUND : error::BAD_REQUEST;
+        }
+        const std::string source_type = ch->Type() ? ch->Type() : "";
+        if (source_type == ChannelType::kBlockStream) {
+            *err_rsp = MakeExecutionErrorJson(
+                "block stream source is not implemented in current release",
+                "BLOCK_STREAM_NOT_IMPLEMENTED",
+                "source_resolve");
+            return error::BAD_REQUEST;
+        }
+        if (source_type == ChannelType::kStream) {
+            has_stream_source = true;
+        } else {
+            has_non_stream_source = true;
+        }
+    }
+
+    if (has_stream_source && has_non_stream_source) {
+        *err_rsp = MakeErrorJson("mixed stream and non-stream sources are not supported");
+        return error::BAD_REQUEST;
+    }
+
+    *task_kind = has_stream_source ? "stream" : "batch";
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleSqlClassify(const std::string&, const std::string& req_body, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req_body.c_str());
+    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("sql") || !doc["sql"].IsString()) {
+        rsp = MakeErrorJson("invalid request, expected {\"sql\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+
+    std::string task_kind;
+    std::string err_rsp;
+    const int32_t rc = ClassifySqlTaskKind(doc["sql"].GetString(), &task_kind, &err_rsp);
+    if (rc != error::OK) {
+        rsp = err_rsp.empty() ? MakeErrorJson("sql classify failed") : err_rsp;
+        return rc;
+    }
+
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("task_kind");
+    w.String(task_kind.c_str());
     w.EndObject();
     rsp = buf.GetString();
     return error::OK;

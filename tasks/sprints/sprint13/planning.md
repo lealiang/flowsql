@@ -61,6 +61,7 @@
 - [x] `execute` 与 `modify/remove` 并发场景无 TOCTOU（原子占用计数 + 两阶段切换 + 失败补偿）。
 - [x] 非 stream sink 并发写能力未声明时按 `SINGLE` 处理，作为 Sprint 13 限制保留。
 - [x] 自动化回归覆盖：`test_stream`、`test_scheduler_e2e`、Web 前端构建。
+- [x] SQL 工作台执行入口批流对称化：`/api/tasks/batch/execute` 与 `/api/tasks/stream/execute` 分流，stream SQL 禁用 `sync`，并规避 classify 竞态误路由。
 
 ---
 
@@ -101,6 +102,7 @@
 - [x] `stop` 成功后终态为 `stopped`，`cancelled` 保留为强制中断语义
 - [x] 补齐跨进程错误透传与诊断字段，保证失败原因在 Web 端可定位
 - [x] 新增端到端回归测试，覆盖跨进程流式任务 `execute/stop/status/list` 主链路
+- [x] SQL 工作台执行入口对称：batch 走 `/tasks/batch/execute`，stream 走 `/tasks/stream/execute`，并在点击执行时强一致判定 SQL 类型
 
 **任务分解**：
 - [x] T6：TaskPlugin 新增 `/tasks/stream/execute|stop|status|list`，统一流任务管理入口与 `task_id` 生成
@@ -109,6 +111,7 @@
 - [x] T9：Task 元数据扩展（`task_kind`、`runtime_task_id`）与错误诊断字段透传（`error`、`op_stats`、状态快照）
 - [x] T10：TaskStatus 扩展 `stopped` 并补齐 `submitted/pending -> pending` 在内的状态映射
 - [x] T11：新增跨进程 E2E（Web → TaskPlugin → Scheduler → StreamRuntime），覆盖 execute/stop/status/list、`stopped/cancelled` 语义与外部 `task_id` 拒绝回归
+- [x] T31：新增 `/tasks/sql/classify` 与 `/tasks/batch/execute`，前端在点击执行时二次 classify 分流，并对 stream SQL 禁用/隐藏 `sync`
 
 ---
 
@@ -191,6 +194,7 @@ npm --prefix src/frontend run build
 - [x] 并发一致性：`execute` 与 `modify/remove` 竞态无 TOCTOU，失败路径无脏状态
 - [x] Web/前端冒烟：Stream 通道增删改 + 流式任务可视化主流程
 - [x] 线程池影响观测：`poll_timeouts`、`poll_errors`、`queue_depth_peak`、线程数量变化
+- [ ] SQL 工作台回归：粘贴 SQL 后立即点击执行仍可正确分流；`batch/execute` 与 `stream/execute` 误路由返回预期错误码
 
 ---
 

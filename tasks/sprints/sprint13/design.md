@@ -85,12 +85,13 @@ Sprint 13 目标是围绕 Story 14.7/14.8/14.9/14.10，完成控制面收敛和�
 
 批任务：
 
-1. `POST /tasks/submit`
-2. `POST /tasks/list`
-3. `POST /tasks/detail`
-4. `POST /tasks/cancel`
-5. `POST /tasks/delete`
-6. `POST /tasks/diagnostics`
+1. `POST /tasks/batch/execute`
+2. `POST /tasks/sql/classify`
+3. `POST /tasks/list`
+4. `POST /tasks/detail`
+5. `POST /tasks/cancel`
+6. `POST /tasks/delete`
+7. `POST /tasks/diagnostics`
 
 流任务：
 
@@ -102,10 +103,11 @@ Sprint 13 目标是围绕 Story 14.7/14.8/14.9/14.10，完成控制面收敛和�
 ### 执行路由（SchedulerPlugin）
 
 1. `POST /scheduler/batch/execute`（替代现有 `instant` 命名）
-2. `POST /scheduler/stream/execute`
-3. `POST /scheduler/stream/stop`
-4. `POST /scheduler/stream/status`
-5. `POST /scheduler/stream/list`
+2. `POST /scheduler/sql/classify`
+3. `POST /scheduler/stream/execute`
+4. `POST /scheduler/stream/stop`
+5. `POST /scheduler/stream/status`
+6. `POST /scheduler/stream/list`
 
 ### Stream 通道管理路由（SchedulerPlugin）
 
@@ -115,6 +117,12 @@ Sprint 13 目标是围绕 Story 14.7/14.8/14.9/14.10，完成控制面收敛和�
 4. `POST /channels/stream/remove`
 
 > 约束：Stream 通道查询统一为 `POST /channels/stream/query`，不再保留 `list` 路由。
+
+补充约束（Sprint 13 增补）：
+
+1. 项目处于构建阶段，不做双入口兼容；`/tasks/submit` 由 `/tasks/batch/execute` 直接替代。
+2. SQL 工作台执行入口保持批流对称：batch 走 `/tasks/batch/execute`，stream 走 `/tasks/stream/execute`。
+3. `POST /tasks/sql/classify` 仅用于前端交互提示，不作为后端执行正确性的唯一依据。
 
 ---
 
@@ -150,9 +158,14 @@ Sprint 13 目标是围绕 Story 14.7/14.8/14.9/14.10，完成控制面收敛和�
 
 把流式任务管理语义从 Scheduler 收敛到 TaskPlugin，建立统一跨进程链路：
 
-`Web -> TaskPlugin (/tasks/stream/*) -> Scheduler (/scheduler/stream/*)`
+`Web -> TaskPlugin (/tasks/batch/*, /tasks/stream/*) -> Scheduler (/scheduler/*)`
 
 ### 14.8.1 TaskPlugin 设计
+
+新增任务执行与分类 handler：
+
+1. `HandleBatchExecute`
+2. `HandleSqlClassify`
 
 新增 4 个流任务 handler：
 
@@ -171,17 +184,20 @@ Sprint 13 目标是围绕 Story 14.7/14.8/14.9/14.10，完成控制面收敛和�
 ### 14.8.2 Scheduler 设计
 
 1. 原 `/tasks/stream/*` 改为 `/scheduler/stream/*`。
-2. 原 `/tasks/instant/execute` 改为 `/scheduler/batch/execute`。
-3. `HandleStreamExecute` 不接收外部 `task_id`，仅返回 Scheduler 内部 `runtime_task_id`（用于 TaskPlugin 映射）。
+2. 新增 `POST /scheduler/sql/classify`，作为 TaskPlugin 的 SQL 类型判定单一来源。
+3. 原 `/tasks/instant/execute` 改为 `/scheduler/batch/execute`。
+4. `HandleStreamExecute` 不接收外部 `task_id`，仅返回 Scheduler 内部 `runtime_task_id`（用于 TaskPlugin 映射）。
 
 ### 14.8.3 WebServer 设计
 
 新增对外 API：
 
-1. `POST /api/tasks/stream/execute`
-2. `POST /api/tasks/stream/stop`
-3. `POST /api/tasks/stream/status`
-4. `POST /api/tasks/stream/list`
+1. `POST /api/tasks/batch/execute`
+2. `POST /api/tasks/sql/classify`
+3. `POST /api/tasks/stream/execute`
+4. `POST /api/tasks/stream/stop`
+5. `POST /api/tasks/stream/status`
+6. `POST /api/tasks/stream/list`
 
 实现方式：
 
@@ -278,6 +294,58 @@ TaskPlugin 任务视图与 Scheduler 运行态的状态映射需显式固定：
 2. `cancelled`：强制中断终态（例如超时、系统停机、运维强制取消），语义上不同于有序停止。
 3. TaskPlugin 侧新增 `stopped` 终态，纳入终态集合与清理策略。
 4. `status` 返回 TaskPlugin 视图状态，`runtime_status` 返回 Scheduler 原生状态，避免语义损失。
+
+### 14.8.7 SQL 工作台执行入口对称化（Sprint 13 增补任务）
+
+背景问题：
+
+1. SQL 工作台若只依赖输入阶段的异步判定结果，存在“用户粘贴 SQL 后立即点击执行、判定结果尚未返回”的竞态窗口。
+2. 流式 SQL 的执行语义是长运行任务，`sync` 交互在产品语义上不成立。
+3. batch 与 stream 入口不对称时，执行链路与错误诊断不够直观。
+
+目标：
+
+1. 批流入口对称：batch 走 `/tasks/batch/execute`，stream 走 `/tasks/stream/execute`。
+2. `classify` 用于 UI 提示，不承载最终正确性；点击执行时做强一致判定。
+3. 流式 SQL 在 SQL 工作台仅允许异步执行（禁用/隐藏 `sync`）。
+
+接口方案：
+
+1. `POST /tasks/sql/classify`
+- 请求：`{"sql":"..."}`。
+- 响应：`{"task_kind":"batch|stream"}`。
+
+2. `POST /tasks/batch/execute`
+- 请求：`{"sql":"..."|"sqls":[...],"mode":"sync|async","timeout_s":0}`。
+- 约束：仅接收 batch SQL；若判定为 stream SQL，返回 `BAD_REQUEST` + `STREAM_SQL_USE_STREAM_API`。
+
+3. `POST /tasks/stream/execute`
+- 请求：`{"sql":"...","timeout_s":0}`。
+- 约束：仅接收 stream SQL；若判定为 batch SQL，返回 `BAD_REQUEST` + `BATCH_SQL_USE_BATCH_API`。
+
+前端执行流程（SQL 工作台）：
+
+1. 输入变化时使用 debounce 调用 `POST /api/tasks/sql/classify`，只用于更新 UI（模式提示、按钮状态）。
+2. 点击执行时，如果 classify 状态为 `pending/unknown` 或与当前 SQL 版本不一致，先同步等待一次 classify 再执行。
+3. 按点击时最新判定结果分流：batch -> `/api/tasks/batch/execute`；stream -> `/api/tasks/stream/execute`。
+4. 当判定为 stream 时，前端强制 `executeMode=async`，并禁用/隐藏同步模式。
+
+后端硬校验（防误路由）：
+
+1. `batch/execute` 和 `stream/execute` 在执行前都做 SQL 类型校验，后端保留最终判定权。
+2. 即使前端发生竞态，也不会出现“stream SQL 以 batch 语义执行”或“batch SQL 误入 stream 执行”的错误。
+3. 错误码统一可诊断，便于前端提示与日志排查。
+
+兼容性策略：
+
+1. 本项目构建阶段不保留 `/tasks/submit` 兼容路径。
+2. Web 端统一暴露 `/api/tasks/batch/execute` 与 `/api/tasks/stream/execute` 的对称入口。
+
+测试补充：
+
+1. “粘贴 SQL 后立即执行”场景下，执行入口选择正确。
+2. stream SQL 无法走 `sync`。
+3. `batch/execute` 调 stream SQL 与 `stream/execute` 调 batch SQL 均返回预期错误码。
 
 ---
 

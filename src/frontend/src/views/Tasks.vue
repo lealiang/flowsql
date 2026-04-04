@@ -9,8 +9,10 @@
           <span>SQL 编辑器</span>
           <div class="header-actions">
             <el-button @click="fillStreamDemoSql">流式示例 SQL</el-button>
+            <el-tag v-if="sqlTaskKind === 'stream'" type="warning">流式 SQL（仅异步）</el-tag>
+            <el-tag v-else-if="sqlTaskKind === 'batch'" type="info">批任务 SQL</el-tag>
             <el-radio-group v-model="executeMode" size="small">
-              <el-radio-button label="sync">同步</el-radio-button>
+              <el-radio-button v-if="!isStreamSql" label="sync">同步</el-radio-button>
               <el-radio-button label="async">异步</el-radio-button>
             </el-radio-group>
             <el-button type="primary" @click="executeSQL" :loading="executing">
@@ -76,7 +78,7 @@
         <el-table-column prop="sql_text" label="SQL" show-overflow-tooltip min-width="300" />
         <el-table-column prop="status" label="状态" width="100">
           <template #default="scope">
-            <el-tag :type="scope.row.status === 'completed' ? 'success' : 'danger'">
+            <el-tag :type="taskStatusTag(scope.row.status)">
               {{ scope.row.status }}
             </el-tag>
           </template>
@@ -150,7 +152,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { CaretRight, Refresh } from '@element-plus/icons-vue'
 import api from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -158,6 +160,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 const sqlText = ref('')
 const executeMode = ref('sync')
 const executing = ref(false)
+const sqlTaskKind = ref('unknown')
 const currentResult = ref(null)
 const tasks = ref([])
 const loading = ref(false)
@@ -166,12 +169,21 @@ const dialogResult = ref(null)
 const resultLoadingId = ref('')
 const currentTaskId = ref('')
 let pollTimer = null
+let classifyTimer = null
+let classifySeq = 0
 const POLL_INTERVAL_MS = 2000
 const STREAM_DEMO_SQL = `SELECT * FROM tcp_session_mock.tcp_src
 USING builtin.tcp_service_merge_stream
 INTO dataframe.serviceaccess`
+const isStreamSql = computed(() => sqlTaskKind.value === 'stream')
 
-const isTerminal = (status) => ['completed', 'failed', 'cancelled', 'timeout'].includes(status)
+const isTerminal = (status) => ['completed', 'failed', 'stopped', 'cancelled', 'timeout'].includes(status)
+
+const taskStatusTag = (status) => {
+  if (status === 'completed' || status === 'stopped') return 'success'
+  if (status === 'running' || status === 'pending') return 'warning'
+  return 'danger'
+}
 
 const stopPolling = () => {
   if (pollTimer) {
@@ -183,6 +195,99 @@ const stopPolling = () => {
 const startPolling = () => {
   if (pollTimer) return
   pollTimer = setInterval(loadTasks, POLL_INTERVAL_MS)
+}
+
+const applySqlTaskKind = (kind) => {
+  if (kind === 'stream') {
+    sqlTaskKind.value = 'stream'
+    executeMode.value = 'async'
+    return
+  }
+  if (kind === 'batch') {
+    sqlTaskKind.value = 'batch'
+    return
+  }
+  sqlTaskKind.value = 'unknown'
+}
+
+const classifyCurrentSql = async ({ silent = false } = {}) => {
+  const sql = sqlText.value.trim()
+  const seq = ++classifySeq
+  if (!sql) {
+    applySqlTaskKind('unknown')
+    return 'unknown'
+  }
+
+  try {
+    const res = await api.classifySql(sql)
+    const taskKind = res?.data?.task_kind
+    if (seq !== classifySeq) return sqlTaskKind.value
+    applySqlTaskKind(taskKind)
+    return sqlTaskKind.value
+  } catch (error) {
+    if (seq === classifySeq) applySqlTaskKind('unknown')
+    if (!silent) {
+      const detail = error.response?.data?.error || error.message || '未知错误'
+      ElMessage.error('SQL 判定失败: ' + detail)
+    }
+    throw error
+  }
+}
+
+const scheduleSqlClassify = () => {
+  if (classifyTimer) {
+    clearTimeout(classifyTimer)
+    classifyTimer = null
+  }
+  classifyTimer = setTimeout(() => {
+    classifyCurrentSql({ silent: true }).catch(() => {})
+  }, 250)
+}
+
+const syncActiveStreamTaskStatuses = async (rows) => {
+  const streamRows = rows.filter((row) => {
+    const kind = row.task_kind || ''
+    const taskId = row.id || row.task_id
+    return kind === 'stream' && taskId && !isTerminal(row.status)
+  })
+  if (streamRows.length === 0) return rows
+
+  const updates = await Promise.all(streamRows.map(async (row) => {
+    const taskId = row.id || row.task_id
+    try {
+      const res = await api.getStreamTaskStatus(taskId)
+      const status = res?.data?.status
+      if (!status) return null
+      return {
+        taskId,
+        status,
+        runtime_status: res?.data?.runtime_status,
+        error_code: String(res?.data?.error_code ?? row.error_code ?? ''),
+        error_message: res?.data?.error_message || row.error_message || ''
+      }
+    } catch {
+      return null
+    }
+  }))
+
+  const updateMap = new Map()
+  updates.forEach((it) => {
+    if (it && it.taskId) updateMap.set(it.taskId, it)
+  })
+  if (updateMap.size === 0) return rows
+
+  return rows.map((row) => {
+    const taskId = row.id || row.task_id
+    const next = updateMap.get(taskId)
+    if (!next) return row
+    return {
+      ...row,
+      status: next.status,
+      runtime_status: next.runtime_status,
+      error_code: next.error_code,
+      error_message: next.error_message
+    }
+  })
 }
 
 const formatTaskResult = (result, runningMessage = '') => {
@@ -247,7 +352,28 @@ const executeSQL = async () => {
   currentResult.value = null
 
   try {
-    const res = await api.createTask(sqlText.value, executeMode.value)
+    if (classifyTimer) {
+      clearTimeout(classifyTimer)
+      classifyTimer = null
+    }
+    const taskKind = await classifyCurrentSql()
+    if (taskKind === 'stream') {
+      const streamRes = await api.executeStreamTask(sqlText.value, 0)
+      const submit = streamRes.data || {}
+      const taskId = submit.task_id
+      currentTaskId.value = taskId
+      ElMessage.success(`流式任务已提交 (ID: ${taskId})`)
+      currentResult.value = {
+        columns: [],
+        rows: [],
+        message: `流式任务 ${taskId} 已提交，正在异步执行`
+      }
+      await loadTasks()
+      startPolling()
+      return
+    }
+
+    const res = await api.executeBatchTask(sqlText.value, executeMode.value)
     const submit = res.data || {}
     const taskId = submit.task_id
 
@@ -293,7 +419,8 @@ const loadTasks = async () => {
   try {
     const res = await api.getTasks()
     const payload = res.data || {}
-    tasks.value = Array.isArray(payload) ? payload : (payload.items || [])
+    const rawTasks = Array.isArray(payload) ? payload : (payload.items || [])
+    tasks.value = await syncActiveStreamTaskStatuses(rawTasks)
     const hasActiveTask = tasks.value.some(t => !isTerminal(t.status))
     if (hasActiveTask) {
       startPolling()
@@ -353,8 +480,13 @@ const cancelTaskAction = async (row) => {
   const taskId = row.id || row.task_id
   if (!taskId) return
   try {
-    await api.cancelTask(taskId)
-    ElMessage.success('已发出取消请求')
+    if ((row.task_kind || '') === 'stream') {
+      await api.stopStreamTask(taskId)
+      ElMessage.success('已停止流式任务')
+    } else {
+      await api.cancelTask(taskId)
+      ElMessage.success('已发出取消请求')
+    }
     await loadTasks()
   } catch (error) {
     const detail = error.response?.data?.error || error.message || '未知错误'
@@ -366,8 +498,16 @@ onMounted(() => {
   loadTasks()
 })
 
+watch(sqlText, () => {
+  scheduleSqlClassify()
+})
+
 onUnmounted(() => {
   stopPolling()
+  if (classifyTimer) {
+    clearTimeout(classifyTimer)
+    classifyTimer = null
+  }
 })
 </script>
 

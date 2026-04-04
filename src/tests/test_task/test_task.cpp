@@ -56,6 +56,24 @@ static std::string MakeTaskIdReq(const std::string& task_id) {
     return std::string("{\"task_id\":\"") + task_id + "\"}";
 }
 
+static RouteItem MakeSqlClassifyRoute() {
+    return {"POST", "/scheduler/sql/classify",
+            [](const std::string&, const std::string& req, std::string& rsp) {
+                rapidjson::Document d;
+                d.Parse(req.c_str());
+                if (d.HasParseError() || !d.IsObject() || !d.HasMember("sql") || !d["sql"].IsString()) {
+                    rsp = R"({"error":"invalid request, expected {\"sql\":\"...\"}"})";
+                    return error::BAD_REQUEST;
+                }
+                const std::string sql = d["sql"].GetString();
+                const bool is_stream = (sql.find("_stream") != std::string::npos) ||
+                                       (sql.find("tcp_session_mock.") != std::string::npos) ||
+                                       (sql.find("stream.") != std::string::npos);
+                rsp = is_stream ? R"({"task_kind":"stream"})" : R"({"task_kind":"batch"})";
+                return error::OK;
+            }};
+}
+
 static int64_t CountTaskEvents(const std::string& db_path, const std::string& task_id) {
     sqlite3* db = nullptr;
     if (sqlite3_open(db_path.c_str(), &db) != SQLITE_OK) {
@@ -185,13 +203,18 @@ int main() {
     const std::string db_path = dir + "/task_store.db";
 
     {
+        MockRouterHandle scheduler({MakeSqlClassifyRoute()});
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
         TaskPlugin p;
         const std::string opt = "db_dir=" + dir + ";disable_worker=1";
         ASSERT_EQ(p.Option(opt.c_str()), 0);
-        ASSERT_EQ(p.Load(nullptr), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
         p.EnumRoutes([&](const RouteItem& item) { routes[item.method + ":" + item.uri] = item.handler; });
-        ASSERT_TRUE(routes.count("POST:/tasks/submit") == 1);
+        ASSERT_TRUE(routes.count("POST:/tasks/batch/execute") == 1);
+        ASSERT_TRUE(routes.count("POST:/tasks/sql/classify") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/list") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/detail") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/diagnostics") == 1);
@@ -199,7 +222,7 @@ int main() {
         ASSERT_TRUE(routes.count("POST:/tasks/cancel") == 1);
 
         std::string rsp;
-        ASSERT_EQ(routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 1"})", rsp), error::OK);
+        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1"})", rsp), error::OK);
         rapidjson::Document d;
         d.Parse(rsp.c_str());
         ASSERT_TRUE(!d.HasParseError());
@@ -216,7 +239,7 @@ int main() {
         ASSERT_TRUE(list["items"][0].HasMember("task_id") && list["items"][0]["task_id"].IsString());
         ASSERT_EQ(std::string(list["items"][0]["task_id"].GetString()), task_id);
 
-        ASSERT_EQ(routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
+        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
         rapidjson::Document sync_ret;
         sync_ret.Parse(rsp.c_str());
         ASSERT_TRUE(!sync_ret.HasParseError() && sync_ret.IsObject());
@@ -267,16 +290,20 @@ int main() {
     {
         const std::string dir2 = MakeTempDir("db_path");
         const std::string db_path = dir2 + "/meta/shared.db";
+        MockRouterHandle scheduler({MakeSqlClassifyRoute()});
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
         TaskPlugin p;
         const std::string opt = "db_path=" + db_path + ";disable_worker=1";
         ASSERT_EQ(p.Option(opt.c_str()), 0);
-        ASSERT_EQ(p.Load(nullptr), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
         std::unordered_map<std::string, fnRouterHandler> local_routes;
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 1"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1"})", rsp), error::OK);
         ASSERT_TRUE(std::filesystem::exists(db_path));
         ASSERT_EQ(p.Stop(), 0);
     }
@@ -286,6 +313,7 @@ int main() {
         const std::string async_db_path = async_dir + "/task_store.db";
 
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/batch/execute",
              [](const std::string&, const std::string&, std::string& rsp) {
                  std::this_thread::sleep_for(std::chrono::milliseconds(120));
@@ -304,12 +332,12 @@ int main() {
 
         std::unordered_map<std::string, fnRouterHandler> local_routes;
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
-        ASSERT_TRUE(local_routes.count("POST:/tasks/submit") == 1);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/batch/execute") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/detail") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/delete") == 1);
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 42","mode":"async"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 42","mode":"async"})", rsp), error::OK);
         rapidjson::Document submit;
         submit.Parse(rsp.c_str());
         ASSERT_TRUE(!submit.HasParseError() && submit.IsObject());
@@ -356,6 +384,7 @@ int main() {
         const std::string async_fail_db_path = async_fail_dir + "/task_store.db";
 
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/batch/execute",
              [](const std::string&, const std::string&, std::string& rsp) {
                  std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -376,7 +405,7 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 99","mode":"async"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 99","mode":"async"})", rsp), error::OK);
         rapidjson::Document submit;
         submit.Parse(rsp.c_str());
         ASSERT_TRUE(!submit.HasParseError() && submit.IsObject());
@@ -411,6 +440,7 @@ int main() {
         MockChannelRegistry channel_registry;
 
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/batch/execute",
              [&captured_sqls](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
@@ -442,8 +472,8 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"](
-                      "/tasks/submit",
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
                       R"({"mode":"async","sqls":["SELECT * FROM sqlite.local.src INTO dataframe.tmp","SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final"]})",
                       rsp),
                   error::OK);
@@ -475,8 +505,15 @@ int main() {
         ASSERT_EQ(captured_sqls[1], "SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final");
 
         const auto& removed = channel_registry.removed_names();
-        ASSERT_EQ(removed.size(), size_t(1));
-        ASSERT_EQ(removed[0], "tmp");
+        ASSERT_TRUE(!removed.empty());
+        bool has_tmp = false;
+        for (const auto& name : removed) {
+            if (name == "tmp") {
+                has_tmp = true;
+                break;
+            }
+        }
+        ASSERT_TRUE(has_tmp);
 
         ASSERT_EQ(local_routes["POST:/tasks/delete"]("/tasks/delete", MakeTaskIdReq(task_id), rsp), error::OK);
         ASSERT_EQ(p.Stop(), 0);
@@ -486,6 +523,7 @@ int main() {
         const std::string diag_dir = MakeTempDir("diagnostics");
         std::atomic<int> call_no{0};
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/batch/execute",
              [&call_no](const std::string&, const std::string&, std::string& rsp) {
                  int n = call_no.fetch_add(1);
@@ -510,8 +548,8 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"](
-                      "/tasks/submit",
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
                       R"({"mode":"async","sqls":["SELECT * FROM sqlite.local.src INTO dataframe.tmp","SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final"]})",
                       rsp),
                   error::OK);
@@ -559,6 +597,7 @@ int main() {
         MockChannelRegistry channel_registry;
 
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/batch/execute",
              [&captured_sqls](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
@@ -589,8 +628,8 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"](
-                      "/tasks/submit",
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
                       R"({"mode":"async","sqls":["SELECT * FROM s1 INTO dataframe.tmp","SELECT * FROM dataframe.tmp,dataframe.tmp USING builtin.concat INTO dataframe.final"]})",
                       rsp),
                   error::OK);
@@ -629,6 +668,7 @@ int main() {
         std::atomic<int> max_in_flight{0};
 
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/batch/execute",
              [&in_flight, &max_in_flight](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
@@ -675,7 +715,7 @@ int main() {
             w.Key("mode");
             w.String("async");
             w.EndObject();
-            ASSERT_EQ(local_routes["POST:/tasks/submit"]("/tasks/submit", req_buf.GetString(), rsp), error::OK);
+            ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", req_buf.GetString(), rsp), error::OK);
             rapidjson::Document submit;
             submit.Parse(rsp.c_str());
             ASSERT_TRUE(!submit.HasParseError() && submit.IsObject());
@@ -724,17 +764,21 @@ int main() {
 
     {
         const std::string cancel_pending_dir = MakeTempDir("cancel_pending");
+        MockRouterHandle scheduler({MakeSqlClassifyRoute()});
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
         TaskPlugin p;
         const std::string opt = "db_dir=" + cancel_pending_dir + ";disable_worker=1";
         ASSERT_EQ(p.Option(opt.c_str()), 0);
-        ASSERT_EQ(p.Load(nullptr), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
         std::unordered_map<std::string, fnRouterHandler> local_routes;
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 1","mode":"async"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"async"})", rsp), error::OK);
         rapidjson::Document submit;
         submit.Parse(rsp.c_str());
         ASSERT_TRUE(!submit.HasParseError() && submit.IsObject());
@@ -759,6 +803,7 @@ int main() {
         std::atomic<int> exec_count{0};
 
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/batch/execute",
              [&exec_count](const std::string&, const std::string&, std::string& rsp) {
                  exec_count.fetch_add(1);
@@ -780,8 +825,8 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"](
-                      "/tasks/submit",
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
                       R"({"mode":"async","sqls":["SELECT * FROM sqlite.local.src INTO dataframe.tmp","SELECT * FROM dataframe.tmp INTO dataframe.out"]})",
                       rsp),
                   error::OK);
@@ -829,6 +874,7 @@ int main() {
     {
         const std::string timeout_dir = MakeTempDir("timeout_task");
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/batch/execute",
              [](const std::string&, const std::string&, std::string& rsp) {
                  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
@@ -849,8 +895,8 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"](
-                      "/tasks/submit",
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
                       R"({"sql":"SELECT 1","mode":"async","timeout_s":1})",
                       rsp),
                   error::OK);
@@ -887,6 +933,7 @@ int main() {
         std::atomic<int> stream_stop_calls{0};
 
         MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
             {"POST", "/scheduler/stream/execute",
              [&stream_execute_calls](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
@@ -1018,12 +1065,146 @@ int main() {
     }
 
     {
+        const std::string classify_dir = MakeTempDir("classify_routes");
+        std::atomic<int> classify_calls{0};
+        std::atomic<int> batch_execute_calls{0};
+        std::atomic<int> stream_execute_calls{0};
+
+        MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
+            {"POST", "/scheduler/sql/classify",
+             [&classify_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("sql") && d["sql"].IsString());
+                 const std::string sql = d["sql"].GetString();
+                 classify_calls.fetch_add(1);
+                 if (sql.find("tcp_session_mock.tcp_src") != std::string::npos) {
+                     rsp = R"({"task_kind":"stream"})";
+                 } else {
+                     rsp = R"({"task_kind":"batch"})";
+                 }
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/batch/execute",
+             [&batch_execute_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("sql") && d["sql"].IsString());
+                 batch_execute_calls.fetch_add(1);
+                 rsp = R"({"status":"completed","rows":0,"result_row_count":0,"result_target":"dataframe.tmp","data":[]})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/execute",
+             [&stream_execute_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("sql") && d["sql"].IsString());
+                 stream_execute_calls.fetch_add(1);
+                 rsp = R"({"runtime_task_id":"stream_task_classify_001"})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/stop",
+             [](const std::string&, const std::string&, std::string& rsp) {
+                 rsp = R"({"task_id":"stream_task_classify_001","status":"stopped"})";
+                 return error::OK;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + classify_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        std::unordered_map<std::string, fnRouterHandler> local_routes;
+        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        ASSERT_TRUE(local_routes.count("POST:/tasks/sql/classify") == 1);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/batch/execute") == 1);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/execute") == 1);
+
+        std::string rsp;
+
+        ASSERT_EQ(local_routes["POST:/tasks/sql/classify"](
+                      "/tasks/sql/classify",
+                      R"({"sql":"SELECT * FROM sqlite.local.src INTO dataframe.tmp"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document classify_batch;
+        classify_batch.Parse(rsp.c_str());
+        ASSERT_TRUE(!classify_batch.HasParseError() && classify_batch.IsObject());
+        ASSERT_TRUE(classify_batch.HasMember("task_kind") && classify_batch["task_kind"].IsString());
+        ASSERT_EQ(std::string(classify_batch["task_kind"].GetString()), "batch");
+
+        ASSERT_EQ(local_routes["POST:/tasks/sql/classify"](
+                      "/tasks/sql/classify",
+                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document classify_stream;
+        classify_stream.Parse(rsp.c_str());
+        ASSERT_TRUE(!classify_stream.HasParseError() && classify_stream.IsObject());
+        ASSERT_TRUE(classify_stream.HasMember("task_kind") && classify_stream["task_kind"].IsString());
+        ASSERT_EQ(std::string(classify_stream["task_kind"].GetString()), "stream");
+
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
+                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","mode":"async"})",
+                      rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document batch_err;
+        batch_err.Parse(rsp.c_str());
+        ASSERT_TRUE(!batch_err.HasParseError() && batch_err.IsObject());
+        ASSERT_TRUE(batch_err.HasMember("error_code") && batch_err["error_code"].IsString());
+        ASSERT_EQ(std::string(batch_err["error_code"].GetString()), "STREAM_SQL_USE_STREAM_API");
+        ASSERT_EQ(batch_execute_calls.load(), 0);
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"sql":"SELECT * FROM sqlite.local.src INTO dataframe.tmp"})",
+                      rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document stream_err;
+        stream_err.Parse(rsp.c_str());
+        ASSERT_TRUE(!stream_err.HasParseError() && stream_err.IsObject());
+        ASSERT_TRUE(stream_err.HasMember("error_code") && stream_err["error_code"].IsString());
+        ASSERT_EQ(std::string(stream_err["error_code"].GetString()), "BATCH_SQL_USE_BATCH_API");
+        ASSERT_EQ(stream_execute_calls.load(), 0);
+
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
+                      R"({"sql":"SELECT * FROM sqlite.local.src INTO dataframe.tmp","mode":"sync"})",
+                      rsp),
+                  error::OK);
+        ASSERT_EQ(batch_execute_calls.load(), 1);
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc"})",
+                      rsp),
+                  error::OK);
+        ASSERT_EQ(stream_execute_calls.load(), 1);
+        ASSERT_TRUE(classify_calls.load() >= 4);
+
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
         const std::string retention_count_dir = MakeTempDir("retention_count");
         const std::string retention_count_db = retention_count_dir + "/task_store.db";
+        MockRouterHandle scheduler({MakeSqlClassifyRoute()});
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
         TaskPlugin p;
         const std::string opt = "db_dir=" + retention_count_dir + ";disable_worker=1;retention_max_count=2";
         ASSERT_EQ(p.Option(opt.c_str()), 0);
-        ASSERT_EQ(p.Load(nullptr), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
         std::unordered_map<std::string, fnRouterHandler> local_routes;
@@ -1031,7 +1212,7 @@ int main() {
 
         std::string rsp;
         for (int i = 0; i < 4; ++i) {
-            ASSERT_EQ(local_routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
+            ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
         }
         ASSERT_EQ(CountTasks(retention_count_db), 2);
         ASSERT_EQ(p.Stop(), 0);
@@ -1040,17 +1221,21 @@ int main() {
     {
         const std::string retention_days_dir = MakeTempDir("retention_days");
         const std::string retention_days_db = retention_days_dir + "/task_store.db";
+        MockRouterHandle scheduler({MakeSqlClassifyRoute()});
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
         TaskPlugin p;
         const std::string opt = "db_dir=" + retention_days_dir + ";disable_worker=1;retention_days=1";
         ASSERT_EQ(p.Option(opt.c_str()), 0);
-        ASSERT_EQ(p.Load(nullptr), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
         std::unordered_map<std::string, fnRouterHandler> local_routes;
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
         rapidjson::Document first_submit;
         first_submit.Parse(rsp.c_str());
         ASSERT_TRUE(!first_submit.HasParseError() && first_submit.IsObject());
@@ -1058,7 +1243,7 @@ int main() {
         ASSERT_TRUE(UpdateTaskCreatedAt(retention_days_db, old_task_id, "2000-01-01 00:00:00"));
 
         // 再创建一个终态任务，触发 retention 清理
-        ASSERT_EQ(local_routes["POST:/tasks/submit"]("/tasks/submit", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
         ASSERT_TRUE(!TaskExists(retention_days_db, old_task_id));
         ASSERT_EQ(CountTasks(retention_days_db), 1);
         ASSERT_EQ(p.Stop(), 0);

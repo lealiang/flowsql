@@ -442,6 +442,7 @@ int main() {
     auto stream_stop = FindRouteHandler(loader, "POST", "/scheduler/stream/stop");
     auto stream_status = FindRouteHandler(loader, "POST", "/scheduler/stream/status");
     auto stream_list = FindRouteHandler(loader, "POST", "/scheduler/stream/list");
+    auto sql_classify = FindRouteHandler(loader, "POST", "/scheduler/sql/classify");
     auto activate = FindRouteHandler(loader, "POST", "/operators/activate");
     auto deactivate = FindRouteHandler(loader, "POST", "/operators/deactivate");
     auto upsert_batch = FindRouteHandler(loader, "POST", "/operators/upsert_batch");
@@ -450,10 +451,36 @@ int main() {
     ASSERT_TRUE(stream_stop != nullptr);
     ASSERT_TRUE(stream_status != nullptr);
     ASSERT_TRUE(stream_list != nullptr);
+    ASSERT_TRUE(sql_classify != nullptr);
     ASSERT_TRUE(activate != nullptr);
     ASSERT_TRUE(deactivate != nullptr);
     ASSERT_TRUE(upsert_batch != nullptr);
     std::puts("[INFO] execute handler ready");
+
+    // T17a: SQL classify 返回批/流类型
+    {
+        std::string rsp;
+        ASSERT_EQ(sql_classify("/scheduler/sql/classify",
+                               MakeReq("SELECT * FROM sqlite.local.src INTO dataframe.classify_batch"),
+                               rsp),
+                  error::OK);
+        rapidjson::Document batch_doc;
+        batch_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!batch_doc.HasParseError() && batch_doc.IsObject());
+        ASSERT_TRUE(batch_doc.HasMember("task_kind") && batch_doc["task_kind"].IsString());
+        ASSERT_EQ(std::string(batch_doc["task_kind"].GetString()), "batch");
+
+        ASSERT_EQ(sql_classify("/scheduler/sql/classify",
+                               MakeReq("SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.classify_stream"),
+                               rsp),
+                  error::OK);
+        rapidjson::Document stream_doc;
+        stream_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!stream_doc.HasParseError() && stream_doc.IsObject());
+        ASSERT_TRUE(stream_doc.HasMember("task_kind") && stream_doc["task_kind"].IsString());
+        ASSERT_EQ(std::string(stream_doc["task_kind"].GetString()), "stream");
+    }
+    std::puts("[PASS] T17a");
 
     // T18: INTO dataframe.result 后可通过 Registry 读取
     {
