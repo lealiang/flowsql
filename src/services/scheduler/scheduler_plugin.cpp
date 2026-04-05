@@ -34,6 +34,7 @@
 #include "framework/interfaces/idatabase_channel.h"
 #include "framework/interfaces/idatabase_factory.h"
 #include "framework/interfaces/idataframe_channel.h"
+#include "framework/interfaces/ibuiltin_registry.h"
 #include "framework/interfaces/ibridge.h"
 #include "framework/interfaces/ioperator.h"
 #include "framework/interfaces/ioperator_catalog.h"
@@ -761,6 +762,10 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
     cb({"POST", "/channels/stream/query",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleQueryStreamChannels(u, req, rsp);
+        }});
+    cb({"POST", "/channels/stream/definitions/query",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleQueryStreamChannelDefinitions(u, req, rsp);
         }});
     cb({"POST", "/channels/stream/add",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
@@ -2374,6 +2379,76 @@ int32_t SchedulerPlugin::HandleGetChannels(const std::string&, const std::string
     }
 
     w.EndArray();
+    rsp = buf.GetString();
+    return error::OK;
+}
+
+// --- HandleQueryStreamChannelDefinitions ---
+int32_t SchedulerPlugin::HandleQueryStreamChannelDefinitions(const std::string&,
+                                                             const std::string&,
+                                                             std::string& rsp) {
+    auto* builtin_registry = querier_ ? static_cast<IBuiltinRegistry*>(querier_->First(IID_BUILTIN_REGISTRY)) : nullptr;
+    if (!builtin_registry) {
+        rsp = MakeErrorJson("builtin registry unavailable");
+        return error::UNAVAILABLE;
+    }
+
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("definitions");
+    w.StartArray();
+
+    builtin_registry->ListStreamChannelTypes([&w](const StreamChannelTypeDescriptor& def) {
+        w.StartObject();
+        w.Key("channel_type");
+        w.String(def.type.c_str());
+        w.Key("display_name");
+        w.String(def.display_name.c_str());
+
+        w.Key("allowed_roles");
+        w.StartArray();
+        for (const auto& role : def.allowed_roles) {
+            w.String(role.c_str());
+        }
+        w.EndArray();
+
+        w.Key("option_schema");
+        w.StartArray();
+        for (const auto& field : def.option_schema) {
+            w.StartObject();
+            w.Key("key");
+            w.String(field.key.c_str());
+            w.Key("type");
+            w.String(field.type.c_str());
+            w.Key("required");
+            w.Bool(field.required);
+            w.Key("default_value");
+            w.String(field.default_value.c_str());
+            w.Key("enum_values");
+            w.StartArray();
+            for (const auto& value : field.enum_values) {
+                w.String(value.c_str());
+            }
+            w.EndArray();
+            w.Key("min_value");
+            w.Int64(field.min_value);
+            w.Key("max_value");
+            w.Int64(field.max_value);
+            w.Key("has_range");
+            w.Bool(field.has_range);
+            w.Key("power_of_two");
+            w.Bool(field.power_of_two);
+            w.Key("desc");
+            w.String(field.desc.c_str());
+            w.EndObject();
+        }
+        w.EndArray();
+        w.EndObject();
+    });
+
+    w.EndArray();
+    w.EndObject();
     rsp = buf.GetString();
     return error::OK;
 }

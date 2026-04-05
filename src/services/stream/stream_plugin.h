@@ -2,6 +2,7 @@
 #define _FLOWSQL_SERVICES_STREAM_STREAM_PLUGIN_H_
 
 #include <common/iplugin.h>
+#include <framework/interfaces/ibuiltin_registry.h>
 #include <framework/interfaces/istream_factory.h>
 #include <framework/interfaces/istream_manager.h>
 
@@ -72,6 +73,7 @@ class __attribute__((visibility("default"))) StreamPlugin : public IPlugin,
     std::mutex mutex_;
 
     IQuerier* querier_ = nullptr;
+    IBuiltinRegistry* builtin_registry_ = nullptr;
     std::string config_file_;
     std::string db_path_;
     sqlite3* db_ = nullptr;

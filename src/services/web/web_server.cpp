@@ -185,6 +185,24 @@ int WebServer::Init(const std::string& db_path) {
         }
         res.set_content(rsp, "application/json");
     });
+    server_.Post("/api/channels/stream/definitions/query", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp;
+        int32_t rc = HandleQueryStreamChannelDefinitions("", req.body.empty() ? "{}" : req.body, rsp);
+        if (rc == error::OK) {
+            res.status = 200;
+        } else if (rc == error::BAD_REQUEST) {
+            res.status = 400;
+        } else if (rc == error::NOT_FOUND) {
+            res.status = 404;
+        } else if (rc == error::CONFLICT) {
+            res.status = 409;
+        } else if (rc == error::UNAVAILABLE) {
+            res.status = 503;
+        } else {
+            res.status = 500;
+        }
+        res.set_content(rsp, "application/json");
+    });
     server_.Post("/api/channels/stream/add", [this](const httplib::Request& req, httplib::Response& res) {
         std::string rsp;
         int32_t rc = HandleAddStreamChannel("", req.body, rsp);
@@ -508,6 +526,10 @@ void WebServer::EnumApiRoutes(std::function<void(const RouteItem&)> cb) {
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleQueryStreamChannels(u, req, rsp);
         }});
+    cb({"POST", "/api/channels/stream/definitions/query",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleQueryStreamChannelDefinitions(u, req, rsp);
+        }});
     cb({"POST", "/api/channels/stream/add",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleAddStreamChannel(u, req, rsp);
@@ -737,6 +759,13 @@ int32_t WebServer::HandleGetChannels(const std::string&, const std::string&, std
 int32_t WebServer::HandleQueryStreamChannels(const std::string&, const std::string& req, std::string& rsp) {
     const std::string body = req.empty() ? "{}" : req;
     return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/query", body, &rsp);
+}
+
+int32_t WebServer::HandleQueryStreamChannelDefinitions(const std::string&,
+                                                       const std::string& req,
+                                                       std::string& rsp) {
+    const std::string body = req.empty() ? "{}" : req;
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/definitions/query", body, &rsp);
 }
 
 int32_t WebServer::HandleAddStreamChannel(const std::string&, const std::string& req, std::string& rsp) {

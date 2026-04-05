@@ -47,6 +47,7 @@ class WebServer {
     // 管理 API handler（fnRouterHandler 签名）
     int32_t HandleHealth(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetChannels(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleQueryStreamChannelDefinitions(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleQueryStreamChannels(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleAddStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleModifyStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);

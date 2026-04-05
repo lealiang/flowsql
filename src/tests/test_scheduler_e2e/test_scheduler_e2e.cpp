@@ -379,8 +379,10 @@ int main() {
     const std::filesystem::path data_dir = std::filesystem::temp_directory_path() / ("flowsql_s9_3_df_" + suffix);
     const std::filesystem::path operator_db_dir = std::filesystem::temp_directory_path() / ("flowsql_s9_3_catalog_" + suffix);
     const std::filesystem::path stream_cfg = std::filesystem::temp_directory_path() / ("flowsql_s9_3_stream_" + suffix + ".yml");
+    const std::filesystem::path stream_meta_db = std::filesystem::temp_directory_path() / ("flowsql_s9_3_stream_meta_" + suffix + ".db");
     std::filesystem::remove(db_path);
     std::filesystem::remove(stream_cfg);
+    std::filesystem::remove(stream_meta_db);
     std::filesystem::create_directories(data_dir);
     std::filesystem::create_directories(operator_db_dir);
 
@@ -414,12 +416,12 @@ int main() {
     }
 
     PluginLoader* loader = PluginLoader::Single();
-    const char* libs[] = {"libflowsql_database.so", "libflowsql_catalog.so", "libflowsql_scheduler.so", "libflowsql_stream.so"};
+    const char* libs[] = {"libflowsql_database.so", "libflowsql_builtin.so", "libflowsql_catalog.so", "libflowsql_scheduler.so", "libflowsql_stream.so"};
     std::string db_opt = "type=sqlite;name=local;path=" + db_path.string();
     std::string catalog_opt = "data_dir=" + data_dir.string() + ";operator_db_dir=" + operator_db_dir.string();
-    std::string stream_opt = "config_file=" + stream_cfg.string();
-    const char* opts[] = {db_opt.c_str(), catalog_opt.c_str(), nullptr, stream_opt.c_str()};
-    ASSERT_EQ(loader->Load(get_absolute_process_path(), libs, opts, 4), 0);
+    std::string stream_opt = "config_file=" + stream_cfg.string() + ";db_path=" + stream_meta_db.string();
+    const char* opts[] = {db_opt.c_str(), nullptr, catalog_opt.c_str(), nullptr, stream_opt.c_str()};
+    ASSERT_EQ(loader->Load(get_absolute_process_path(), libs, opts, 5), 0);
     std::puts("[INFO] plugins loaded");
     ASSERT_EQ(loader->StartAll(), 0);
     std::puts("[INFO] plugins started");
@@ -442,6 +444,8 @@ int main() {
     auto stream_stop = FindRouteHandler(loader, "POST", "/scheduler/stream/stop");
     auto stream_status = FindRouteHandler(loader, "POST", "/scheduler/stream/status");
     auto stream_list = FindRouteHandler(loader, "POST", "/scheduler/stream/list");
+    auto stream_add = FindRouteHandler(loader, "POST", "/channels/stream/add");
+    auto stream_definitions_query = FindRouteHandler(loader, "POST", "/channels/stream/definitions/query");
     auto sql_classify = FindRouteHandler(loader, "POST", "/scheduler/sql/classify");
     auto activate = FindRouteHandler(loader, "POST", "/operators/activate");
     auto deactivate = FindRouteHandler(loader, "POST", "/operators/deactivate");
@@ -451,6 +455,8 @@ int main() {
     ASSERT_TRUE(stream_stop != nullptr);
     ASSERT_TRUE(stream_status != nullptr);
     ASSERT_TRUE(stream_list != nullptr);
+    ASSERT_TRUE(stream_add != nullptr);
+    ASSERT_TRUE(stream_definitions_query != nullptr);
     ASSERT_TRUE(sql_classify != nullptr);
     ASSERT_TRUE(activate != nullptr);
     ASSERT_TRUE(deactivate != nullptr);
@@ -481,6 +487,32 @@ int main() {
         ASSERT_EQ(std::string(stream_doc["task_kind"].GetString()), "stream");
     }
     std::puts("[PASS] T17a");
+
+    // T17b: Stream 通道定义元数据查询
+    {
+        std::string rsp;
+        ASSERT_EQ(stream_definitions_query("/channels/stream/definitions/query", "{}", rsp), error::OK);
+        rapidjson::Document doc;
+        doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!doc.HasParseError() && doc.IsObject());
+        ASSERT_TRUE(doc.HasMember("definitions") && doc["definitions"].IsArray());
+
+        bool found_ring = false;
+        bool found_stream_hub = false;
+        for (const auto& item : doc["definitions"].GetArray()) {
+            ASSERT_TRUE(item.IsObject());
+            ASSERT_TRUE(item.HasMember("channel_type") && item["channel_type"].IsString());
+            ASSERT_TRUE(item.HasMember("display_name") && item["display_name"].IsString());
+            ASSERT_TRUE(item.HasMember("allowed_roles") && item["allowed_roles"].IsArray());
+            ASSERT_TRUE(item.HasMember("option_schema") && item["option_schema"].IsArray());
+            const std::string channel_type = item["channel_type"].GetString();
+            if (channel_type == "ring") found_ring = true;
+            if (channel_type == "stream_hub") found_stream_hub = true;
+        }
+        ASSERT_TRUE(found_ring);
+        ASSERT_TRUE(found_stream_hub);
+    }
+    std::puts("[PASS] T17b");
 
     // T18: INTO dataframe.result 后可通过 Registry 读取
     {
@@ -1182,7 +1214,33 @@ int main() {
     }
     std::puts("[PASS] T43");
 
-    // T44: Web 代理流式通道查询接口（严格语义：上游不可达时返回 UNAVAILABLE）
+    // T44: Story 14.11 T5 回归（缺失注册/非法配置/重复创建）
+    {
+        std::string rsp;
+        ASSERT_EQ(stream_add("/channels/stream/add",
+                             R"({"type":"no_such_stream_type","name":"x_missing","option":""})",
+                             rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("add stream channel failed") != std::string::npos);
+
+        ASSERT_EQ(stream_add("/channels/stream/add",
+                             R"({"type":"ring","name":"x_invalid","option":"ring_mode=spsc;ring_size=3;overflow=drop;finite=false"})",
+                             rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("add stream channel failed") != std::string::npos);
+
+        ASSERT_EQ(stream_add("/channels/stream/add",
+                             R"({"type":"ring","name":"x_dup","option":"ring_mode=spsc;ring_size=256;overflow=drop;finite=false;batch_rows=64"})",
+                             rsp),
+                  error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add",
+                             R"({"type":"ring","name":"x_dup","option":"ring_mode=spsc;ring_size=256;overflow=drop;finite=false;batch_rows=64"})",
+                             rsp),
+                  error::CONFLICT);
+    }
+    std::puts("[PASS] T44");
+
+    // T45: Web 代理流式通道查询接口（严格语义：上游不可达时返回 UNAVAILABLE）
     {
         const std::filesystem::path web_db_path = std::filesystem::temp_directory_path() /
                                                   ("flowsql_s9_3_web_" + suffix + ".db");
@@ -1196,21 +1254,28 @@ int main() {
         ASSERT_EQ(loader->Load(get_absolute_process_path(), web_libs, web_opts, 1), 0);
 
         fnRouterHandler web_stream_query = nullptr;
+        fnRouterHandler web_stream_definitions_query = nullptr;
         web_stream_query = FindRouteHandler(loader, "POST", "/api/channels/stream/query");
+        web_stream_definitions_query = FindRouteHandler(loader, "POST", "/api/channels/stream/definitions/query");
         ASSERT_TRUE(web_stream_query != nullptr);
+        ASSERT_TRUE(web_stream_definitions_query != nullptr);
 
         std::string rsp;
         ASSERT_EQ(web_stream_query("/api/channels/stream/query", "{}", rsp), error::UNAVAILABLE);
         ASSERT_TRUE(rsp.find("service unreachable") != std::string::npos);
+        ASSERT_EQ(web_stream_definitions_query("/api/channels/stream/definitions/query", "{}", rsp), error::UNAVAILABLE);
+        ASSERT_TRUE(rsp.find("service unreachable") != std::string::npos);
         std::filesystem::remove(web_db_path);
     }
-    std::puts("[PASS] T44");
+    std::puts("[PASS] T45");
 
     exec = fnRouterHandler();
     stream_exec = fnRouterHandler();
     stream_stop = fnRouterHandler();
     stream_status = fnRouterHandler();
     stream_list = fnRouterHandler();
+    stream_add = fnRouterHandler();
+    stream_definitions_query = fnRouterHandler();
     sql_classify = fnRouterHandler();
     activate = fnRouterHandler();
     deactivate = fnRouterHandler();
@@ -1219,6 +1284,7 @@ int main() {
     loader->Unload();
     std::filesystem::remove(db_path);
     std::filesystem::remove(stream_cfg);
+    std::filesystem::remove(stream_meta_db);
     std::filesystem::remove_all(data_dir);
     std::filesystem::remove_all(operator_db_dir);
 

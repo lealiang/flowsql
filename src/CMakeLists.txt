@@ -68,6 +68,7 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/services/stream ${CMAKE_BINARY_DIR}/stream)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_stream ${CMAKE_BINARY_DIR}/test_stream)
 
 # Stage 8: Catalog 目录服务
+add_subdirectory(${CMAKE_SOURCE_DIR}/services/builtin ${CMAKE_BINARY_DIR}/builtin)
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/catalog ${CMAKE_BINARY_DIR}/catalog)
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/binaddon ${CMAKE_BINARY_DIR}/binaddon)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_builtin ${CMAKE_BINARY_DIR}/test_builtin)

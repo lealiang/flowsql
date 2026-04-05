@@ -1,16 +1,19 @@
 #include "stream_plugin.h"
 
-#include <framework/builtin/stream/tcp_session_mock_stream_channel.h>
-#include <framework/core/ring_stream_channel.h>
-
 #include <common/log.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
+#include <string>
 #include <tuple>
 #include <vector>
+
+#include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
 #include <sqlite3.h>
 #include <yaml-cpp/yaml.h>
 
@@ -38,102 +41,63 @@ std::string ToLowerAscii(std::string s) {
     return s;
 }
 
-bool ParseBool(const std::string& value, bool* out) {
-    if (!out) return false;
-    const std::string v = ToLowerAscii(value);
-    if (v == "1" || v == "true" || v == "yes" || v == "on") {
-        *out = true;
-        return true;
+bool IsIntegerLiteral(const std::string& s) {
+    if (s.empty()) return false;
+    size_t i = 0;
+    if (s[0] == '+' || s[0] == '-') i = 1;
+    if (i >= s.size()) return false;
+    for (; i < s.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
     }
-    if (v == "0" || v == "false" || v == "no" || v == "off") {
-        *out = false;
-        return true;
-    }
-    return false;
+    return true;
 }
 
-int ParseRingOptions(const std::string& option, RingStreamChannelOptions* out) {
+int ParseOptionObject(const std::string& option, rapidjson::Document* out, std::string* err) {
     if (!out) return EINVAL;
+    out->SetObject();
+    auto& alloc = out->GetAllocator();
     if (option.empty()) return 0;
 
-    size_t pos = 0;
-    while (pos < option.size()) {
-        const size_t eq = option.find('=', pos);
-        if (eq == std::string::npos) break;
-        size_t end = option.find(';', eq + 1);
-        if (end == std::string::npos) end = option.size();
+    const std::string trimmed = [&option]() {
+        size_t begin = 0;
+        size_t end = option.size();
+        while (begin < end && std::isspace(static_cast<unsigned char>(option[begin]))) ++begin;
+        while (end > begin && std::isspace(static_cast<unsigned char>(option[end - 1]))) --end;
+        return option.substr(begin, end - begin);
+    }();
 
-        const std::string key = option.substr(pos, eq - pos);
-        const std::string value = option.substr(eq + 1, end - eq - 1);
-        try {
-            if (key == "ring_size") {
-                out->ring_size = static_cast<size_t>(std::stoull(value));
-            } else if (key == "batch_rows") {
-                out->batch_rows = std::stoi(value);
-            } else if (key == "overflow") {
-                out->overflow = ParseOverflowPolicy(value);
-            } else if (key == "ring_mode") {
-                out->ring_mode = ParseRingMode(value);
-            } else if (key == "finite") {
-                bool parsed = false;
-                if (!ParseBool(value, &parsed)) return EINVAL;
-                out->finite = parsed;
-            }
-        } catch (...) {
+    if (trimmed.empty()) return 0;
+    if (trimmed.front() == '{') {
+        out->Parse(trimmed.c_str());
+        if (out->HasParseError() || !out->IsObject()) {
+            if (err) *err = "option json parse failed";
             return EINVAL;
         }
-
-        pos = (end < option.size()) ? end + 1 : option.size();
+        return 0;
     }
-    return 0;
-}
-
-int ParseTcpSessionMockOptions(const std::string& option, TcpSessionMockOptions* out) {
-    if (!out) return EINVAL;
-    out->mode = TcpSessionMockMode::kNone;
-    out->total_records = 1024;
-    out->batch_rows = 64;
-    out->emit_interval_ms = 0;
-    out->partition_count = 4;
-    out->queue_options.ring_size = 256;
-    out->queue_options.batch_rows = 1024;
-    out->queue_options.overflow = OverflowPolicy::kDrop;
-    out->queue_options.ring_mode = RingMode::SPSC;
-    out->queue_options.finite = true;
-    if (option.empty()) return 0;
 
     size_t pos = 0;
-    while (pos < option.size()) {
-        const size_t eq = option.find('=', pos);
+    while (pos < trimmed.size()) {
+        const size_t eq = trimmed.find('=', pos);
         if (eq == std::string::npos) break;
-        size_t end = option.find(';', eq + 1);
-        if (end == std::string::npos) end = option.size();
+        size_t end = trimmed.find(';', eq + 1);
+        if (end == std::string::npos) end = trimmed.size();
 
-        const std::string key = option.substr(pos, eq - pos);
-        const std::string value = option.substr(eq + 1, end - eq - 1);
-        try {
-            if (key == "mode") {
-                out->mode = ParseTcpSessionMockMode(value);
-            } else if (key == "total_records") {
-                out->total_records = std::stoll(value);
-            } else if (key == "batch_rows") {
-                out->batch_rows = std::stoi(value);
-            } else if (key == "emit_interval_ms") {
-                out->emit_interval_ms = std::stoi(value);
-            } else if (key == "partition_count") {
-                out->partition_count = std::stoi(value);
-            } else if (key == "ring_size") {
-                out->queue_options.ring_size = static_cast<size_t>(std::stoull(value));
-            } else if (key == "overflow") {
-                out->queue_options.overflow = ParseOverflowPolicy(value);
-            } else if (key == "ring_mode") {
-                out->queue_options.ring_mode = ParseRingMode(value);
+        const std::string key = trimmed.substr(pos, eq - pos);
+        const std::string value = trimmed.substr(eq + 1, end - eq - 1);
+        if (!key.empty()) {
+            rapidjson::Value key_json(key.c_str(), alloc);
+            const std::string lower = ToLowerAscii(value);
+            if (lower == "true" || lower == "false") {
+                out->AddMember(key_json, rapidjson::Value(lower == "true"), alloc);
+            } else if (IsIntegerLiteral(value)) {
+                const int64_t num = std::strtoll(value.c_str(), nullptr, 10);
+                out->AddMember(key_json, rapidjson::Value(num), alloc);
+            } else {
+                out->AddMember(key_json, rapidjson::Value(value.c_str(), alloc), alloc);
             }
-        } catch (...) {
-            return EINVAL;
         }
-
-        pos = (end < option.size()) ? end + 1 : option.size();
+        pos = (end < trimmed.size()) ? end + 1 : trimmed.size();
     }
     return 0;
 }
@@ -167,6 +131,12 @@ int StreamPlugin::Option(const char* arg) {
 int StreamPlugin::Load(IQuerier* querier) {
     std::lock_guard<std::mutex> lock(mutex_);
     querier_ = querier;
+    builtin_registry_ = querier_ ? static_cast<IBuiltinRegistry*>(querier_->First(IID_BUILTIN_REGISTRY)) : nullptr;
+    if (!builtin_registry_) {
+        last_error_ = "builtin registry unavailable";
+        LOG_ERROR("StreamPlugin::Load: %s", last_error_.c_str());
+        return -1;
+    }
 
     configs_.clear();
     channels_.clear();
@@ -207,6 +177,7 @@ int StreamPlugin::Unload() {
         db_ = nullptr;
     }
     querier_ = nullptr;
+    builtin_registry_ = nullptr;
     return 0;
 }
 
@@ -313,48 +284,46 @@ int StreamPlugin::BuildOneChannelLocked(const StreamChannelConfig& cfg,
                                         std::shared_ptr<IStreamChannel>* out) {
     if (!out) return EINVAL;
     out->reset();
-
-    if (cfg.type == "ring") {
-        RingStreamChannelOptions options;
-        const int parse_rc = ParseRingOptions(cfg.option, &options);
-        if (parse_rc != 0) {
-            last_error_ = "invalid ring option for stream channel: " + cfg.type + "." + cfg.name;
-            return EINVAL;
-        }
-
-        auto channel = std::make_shared<RingStreamChannel>(cfg.type, cfg.name, options);
-        const int open_rc = channel->Open();
-        if (open_rc != 0) {
-            last_error_ = "open stream channel failed: " + cfg.type + "." + cfg.name;
-            return open_rc;
-        }
-        *out = std::move(channel);
-        return 0;
+    if (!builtin_registry_) {
+        last_error_ = "builtin registry unavailable";
+        return ENOTSUP;
     }
 
-    if (cfg.type == "tcp_session_mock") {
-        TcpSessionMockOptions options;
-        const int parse_rc = ParseTcpSessionMockOptions(cfg.option, &options);
-        if (parse_rc != 0) {
-            last_error_ = "invalid tcp_session_mock option for stream channel: " + cfg.type + "." + cfg.name;
-            return EINVAL;
-        }
-
-        auto channel = std::make_shared<TcpSessionMockStreamChannel>(cfg.type, cfg.name, options);
-        const int open_rc = channel->Open();
-        if (open_rc != 0) {
-            last_error_ = "open stream channel failed: " + cfg.type + "." + cfg.name;
-            return open_rc;
-        }
-        *out = std::move(channel);
-        return 0;
+    StreamChannelTypeDescriptor desc;
+    if (builtin_registry_->FindStreamChannelType(cfg.type, &desc) != 0) {
+        last_error_ = "unsupported stream channel type: " + cfg.type;
+        LOG_WARN("StreamPlugin::BuildOneChannelLocked: unsupported stream type=%s name=%s",
+                 cfg.type.c_str(), cfg.name.c_str());
+        return ENOTSUP;
     }
 
-    // 路径 B 类型（如 netcard）本 Sprint 不实现，跳过加载。
-    last_error_ = "unsupported stream channel type: " + cfg.type;
-    LOG_WARN("StreamPlugin::BuildOneChannelLocked: unsupported stream type=%s name=%s",
-             cfg.type.c_str(), cfg.name.c_str());
-    return ENOTSUP;
+    rapidjson::Document option_doc;
+    std::string parse_err;
+    const int parse_rc = ParseOptionObject(cfg.option, &option_doc, &parse_err);
+    if (parse_rc != 0) {
+        last_error_ = "invalid option for stream channel: " + cfg.type + "." + cfg.name +
+                      ", err=" + parse_err;
+        return parse_rc;
+    }
+
+    std::string normalized_json;
+    std::string validate_err;
+    const int validate_rc =
+        desc.validate_and_normalize(option_doc, &normalized_json, &validate_err);
+    if (validate_rc != 0) {
+        last_error_ = "validate stream option failed: " + cfg.type + "." + cfg.name +
+                      ", err=" + validate_err;
+        return validate_rc;
+    }
+
+    std::string build_err;
+    const int build_rc = desc.build(cfg.type, cfg.name, normalized_json, out, &build_err);
+    if (build_rc != 0) {
+        last_error_ = "build stream channel failed: " + cfg.type + "." + cfg.name +
+                      ", err=" + build_err;
+        return build_rc;
+    }
+    return 0;
 }
 
 int StreamPlugin::EnsureStoreReadyLocked() {

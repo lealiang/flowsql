@@ -29,6 +29,7 @@ services:
         option: "db_path=./meta/flowsql_meta.db"
       - libflowsql_scheduler.so
       - libflowsql_bridge.so
+      - libflowsql_builtin.so
       - name: libflowsql_catalog.so
         option: "data_dir=./dataframes;operator_db_path=./meta/flowsql_meta.db"
       - name: libflowsql_binaddon.so

@@ -1,17 +1,13 @@
 #include "catalog_plugin.h"
 
-#include <framework/builtin/dataframe/concat_operator.h>
-#include <framework/builtin/dataframe/hstack_operator.h>
-#include <framework/builtin/dataframe/passthrough_operator.h>
-#include <framework/builtin/stream/count_window_stream_operator.h>
-#include <framework/builtin/stream/passthrough_stream_operator.h>
-#include <framework/builtin/stream/tcp_service_merge_stream_operator.h>
 #include <framework/core/dataframe.h>
 #include <framework/core/dataframe_channel.h>
+#include <framework/interfaces/ibuiltin_registry.h>
 
 #include <common/error_code.h>
 #include <common/log.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <cctype>
@@ -22,6 +18,7 @@
 #include <fstream>
 #include <sstream>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -47,6 +44,13 @@ bool EqualsIgnoreCase(const std::string& a, const char* b) {
         }
     }
     return true;
+}
+
+std::string ToLowerAscii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
 }
 
 bool IsSafeUploadFilename(const std::string& filename) {
@@ -101,18 +105,35 @@ int CatalogPlugin::Load(IQuerier* querier) {
             LOG_WARN("CatalogPlugin::Load: operator catalog db init failed, will retry in Start()");
         }
     }
-    if (Register("passthrough", []() -> IOperator* { return new PassthroughOperator(); }) != 0) return -1;
-    if (Register("concat", []() -> IOperator* { return new ConcatOperator(); }) != 0) return -1;
-    if (Register("hstack", []() -> IOperator* { return new HstackOperator(); }) != 0) return -1;
-    if (Register("builtin.passthrough", []() -> IOperator* { return new PassthroughOperator(); }) != 0) return -1;
-    if (Register("builtin.concat", []() -> IOperator* { return new ConcatOperator(); }) != 0) return -1;
-    if (Register("builtin.hstack", []() -> IOperator* { return new HstackOperator(); }) != 0) return -1;
-    if (Register("passthrough_stream", []() -> IOperator* { return new PassthroughStreamOperator(); }) != 0) return -1;
-    if (Register("count_window_stream", []() -> IOperator* { return new CountWindowStreamOperator(); }) != 0) return -1;
-    if (Register("tcp_service_merge_stream", []() -> IOperator* { return new TcpServiceMergeStreamOperator(); }) != 0) return -1;
-    if (Register("builtin.passthrough_stream", []() -> IOperator* { return new PassthroughStreamOperator(); }) != 0) return -1;
-    if (Register("builtin.count_window_stream", []() -> IOperator* { return new CountWindowStreamOperator(); }) != 0) return -1;
-    if (Register("builtin.tcp_service_merge_stream", []() -> IOperator* { return new TcpServiceMergeStreamOperator(); }) != 0) return -1;
+    auto* builtin_registry = querier_ ? static_cast<IBuiltinRegistry*>(querier_->First(IID_BUILTIN_REGISTRY)) : nullptr;
+    if (!builtin_registry) {
+        LOG_ERROR("CatalogPlugin::Load: builtin registry unavailable");
+        return -1;
+    }
+
+    bool ok = true;
+    std::unordered_set<std::string> seen;
+    builtin_registry->ListBuiltinOperators([&](const BuiltinOperatorDescriptor& desc) {
+        const auto make_factory = [builtin_registry, category = desc.category, name = desc.name]() -> IOperator* {
+            return builtin_registry->CreateBuiltinOperator(category, name);
+        };
+
+        auto register_one = [&](const std::string& reg_name) {
+            if (reg_name.empty()) return;
+            const std::string key = ToLowerAscii(reg_name);
+            if (!seen.insert(key).second) return;
+            if (Register(reg_name.c_str(), make_factory) != 0) {
+                LOG_ERROR("CatalogPlugin::Load: register builtin operator failed: %s", reg_name.c_str());
+                ok = false;
+            }
+        };
+
+        register_one(desc.category + "." + desc.name);
+        for (const auto& alias : desc.aliases) {
+            register_one(alias);
+        }
+    });
+    if (!ok) return -1;
     return 0;
 }
 

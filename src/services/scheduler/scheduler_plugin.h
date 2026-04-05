@@ -54,6 +54,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     int32_t HandleStreamStatus(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamList(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetChannels(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleQueryStreamChannelDefinitions(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleQueryStreamChannels(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleAddStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleModifyStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);

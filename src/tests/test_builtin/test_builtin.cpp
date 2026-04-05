@@ -14,10 +14,14 @@
 #include <common/error_code.h>
 #include <framework/core/dataframe.h>
 #include <framework/core/dataframe_channel.h>
+#include <framework/interfaces/ibuiltin_registry.h>
 #include <framework/interfaces/ibinaddon_host.h>
 #include <framework/interfaces/ioperator.h>
 #include <framework/interfaces/ioperator_catalog.h>
 #include <framework/interfaces/ioperator_registry.h>
+#include <framework/builtin/dataframe/concat_operator.h>
+#include <framework/builtin/dataframe/hstack_operator.h>
+#include <framework/builtin/dataframe/passthrough_operator.h>
 #include <services/binaddon/binaddon_host_plugin.h>
 #include <services/catalog/catalog_plugin.h>
 #include <framework/interfaces/irouter_handle.h>
@@ -129,6 +133,7 @@ class TestQuerier : public IQuerier {
  public:
     IOperatorRegistry* op_registry = nullptr;
     IBinAddonHost* binaddon_host = nullptr;
+    IBuiltinRegistry* builtin_registry = nullptr;
 
     int Traverse(const Guid&, fntraverse) override { return 0; }
 
@@ -139,8 +144,49 @@ class TestQuerier : public IQuerier {
         if (memcmp(&iid, &IID_BINADDON_HOST, sizeof(Guid)) == 0) {
             return binaddon_host;
         }
+        if (memcmp(&iid, &IID_BUILTIN_REGISTRY, sizeof(Guid)) == 0) {
+            return builtin_registry;
+        }
         return nullptr;
     }
+};
+
+class TestBuiltinRegistry : public IBuiltinRegistry {
+ public:
+    int FindStreamChannelType(const std::string&,
+                              StreamChannelTypeDescriptor*) override {
+        return -1;
+    }
+
+    void ListStreamChannelTypes(
+        std::function<void(const StreamChannelTypeDescriptor&)>) override {}
+
+    void ListBuiltinOperators(
+        std::function<void(const BuiltinOperatorDescriptor&)> callback) override {
+        if (!callback) return;
+        for (const auto& item : descriptors_) callback(item);
+    }
+
+    IOperator* CreateBuiltinOperator(const std::string& category,
+                                     const std::string& name) override {
+        const std::string full = category + "." + name;
+        for (const auto& item : descriptors_) {
+            if ((item.category + "." + item.name) == full) {
+                return item.factory ? item.factory() : nullptr;
+            }
+        }
+        return nullptr;
+    }
+
+ private:
+    const std::vector<BuiltinOperatorDescriptor> descriptors_ = {
+        {"builtin", "passthrough", {"passthrough", "builtin.passthrough"},
+         []() -> IOperator* { return new PassthroughOperator(); }},
+        {"builtin", "concat", {"concat", "builtin.concat"},
+         []() -> IOperator* { return new ConcatOperator(); }},
+        {"builtin", "hstack", {"hstack", "builtin.hstack"},
+         []() -> IOperator* { return new HstackOperator(); }},
+    };
 };
 
 static void TestRegistryBasic() {
@@ -148,9 +194,12 @@ static void TestRegistryBasic() {
     const std::string dir = MakeTempDir("basic");
 
     CatalogPlugin p;
+    TestBuiltinRegistry builtin_registry;
+    TestQuerier querier;
+    querier.builtin_registry = &builtin_registry;
     const std::string opt = MakeCatalogOption(dir);
     ASSERT_EQ(p.Option(opt.c_str()), 0);
-    ASSERT_EQ(p.Load(nullptr), 0);
+    ASSERT_EQ(p.Load(&querier), 0);
     ASSERT_EQ(p.Start(), 0);
 
     auto ch1 = MakeChannel("result");
@@ -203,17 +252,23 @@ static void TestRestartRecover() {
 
     {
         CatalogPlugin p1;
+        TestBuiltinRegistry builtin_registry;
+        TestQuerier querier;
+        querier.builtin_registry = &builtin_registry;
         const std::string opt = MakeCatalogOption(dir);
         ASSERT_EQ(p1.Option(opt.c_str()), 0);
-        ASSERT_EQ(p1.Load(nullptr), 0);
+        ASSERT_EQ(p1.Load(&querier), 0);
         ASSERT_EQ(p1.Start(), 0);
         ASSERT_EQ(p1.Register("daily", std::static_pointer_cast<IChannel>(MakeChannel("daily", 3))), 0);
     }
 
     CatalogPlugin p2;
+    TestBuiltinRegistry builtin_registry;
+    TestQuerier querier;
+    querier.builtin_registry = &builtin_registry;
     const std::string opt = MakeCatalogOption(dir);
     ASSERT_EQ(p2.Option(opt.c_str()), 0);
-    ASSERT_EQ(p2.Load(nullptr), 0);
+    ASSERT_EQ(p2.Load(&querier), 0);
     ASSERT_EQ(p2.Start(), 0);
 
     auto got = GetDataFrame(p2, "daily");
@@ -227,9 +282,12 @@ static void TestConcurrency() {
     const std::string dir = MakeTempDir("concurrency");
 
     CatalogPlugin p;
+    TestBuiltinRegistry builtin_registry;
+    TestQuerier querier;
+    querier.builtin_registry = &builtin_registry;
     const std::string opt = MakeCatalogOption(dir);
     ASSERT_EQ(p.Option(opt.c_str()), 0);
-    ASSERT_EQ(p.Load(nullptr), 0);
+    ASSERT_EQ(p.Load(&querier), 0);
     ASSERT_EQ(p.Start(), 0);
 
     std::vector<std::thread> threads;
@@ -255,8 +313,11 @@ static void TestConcurrency() {
 static void TestPersistFail() {
     std::puts("[TEST] T14 persist fail ...");
     CatalogPlugin p;
+    TestBuiltinRegistry builtin_registry;
+    TestQuerier querier;
+    querier.builtin_registry = &builtin_registry;
     ASSERT_EQ(p.Option("data_dir=/proc/flowsql_catalog_test_no_permission"), 0);
-    ASSERT_EQ(p.Load(nullptr), 0);
+    ASSERT_EQ(p.Load(&querier), 0);
 
     // Start 可能失败（目录不可创建），但 Register 也必须失败且不产生内存注册。
     (void)p.Start();
@@ -270,9 +331,12 @@ static void TestOperatorRegistry() {
     const std::string dir = MakeTempDir("operator");
 
     CatalogPlugin p;
+    TestBuiltinRegistry builtin_registry;
+    TestQuerier querier;
+    querier.builtin_registry = &builtin_registry;
     const std::string opt = MakeCatalogOption(dir);
     ASSERT_EQ(p.Option(opt.c_str()), 0);
-    ASSERT_EQ(p.Load(nullptr), 0);  // Load 自动注册 passthrough
+    ASSERT_EQ(p.Load(&querier), 0);  // Load 自动注册 passthrough
     ASSERT_EQ(p.Start(), 0);
 
     // T15
@@ -298,9 +362,12 @@ static void TestOperatorCatalog() {
     const std::string upload = MakeTempDir("op_catalog_upload");
 
     CatalogPlugin p;
+    TestBuiltinRegistry builtin_registry;
+    TestQuerier querier;
+    querier.builtin_registry = &builtin_registry;
     const std::string opt = MakeCatalogOption(dir);
     ASSERT_EQ(p.Option(opt.c_str()), 0);
-    ASSERT_EQ(p.Load(nullptr), 0);
+    ASSERT_EQ(p.Load(&querier), 0);
     ASSERT_EQ(p.Start(), 0);
 
     std::vector<OperatorMeta> batch;
@@ -419,6 +486,8 @@ static void TestCppPluginLifecycle() {
     TestQuerier querier;
     querier.op_registry = static_cast<IOperatorRegistry*>(&p);
     querier.binaddon_host = static_cast<IBinAddonHost*>(&binaddon);
+    TestBuiltinRegistry builtin_registry;
+    querier.builtin_registry = &builtin_registry;
 
     const std::string opt = MakeCatalogOption(dir);
     const std::string db_path = (std::filesystem::path(dir) / "catalog" / "operator_catalog.db").string();
@@ -555,9 +624,12 @@ static void TestOperatorDbPathOption() {
     const std::string db_path = dir + "/meta/shared.db";
 
     CatalogPlugin p;
+    TestBuiltinRegistry builtin_registry;
+    TestQuerier querier;
+    querier.builtin_registry = &builtin_registry;
     const std::string opt = MakeCatalogOptionWithDbPath(dir, db_path);
     ASSERT_EQ(p.Option(opt.c_str()), 0);
-    ASSERT_EQ(p.Load(nullptr), 0);
+    ASSERT_EQ(p.Load(&querier), 0);
     ASSERT_EQ(p.Start(), 0);
 
     std::vector<OperatorMeta> batch;
@@ -577,9 +649,12 @@ static void TestHttpRoutes() {
     const std::string upload = MakeTempDir("http_upload");
 
     CatalogPlugin p;
+    TestBuiltinRegistry builtin_registry;
+    TestQuerier querier;
+    querier.builtin_registry = &builtin_registry;
     const std::string opt = MakeCatalogOption(dir);
     ASSERT_EQ(p.Option(opt.c_str()), 0);
-    ASSERT_EQ(p.Load(nullptr), 0);
+    ASSERT_EQ(p.Load(&querier), 0);
     ASSERT_EQ(p.Start(), 0);
 
     std::unordered_map<std::string, fnRouterHandler> routes;
