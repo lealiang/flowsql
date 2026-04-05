@@ -86,6 +86,71 @@ static std::string StreamNamePart(const std::string& name) {
     return name.substr(strlen("stream."));
 }
 
+struct ParsedChannelRef {
+    std::string raw;
+    std::string base;
+    bool has_selector = false;
+    bool wildcard_selector = false;
+    int selector_index = -1;
+};
+
+static bool ParseChannelRef(const std::string& raw,
+                            ParsedChannelRef* out,
+                            std::string* err) {
+    if (!out) return false;
+    if (err) err->clear();
+    out->raw = raw;
+    out->base.clear();
+    out->has_selector = false;
+    out->wildcard_selector = false;
+    out->selector_index = -1;
+
+    if (raw.empty()) {
+        if (err) *err = "empty channel reference";
+        return false;
+    }
+
+    const auto lb = raw.find('[');
+    if (lb == std::string::npos) {
+        out->base = raw;
+        return true;
+    }
+
+    const auto rb = raw.find(']', lb + 1);
+    if (rb == std::string::npos) {
+        if (err) *err = "invalid channel selector: missing ']'";
+        return false;
+    }
+    if (raw.find('[', rb + 1) != std::string::npos || rb + 1 != raw.size()) {
+        if (err) *err = "invalid channel selector: duplicate selector is not allowed";
+        return false;
+    }
+
+    out->base = raw.substr(0, lb);
+    if (out->base.empty()) {
+        if (err) *err = "invalid channel selector: empty base channel";
+        return false;
+    }
+    const std::string selector = raw.substr(lb + 1, rb - lb - 1);
+    out->has_selector = true;
+    if (selector == "*") {
+        out->wildcard_selector = true;
+        return true;
+    }
+    if (selector.empty()) {
+        if (err) *err = "invalid channel selector: expected '*' or index";
+        return false;
+    }
+    for (char c : selector) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            if (err) *err = "invalid channel selector: expected '*' or index";
+            return false;
+        }
+    }
+    out->selector_index = std::atoi(selector.c_str());
+    return true;
+}
+
 static bool ParseDatabaseDestination(const std::string& dest,
                                      std::string* db_type,
                                      std::string* db_name,
@@ -140,6 +205,123 @@ static int32_t MapStreamManagerErrorToStatus(int rc) {
 
 static std::string MakeStreamChannelKey(const std::string& type, const std::string& name) {
     return ToLowerAscii(type) + "." + name;
+}
+
+static std::string NormalizeStreamRole(const std::string& role) {
+    const std::string lower = ToLowerAscii(role);
+    if (lower == "source" || lower == "sink" || lower == "both") return lower;
+    return "";
+}
+
+static bool IsSourceRoleAllowed(const std::string& role) {
+    const std::string normalized = NormalizeStreamRole(role);
+    return normalized == "source" || normalized == "both";
+}
+
+static bool IsSinkRoleAllowed(const std::string& role) {
+    const std::string normalized = NormalizeStreamRole(role);
+    return normalized == "sink" || normalized == "both";
+}
+
+static int ParseOptionObject(const std::string& option, rapidjson::Document* out, std::string* err) {
+    if (!out) return EINVAL;
+    out->SetObject();
+    auto& alloc = out->GetAllocator();
+    if (option.empty()) return 0;
+
+    const std::string trimmed = [&option]() {
+        size_t begin = 0;
+        size_t end = option.size();
+        while (begin < end && std::isspace(static_cast<unsigned char>(option[begin]))) ++begin;
+        while (end > begin && std::isspace(static_cast<unsigned char>(option[end - 1]))) --end;
+        return option.substr(begin, end - begin);
+    }();
+
+    if (trimmed.empty()) return 0;
+    if (trimmed.front() == '{') {
+        out->Parse(trimmed.c_str());
+        if (out->HasParseError() || !out->IsObject()) {
+            if (err) *err = "option json parse failed";
+            return EINVAL;
+        }
+        return 0;
+    }
+
+    size_t pos = 0;
+    while (pos < trimmed.size()) {
+        const size_t eq = trimmed.find('=', pos);
+        if (eq == std::string::npos) break;
+        size_t end = trimmed.find(';', eq + 1);
+        if (end == std::string::npos) end = trimmed.size();
+
+        const std::string key = trimmed.substr(pos, eq - pos);
+        const std::string value = trimmed.substr(eq + 1, end - eq - 1);
+        if (!key.empty()) {
+            rapidjson::Value key_json(key.c_str(), alloc);
+            const std::string lower = ToLowerAscii(value);
+            bool is_int = !value.empty();
+            size_t i = 0;
+            if (is_int && (value[0] == '+' || value[0] == '-')) i = 1;
+            if (i >= value.size()) is_int = false;
+            for (; is_int && i < value.size(); ++i) {
+                if (!std::isdigit(static_cast<unsigned char>(value[i]))) {
+                    is_int = false;
+                }
+            }
+            if (lower == "true" || lower == "false") {
+                out->AddMember(key_json, rapidjson::Value(lower == "true"), alloc);
+            } else if (is_int) {
+                const int64_t num = static_cast<int64_t>(std::strtoll(value.c_str(), nullptr, 10));
+                out->AddMember(key_json, rapidjson::Value(num), alloc);
+            } else {
+                out->AddMember(key_json, rapidjson::Value(value.c_str(), alloc), alloc);
+            }
+        }
+        pos = (end < trimmed.size()) ? end + 1 : trimmed.size();
+    }
+    return 0;
+}
+
+static std::string OptionObjectToJson(const rapidjson::Value& option_obj) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    option_obj.Accept(w);
+    return buf.GetString();
+}
+
+static std::string BuildOptionWithRoleJson(const rapidjson::Value* options,
+                                           const std::string& role) {
+    rapidjson::Document d;
+    d.SetObject();
+    auto& alloc = d.GetAllocator();
+    if (options && options->IsObject()) {
+        for (auto it = options->MemberBegin(); it != options->MemberEnd(); ++it) {
+            rapidjson::Value key;
+            key.SetString(it->name.GetString(), alloc);
+            rapidjson::Value value;
+            value.CopyFrom(it->value, alloc);
+            d.AddMember(key, value, alloc);
+        }
+    }
+    rapidjson::Value role_key("role", alloc);
+    rapidjson::Value role_value(role.c_str(), alloc);
+    if (d.HasMember("role")) {
+        d["role"] = role_value;
+    } else {
+        d.AddMember(role_key, role_value, alloc);
+    }
+    return OptionObjectToJson(d);
+}
+
+static std::string ReadRoleFromOption(const std::string& option) {
+    rapidjson::Document d;
+    std::string parse_err;
+    if (ParseOptionObject(option, &d, &parse_err) != 0 || !d.IsObject()) {
+        return "both";
+    }
+    if (!d.HasMember("role") || !d["role"].IsString()) return "both";
+    const std::string role = NormalizeStreamRole(d["role"].GetString());
+    return role.empty() ? "both" : role;
 }
 
 // --- JSON 辅助 ---
@@ -358,6 +540,14 @@ static void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
     w->Int(s.error_code);
     w->Key("error_message");
     w->String(s.error_message.c_str());
+    w->Key("resolved_sources");
+    w->StartArray();
+    for (const auto& source : s.resolved_sources) {
+        w->String(source.c_str());
+    }
+    w->EndArray();
+    w->Key("source_expand_rule");
+    w->String(s.source_expand_rule.c_str());
 
     rapidjson::Document stats_doc;
     if (!s.op_stats_json.empty()) {
@@ -604,6 +794,10 @@ int SchedulerPlugin::Option(const char* arg) {
         if (key == "host") host_ = val;
         else if (key == "port") port_ = std::stoi(val);
         else if (key == "stream_workers") stream_worker_count_ = static_cast<size_t>(std::stoull(val));
+        else if (key == "max_resolved_sources") {
+            const size_t parsed = static_cast<size_t>(std::stoull(val));
+            max_resolved_sources_ = std::max<size_t>(1, parsed);
+        }
 
         pos = (end < opts.size()) ? end + 1 : opts.size();
     }
@@ -803,6 +997,27 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
         auto ch = ch_registry->Get(DataFrameNamePart(name).c_str());
         auto* df = dynamic_cast<IDataFrameChannel*>(ch.get());
         if (df) return df;
+    }
+
+    if (IsStreamRef(name) && querier_) {
+        auto* stream_factory = static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY));
+        if (stream_factory) {
+            const std::string target = StreamNamePart(name);
+            IStreamChannel* matched = nullptr;
+            bool ambiguous = false;
+            stream_factory->List([&](const char*, const char* stream_name, IStreamChannel* stream_ch) {
+                if (!stream_name || !stream_ch) return;
+                if (target != stream_name) return;
+                if (matched && matched != stream_ch) {
+                    ambiguous = true;
+                    return;
+                }
+                matched = stream_ch;
+            });
+            if (!ambiguous && matched) {
+                return matched;
+            }
+        }
     }
 
     // 先在内部通道表中查找
@@ -1177,6 +1392,182 @@ std::string SchedulerPlugin::NextStreamTaskId() {
     return oss.str();
 }
 
+std::string SchedulerPlugin::QueryStreamChannelRole(const std::string& type, const std::string& name) {
+    auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
+    if (!stream_manager) return "both";
+    std::string role = "both";
+    const std::string expect_type = ToLowerAscii(type);
+    stream_manager->QueryChannels([&](const std::string& ch_type,
+                                      const std::string& ch_name,
+                                      const std::string& option,
+                                      const std::string&) {
+        if (ToLowerAscii(ch_type) != expect_type || ch_name != name) return;
+        role = ReadRoleFromOption(option);
+    });
+    return role;
+}
+
+int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
+                                               SourceResolveResult* out,
+                                               std::string* err_rsp) {
+    if (!out) {
+        if (err_rsp) *err_rsp = MakeErrorJson("source resolve target is null");
+        return error::INTERNAL_ERROR;
+    }
+    out->channels.clear();
+    out->stream_channels.clear();
+    out->source_keys.clear();
+    out->resolved_sources.clear();
+    out->source_expand_rule = "explicit";
+    out->has_stream_source = false;
+    out->has_non_stream_source = false;
+    if (err_rsp) err_rsp->clear();
+
+    auto fail = [&](int32_t status,
+                    const std::string& message,
+                    const std::string& error_code = "") -> int32_t {
+        if (err_rsp) {
+            if (error_code.empty()) {
+                *err_rsp = MakeErrorJson(message);
+            } else {
+                *err_rsp = MakeExecutionErrorJson(message, error_code, "source_resolve");
+            }
+        }
+        return status;
+    };
+
+    if (stmt.sources.empty()) {
+        return fail(error::BAD_REQUEST, "source channel not found");
+    }
+
+    for (const auto& source_ref : stmt.sources) {
+        ParsedChannelRef ref;
+        std::string parse_err;
+        if (!ParseChannelRef(source_ref, &ref, &parse_err)) {
+            return fail(error::BAD_REQUEST, parse_err, "STREAM_HUB_SELECTOR_INVALID");
+        }
+
+        IChannel* source_ch = FindChannel(ref.base);
+        if (!source_ch) {
+            return fail(IsDataFrameRef(ref.base) ? error::NOT_FOUND : error::BAD_REQUEST,
+                        "source channel not found: " + ref.base);
+        }
+
+        const std::string source_type = source_ch->Type() ? source_ch->Type() : "";
+        if (source_type == ChannelType::kBlockStream) {
+            return fail(error::BAD_REQUEST,
+                        "block stream source is not implemented in current release",
+                        "BLOCK_STREAM_NOT_IMPLEMENTED");
+        }
+
+        if (source_type != ChannelType::kStream) {
+            if (ref.has_selector) {
+                return fail(error::BAD_REQUEST,
+                            "channel selector is only supported on stream_hub source: " + source_ref,
+                            "STREAM_HUB_SELECTOR_INVALID");
+            }
+            out->has_non_stream_source = true;
+            out->channels.push_back(source_ch);
+            out->resolved_sources.push_back(ref.base);
+            continue;
+        }
+
+        out->has_stream_source = true;
+        auto* stream_ch = dynamic_cast<IStreamChannel*>(source_ch);
+        if (!stream_ch) {
+            return fail(error::BAD_REQUEST,
+                        "source channel cast to IStreamChannel failed: " + ref.base);
+        }
+        const std::string source_role = QueryStreamChannelRole(stream_ch->Category(), stream_ch->Name());
+        if (!IsSourceRoleAllowed(source_role)) {
+            return fail(error::BAD_REQUEST,
+                        "stream channel role does not allow source: " +
+                            std::string(stream_ch->Category()) + "." + stream_ch->Name(),
+                        "STREAM_CHANNEL_ROLE_MISMATCH");
+        }
+
+        if (stream_ch->IsHubChannel()) {
+            if (IEquals(stream_ch->HubModeHint() ? stream_ch->HubModeHint() : "", "merge")) {
+                if (ref.has_selector) {
+                    return fail(error::BAD_REQUEST,
+                                "stream_hub(merge) does not allow selector: " + source_ref,
+                                "STREAM_HUB_SELECTOR_NOT_ALLOWED_MERGE");
+                }
+                out->channels.push_back(stream_ch);
+                out->stream_channels.push_back(std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {}));
+                out->source_keys.push_back(MakeStreamChannelKey(stream_ch->Category(), stream_ch->Name()));
+                out->resolved_sources.push_back(ref.base);
+                continue;
+            }
+
+            const size_t partition_count = stream_ch->HubPartitionCount();
+            if (partition_count == 0) {
+                return fail(error::BAD_REQUEST,
+                            "stream_hub(split) has no derived partitions: " + ref.base,
+                            "STREAM_HUB_SELECTOR_INVALID");
+            }
+            if (partition_count > max_resolved_sources_) {
+                return fail(error::BAD_REQUEST,
+                            "resolved sources exceed max_resolved_sources: " +
+                                std::to_string(partition_count) + " > " + std::to_string(max_resolved_sources_),
+                            "STREAM_HUB_SELECTOR_OUT_OF_RANGE");
+            }
+
+            if (!ref.has_selector || ref.wildcard_selector) {
+                if (!ref.has_selector) {
+                    out->source_expand_rule = "auto_wildcard";
+                }
+                for (size_t i = 0; i < partition_count; ++i) {
+                    auto partition = stream_ch->HubPartition(i);
+                    if (!partition) {
+                        return fail(error::BAD_REQUEST,
+                                    "stream_hub partition resolve failed: " + ref.base,
+                                    "STREAM_HUB_SELECTOR_INVALID");
+                    }
+                    out->channels.push_back(partition.get());
+                    out->stream_channels.push_back(partition);
+                    out->source_keys.push_back(
+                        MakeStreamChannelKey(partition->Category(), partition->Name()));
+                    out->resolved_sources.push_back(
+                        ref.base + "[" + std::to_string(i) + "]");
+                }
+                continue;
+            }
+
+            const int idx = ref.selector_index;
+            if (idx < 0 || static_cast<size_t>(idx) >= partition_count) {
+                return fail(error::BAD_REQUEST,
+                            "stream_hub selector out of range: " + source_ref,
+                            "STREAM_HUB_SELECTOR_OUT_OF_RANGE");
+            }
+            auto partition = stream_ch->HubPartition(static_cast<size_t>(idx));
+            if (!partition) {
+                return fail(error::BAD_REQUEST,
+                            "stream_hub partition resolve failed: " + source_ref,
+                            "STREAM_HUB_SELECTOR_INVALID");
+            }
+            out->channels.push_back(partition.get());
+            out->stream_channels.push_back(partition);
+            out->source_keys.push_back(
+                MakeStreamChannelKey(partition->Category(), partition->Name()));
+            out->resolved_sources.push_back(ref.base + "[" + std::to_string(idx) + "]");
+            continue;
+        }
+
+        if (ref.has_selector) {
+            return fail(error::BAD_REQUEST,
+                        "channel selector is only supported on stream_hub source: " + source_ref,
+                        "STREAM_HUB_SELECTOR_INVALID");
+        }
+        out->channels.push_back(stream_ch);
+        out->stream_channels.push_back(std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {}));
+        out->source_keys.push_back(MakeStreamChannelKey(stream_ch->Category(), stream_ch->Name()));
+        out->resolved_sources.push_back(ref.base);
+    }
+
+    return error::OK;
+}
+
 int32_t SchedulerPlugin::ResolveStreamSink(
     const SqlStatement& stmt,
     SinkBinding* binding,
@@ -1196,7 +1587,23 @@ int32_t SchedulerPlugin::ResolveStreamSink(
         return error::BAD_REQUEST;
     }
 
-    if (IsStreamRef(stmt.dest)) {
+    ParsedChannelRef dest_ref;
+    std::string dest_parse_err;
+    if (!ParseChannelRef(stmt.dest, &dest_ref, &dest_parse_err)) {
+        if (err_out) *err_out = dest_parse_err;
+        return error::BAD_REQUEST;
+    }
+    if (dest_ref.has_selector && IsStreamRef(dest_ref.base)) {
+        if (err_out) {
+            *err_out = MakeExecutionErrorJson(
+                "INTO stream selector is not allowed: " + stmt.dest,
+                "STREAM_HUB_SELECTOR_NOT_ALLOWED_INTO",
+                "sink_resolve");
+        }
+        return error::BAD_REQUEST;
+    }
+
+    if (IsStreamRef(dest_ref.base)) {
         auto* stream_factory = querier_
             ? static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY))
             : nullptr;
@@ -1205,7 +1612,7 @@ int32_t SchedulerPlugin::ResolveStreamSink(
             return error::UNAVAILABLE;
         }
 
-        const std::string sink_name = StreamNamePart(stmt.dest);
+        const std::string sink_name = StreamNamePart(dest_ref.base);
         IStreamChannel* matched = nullptr;
         bool ambiguous = false;
         stream_factory->List([&](const char*, const char* name, IStreamChannel* ch) {
@@ -1222,8 +1629,19 @@ int32_t SchedulerPlugin::ResolveStreamSink(
             return error::CONFLICT;
         }
         if (!matched) {
-            if (err_out) *err_out = "stream sink not found: " + stmt.dest;
+            if (err_out) *err_out = "stream sink not found: " + dest_ref.base;
             return error::NOT_FOUND;
+        }
+        const std::string sink_role = QueryStreamChannelRole(matched->Category(), matched->Name());
+        if (!IsSinkRoleAllowed(sink_role)) {
+            if (err_out) {
+                *err_out = MakeExecutionErrorJson(
+                    "stream channel role does not allow sink: " +
+                        std::string(matched->Category()) + "." + matched->Name(),
+                    "STREAM_CHANNEL_ROLE_MISMATCH",
+                    "sink_resolve");
+            }
+            return error::BAD_REQUEST;
         }
 
         auto output = std::shared_ptr<IStreamChannel>(matched, [](IStreamChannel*) {});
@@ -1235,7 +1653,12 @@ int32_t SchedulerPlugin::ResolveStreamSink(
         return error::OK;
     }
 
-    if (IsDataFrameRef(stmt.dest)) {
+    if (dest_ref.has_selector) {
+        if (err_out) *err_out = "selector is only supported for stream source";
+        return error::BAD_REQUEST;
+    }
+
+    if (IsDataFrameRef(dest_ref.base)) {
         auto* ch_registry = querier_
             ? static_cast<IChannelRegistry*>(querier_->First(IID_CHANNEL_REGISTRY))
             : nullptr;
@@ -1244,7 +1667,7 @@ int32_t SchedulerPlugin::ResolveStreamSink(
             return error::UNAVAILABLE;
         }
 
-        const std::string df_name = DataFrameNamePart(stmt.dest);
+        const std::string df_name = DataFrameNamePart(dest_ref.base);
         std::shared_ptr<IChannel> df_holder = ch_registry->Get(df_name.c_str());
         if (!df_holder) {
             auto created = std::make_shared<DataFrameChannel>("dataframe", df_name);
@@ -1253,7 +1676,7 @@ int32_t SchedulerPlugin::ResolveStreamSink(
                 // 处理并发注册：重查一次
                 df_holder = ch_registry->Get(df_name.c_str());
                 if (!df_holder) {
-                    if (err_out) *err_out = "register dataframe sink failed: " + stmt.dest;
+                    if (err_out) *err_out = "register dataframe sink failed: " + dest_ref.base;
                     return error::INTERNAL_ERROR;
                 }
             } else {
@@ -1263,7 +1686,7 @@ int32_t SchedulerPlugin::ResolveStreamSink(
 
         auto appendable = std::dynamic_pointer_cast<IAppendableDataFrameChannel>(df_holder);
         if (!appendable) {
-            if (err_out) *err_out = "dataframe sink is not appendable: " + stmt.dest;
+            if (err_out) *err_out = "dataframe sink is not appendable: " + dest_ref.base;
             return error::BAD_REQUEST;
         }
         if (!appendable->IsOpened()) {
@@ -1278,13 +1701,13 @@ int32_t SchedulerPlugin::ResolveStreamSink(
     std::string db_type;
     std::string db_name;
     std::string table_from_dest;
-    if (!ParseDatabaseDestination(stmt.dest, &db_type, &db_name, &table_from_dest)) {
-        if (err_out) *err_out = "invalid INTO destination: " + stmt.dest +
+    if (!ParseDatabaseDestination(dest_ref.base, &db_type, &db_name, &table_from_dest)) {
+        if (err_out) *err_out = "invalid INTO destination: " + dest_ref.base +
             ", expected stream.<name>, dataframe.<name>, or <db_type>.<db_name>[.<table>]";
         return error::BAD_REQUEST;
     }
 
-    if (IChannel* existing = FindChannel(stmt.dest); existing) {
+    if (IChannel* existing = FindChannel(dest_ref.base); existing) {
         if (!existing->IsOpened()) {
             (void)existing->Open();
         }
@@ -1483,35 +1906,19 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
         return error::CONFLICT;
     }
 
-    std::vector<std::shared_ptr<IStreamChannel>> source_channels;
-    source_channels.reserve(stmt.sources.size());
-    std::vector<std::string> source_keys;
-    source_keys.reserve(stmt.sources.size());
-    for (const auto& source_name : stmt.sources) {
-        IChannel* raw = FindChannel(source_name);
-        if (!raw) {
-            rsp = MakeErrorJson("source channel not found: " + source_name);
-            return error::NOT_FOUND;
-        }
-        if (std::string(raw->Type()) == ChannelType::kBlockStream) {
-            rsp = MakeExecutionErrorJson(
-                "block stream source is not implemented in current release",
-                "BLOCK_STREAM_NOT_IMPLEMENTED",
-                "source_resolve");
-            return error::BAD_REQUEST;
-        }
-        if (std::string(raw->Type()) != ChannelType::kStream) {
-            rsp = MakeErrorJson("source channel is not stream type: " + source_name);
-            return error::BAD_REQUEST;
-        }
-        auto* stream_ch = dynamic_cast<IStreamChannel*>(raw);
-        if (!stream_ch) {
-            rsp = MakeErrorJson("source channel cast to IStreamChannel failed: " + source_name);
-            return error::BAD_REQUEST;
-        }
-        source_channels.push_back(std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {}));
-        source_keys.push_back(MakeStreamChannelKey(raw->Category(), raw->Name()));
+    SourceResolveResult source_resolved;
+    std::string source_err_rsp;
+    const int32_t source_rc = ResolveSourceBindings(stmt, &source_resolved, &source_err_rsp);
+    if (source_rc != error::OK) {
+        rsp = source_err_rsp.empty() ? MakeErrorJson("source resolve failed") : source_err_rsp;
+        return source_rc;
     }
+    if (!source_resolved.has_stream_source || source_resolved.has_non_stream_source) {
+        rsp = MakeErrorJson("stream task requires stream source only");
+        return error::BAD_REQUEST;
+    }
+    std::vector<std::shared_ptr<IStreamChannel>> source_channels = source_resolved.stream_channels;
+    std::vector<std::string> source_keys = source_resolved.source_keys;
     if (source_channels.empty()) {
         rsp = MakeErrorJson("source channel not found");
         return error::BAD_REQUEST;
@@ -1530,7 +1937,11 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     std::string sink_error;
     const int32_t sink_rc = ResolveStreamSink(stmt, &sink_binding, &sink_error);
     if (sink_rc != error::OK) {
-        rsp = MakeErrorJson(sink_error);
+        if (!sink_error.empty() && sink_error.front() == '{') {
+            rsp = sink_error;
+        } else {
+            rsp = MakeErrorJson(sink_error);
+        }
         return sink_rc;
     }
     auto output = sink_binding.sink_channel;
@@ -1799,6 +2210,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
             static_schema != nullptr));
     }
     task->PrepareForRun(static_cast<uint32_t>(input_ports.size()), CurrentTimeMs());
+    task->SetSourceResolveMeta(source_resolved.resolved_sources, source_resolved.source_expand_rule);
 
     const int open_rc = open_target->Open();
     if (open_rc != 0) {
@@ -1823,6 +2235,16 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     w.String("submitted");
     w.Key("runtime_task_id");
     w.String(task->Id().c_str());
+    w.Key("task_id");
+    w.String(task->Id().c_str());
+    w.Key("resolved_sources");
+    w.StartArray();
+    for (const auto& source_name : source_resolved.resolved_sources) {
+        w.String(source_name.c_str());
+    }
+    w.EndArray();
+    w.Key("source_expand_rule");
+    w.String(source_resolved.source_expand_rule.c_str());
     w.EndObject();
     rsp = buf.GetString();
     return error::OK;
@@ -1855,35 +2277,18 @@ int32_t SchedulerPlugin::ClassifySqlTaskKind(const std::string& sql_text,
         return error::BAD_REQUEST;
     }
 
-    bool has_stream_source = false;
-    bool has_non_stream_source = false;
-    for (const auto& source_name : stmt.sources) {
-        IChannel* ch = FindChannel(source_name);
-        if (!ch) {
-            *err_rsp = MakeErrorJson("source channel not found: " + source_name);
-            return IsDataFrameRef(source_name) ? error::NOT_FOUND : error::BAD_REQUEST;
-        }
-        const std::string source_type = ch->Type() ? ch->Type() : "";
-        if (source_type == ChannelType::kBlockStream) {
-            *err_rsp = MakeExecutionErrorJson(
-                "block stream source is not implemented in current release",
-                "BLOCK_STREAM_NOT_IMPLEMENTED",
-                "source_resolve");
-            return error::BAD_REQUEST;
-        }
-        if (source_type == ChannelType::kStream) {
-            has_stream_source = true;
-        } else {
-            has_non_stream_source = true;
-        }
+    SourceResolveResult source_resolved;
+    const int32_t resolve_rc = ResolveSourceBindings(stmt, &source_resolved, err_rsp);
+    if (resolve_rc != error::OK) {
+        return resolve_rc;
     }
 
-    if (has_stream_source && has_non_stream_source) {
+    if (source_resolved.has_stream_source && source_resolved.has_non_stream_source) {
         *err_rsp = MakeErrorJson("mixed stream and non-stream sources are not supported");
         return error::BAD_REQUEST;
     }
 
-    *task_kind = has_stream_source ? "stream" : "batch";
+    *task_kind = source_resolved.has_stream_source ? "stream" : "batch";
     return error::OK;
 }
 
@@ -2073,44 +2478,22 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
         return error::BAD_REQUEST;
     }
 
-    std::vector<IChannel*> input_channels;
-    input_channels.reserve(stmt.sources.size());
-    for (const auto& name : stmt.sources) {
-        IChannel* ch = FindChannel(name);
-        if (!ch) {
-            rsp = MakeErrorJson("source channel not found: " + name);
-            return IsDataFrameRef(name) ? error::NOT_FOUND : error::BAD_REQUEST;
-        }
-        input_channels.push_back(ch);
+    SourceResolveResult source_resolved;
+    std::string source_err_rsp;
+    const int32_t source_rc = ResolveSourceBindings(stmt, &source_resolved, &source_err_rsp);
+    if (source_rc != error::OK) {
+        rsp = source_err_rsp.empty() ? MakeErrorJson("source resolve failed") : source_err_rsp;
+        return source_rc;
     }
-
-    for (auto* ch : input_channels) {
-        if (ch && std::string(ch->Type()) == ChannelType::kBlockStream) {
-            rsp = MakeExecutionErrorJson(
-                "block stream source is not implemented in current release",
-                "BLOCK_STREAM_NOT_IMPLEMENTED",
-                "source_resolve");
-            return error::BAD_REQUEST;
-        }
+    if (source_resolved.has_stream_source && source_resolved.has_non_stream_source) {
+        rsp = MakeErrorJson("mixed stream and non-stream sources are not supported");
+        return error::BAD_REQUEST;
     }
-
-    bool has_stream_source = false;
-    bool has_non_stream_source = false;
-    for (auto* ch : input_channels) {
-        if (!ch) continue;
-        if (std::string(ch->Type()) == ChannelType::kStream) {
-            has_stream_source = true;
-        } else {
-            has_non_stream_source = true;
-        }
-    }
-    if (has_stream_source) {
-        if (has_non_stream_source) {
-            rsp = MakeErrorJson("mixed stream and non-stream sources are not supported");
-            return error::BAD_REQUEST;
-        }
+    if (source_resolved.has_stream_source) {
         return ExecuteStreamTask(stmt, rsp);
     }
+
+    std::vector<IChannel*> input_channels = source_resolved.channels;
 
     std::vector<std::shared_ptr<IOperator>> op_holders;
     std::vector<IOperator*> op_chain;
@@ -2465,11 +2848,12 @@ int32_t SchedulerPlugin::HandleQueryStreamChannels(const std::string&,
     w.StartArray();
 
     auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
+    auto* stream_factory = querier_ ? static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY)) : nullptr;
     if (stream_manager) {
-        stream_manager->QueryChannels([this, &w](const std::string& type,
-                                                 const std::string& name,
-                                                 const std::string& option,
-                                                 const std::string& status) {
+        stream_manager->QueryChannels([this, stream_factory, &w](const std::string& type,
+                                                                 const std::string& name,
+                                                                 const std::string& option,
+                                                                 const std::string& status) {
             const std::string key = MakeStreamChannelKey(type, name);
             uint32_t in_use_count = 0;
             {
@@ -2477,18 +2861,85 @@ int32_t SchedulerPlugin::HandleQueryStreamChannels(const std::string&,
                 auto it = stream_channel_ref_counts_.find(key);
                 if (it != stream_channel_ref_counts_.end()) in_use_count = it->second;
             }
+            IStreamChannel* stream_ch = stream_factory ? stream_factory->Get(type.c_str(), name.c_str()) : nullptr;
+            const std::string role = ReadRoleFromOption(option);
+
+            rapidjson::Document option_doc;
+            std::string option_parse_err;
+            const bool option_ok = (ParseOptionObject(option, &option_doc, &option_parse_err) == 0 && option_doc.IsObject());
 
             w.StartObject();
             w.Key("type");
             w.String(type.c_str());
             w.Key("name");
             w.String(name.c_str());
+            w.Key("role");
+            w.String(role.c_str());
             w.Key("option");
             w.String(option.c_str());
+            w.Key("option_json");
+            if (option_ok) {
+                rapidjson::Document option_only;
+                option_only.SetObject();
+                auto& alloc = option_only.GetAllocator();
+                for (auto it = option_doc.MemberBegin(); it != option_doc.MemberEnd(); ++it) {
+                    if (std::string(it->name.GetString()) == "role") continue;
+                    rapidjson::Value key_json;
+                    key_json.SetString(it->name.GetString(), alloc);
+                    rapidjson::Value val_json;
+                    val_json.CopyFrom(it->value, alloc);
+                    option_only.AddMember(key_json, val_json, alloc);
+                }
+                const std::string option_json = OptionObjectToJson(option_only);
+                w.RawValue(option_json.c_str(), option_json.size(), rapidjson::kObjectType);
+            } else {
+                w.StartObject();
+                w.EndObject();
+            }
             w.Key("status");
             w.String(status.c_str());
             w.Key("in_use");
             w.Bool(in_use_count > 0);
+            w.Key("capacity");
+            w.Uint64(stream_ch ? stream_ch->Capacity() : 0);
+            w.Key("size");
+            w.Uint64(stream_ch ? stream_ch->Size() : 0);
+            w.Key("is_finite");
+            w.Bool(stream_ch ? stream_ch->IsFinite() : false);
+            w.Key("is_finished");
+            w.Bool(stream_ch ? stream_ch->IsFinished() : true);
+            w.Key("derived_channels");
+            w.StartArray();
+            if (stream_ch && stream_ch->IsHubChannel() &&
+                IEquals(stream_ch->HubModeHint() ? stream_ch->HubModeHint() : "", "split")) {
+                for (size_t i = 0; i < stream_ch->HubPartitionCount(); ++i) {
+                    auto partition = stream_ch->HubPartition(i);
+                    if (!partition) continue;
+                    std::string part_status = "running";
+                    if (partition->IsFinished() && partition->IsEmpty()) {
+                        part_status = "stopped";
+                    } else if (partition->IsFinished()) {
+                        part_status = "draining";
+                    }
+                    w.StartObject();
+                    w.Key("index");
+                    w.Uint(static_cast<unsigned>(i));
+                    w.Key("name");
+                    w.String(partition->Name());
+                    w.Key("status");
+                    w.String(part_status.c_str());
+                    w.Key("capacity");
+                    w.Uint64(partition->Capacity());
+                    w.Key("size");
+                    w.Uint64(partition->Size());
+                    w.Key("is_finite");
+                    w.Bool(partition->IsFinite());
+                    w.Key("is_finished");
+                    w.Bool(partition->IsFinished());
+                    w.EndObject();
+                }
+            }
+            w.EndArray();
             w.EndObject();
         });
     }
@@ -2515,28 +2966,78 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
         return error::BAD_REQUEST;
     }
 
-    auto parse_field = [&doc](const char* key, std::string* out) {
-        if (!out) return;
-        out->clear();
-        if (!doc.HasMember(key) || !doc[key].IsString()) return;
-        *out = doc[key].GetString();
-    };
-
     std::string type;
     std::string name;
-    std::string option;
-    parse_field("type", &type);
-    parse_field("name", &name);
-    parse_field("option", &option);
-    if ((type.empty() || name.empty()) && doc.HasMember("config") && doc["config"].IsObject()) {
-        const auto& cfg = doc["config"];
-        if (type.empty() && cfg.HasMember("type") && cfg["type"].IsString()) type = cfg["type"].GetString();
-        if (name.empty() && cfg.HasMember("name") && cfg["name"].IsString()) name = cfg["name"].GetString();
-        if (option.empty() && cfg.HasMember("option") && cfg["option"].IsString()) option = cfg["option"].GetString();
+    std::string role_raw;
+    std::string option_legacy;
+    const rapidjson::Value* options_obj = nullptr;
+    const rapidjson::Value* cfg = (doc.HasMember("config") && doc["config"].IsObject()) ? &doc["config"] : nullptr;
+    auto read_string = [&](const char* key, std::string* out) {
+        if (!out) return;
+        out->clear();
+        if (doc.HasMember(key) && doc[key].IsString()) {
+            *out = doc[key].GetString();
+            return;
+        }
+        if (cfg && cfg->HasMember(key) && (*cfg)[key].IsString()) {
+            *out = (*cfg)[key].GetString();
+        }
+    };
+    read_string("type", &type);
+    read_string("name", &name);
+    read_string("role", &role_raw);
+    read_string("option", &option_legacy);
+    if (doc.HasMember("options") && doc["options"].IsObject()) {
+        options_obj = &doc["options"];
+    } else if (cfg && cfg->HasMember("options") && (*cfg)["options"].IsObject()) {
+        options_obj = &(*cfg)["options"];
     }
     if (type.empty() || name.empty()) {
-        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"option\":\"...\"}");
+        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"role\":\"...\",\"options\":{...}}");
         return error::BAD_REQUEST;
+    }
+    std::string role = role_raw.empty() ? "both" : NormalizeStreamRole(role_raw);
+    if (role.empty()) {
+        rsp = MakeErrorJson("invalid role, expected source|sink|both");
+        return error::BAD_REQUEST;
+    }
+    if (!option_legacy.empty() && role_raw.empty()) {
+        role = ReadRoleFromOption(option_legacy);
+    }
+
+    auto* builtin_registry = querier_ ? static_cast<IBuiltinRegistry*>(querier_->First(IID_BUILTIN_REGISTRY)) : nullptr;
+    if (builtin_registry) {
+        StreamChannelTypeDescriptor def;
+        if (builtin_registry->FindStreamChannelType(type, &def) != 0) {
+            rsp = MakeErrorJson("unsupported stream channel type: " + type);
+            return error::BAD_REQUEST;
+        }
+        bool allowed = def.allowed_roles.empty();
+        for (const auto& item : def.allowed_roles) {
+            if (NormalizeStreamRole(item) == role) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) {
+            rsp = MakeErrorJson("role is not allowed for stream type: " + type);
+            return error::BAD_REQUEST;
+        }
+    }
+
+    std::string option;
+    if (options_obj) {
+        option = BuildOptionWithRoleJson(options_obj, role);
+    } else if (!option_legacy.empty()) {
+        rapidjson::Document option_doc;
+        std::string parse_err;
+        if (ParseOptionObject(option_legacy, &option_doc, &parse_err) != 0 || !option_doc.IsObject()) {
+            rsp = MakeErrorJson("invalid option: " + parse_err);
+            return error::BAD_REQUEST;
+        }
+        option = BuildOptionWithRoleJson(&option_doc, role);
+    } else {
+        option = BuildOptionWithRoleJson(nullptr, role);
     }
 
     const int rc = stream_manager->AddChannel(ToLowerAscii(type), name, option);
@@ -2564,28 +3065,77 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
         return error::BAD_REQUEST;
     }
 
-    auto parse_field = [&doc](const char* key, std::string* out) {
-        if (!out) return;
-        out->clear();
-        if (!doc.HasMember(key) || !doc[key].IsString()) return;
-        *out = doc[key].GetString();
-    };
-
     std::string type;
     std::string name;
-    std::string option;
-    parse_field("type", &type);
-    parse_field("name", &name);
-    parse_field("option", &option);
-    if ((type.empty() || name.empty()) && doc.HasMember("config") && doc["config"].IsObject()) {
-        const auto& cfg = doc["config"];
-        if (type.empty() && cfg.HasMember("type") && cfg["type"].IsString()) type = cfg["type"].GetString();
-        if (name.empty() && cfg.HasMember("name") && cfg["name"].IsString()) name = cfg["name"].GetString();
-        if (option.empty() && cfg.HasMember("option") && cfg["option"].IsString()) option = cfg["option"].GetString();
+    std::string role_raw;
+    std::string option_legacy;
+    const rapidjson::Value* options_obj = nullptr;
+    const rapidjson::Value* cfg = (doc.HasMember("config") && doc["config"].IsObject()) ? &doc["config"] : nullptr;
+    auto read_string = [&](const char* key, std::string* out) {
+        if (!out) return;
+        out->clear();
+        if (doc.HasMember(key) && doc[key].IsString()) {
+            *out = doc[key].GetString();
+            return;
+        }
+        if (cfg && cfg->HasMember(key) && (*cfg)[key].IsString()) {
+            *out = (*cfg)[key].GetString();
+        }
+    };
+    read_string("type", &type);
+    read_string("name", &name);
+    read_string("role", &role_raw);
+    read_string("option", &option_legacy);
+    if (doc.HasMember("options") && doc["options"].IsObject()) {
+        options_obj = &doc["options"];
+    } else if (cfg && cfg->HasMember("options") && (*cfg)["options"].IsObject()) {
+        options_obj = &(*cfg)["options"];
     }
     if (type.empty() || name.empty()) {
-        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"option\":\"...\"}");
+        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"role\":\"...\",\"options\":{...}}");
         return error::BAD_REQUEST;
+    }
+    std::string role = role_raw.empty() ? "both" : NormalizeStreamRole(role_raw);
+    if (role.empty()) {
+        rsp = MakeErrorJson("invalid role, expected source|sink|both");
+        return error::BAD_REQUEST;
+    }
+    if (!option_legacy.empty() && role_raw.empty()) {
+        role = ReadRoleFromOption(option_legacy);
+    }
+
+    auto* builtin_registry = querier_ ? static_cast<IBuiltinRegistry*>(querier_->First(IID_BUILTIN_REGISTRY)) : nullptr;
+    if (builtin_registry) {
+        StreamChannelTypeDescriptor def;
+        if (builtin_registry->FindStreamChannelType(type, &def) != 0) {
+            rsp = MakeErrorJson("unsupported stream channel type: " + type);
+            return error::BAD_REQUEST;
+        }
+        bool allowed = def.allowed_roles.empty();
+        for (const auto& item : def.allowed_roles) {
+            if (NormalizeStreamRole(item) == role) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) {
+            rsp = MakeErrorJson("role is not allowed for stream type: " + type);
+            return error::BAD_REQUEST;
+        }
+    }
+    std::string option;
+    if (options_obj) {
+        option = BuildOptionWithRoleJson(options_obj, role);
+    } else if (!option_legacy.empty()) {
+        rapidjson::Document option_doc;
+        std::string parse_err;
+        if (ParseOptionObject(option_legacy, &option_doc, &parse_err) != 0 || !option_doc.IsObject()) {
+            rsp = MakeErrorJson("invalid option: " + parse_err);
+            return error::BAD_REQUEST;
+        }
+        option = BuildOptionWithRoleJson(&option_doc, role);
+    } else {
+        option = BuildOptionWithRoleJson(nullptr, role);
     }
 
     SweepFinishedTaskLeases();

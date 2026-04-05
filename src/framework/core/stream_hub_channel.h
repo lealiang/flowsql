@@ -2,7 +2,7 @@
 #define _FLOWSQL_FRAMEWORK_CORE_STREAM_HUB_CHANNEL_H_
 
 #include <framework/core/ring_stream_channel.h>
-#include <framework/interfaces/istream_channel.h>
+#include <framework/interfaces/istream_hub_channel.h>
 
 #include <atomic>
 #include <memory>
@@ -28,7 +28,7 @@ struct StreamHubOptions {
 StreamHubMode ParseStreamHubMode(const std::string& mode);
 const char* StreamHubModeName(StreamHubMode mode);
 
-class StreamHubChannel : public IStreamChannel {
+class StreamHubChannel : public IStreamHubChannel {
  public:
     StreamHubChannel(std::string category,
                      std::string name,
@@ -36,8 +36,15 @@ class StreamHubChannel : public IStreamChannel {
     ~StreamHubChannel() override;
 
     StreamHubMode mode() const { return options_.mode; }
-    size_t PartitionCount() const;
-    std::shared_ptr<IStreamChannel> GetPartition(size_t idx) const;
+    const char* HubMode() const override { return StreamHubModeName(options_.mode); }
+    size_t PartitionCount() const override;
+    std::shared_ptr<IStreamChannel> GetPartition(size_t idx) const override;
+    bool IsHubChannel() const override { return true; }
+    const char* HubModeHint() const override { return HubMode(); }
+    size_t HubPartitionCount() const override { return PartitionCount(); }
+    std::shared_ptr<IStreamChannel> HubPartition(size_t idx) const override {
+        return GetPartition(idx);
+    }
 
     // IChannel
     const char* Category() override { return category_.c_str(); }

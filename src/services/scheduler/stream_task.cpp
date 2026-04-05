@@ -198,6 +198,14 @@ void StreamTask::SetFailedOnce(int code, const std::string& msg) {
     status_.store(StreamTaskStatus::kFailed, std::memory_order_release);
 }
 
+void StreamTask::SetSourceResolveMeta(std::vector<std::string> resolved_sources,
+                                      std::string source_expand_rule) {
+    std::lock_guard<std::mutex> lock(source_meta_mu_);
+    resolved_sources_ = std::move(resolved_sources);
+    source_expand_rule_ = std::move(source_expand_rule);
+    if (source_expand_rule_.empty()) source_expand_rule_ = "explicit";
+}
+
 void StreamTask::TouchActive(int64_t now_ms) {
     last_active_ms_.store(now_ms, std::memory_order_relaxed);
 }
@@ -307,6 +315,11 @@ TaskSnapshot StreamTask::Snapshot() const {
     }
     merged += "]";
     s.op_stats_json = std::move(merged);
+    {
+        std::lock_guard<std::mutex> lock(source_meta_mu_);
+        s.resolved_sources = resolved_sources_;
+        s.source_expand_rule = source_expand_rule_;
+    }
     return s;
 }
 

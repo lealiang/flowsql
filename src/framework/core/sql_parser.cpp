@@ -41,6 +41,58 @@ std::string SqlParser::ReadIdentifier() {
     return std::string(start, pos_);
 }
 
+std::string SqlParser::ReadChannelRef(std::string* err) {
+    if (err) err->clear();
+    const std::string base = ReadIdentifier();
+    if (base.empty()) return "";
+
+    const char* saved = pos_;
+    SkipWhitespace();
+    if (pos_ >= end_ || *pos_ != '[') {
+        pos_ = saved;
+        return base;
+    }
+
+    ++pos_;  // skip '['
+    SkipWhitespace();
+    if (pos_ >= end_) {
+        if (err) *err = "invalid channel selector: missing ']'";
+        return "";
+    }
+
+    std::string selector;
+    if (*pos_ == '*') {
+        selector = "[*]";
+        ++pos_;
+    } else {
+        const char* digits_start = pos_;
+        while (pos_ < end_ && std::isdigit(static_cast<unsigned char>(*pos_))) {
+            ++pos_;
+        }
+        if (digits_start == pos_) {
+            if (err) *err = "invalid channel selector: expected '*' or index";
+            return "";
+        }
+        selector = "[";
+        selector.append(digits_start, pos_);
+        selector.push_back(']');
+    }
+
+    SkipWhitespace();
+    if (pos_ >= end_ || *pos_ != ']') {
+        if (err) *err = "invalid channel selector: missing ']'";
+        return "";
+    }
+    ++pos_;  // skip ']'
+
+    SkipWhitespace();
+    if (pos_ < end_ && *pos_ == '[') {
+        if (err) *err = "invalid channel selector: duplicate selector is not allowed";
+        return "";
+    }
+    return base + selector;
+}
+
 // 读取值：支持带引号的字符串或普通标识符
 std::string SqlParser::ReadValue() {
     SkipWhitespace();
@@ -184,8 +236,13 @@ SqlStatement SqlParser::Parse(const std::string& sql) {
         return stmt;
     }
     stmt.sources.clear();
-    stmt.sources.push_back(ReadIdentifier());
+    std::string channel_err;
+    stmt.sources.push_back(ReadChannelRef(&channel_err));
     if (stmt.sources[0].empty()) {
+        if (!channel_err.empty()) {
+            stmt.error = channel_err;
+            return stmt;
+        }
         stmt.error = "expected source channel name after FROM";
         return stmt;
     }
@@ -193,8 +250,12 @@ SqlStatement SqlParser::Parse(const std::string& sql) {
     while (pos_ < end_ && *pos_ == ',') {
         ++pos_;  // 跳过逗号
         SkipWhitespace();
-        std::string src = ReadIdentifier();
+        std::string src = ReadChannelRef(&channel_err);
         if (src.empty()) {
+            if (!channel_err.empty()) {
+                stmt.error = channel_err;
+                return stmt;
+            }
             stmt.error = "expected source channel name after ','";
             return stmt;
         }
@@ -359,8 +420,13 @@ SqlStatement SqlParser::Parse(const std::string& sql) {
 
     // [INTO <dest>]
     if (MatchKeyword("INTO")) {
-        stmt.dest = ReadIdentifier();
+        std::string dest_err;
+        stmt.dest = ReadChannelRef(&dest_err);
         if (stmt.dest.empty()) {
+            if (!dest_err.empty()) {
+                stmt.error = dest_err;
+                return stmt;
+            }
             stmt.error = "expected destination channel name after INTO";
             return stmt;
         }

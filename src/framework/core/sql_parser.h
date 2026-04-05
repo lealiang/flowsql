@@ -49,6 +49,7 @@ class SqlParser {
     void SkipWhitespace();
     bool MatchKeyword(const char* keyword);
     std::string ReadIdentifier();
+    std::string ReadChannelRef(std::string* err);
     std::string ReadValue();
 
     const char* pos_ = nullptr;

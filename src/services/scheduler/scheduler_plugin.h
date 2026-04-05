@@ -100,6 +100,19 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     int32_t ResolveStreamSink(const SqlStatement& stmt,
                               SinkBinding* binding,
                               std::string* err_out);
+    struct SourceResolveResult {
+        std::vector<IChannel*> channels;
+        std::vector<std::shared_ptr<IStreamChannel>> stream_channels;
+        std::vector<std::string> source_keys;
+        std::vector<std::string> resolved_sources;
+        std::string source_expand_rule = "explicit";
+        bool has_stream_source = false;
+        bool has_non_stream_source = false;
+    };
+    int32_t ResolveSourceBindings(const SqlStatement& stmt,
+                                  SourceResolveResult* out,
+                                  std::string* err_rsp);
+    std::string QueryStreamChannelRole(const std::string& type, const std::string& name);
     int TryAcquireStreamTaskLeases(const std::string& runtime_task_id,
                                    const std::vector<std::string>& source_keys,
                                    const std::vector<std::string>& sink_keys,
@@ -117,6 +130,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
 
     std::string host_ = "127.0.0.1";
     int port_ = 18803;
+    size_t max_resolved_sources_ = 64;
 
     // 用于生成唯一临时通道名
     std::atomic<uint64_t> tmp_channel_seq_{0};

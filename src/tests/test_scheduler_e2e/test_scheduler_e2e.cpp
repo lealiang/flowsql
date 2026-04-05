@@ -1221,13 +1221,15 @@ int main() {
                              R"({"type":"no_such_stream_type","name":"x_missing","option":""})",
                              rsp),
                   error::BAD_REQUEST);
-        ASSERT_TRUE(rsp.find("add stream channel failed") != std::string::npos);
+        ASSERT_TRUE(rsp.find("add stream channel failed") != std::string::npos ||
+                    rsp.find("unsupported stream channel type") != std::string::npos);
 
         ASSERT_EQ(stream_add("/channels/stream/add",
                              R"({"type":"ring","name":"x_invalid","option":"ring_mode=spsc;ring_size=3;overflow=drop;finite=false"})",
                              rsp),
                   error::BAD_REQUEST);
-        ASSERT_TRUE(rsp.find("add stream channel failed") != std::string::npos);
+        ASSERT_TRUE(rsp.find("add stream channel failed") != std::string::npos ||
+                    rsp.find("invalid option") != std::string::npos);
 
         ASSERT_EQ(stream_add("/channels/stream/add",
                              R"({"type":"ring","name":"x_dup","option":"ring_mode=spsc;ring_size=256;overflow=drop;finite=false;batch_rows=64"})",
@@ -1240,7 +1242,179 @@ int main() {
     }
     std::puts("[PASS] T44");
 
-    // T45: Web 代理流式通道查询接口（严格语义：上游不可达时返回 UNAVAILABLE）
+    // T46: Story 14.12 回归（结构化 add/query + split/merge selector 语义）
+    {
+        std::string rsp;
+        ASSERT_EQ(stream_add("/channels/stream/add", R"({
+            "type":"stream_hub",
+            "name":"npm_hub",
+            "role":"both",
+            "options":{
+                "mode":"split",
+                "partition_count":2,
+                "partition_ring_mode":"spsc",
+                "partition_ring_size":256
+            }
+        })", rsp), error::OK);
+
+        ASSERT_EQ(stream_add("/channels/stream/add", R"({
+            "type":"stream_hub",
+            "name":"npm_merge",
+            "role":"both",
+            "options":{
+                "mode":"merge",
+                "partition_count":2,
+                "partition_ring_mode":"spsc",
+                "partition_ring_size":256
+            }
+        })", rsp), error::OK);
+
+        ASSERT_EQ(stream_add("/channels/stream/add", R"({
+            "type":"ring",
+            "name":"source_only_ring",
+            "role":"source",
+            "options":{
+                "ring_mode":"spsc",
+                "ring_size":256,
+                "overflow":"drop",
+                "finite":false
+            }
+        })", rsp), error::OK);
+
+        ASSERT_EQ(stream_add("/channels/stream/add", R"({
+            "type":"ring",
+            "name":"sink_only_ring",
+            "role":"sink",
+            "options":{
+                "ring_mode":"spsc",
+                "ring_size":256,
+                "overflow":"drop",
+                "finite":false
+            }
+        })", rsp), error::OK);
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING builtin.passthrough_stream INTO stream.source_only_ring"),
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_CHANNEL_ROLE_MISMATCH") != std::string::npos);
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              MakeReq("SELECT * FROM stream.sink_only_ring "
+                                      "USING builtin.passthrough_stream INTO dataframe.sink_role_bad"),
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_CHANNEL_ROLE_MISMATCH") != std::string::npos);
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING builtin.passthrough_stream INTO stream.npm_hub[0]"),
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_HUB_SELECTOR_NOT_ALLOWED_INTO") != std::string::npos);
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              MakeReq("SELECT * FROM stream.npm_merge[*] "
+                                      "USING builtin.passthrough_stream INTO dataframe.npm_merge_bad"),
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_HUB_SELECTOR_NOT_ALLOWED_MERGE") != std::string::npos);
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                                      "USING builtin.passthrough_stream INTO stream.npm_hub"),
+                              rsp),
+                  error::OK);
+        std::string producer_task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!producer_task_id.empty());
+
+        auto wait_stream_terminal = [&](const std::string& task_id, std::string* final_status) -> bool {
+            for (int i = 0; i < 500; ++i) {
+                std::string s_rsp;
+                if (stream_status("/scheduler/stream/status", MakeTaskReq(task_id), s_rsp) != error::OK) {
+                    return false;
+                }
+                const std::string st = ParseStatus(s_rsp);
+                if (st == "stopped" || st == "cancelled" || st == "failed") {
+                    if (final_status) *final_status = st;
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            return false;
+        };
+
+        std::string terminal_status;
+        ASSERT_TRUE(wait_stream_terminal(producer_task_id, &terminal_status));
+        ASSERT_EQ(terminal_status, "stopped");
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              MakeReq("SELECT * FROM stream.npm_hub "
+                                      "USING builtin.passthrough_stream INTO dataframe.npm_auto"),
+                              rsp),
+                  error::OK);
+
+        rapidjson::Document exec_doc;
+        exec_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!exec_doc.HasParseError() && exec_doc.IsObject());
+        ASSERT_TRUE(exec_doc.HasMember("resolved_sources") && exec_doc["resolved_sources"].IsArray());
+        ASSERT_EQ(exec_doc["resolved_sources"].Size(), 2u);
+        ASSERT_TRUE(exec_doc.HasMember("source_expand_rule") && exec_doc["source_expand_rule"].IsString());
+        ASSERT_EQ(std::string(exec_doc["source_expand_rule"].GetString()), "auto_wildcard");
+
+        std::string consumer_task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!consumer_task_id.empty());
+        std::string status_rsp;
+        ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(consumer_task_id), status_rsp), error::OK);
+        rapidjson::Document status_doc;
+        status_doc.Parse(status_rsp.c_str());
+        ASSERT_TRUE(!status_doc.HasParseError() && status_doc.IsObject());
+        ASSERT_TRUE(status_doc.HasMember("resolved_sources") && status_doc["resolved_sources"].IsArray());
+        ASSERT_EQ(status_doc["resolved_sources"].Size(), 2u);
+        ASSERT_TRUE(status_doc.HasMember("source_expand_rule") && status_doc["source_expand_rule"].IsString());
+        ASSERT_EQ(std::string(status_doc["source_expand_rule"].GetString()), "auto_wildcard");
+
+        ASSERT_EQ(stream_stop("/scheduler/stream/stop", MakeTaskReq(consumer_task_id), status_rsp), error::OK);
+        status_doc.Parse(status_rsp.c_str());
+        ASSERT_TRUE(!status_doc.HasParseError() && status_doc.IsObject());
+        ASSERT_TRUE(status_doc.HasMember("resolved_sources") && status_doc["resolved_sources"].IsArray());
+        ASSERT_EQ(status_doc["resolved_sources"].Size(), 2u);
+
+        std::string query_rsp;
+        auto stream_query = FindRouteHandler(loader, "POST", "/channels/stream/query");
+        ASSERT_TRUE(stream_query != nullptr);
+        ASSERT_EQ(stream_query("/channels/stream/query", "{}", query_rsp), error::OK);
+        rapidjson::Document qdoc;
+        qdoc.Parse(query_rsp.c_str());
+        ASSERT_TRUE(!qdoc.HasParseError() && qdoc.IsObject());
+        ASSERT_TRUE(qdoc.HasMember("channels") && qdoc["channels"].IsArray());
+        bool found_split_hub = false;
+        bool found_merge_hub = false;
+        for (const auto& item : qdoc["channels"].GetArray()) {
+            if (!item.IsObject()) continue;
+            if (!item.HasMember("name") || !item["name"].IsString()) continue;
+            const std::string name = item["name"].GetString();
+            if (name == "npm_hub") {
+                found_split_hub = true;
+                ASSERT_TRUE(item.HasMember("role") && item["role"].IsString());
+                ASSERT_EQ(std::string(item["role"].GetString()), "both");
+                ASSERT_TRUE(item.HasMember("option_json") && item["option_json"].IsObject());
+                ASSERT_TRUE(item.HasMember("derived_channels") && item["derived_channels"].IsArray());
+                ASSERT_EQ(item["derived_channels"].Size(), 2u);
+            }
+            if (name == "npm_merge") {
+                found_merge_hub = true;
+                ASSERT_TRUE(item.HasMember("derived_channels") && item["derived_channels"].IsArray());
+                ASSERT_EQ(item["derived_channels"].Size(), 0u);
+            }
+        }
+        ASSERT_TRUE(found_split_hub);
+        ASSERT_TRUE(found_merge_hub);
+    }
+    std::puts("[PASS] T46");
+
+    // T47: Web 代理流式通道查询接口（严格语义：上游不可达时返回 UNAVAILABLE）
     {
         const std::filesystem::path web_db_path = std::filesystem::temp_directory_path() /
                                                   ("flowsql_s9_3_web_" + suffix + ".db");
@@ -1267,7 +1441,7 @@ int main() {
         ASSERT_TRUE(rsp.find("service unreachable") != std::string::npos);
         std::filesystem::remove(web_db_path);
     }
-    std::puts("[PASS] T45");
+    std::puts("[PASS] T47");
 
     exec = fnRouterHandler();
     stream_exec = fnRouterHandler();

@@ -179,6 +179,12 @@ interface IStreamChannel : public IChannel {
         caps.partition.preserves_partition_order = false;
         return caps;
     }
+
+    // Stream hub 扩展能力（默认不支持）
+    virtual bool IsHubChannel() const { return false; }
+    virtual const char* HubModeHint() const { return ""; }  // split|merge
+    virtual size_t HubPartitionCount() const { return 0; }
+    virtual std::shared_ptr<IStreamChannel> HubPartition(size_t) const { return nullptr; }
 };
 
 }  // namespace flowsql

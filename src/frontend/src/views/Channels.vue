@@ -21,6 +21,7 @@
             <input ref="csvInput" type="file" accept=".csv" style="display:none" @change="handleCsvSelected" />
             <el-button v-if="activeChannelType === 'dataframe'" type="success" @click="triggerCsvUpload">导入 CSV</el-button>
             <el-button v-if="activeChannelType === 'database'" type="primary" @click="showAddDialog = true">新增数据库通道</el-button>
+            <el-button v-if="activeChannelType === 'stream'" type="primary" @click="openAddStreamDialog">新增 Stream 通道</el-button>
           </div>
         </div>
       </template>
@@ -95,13 +96,30 @@
           </el-table>
 
           <el-table v-else :data="filteredStreamChannels" style="width: 100%" v-loading="loadingStream">
-            <el-table-column prop="type" label="类型" width="180" />
-            <el-table-column prop="name" label="名称" min-width="260" />
+            <el-table-column prop="type" label="类型" width="140" />
+            <el-table-column prop="name" label="名称" min-width="220" />
+            <el-table-column prop="role" label="角色" width="110">
+              <template #default="scope">
+                <el-tag size="small" effect="plain">{{ scope.row.role || 'both' }}</el-tag>
+              </template>
+            </el-table-column>
             <el-table-column prop="status" label="状态" width="160">
               <template #default="scope">
                 <el-tag :type="streamStatusTagType(scope.row.status)">
                   {{ scope.row.status || 'unknown' }}
                 </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="容量/占用" min-width="180">
+              <template #default="scope">
+                <span>{{ scope.row.size || 0 }}/{{ scope.row.capacity || 0 }}</span>
+                <el-tag v-if="scope.row.in_use" style="margin-left:8px" type="warning" size="small">in_use</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="220">
+              <template #default="scope">
+                <el-button type="primary" size="small" text @click="openEditStreamDialog(scope.row)">编辑</el-button>
+                <el-button type="danger" size="small" text @click="removeStream(scope.row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -257,6 +275,78 @@
         <el-button type="primary" :loading="submitting" @click="handleAdd">确认添加</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="showStreamDialog" :title="streamDialogTitle" width="620px" @close="resetStreamForm">
+      <el-form :model="streamForm" label-width="120px">
+        <el-form-item label="通道类型" required>
+          <el-select v-model="streamForm.type" placeholder="请选择类型" style="width:100%" @change="onStreamTypeChange">
+            <el-option
+              v-for="def in streamDefinitions"
+              :key="def.channel_type"
+              :label="def.display_name || def.channel_type"
+              :value="def.channel_type"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="通道名称" required>
+          <el-input v-model="streamForm.name" placeholder="例如 npm_hub" :disabled="streamDialogMode === 'edit'" />
+        </el-form-item>
+        <el-form-item label="角色" required>
+          <el-select v-model="streamForm.role" style="width:100%">
+            <el-option
+              v-for="role in currentStreamRoles"
+              :key="role"
+              :label="role"
+              :value="role"
+            />
+          </el-select>
+        </el-form-item>
+
+        <el-form-item
+          v-for="field in currentStreamSchema"
+          :key="field.key"
+          :label="field.key"
+          :required="!!field.required"
+        >
+          <el-select
+            v-if="field.type === 'enum'"
+            v-model="streamForm.options[field.key]"
+            style="width:100%"
+          >
+            <el-option
+              v-for="v in (field.enum_values || [])"
+              :key="v"
+              :label="v"
+              :value="v"
+            />
+          </el-select>
+          <el-input-number
+            v-else-if="field.type === 'int'"
+            v-model="streamForm.options[field.key]"
+            :min="field.has_range ? field.min_value : undefined"
+            :max="field.has_range && field.max_value > 0 ? field.max_value : undefined"
+            style="width:100%"
+          />
+          <el-switch
+            v-else-if="field.type === 'bool'"
+            v-model="streamForm.options[field.key]"
+          />
+          <el-input
+            v-else-if="field.type === 'array'"
+            v-model="streamArrayInputs[field.key]"
+            placeholder="使用逗号分隔多个值"
+          />
+          <el-input
+            v-else
+            v-model="streamForm.options[field.key]"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showStreamDialog = false">取消</el-button>
+        <el-button type="primary" :loading="streamSubmitting" @click="submitStreamForm">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -276,9 +366,24 @@ const csvInput = ref(null)
 const dbChannels = ref([])
 const dfChannels = ref([])
 const streamChannels = ref([])
+const streamDefinitions = ref([])
 const loadingDb = ref(false)
 const loadingDf = ref(false)
 const loadingStream = ref(false)
+const showStreamDialog = ref(false)
+const streamDialogMode = ref('add')
+const streamSubmitting = ref(false)
+const streamArrayInputs = ref({})
+const streamForm = ref({
+  type: '',
+  name: '',
+  role: 'both',
+  options: {}
+})
+
+const streamDialogTitle = computed(() =>
+  streamDialogMode.value === 'edit' ? '编辑 Stream 通道' : '新增 Stream 通道'
+)
 
 const form = ref({
   type: 'mysql', name: '', host: '127.0.0.1', port: '',
@@ -306,6 +411,7 @@ const filteredStreamChannels = computed(() => {
   return streamChannels.value.filter(ch =>
     (ch.name || '').toLowerCase().includes(s) ||
     (ch.type || '').toLowerCase().includes(s) ||
+    (ch.role || '').toLowerCase().includes(s) ||
     (ch.status || '').toLowerCase().includes(s)
   )
 })
@@ -314,6 +420,20 @@ const sectionTitle = computed(() => {
   if (activeChannelType.value === 'dataframe') return 'DataFrame 通道'
   if (activeChannelType.value === 'database') return '数据库通道'
   return 'Stream 通道'
+})
+
+const currentStreamDefinition = computed(() =>
+  streamDefinitions.value.find(d => d.channel_type === streamForm.value.type) || null
+)
+
+const currentStreamSchema = computed(() =>
+  (currentStreamDefinition.value?.option_schema || [])
+)
+
+const currentStreamRoles = computed(() => {
+  const roles = currentStreamDefinition.value?.allowed_roles
+  if (!roles || roles.length === 0) return ['both', 'source', 'sink']
+  return roles
 })
 
 const getTypeName = (typeId) => {
@@ -384,7 +504,15 @@ const loadStreamChannels = async () => {
     streamChannels.value = list.map(ch => ({
       type: ch.type || '',
       name: ch.name || '',
+      role: ch.role || 'both',
       status: ch.status || 'unknown'
+      ,
+      in_use: !!ch.in_use,
+      size: Number(ch.size || 0),
+      capacity: Number(ch.capacity || 0),
+      option_json: ch.option_json || {},
+      option: ch.option || '',
+      derived_channels: Array.isArray(ch.derived_channels) ? ch.derived_channels : []
     }))
   } catch (error) {
     ElMessage.error('加载 Stream 通道失败: ' + (error.response?.data?.error || error.message))
@@ -393,15 +521,25 @@ const loadStreamChannels = async () => {
   }
 }
 
+const loadStreamDefinitions = async () => {
+  try {
+    const res = await api.getStreamDefinitions()
+    streamDefinitions.value = Array.isArray(res.data?.definitions) ? res.data.definitions : []
+  } catch (error) {
+    streamDefinitions.value = []
+    ElMessage.error('加载 Stream 类型定义失败: ' + (error.response?.data?.error || error.message))
+  }
+}
+
 const reloadAll = async () => {
-  await Promise.all([loadDbChannels(), loadDfChannels(), loadStreamChannels()])
+  await Promise.all([loadDbChannels(), loadDfChannels(), loadStreamChannels(), loadStreamDefinitions()])
 }
 
 const switchChannelType = async (nextType) => {
   if (activeChannelType.value === nextType) return
   activeChannelType.value = nextType
   if (nextType === 'stream') {
-    await loadStreamChannels()
+    await Promise.all([loadStreamChannels(), loadStreamDefinitions()])
   } else if (nextType === 'database') {
     await loadDbChannels()
   } else if (nextType === 'dataframe') {
@@ -503,8 +641,156 @@ const handleRemoveDb = async (row) => {
   }
 }
 
+const defaultValueByField = (field) => {
+  const raw = field?.default_value
+  if (field?.type === 'bool') return String(raw).toLowerCase() === 'true'
+  if (field?.type === 'int') {
+    const n = Number(raw)
+    return Number.isFinite(n) ? n : 0
+  }
+  if (field?.type === 'array') return Array.isArray(raw) ? raw : []
+  return raw ?? ''
+}
+
+const applyStreamSchemaDefaults = () => {
+  const nextOptions = {}
+  const nextArrayInputs = {}
+  currentStreamSchema.value.forEach((field) => {
+    nextOptions[field.key] = defaultValueByField(field)
+    if (field.type === 'array') {
+      const arr = Array.isArray(nextOptions[field.key]) ? nextOptions[field.key] : []
+      nextArrayInputs[field.key] = arr.join(',')
+    }
+  })
+  streamForm.value.options = nextOptions
+  streamArrayInputs.value = nextArrayInputs
+  const allowedRoles = currentStreamRoles.value
+  if (!allowedRoles.includes(streamForm.value.role)) {
+    streamForm.value.role = allowedRoles[0] || 'both'
+  }
+}
+
+const onStreamTypeChange = () => {
+  applyStreamSchemaDefaults()
+}
+
+const openAddStreamDialog = async () => {
+  streamDialogMode.value = 'add'
+  if (streamDefinitions.value.length === 0) {
+    await loadStreamDefinitions()
+  }
+  streamForm.value = {
+    type: streamDefinitions.value[0]?.channel_type || '',
+    name: '',
+    role: 'both',
+    options: {}
+  }
+  applyStreamSchemaDefaults()
+  showStreamDialog.value = true
+}
+
+const openEditStreamDialog = async (row) => {
+  streamDialogMode.value = 'edit'
+  if (streamDefinitions.value.length === 0) {
+    await loadStreamDefinitions()
+  }
+  const options = { ...(row.option_json || {}) }
+  streamForm.value = {
+    type: row.type,
+    name: row.name,
+    role: row.role || 'both',
+    options
+  }
+  applyStreamSchemaDefaults()
+  // 用现有值覆盖 schema 默认值
+  streamForm.value.options = {
+    ...streamForm.value.options,
+    ...(row.option_json || {})
+  }
+  const arrInputs = {}
+  currentStreamSchema.value.forEach((field) => {
+    if (field.type === 'array') {
+      const val = streamForm.value.options[field.key]
+      arrInputs[field.key] = Array.isArray(val) ? val.join(',') : ''
+    }
+  })
+  streamArrayInputs.value = arrInputs
+  showStreamDialog.value = true
+}
+
+const normalizeStreamOptions = () => {
+  const out = {}
+  currentStreamSchema.value.forEach((field) => {
+    let val = streamForm.value.options[field.key]
+    if (field.type === 'array') {
+      const text = streamArrayInputs.value[field.key] || ''
+      val = text.split(',').map(v => v.trim()).filter(Boolean)
+    } else if (field.type === 'int') {
+      val = Number(val)
+      if (!Number.isFinite(val)) val = Number(field.default_value || 0)
+    } else if (field.type === 'bool') {
+      val = !!val
+    }
+    if (field.required && (val === '' || val === null || val === undefined || (Array.isArray(val) && val.length === 0))) {
+      throw new Error(`参数 ${field.key} 为必填`)
+    }
+    out[field.key] = val
+  })
+  return out
+}
+
+const submitStreamForm = async () => {
+  if (!streamForm.value.type || !streamForm.value.name) {
+    ElMessage.warning('类型和名称为必填项')
+    return
+  }
+  const role = streamForm.value.role || 'both'
+  if (!['source', 'sink', 'both'].includes(role)) {
+    ElMessage.warning('角色必须是 source/sink/both')
+    return
+  }
+  streamSubmitting.value = true
+  try {
+    const payload = {
+      type: streamForm.value.type,
+      name: streamForm.value.name,
+      role,
+      options: normalizeStreamOptions()
+    }
+    if (streamDialogMode.value === 'edit') {
+      await api.modifyStreamChannel(payload)
+      ElMessage.success('Stream 通道修改成功')
+    } else {
+      await api.addStreamChannel(payload)
+      ElMessage.success('Stream 通道新增成功')
+    }
+    showStreamDialog.value = false
+    await loadStreamChannels()
+  } catch (error) {
+    ElMessage.error('保存 Stream 通道失败: ' + (error.response?.data?.error || error.message))
+  } finally {
+    streamSubmitting.value = false
+  }
+}
+
+const removeStream = async (row) => {
+  try {
+    await ElMessageBox.confirm(`确认删除 Stream 通道 ${row.type}.${row.name}？`, '删除确认', { type: 'warning' })
+    await api.removeStreamChannel(row.type, row.name)
+    ElMessage.success('删除成功')
+    await loadStreamChannels()
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error('删除失败: ' + (e.response?.data?.error || e.message))
+  }
+}
+
 const resetForm = () => {
   form.value = { type: 'mysql', name: '', host: '127.0.0.1', port: '', user: '', password: '', database: '', path: '' }
+}
+
+const resetStreamForm = () => {
+  streamForm.value = { type: '', name: '', role: 'both', options: {} }
+  streamArrayInputs.value = {}
 }
 
 const drawerVisible = ref(false)

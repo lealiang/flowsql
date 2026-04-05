@@ -80,6 +80,8 @@ struct TaskSnapshot {
     int error_code = 0;
     std::string error_message;
     std::string op_stats_json;
+    std::vector<std::string> resolved_sources;
+    std::string source_expand_rule;
 };
 
 enum StepResult {
@@ -138,6 +140,8 @@ class StreamTask final {
     void Join();
     TaskSnapshot Snapshot() const;
     void SetFailedOnce(int code, const std::string& msg);
+    void SetSourceResolveMeta(std::vector<std::string> resolved_sources,
+                              std::string source_expand_rule);
     void OnShardDone();
     void TouchActive(int64_t now_ms);
 
@@ -162,6 +166,9 @@ class StreamTask final {
     std::atomic<int64_t> started_ms_{0};
     std::atomic<int64_t> last_active_ms_{0};
     std::atomic<int64_t> finished_ms_{0};
+    mutable std::mutex source_meta_mu_;
+    std::vector<std::string> resolved_sources_;
+    std::string source_expand_rule_ = "explicit";
 };
 
 }  // namespace scheduler

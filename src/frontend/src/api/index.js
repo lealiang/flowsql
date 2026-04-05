@@ -96,8 +96,9 @@ export default {
   // dataframe 通道管理
   listDfChannels: () => api.get('/api/channels/dataframe'),
   listStreamChannels: () => api.post('/api/channels/stream/query', {}),
-  addStreamChannel: (type, name, option = '') => api.post('/api/channels/stream/add', { type, name, option }),
-  modifyStreamChannel: (type, name, option = '') => api.post('/api/channels/stream/modify', { type, name, option }),
+  getStreamDefinitions: () => api.post('/api/channels/stream/definitions/query', {}),
+  addStreamChannel: (payload) => api.post('/api/channels/stream/add', payload),
+  modifyStreamChannel: (payload) => api.post('/api/channels/stream/modify', payload),
   removeStreamChannel: (type, name) => api.post('/api/channels/stream/remove', { type, name }),
   importCsv: (file) => {
     const form = new FormData()

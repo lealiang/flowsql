@@ -457,6 +457,31 @@ void test_sql_parser() {
         assert(!bad.error.empty());
     }
 
+    // Test stream selector syntax (Story 14.12)
+    {
+        auto stmt = parser.Parse(
+            "SELECT * FROM stream.npm_hub[*], stream.npm_hub[0] "
+            "USING builtin.passthrough_stream INTO stream.npm_sink");
+        assert(stmt.error.empty());
+        assert(stmt.sources.size() == 2);
+        assert(stmt.sources[0] == "stream.npm_hub[*]");
+        assert(stmt.sources[1] == "stream.npm_hub[0]");
+        assert(stmt.dest == "stream.npm_sink");
+    }
+
+    // Test selector parse errors
+    {
+        auto bad = parser.Parse("SELECT * FROM stream.npm_hub[a] INTO dataframe.out");
+        assert(!bad.error.empty());
+        auto bad2 = parser.Parse("SELECT * FROM stream.npm_hub[ INTO dataframe.out");
+        assert(!bad2.error.empty());
+        auto bad3 = parser.Parse("SELECT * FROM stream.npm_hub[0][1] INTO dataframe.out");
+        assert(!bad3.error.empty());
+        auto ok = parser.Parse("SELECT * FROM stream.npm_hub INTO stream.npm_out[0]");
+        assert(ok.error.empty());
+        assert(ok.dest == "stream.npm_out[0]");
+    }
+
     printf("[PASS] SQL parser (USING optional + columns)\n");
 }
 

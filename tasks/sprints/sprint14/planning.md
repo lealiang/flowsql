@@ -45,7 +45,7 @@
 
 - [x] `StreamPlugin` 通道构建通过统一注册表分发，不再内置 `if(type==...)` 选择分支。
 - [x] `CatalogPlugin` 内置算子注册改为统一注册表驱动，新增内置项无需修改核心注册流程。
-- [ ] Stream 通道管理接口返回字段可支撑 sink 运维（模式、容量、占用、状态）。
+- [x] Stream 通道管理接口返回字段可支撑 sink 运维（模式、容量、占用、状态）。
 - [ ] 支持单任务多 SQL 的 Group DAG 执行，覆盖串行、并发与组合拓扑。
 - [ ] 慢分支与异常分支行为可观测、可停止、可定位。
 - [ ] 自动化测试覆盖并通过：`test_stream`、`test_scheduler_e2e`、Web 前端构建与关键联调回归。
@@ -83,24 +83,24 @@
 **依赖**：Story 14.11（建议）
 
 **验收标准**：
-- [ ] 具名 Stream 通道可显式创建并作为 `INTO stream.<name>` sink 使用。
-- [ ] `query` 返回关键运行态字段：容量、模式、状态、占用标记与必要统计。
-- [ ] 明确并落地通道角色校验（source/sink/both）与错误信息。
-- [ ] 新增 `POST /channels/stream/types/query`，前端按后端类型 schema 动态渲染参数表单。
-- [ ] `stream_hub(split)` 支持 source selector：`stream.<hub>`、`stream.<hub>[*]`、`stream.<hub>[i]`。
-- [ ] `stream_hub(merge)` 仅支持 root source：`stream.<hub>`；`[*]/[i]` 明确报错。
-- [ ] 当 source 为 split hub 且未指定 selector 时，后端自动等价 `[*]` 展开，并在状态中返回 `resolved_sources`。
-- [ ] `INTO stream.<hub>` 在 `split/merge` 下都可写 root；`INTO stream.<hub>[*|i]` 一律报错。
-- [ ] `modify/remove` 与运行态并发冲突处理可复现、可观测。
+- [x] 具名 Stream 通道可显式创建并作为 `INTO stream.<name>` sink 使用。
+- [x] `query` 返回关键运行态字段：容量、模式、状态、占用标记与必要统计。
+- [x] 明确并落地通道角色校验（source/sink/both）与错误信息。
+- [x] 新增 `POST /channels/stream/definitions/query`，前端按后端类型 schema 动态渲染参数表单。
+- [x] `stream_hub(split)` 支持 source selector：`stream.<hub>`、`stream.<hub>[*]`、`stream.<hub>[i]`。
+- [x] `stream_hub(merge)` 仅支持 root source：`stream.<hub>`；`[*]/[i]` 明确报错。
+- [x] 当 source 为 split hub 且未指定 selector 时，后端自动等价 `[*]` 展开，并在状态中返回 `resolved_sources`。
+- [x] `INTO stream.<hub>` 在 `split/merge` 下都可写 root；`INTO stream.<hub>[*|i]` 一律报错。
+- [x] `modify/remove` 与运行态并发冲突处理可复现、可观测。
 
 **任务分解**：
-- [ ] T6：梳理并固化 Stream 通道管理契约（结构化 options、role、状态与观测字段）。
-- [ ] T7：新增 `/channels/stream/types/query` 与 `/api/channels/stream/types/query` 代理。
-- [ ] T8：扩展 `/channels/stream/query` 响应字段并补齐角色校验、错误码映射。
-- [ ] T9：前端 Stream 通道新增/修改改为动态 schema 表单（含 `spsc/spmc/mpsc/mpmc`、`stream_hub` 参数）。
-- [ ] T10：实现 `split/merge` 的 source selector 语义与自动 `[*]` 展开（仅 split 生效），并补齐 `INTO` selector 禁止规则与端到端回归测试。
-- [ ] T10.1：`ClassifySqlTaskKind` 与 `ExecuteStreamTask` 复用统一 source 解析函数，保证分类/执行一致性。
-- [ ] T10.2：SQL parser 采用最小侵入方案支持 source/dest selector，并补齐历史 SQL 回归与非法 selector 用例。
+- [x] T6：梳理并固化 Stream 通道管理契约（结构化 options、role、状态与观测字段）。
+- [x] T7：新增 `/channels/stream/definitions/query` 与 `/api/channels/stream/definitions/query` 代理。
+- [x] T8：扩展 `/channels/stream/query` 响应字段并补齐角色校验、错误码映射。
+- [x] T9：前端 Stream 通道新增/修改改为动态 schema 表单（含 `spsc/spmc/mpsc/mpmc`、`stream_hub` 参数）。
+- [x] T10：实现 `split/merge` 的 source selector 语义与自动 `[*]` 展开（仅 split 生效），并补齐 `INTO` selector 禁止规则与端到端回归测试。
+- [x] T10.1：`ClassifySqlTaskKind` 与 `ExecuteStreamTask` 复用统一 source 解析函数，保证分类/执行一致性。
+- [x] T10.2：SQL parser 采用最小侵入方案支持 source/dest selector，并补齐历史 SQL 回归与非法 selector 用例。
 
 ---
 
