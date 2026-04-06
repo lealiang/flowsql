@@ -142,6 +142,16 @@ static bool UpdateTaskCreatedAt(const std::string& db_path, const std::string& t
     return ok;
 }
 
+template <class Fn>
+static bool WaitUntil(Fn&& pred, int timeout_ms, int interval_ms = 50) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+    return pred();
+}
+
 class MockRouterHandle : public IRouterHandle {
  public:
     explicit MockRouterHandle(std::vector<RouteItem> items) : items_(std::move(items)) {}
@@ -1592,7 +1602,9 @@ int main() {
         for (int i = 0; i < 4; ++i) {
             ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);
         }
-        ASSERT_EQ(CountTasks(retention_count_db), 2);
+        ASSERT_TRUE(WaitUntil([&]() {
+            return CountTasks(retention_count_db) == 2;
+        }, 4000, 100));
         ASSERT_EQ(p.Stop(), 0);
     }
 
@@ -1622,8 +1634,12 @@ int main() {
 
         // 再创建一个终态任务，触发 retention 清理
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);
-        ASSERT_TRUE(!TaskExists(retention_days_db, old_task_id));
-        ASSERT_EQ(CountTasks(retention_days_db), 1);
+        ASSERT_TRUE(WaitUntil([&]() {
+            return !TaskExists(retention_days_db, old_task_id);
+        }, 4000, 100));
+        ASSERT_TRUE(WaitUntil([&]() {
+            return CountTasks(retention_days_db) == 1;
+        }, 4000, 100));
         ASSERT_EQ(p.Stop(), 0);
     }
 

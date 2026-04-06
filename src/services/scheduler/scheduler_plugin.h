@@ -72,7 +72,13 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     int32_t HandlePreviewDataframe(const std::string& uri, const std::string& req, std::string& rsp);
 
     // 通道管理
+    void RegisterManagedChannel(const std::string& key, std::shared_ptr<IChannel> ch);
+    void EraseManagedChannel(const std::string& key);
+    void ClearManagedChannels();
+    std::shared_ptr<IChannel> FindManagedChannelShared(const std::string& key);
+    std::vector<std::pair<std::string, std::shared_ptr<IChannel>>> SnapshotManagedChannels();
     IChannel* FindChannel(const std::string& name);
+    IChannel* FindChannel(const std::string& name, std::shared_ptr<IChannel>* owner_out);
     void RegisterChannel(const std::string& key, std::shared_ptr<IChannel> ch);
 
     // 算子查找
@@ -123,6 +129,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
                               std::string* err_out);
     struct SourceResolveResult {
         std::vector<IChannel*> channels;
+        std::vector<std::shared_ptr<IChannel>> channel_holders;
         std::vector<std::shared_ptr<IStreamChannel>> stream_channels;
         std::vector<std::string> source_keys;
         std::vector<std::string> resolved_sources;
@@ -153,6 +160,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     IQuerier* querier_ = nullptr;
 
     // 通道表
+    mutable std::mutex channels_mu_;
     std::unordered_map<std::string, std::shared_ptr<IChannel>> channels_;
 
     std::string host_ = "127.0.0.1";

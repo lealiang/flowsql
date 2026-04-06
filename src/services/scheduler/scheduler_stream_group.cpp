@@ -587,7 +587,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         }
 
         if (StartsWithIgnoreCaseLocal(sink_base, "stream.")) {
-            IChannel* sink_ch = FindChannel(sink_base);
+            std::shared_ptr<IChannel> sink_owner;
+            IChannel* sink_ch = FindChannel(sink_base, &sink_owner);
             auto* sink_stream = dynamic_cast<IStreamChannel*>(sink_ch);
             if (!sink_stream) {
                 rsp = MakeExecutionErrorJsonLocal(
@@ -836,7 +837,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             }
         }
         for (const auto& channel_ref : created_channel_refs) {
-            channels_.erase(channel_ref);
+            EraseManagedChannel(channel_ref);
         }
         created_channel_refs.clear();
     };

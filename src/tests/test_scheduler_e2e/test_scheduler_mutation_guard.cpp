@@ -2,10 +2,12 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include <framework/interfaces/ichannel.h>
 #include <services/scheduler/scheduler_plugin.h>
 
 #define ASSERT_TRUE(expr)                                                                   \
@@ -30,6 +32,28 @@
 
 namespace flowsql {
 namespace scheduler {
+
+class DummyChannel : public IChannel {
+ public:
+    DummyChannel(std::string category, std::string name, std::string type)
+        : category_(std::move(category)), name_(std::move(name)), type_(std::move(type)) {}
+
+    const char* Category() override { return category_.c_str(); }
+    const char* Name() override { return name_.c_str(); }
+    const char* Type() override { return type_.c_str(); }
+    const char* Schema() override { return "{}"; }
+    int Open() override { opened_ = true; return 0; }
+    int Close() override { opened_ = false; return 0; }
+    bool IsOpened() const override { return opened_; }
+    int Flush() override { return 0; }
+
+ private:
+    std::string category_;
+    std::string name_;
+    std::string type_;
+    bool opened_ = false;
+};
+
 struct SchedulerPluginTestAccessor {
     static int TryBeginStreamChannelMutation(SchedulerPlugin* plugin,
                                              const std::string& key,
@@ -70,6 +94,22 @@ struct SchedulerPluginTestAccessor {
         const std::vector<std::string>& keys,
         std::unordered_map<std::string, uint64_t>* snapshot_out) {
         plugin->CaptureStreamChannelVersionSnapshot(keys, snapshot_out);
+    }
+
+    static void RegisterChannel(SchedulerPlugin* plugin,
+                                const std::string& key,
+                                std::shared_ptr<IChannel> ch) {
+        plugin->RegisterChannel(key, std::move(ch));
+    }
+
+    static void EraseManagedChannel(SchedulerPlugin* plugin, const std::string& key) {
+        plugin->EraseManagedChannel(key);
+    }
+
+    static IChannel* FindChannelWithOwner(SchedulerPlugin* plugin,
+                                          const std::string& key,
+                                          std::shared_ptr<IChannel>* owner_out) {
+        return plugin->FindChannel(key, owner_out);
     }
 };
 }  // namespace scheduler
@@ -196,6 +236,24 @@ int main() {
                   &version_conflict_key),
               0);
     flowsql::scheduler::SchedulerPluginTestAccessor::ReleaseStreamTaskLeases(&plugin, "stream_task_version_new");
+
+    // Managed channel owner should remain alive after map erase if caller holds shared owner.
+    {
+        const std::string managed_key = "stream.test_managed";
+        auto managed = std::make_shared<flowsql::scheduler::DummyChannel>(
+            "stream", "test_managed", flowsql::ChannelType::kStream);
+        flowsql::scheduler::SchedulerPluginTestAccessor::RegisterChannel(&plugin, managed_key, managed);
+
+        std::shared_ptr<flowsql::IChannel> owner;
+        flowsql::IChannel* raw = flowsql::scheduler::SchedulerPluginTestAccessor::FindChannelWithOwner(
+            &plugin, managed_key, &owner);
+        ASSERT_TRUE(raw != nullptr);
+        ASSERT_TRUE(owner != nullptr);
+        ASSERT_EQ(raw, owner.get());
+
+        flowsql::scheduler::SchedulerPluginTestAccessor::EraseManagedChannel(&plugin, managed_key);
+        ASSERT_EQ(std::string(owner->Type()), std::string(flowsql::ChannelType::kStream));
+    }
 
     // StreamTaskGroup stop semantics: stopped group must not mark non-submitted nodes as skipped.
     {

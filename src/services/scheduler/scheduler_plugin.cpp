@@ -224,6 +224,21 @@ static bool IsSinkRoleAllowed(const std::string& role) {
     return normalized == "sink" || normalized == "both";
 }
 
+static std::shared_ptr<IChannel> MakeNonOwningChannelHolder(IChannel* ch) {
+    if (!ch) return nullptr;
+    return std::shared_ptr<IChannel>(ch, [](IChannel*) {});
+}
+
+static std::shared_ptr<IStreamChannel> MakeStreamOwner(IStreamChannel* stream_ch,
+                                                       const std::shared_ptr<IChannel>& owner) {
+    if (!stream_ch) return nullptr;
+    if (owner) {
+        auto stream_owner = std::dynamic_pointer_cast<IStreamChannel>(owner);
+        if (stream_owner) return stream_owner;
+    }
+    return std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {});
+}
+
 static int ParseOptionObject(const std::string& option, rapidjson::Document* out, std::string* err) {
     if (!out) return EINVAL;
     out->SetObject();
@@ -1018,8 +1033,42 @@ int SchedulerPlugin::Unload() {
 }
 
 // --- 通道管理 ---
-void SchedulerPlugin::RegisterChannel(const std::string& key, std::shared_ptr<IChannel> ch) {
+void SchedulerPlugin::RegisterManagedChannel(const std::string& key, std::shared_ptr<IChannel> ch) {
+    if (key.empty() || !ch) return;
+    std::lock_guard<std::mutex> lock(channels_mu_);
     channels_[key] = std::move(ch);
+}
+
+void SchedulerPlugin::EraseManagedChannel(const std::string& key) {
+    if (key.empty()) return;
+    std::lock_guard<std::mutex> lock(channels_mu_);
+    channels_.erase(key);
+}
+
+void SchedulerPlugin::ClearManagedChannels() {
+    std::lock_guard<std::mutex> lock(channels_mu_);
+    channels_.clear();
+}
+
+std::shared_ptr<IChannel> SchedulerPlugin::FindManagedChannelShared(const std::string& key) {
+    std::lock_guard<std::mutex> lock(channels_mu_);
+    auto it = channels_.find(key);
+    if (it == channels_.end()) return nullptr;
+    return it->second;
+}
+
+std::vector<std::pair<std::string, std::shared_ptr<IChannel>>> SchedulerPlugin::SnapshotManagedChannels() {
+    std::vector<std::pair<std::string, std::shared_ptr<IChannel>>> snapshot;
+    std::lock_guard<std::mutex> lock(channels_mu_);
+    snapshot.reserve(channels_.size());
+    for (const auto& kv : channels_) {
+        snapshot.push_back(kv);
+    }
+    return snapshot;
+}
+
+void SchedulerPlugin::RegisterChannel(const std::string& key, std::shared_ptr<IChannel> ch) {
+    RegisterManagedChannel(key, std::move(ch));
 }
 
 // --- IPlugin::Start ---
@@ -1167,7 +1216,7 @@ int SchedulerPlugin::Stop() {
         stream_channel_ref_counts_.clear();
         stream_channel_mutating_.clear();
     }
-    channels_.clear();
+    ClearManagedChannels();
     LOG_INFO("SchedulerPlugin::Stop: done");
     return 0;
 }
@@ -1239,11 +1288,24 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
 
 // --- 通道查找辅助 ---
 IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
+    return FindChannel(name, nullptr);
+}
+
+IChannel* SchedulerPlugin::FindChannel(const std::string& name, std::shared_ptr<IChannel>* owner_out) {
+    if (owner_out) owner_out->reset();
     auto* ch_registry = querier_ ? static_cast<IChannelRegistry*>(querier_->First(IID_CHANNEL_REGISTRY)) : nullptr;
     if (IsDataFrameRef(name) && ch_registry) {
         auto ch = ch_registry->Get(DataFrameNamePart(name).c_str());
         auto* df = dynamic_cast<IDataFrameChannel*>(ch.get());
-        if (df) return df;
+        if (df) {
+            if (owner_out) *owner_out = std::move(ch);
+            return df;
+        }
+    }
+
+    if (auto managed = FindManagedChannelShared(name)) {
+        if (owner_out) *owner_out = managed;
+        return managed.get();
     }
 
     if (IsStreamRef(name) && querier_) {
@@ -1262,14 +1324,11 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
                 matched = stream_ch;
             });
             if (!ambiguous && matched) {
+                if (owner_out) *owner_out = MakeNonOwningChannelHolder(matched);
                 return matched;
             }
         }
     }
-
-    // 先在内部通道表中查找
-    auto it = channels_.find(name);
-    if (it != channels_.end()) return it->second.get();
 
     // 通过 IQuerier 遍历静态注册的通道
     IChannel* found = nullptr;
@@ -1290,6 +1349,7 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
             return 0;
         });
     }
+    if (found && owner_out) *owner_out = MakeNonOwningChannelHolder(found);
 
     // 模糊匹配内部通道表
     if (!found) {
@@ -1314,6 +1374,7 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
             }
         }
     }
+    if (found && owner_out && !*owner_out) *owner_out = MakeNonOwningChannelHolder(found);
 
     // 尝试通过 IStreamFactory 获取流式通道（type.name）
     if (!found && querier_) {
@@ -1330,6 +1391,7 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
             }
         }
     }
+    if (found && owner_out && !*owner_out) *owner_out = MakeNonOwningChannelHolder(found);
 
     return found;
 }
@@ -1695,6 +1757,7 @@ int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
         return error::INTERNAL_ERROR;
     }
     out->channels.clear();
+    out->channel_holders.clear();
     out->stream_channels.clear();
     out->source_keys.clear();
     out->resolved_sources.clear();
@@ -1727,10 +1790,14 @@ int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
             return fail(error::BAD_REQUEST, parse_err, "STREAM_HUB_SELECTOR_INVALID");
         }
 
-        IChannel* source_ch = FindChannel(ref.base);
+        std::shared_ptr<IChannel> source_owner;
+        IChannel* source_ch = FindChannel(ref.base, &source_owner);
         if (!source_ch) {
             return fail(IsDataFrameRef(ref.base) ? error::NOT_FOUND : error::BAD_REQUEST,
                         "source channel not found: " + ref.base);
+        }
+        if (source_owner) {
+            out->channel_holders.push_back(source_owner);
         }
 
         const std::string source_type = source_ch->Type() ? source_ch->Type() : "";
@@ -1774,7 +1841,7 @@ int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
                                 "STREAM_HUB_SELECTOR_NOT_ALLOWED_MERGE");
                 }
                 out->channels.push_back(stream_ch);
-                out->stream_channels.push_back(std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {}));
+                out->stream_channels.push_back(MakeStreamOwner(stream_ch, source_owner));
                 out->source_keys.push_back(MakeStreamChannelKey(stream_ch->Category(), stream_ch->Name()));
                 out->resolved_sources.push_back(ref.base);
                 continue;
@@ -1840,7 +1907,7 @@ int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
                         "STREAM_HUB_SELECTOR_INVALID");
         }
         out->channels.push_back(stream_ch);
-        out->stream_channels.push_back(std::shared_ptr<IStreamChannel>(stream_ch, [](IStreamChannel*) {}));
+        out->stream_channels.push_back(MakeStreamOwner(stream_ch, source_owner));
         out->source_keys.push_back(MakeStreamChannelKey(stream_ch->Category(), stream_ch->Name()));
         out->resolved_sources.push_back(ref.base);
     }
@@ -1884,30 +1951,9 @@ int32_t SchedulerPlugin::ResolveStreamSink(
     }
 
     if (IsStreamRef(dest_ref.base)) {
-        auto* stream_factory = querier_
-            ? static_cast<IStreamFactory*>(querier_->First(IID_STREAM_FACTORY))
-            : nullptr;
-        if (!stream_factory) {
-            if (err_out) *err_out = "stream factory unavailable";
-            return error::UNAVAILABLE;
-        }
-
-        const std::string sink_name = StreamNamePart(dest_ref.base);
-        IStreamChannel* matched = nullptr;
-        bool ambiguous = false;
-        stream_factory->List([&](const char*, const char* name, IStreamChannel* ch) {
-            if (!name || !ch) return;
-            if (sink_name != name) return;
-            if (matched && matched != ch) {
-                ambiguous = true;
-                return;
-            }
-            matched = ch;
-        });
-        if (ambiguous) {
-            if (err_out) *err_out = "ambiguous stream sink name: " + sink_name;
-            return error::CONFLICT;
-        }
+        std::shared_ptr<IChannel> sink_owner;
+        IChannel* sink_raw = FindChannel(dest_ref.base, &sink_owner);
+        auto* matched = dynamic_cast<IStreamChannel*>(sink_raw);
         if (!matched) {
             if (err_out) *err_out = "stream sink not found: " + dest_ref.base;
             return error::NOT_FOUND;
@@ -1924,7 +1970,7 @@ int32_t SchedulerPlugin::ResolveStreamSink(
             return error::BAD_REQUEST;
         }
 
-        auto output = std::shared_ptr<IStreamChannel>(matched, [](IStreamChannel*) {});
+        auto output = MakeStreamOwner(matched, sink_owner);
         if (output && !output->IsOpened()) {
             (void)output->Open();
         }
@@ -1987,11 +2033,12 @@ int32_t SchedulerPlugin::ResolveStreamSink(
         return error::BAD_REQUEST;
     }
 
-    if (IChannel* existing = FindChannel(dest_ref.base); existing) {
+    std::shared_ptr<IChannel> existing_owner;
+    if (IChannel* existing = FindChannel(dest_ref.base, &existing_owner); existing) {
         if (!existing->IsOpened()) {
             (void)existing->Open();
         }
-        binding->sink_channel = std::shared_ptr<IChannel>(existing, [](IChannel*) {});
+        binding->sink_channel = existing_owner ? existing_owner : MakeNonOwningChannelHolder(existing);
         binding->sink_type = existing->Type() ? existing->Type() : "";
         if (binding->sink_type == ChannelType::kDatabase) {
             binding->db_type = db_type;
@@ -2296,7 +2343,7 @@ void SchedulerPlugin::CleanupGroupRuntimeResources(const std::string& group_runt
             final_snapshots.push_back(std::move(snap));
         }
         for (const auto& channel_ref : ss.internal_channel_refs) {
-            channels_.erase(channel_ref);
+            EraseManagedChannel(channel_ref);
         }
     }
     if (!final_snapshots.empty()) {
@@ -3193,6 +3240,7 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
 
         std::shared_ptr<DataFrameChannel> temp_sink;
         std::shared_ptr<IDataFrameChannel> named_df_sink;
+        std::shared_ptr<IChannel> named_sink_holder;
         IChannel* sink = nullptr;
 
         if (!stmt.dest.empty()) {
@@ -3212,7 +3260,7 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
                 named_df_sink = ch;
                 sink = ch.get();
             } else {
-                sink = FindChannel(stmt.dest);
+                sink = FindChannel(stmt.dest, &named_sink_holder);
                 if (!sink) {
                     rsp = MakeErrorJson("destination channel not found: " + stmt.dest);
                     return error::NOT_FOUND;
@@ -3336,7 +3384,8 @@ int32_t SchedulerPlugin::HandleGetChannels(const std::string&, const std::string
     w.StartArray();
 
     // 内部通道表
-    for (auto& [key, ch_ptr] : channels_) {
+    auto managed_snapshot = SnapshotManagedChannels();
+    for (auto& [key, ch_ptr] : managed_snapshot) {
         auto* ch = ch_ptr.get();
         w.StartObject();
         w.Key("category"); w.String(ch->Category());
@@ -3899,11 +3948,8 @@ int32_t SchedulerPlugin::HandlePreviewDataframe(const std::string&, const std::s
     std::string key     = category + "." + name;
 
     // 先在内部通道表查找
-    IChannel* raw_ch = nullptr;
-    auto it = channels_.find(key);
-    if (it != channels_.end()) {
-        raw_ch = it->second.get();
-    }
+    std::shared_ptr<IChannel> managed_holder = FindManagedChannelShared(key);
+    IChannel* raw_ch = managed_holder.get();
 
     // 再去 IQuerier 静态注册通道查找
     if (!raw_ch && querier_) {

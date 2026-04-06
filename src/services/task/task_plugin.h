@@ -56,6 +56,8 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     int CleanupOrphans();
     int WriteTaskEvent(const std::string& task_id, const std::string& from_status,
                        const std::string& to_status, const std::string& message);
+    int WriteTaskEventNoLock(const std::string& task_id, const std::string& from_status,
+                             const std::string& to_status, const std::string& message);
     int WriteDiagnostic(const std::string& task_id,
                         int sql_index,
                         const std::string& sql_text,
@@ -64,6 +66,7 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
                         int64_t sink_rows,
                         const std::string& operator_chain);
     int RunRetentionCleanup();
+    int RunRetentionCleanupNoLock();
     int CreateTaskInternal(const std::string& request_sql,
                            const std::string& sqls_json,
                            int sql_count,
@@ -96,6 +99,16 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     std::string DequeueTask();
     void WorkerLoop();
     void TimeoutLoop();
+    int GetTaskNoLock(const std::string& task_id, TaskRecord* out);
+    int DeleteTaskNoLock(const std::string& task_id);
+    int UpdateStatusNoLock(const std::string& task_id,
+                           TaskStatus new_status,
+                           const std::string& error_code,
+                           const std::string& error_message,
+                           const std::string& error_stage,
+                           int64_t result_row_count,
+                           int64_t result_col_count,
+                           const std::string& result_target);
     int ExecuteOneTask(const std::string& task_id, std::string* execute_rsp = nullptr);
     int32_t HandleBatchExecute(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleSqlClassify(const std::string& uri, const std::string& req, std::string& rsp);
@@ -110,6 +123,7 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     int32_t HandleStreamList(const std::string& uri, const std::string& req, std::string& rsp);
 
     IQuerier* querier_ = nullptr;
+    mutable std::mutex db_mu_;
     sqlite3* db_ = nullptr;
     std::string db_dir_ = "./taskdb";
     std::string db_path_;
