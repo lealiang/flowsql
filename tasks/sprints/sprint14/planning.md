@@ -46,9 +46,9 @@
 - [x] `StreamPlugin` 通道构建通过统一注册表分发，不再内置 `if(type==...)` 选择分支。
 - [x] `CatalogPlugin` 内置算子注册改为统一注册表驱动，新增内置项无需修改核心注册流程。
 - [x] Stream 通道管理接口返回字段可支撑 sink 运维（模式、容量、占用、状态）。
-- [ ] 支持单任务多 SQL 的 Group DAG 执行，覆盖串行、并发与组合拓扑。
-- [ ] 慢分支与异常分支行为可观测、可停止、可定位。
-- [ ] 自动化测试覆盖并通过：`test_stream`、`test_scheduler_e2e`、Web 前端构建与关键联调回归。
+- [x] 支持单任务多 SQL 的 Group DAG 执行，覆盖串行、并发与组合拓扑。
+- [x] 慢分支与异常分支行为可观测、可停止、可定位。
+- [x] 自动化测试覆盖并通过：`test_stream`、`test_scheduler_e2e`、Web 前端构建与关键联调回归。
 
 ---
 
@@ -111,31 +111,43 @@
 **依赖**：无
 
 **验收标准**：
-- [ ] 复用 `POST /tasks/stream/execute` 与 `POST /scheduler/stream/execute`，通过 `execution_kind/group_mode` 显式区分 single 与 group。
-- [ ] `group_mode=dag` 支持三类拓扑：串行链式、同源广播并发、串并组合。
-- [ ] 同源广播分支满足集合一致性（source 读一次；允许全分支一致 drop，禁止分支间不一致可见）。
-- [ ] DAG 校验完整（无环、依赖合法、share set 合法），失败路径错误码清晰。
-- [ ] 慢分支/故障分支策略明确：背压、fail-fast 收敛、错误透传。
-- [ ] `timeout_s` 与 `share_set_ready_timeout_s` 语义明确，超时路径可收敛且错误码可观测。
-- [ ] `execute` 与 `modify/remove` 并发下无 TOCTOU 误判（版本校验 + 引用登记原子）。
-- [ ] 组级可观测性可用（节点状态、失败节点、share set 摘要）。
-- [ ] 前端工作台支持流式 group DAG 提交与状态展示。
+- [x] 复用 `POST /tasks/stream/execute` 与 `POST /scheduler/stream/execute`，通过 `execution_kind/group_mode` 显式区分 single 与 group（统一 `sql_text` 入参）。
+- [x] `group_mode=dag` 支持三类拓扑：串行链式、同源广播并发、串并组合。
+- [x] 多 SQL 仅支持分号 `;` 切分（换行不切分）；`sql_text` 切分器可正确处理字符串/注释中的分号。
+- [x] 同源广播分支满足集合一致性（source 读一次；允许全分支一致 drop，禁止分支间不一致可见）。
+- [x] DAG 校验完整（无环、依赖合法、share set 合法），失败路径错误码清晰（含 `missing_keys/extra_keys` 差异明细）。
+- [x] 慢分支/故障分支策略明确：背压、fail-fast 收敛、错误透传。
+- [x] `timeout_s` 与 `share_set_ready_timeout_s` 语义明确，超时路径可收敛且错误码可观测（语义错误码而非仅 errno）。
+- [x] `execute` 与 `modify/remove` 并发下无 TOCTOU 误判（版本校验 + 引用登记原子）。
+- [x] group 采用“组级一次性租约并集申请 + 节点执行复用租约”，异常路径无租约残留。
+- [x] stop/timeout/fail-fast 路径满足“先停 hub，再停 node”收敛顺序。
+- [x] 组级可观测性可用（节点状态、失败节点、share set 摘要）。
+- [x] 前端工作台支持流式 group 提交与状态展示（前端不构建 DAG，仅提交 `sql_text` 并展示后端回传 DAG）。
 
 **任务分解**：
-- [ ] T11：定义 `StreamTaskGroup + DagNodeRuntime` 数据结构与状态机（group/node 两级）。
-- [ ] T12：在 `/scheduler/stream/execute` 增加 `execution_kind` 分发与 `group_mode=dag` 校验。
-- [ ] T13：实现 DAG 归一化与校验（ID 唯一、依赖合法、无环、share set 合法）。
-- [ ] T13.1：补齐 DAG 护栏校验（`max_group_nodes/max_group_edges/max_group_share_sets/max_group_sql_bytes`）与错误码 `STREAM_GROUP_DAG_TOO_LARGE`。
-- [ ] T14：实现 `source_share_sets` 与 `BroadcastHub`（同源一次读取、多分支广播）。
-- [ ] T14.1：实现 `coordinated drop`（全分支一致丢弃）与 `broadcast_seq` 指标。
-- [ ] T15：实现 DAG 调度推进（拓扑启动、`on_running/on_finished`、share set 全员 ready 启动屏障）。
-- [ ] T15.1：实现 share set 成员 `start_condition=on_running` 限制与 `share_set_ready_timeout_s` 屏障超时。
-- [ ] T16：实现组级 stop/status/list、租约申请/释放与 fail-fast 收敛。
-- [ ] T16.1：实现 `timeout_s` 组级超时收敛与 `STREAM_GROUP_TIMEOUT` 错误透传。
-- [ ] T16.2：实现 `execute` 与 `modify/remove` 的 TOCTOU 原子防护（版本复核 + 引用登记 + 失败回滚）。
-- [ ] T17：补齐 `TaskPlugin` 与前端工作台请求契约（`execution_kind/group_mode/dag`）及可视化展示。
-- [ ] T18：补齐 DAG 回归测试（串行、并行、组合、环路校验、异常收敛）。
-- [ ] T18.1：补齐高压丢弃一致性测试（`delivered/dropped/seq` 跨分支一致）。
+- [x] T11：定义 `StreamTaskGroup + DagNodeRuntime` 数据结构与状态机（group/node 两级）。
+- [x] T12：在 `/scheduler/stream/execute` 增加 `execution_kind` 分发与 `group_mode=dag` 校验。
+- [x] T12.1：统一请求契约为 `sql_text`（single/group），拒绝 `group` 直传 `dag/nodes/source_share_sets`。
+- [x] T13：后端实现 `sql_text` 切分器（分号切分、字符串/注释保护、空语句拒绝）。
+- [x] T13.1：实现 DAG 自动构建与归一化（按 `sql_text` 生成节点、依赖推导、share set 自动识别）。
+- [x] T13.2：补齐 DAG 护栏校验（`max_group_nodes/max_group_edges/max_group_share_sets/max_group_sql_bytes`）与错误码 `STREAM_GROUP_DAG_TOO_LARGE`。
+- [x] T14：实现 `source_share_sets` 与 `BroadcastHub`（同源一次读取、多分支广播）。
+- [x] T14.1：实现 `coordinated drop`（全分支一致丢弃）与 `broadcast_seq` 指标。
+- [x] T14.2：补齐 share set 同源 mismatch 差异回传（`missing_keys/extra_keys`）。
+- [x] T15：实现 DAG 调度推进（拓扑启动、`on_running`、share set 全员 ready 启动屏障）。
+- [x] T15.1：实现 `share_set_ready_timeout_s` 屏障超时并回传 `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`。
+- [x] T16：实现组级 stop/status/list、租约申请/释放与 fail-fast 收敛。
+- [x] T16.1：实现 `timeout_s` 组级超时收敛与 `STREAM_GROUP_TIMEOUT` 语义错误码透传。
+- [x] T16.2：实现“先停 hub，再停 node”的组级收敛顺序。
+- [x] T16.3：实现组级一次性租约并集申请/释放（节点执行复用租约）。
+- [x] T16.4：实现 `execute` 与 `modify/remove` 的 TOCTOU 原子防护（版本复核 + 引用登记 + 失败回滚）。
+- [x] T17：补齐 `TaskPlugin` 与前端工作台请求契约（`execution_kind/group_mode/sql_text`）及可视化展示。
+- [x] T17.1：前端仅做输入级校验（非空、group 至少两条 SQL），错误码映射 `STREAM_GROUP_*` 提示。
+- [x] T18：补齐 DAG 回归测试（串行、并行、组合、环路校验、异常收敛）。
+- [x] T18.1：补齐高压丢弃一致性测试（`delivered/dropped/seq` 跨分支一致）。
+- [x] T18.2：补齐超时错误码与语义测试（`STREAM_GROUP_TIMEOUT`、`STREAM_GROUP_SHARE_SET_READY_TIMEOUT`）。
+- [x] T18.3：补齐 TOCTOU 并发测试与组级租约残留测试。
+- [x] T19：Sprint 14 验收完成后同步功能 README（分号规则、`sql_text` 契约、关键错误码）。
 
 ---
 
@@ -152,12 +164,14 @@ npm --prefix src/frontend run build
 
 **新增测试范围**：
 
-- [ ] `test_stream`：DAG 节点调度、广播分发正确性、慢分支稳定性、Stop/Cancel/Timeout 收敛。
-- [ ] `test_scheduler_e2e`：单任务多 SQL 的 DAG 串并组合全链路回归。
-- [ ] 管理面回归：`/channels/stream/query|add|modify|remove` 与 sink 绑定校验（含 `stream_hub split/merge` 语义）。
-- [ ] 前端冒烟：具名 Stream Sink 创建、查询、任务执行与状态展示。
-- [ ] SQL parser/语义回归：历史语法 AST 稳定 + selector 新增/非法语法用例 + `merge` 语义拒绝用例。
-- [ ] 并发回归：`execute` 与 `modify/remove` 并发压测，验证 TOCTOU 防护与 in-use 判定稳定。
+- [x] `test_stream`：DAG 节点调度、广播分发正确性、慢分支稳定性、Stop/Cancel/Timeout 收敛。
+- [x] `test_scheduler_e2e`：单任务多 SQL 的 DAG 串并组合全链路回归。
+- [x] 管理面回归：`/channels/stream/query|add|modify|remove` 与 sink 绑定校验（含 `stream_hub split/merge` 语义）。
+- [x] 前端冒烟：具名 Stream Sink 创建、查询、任务执行与状态展示。
+- [x] SQL parser/语义回归：历史语法 AST 稳定 + selector 新增/非法语法用例 + `merge` 语义拒绝用例。
+- [x] 并发回归：`execute` 与 `modify/remove` 并发压测，验证 TOCTOU 防护与 in-use 判定稳定。
+- [x] `sql_text` 切分回归：分号切分、字符串/注释内分号、空语句拒绝、错误定位（`sql_index` 统一 `0-based`）。
+- [x] 错误码回归：`STREAM_GROUP_SQL_TEXT_INVALID`、`STREAM_GROUP_TIMEOUT`、`STREAM_GROUP_SHARE_SET_READY_TIMEOUT`。
 
 ---
 
@@ -189,3 +203,11 @@ Day 6-8: Story 14.13（Group DAG 编排 + 测试回归）
 3. Story 14.12 设计与实现：具名 Stream Sink 管理与观测
 4. Story 14.13 设计与实现：流式 Group DAG 执行链路
 5. 测试与回归报告：并发正确性、稳定性、管理面与前端联调
+
+---
+
+## 后续潜在任务（不纳入 Sprint 14）
+
+- [ ] Story 14.14（候选）：Hybrid DAG（batch + stream 混合编排）
+- [ ] 首阶段建议约束：`source_share_sets` 仅允许 stream 节点；`stream -> batch` 仅允许 `on_finished`；`batch -> stream` 仅支持一次性装填并在写入完成后 `CloseStream()`
+- [ ] 目标价值：支持“先批后流 / 先流后批”的单任务一键编排，统一任务依赖、超时与状态观测

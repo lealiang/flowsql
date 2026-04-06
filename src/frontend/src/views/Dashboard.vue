@@ -49,7 +49,7 @@
         <el-table-column prop="sql_text" label="SQL" min-width="420" show-overflow-tooltip />
         <el-table-column prop="status" label="状态" width="100">
           <template #default="scope">
-            <el-tag :type="scope.row.status === 'completed' ? 'success' : 'danger'">
+            <el-tag :type="taskStatusTag(scope.row.status)">
               {{ scope.row.status }}
             </el-tag>
           </template>
@@ -84,6 +84,12 @@ const parseOperatorActive = (op) => {
   return v === 1 || v === '1' || v === true
 }
 
+const taskStatusTag = (status) => {
+  if (status === 'completed' || status === 'stopped') return 'success'
+  if (status === 'running' || status === 'pending') return 'warning'
+  return 'danger'
+}
+
 const loadData = async () => {
   try {
     const [channelsRes, builtinRes, pythonRes, cppRes, tasksRes] = await Promise.all([
@@ -107,7 +113,7 @@ const loadData = async () => {
     stats.value.activeOperators = operators.filter(parseOperatorActive).length
 
     stats.value.totalTasks = tasks.length
-    stats.value.successTasks = tasks.filter(t => t.status === 'completed').length
+    stats.value.successTasks = tasks.filter(t => t.status === 'completed' || t.status === 'stopped').length
 
     recentTasks.value = tasks.slice(0, 5)
   } catch (error) {

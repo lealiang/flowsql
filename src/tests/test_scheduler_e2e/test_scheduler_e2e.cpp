@@ -82,6 +82,16 @@ static std::string MakeReq(const std::string& sql) {
     return buf.GetString();
 }
 
+static std::string MakeStreamReq(const std::string& sql_text) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("sql_text");
+    w.String(sql_text.c_str());
+    w.EndObject();
+    return buf.GetString();
+}
+
 static std::string MakeTaskReq(const std::string& task_id) {
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
@@ -287,6 +297,50 @@ class DbDirectWriterStreamOperator final : public IOperator, public IStreamOpera
     std::string last_error_;
 };
 
+class SlowPassthroughStreamOperator final : public IOperator, public IStreamOperator {
+ public:
+    std::string Category() override { return "custom"; }
+    std::string Name() override { return "slow_passthrough_stream"; }
+    std::string Description() override { return "slow stream passthrough for coordinated-drop e2e"; }
+    OperatorPosition Position() override { return OperatorPosition::DATA; }
+
+    int Work(IChannel*, IChannel*) override { return -1; }
+    int Configure(const char*, const char*) override { return 0; }
+
+    int Init(const char*, const StreamSinkContext& sink_ctx) override {
+        last_error_.clear();
+        output_.reset();
+        if (sink_ctx.sink_type != ChannelType::kStream) {
+            last_error_ = "slow passthrough requires stream sink";
+            return -1;
+        }
+        auto* out = dynamic_cast<IStreamChannel*>(sink_ctx.sink_channel);
+        if (!out) {
+            last_error_ = "stream sink cast failed";
+            return -1;
+        }
+        output_ = std::shared_ptr<IStreamChannel>(out, [](IStreamChannel*) {});
+        return 0;
+    }
+
+    int OnSchemaReady(std::shared_ptr<arrow::Schema>) override { return 0; }
+
+    int Process(const arrow::RecordBatch& batch, int64_t ts_ms) override {
+        if (!output_) return -1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        return output_->Put(batch.Slice(0, batch.num_rows()), ts_ms);
+    }
+
+    int Tick(int64_t) override { return 0; }
+    int Flush() override { return 0; }
+    std::string GetStats() override { return "{}"; }
+    std::string LastError() override { return last_error_; }
+
+ private:
+    std::shared_ptr<IStreamChannel> output_;
+    std::string last_error_;
+};
+
 static bool ListContainsTaskId(const std::string& rsp, const std::string& task_id) {
     rapidjson::Document d;
     d.Parse(rsp.c_str());
@@ -405,6 +459,9 @@ int main() {
         out << "      option: \"ring_size=256;batch_rows=128;overflow=drop;ring_mode=spsc;finite=false\"\n";
         out << "    - type: ring\n";
         out << "      name: svc_out\n";
+        out << "      option: \"ring_size=256;batch_rows=128;overflow=drop;ring_mode=spsc;finite=false\"\n";
+        out << "    - type: ring\n";
+        out << "      name: df_out\n";
         out << "      option: \"ring_size=256;batch_rows=128;overflow=drop;ring_mode=spsc;finite=false\"\n";
         out << "    - type: tcp_session_mock\n";
         out << "      name: tcp_src\n";
@@ -932,6 +989,44 @@ int main() {
     }
     std::puts("[PASS] T38");
 
+    // T38A: batch execute 支持 dataframe -> stream
+    {
+        std::string rsp;
+        ASSERT_EQ(exec("/scheduler/batch/execute",
+                       MakeReq("SELECT * FROM sqlite.local.src INTO dataframe.df2stream_src"),
+                       rsp),
+                  error::OK);
+
+        auto* df_out = stream_factory->Get("ring", "df_out");
+        ASSERT_TRUE(df_out != nullptr);
+
+        while (true) {
+            PollEvent ev = df_out->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+
+        ASSERT_EQ(exec("/scheduler/batch/execute",
+                       MakeReq("SELECT * FROM dataframe.df2stream_src INTO ring.df_out"),
+                       rsp),
+                  error::OK);
+        ASSERT_TRUE(rsp.find("\"status\":\"completed\"") != std::string::npos);
+
+        int rows = 0;
+        bool saw_eof = false;
+        for (int i = 0; i < 200; ++i) {
+            PollEvent ev = df_out->PollNext(10);
+            if (ev.kind == PollEventKind::kData && ev.batch.data) {
+                rows += static_cast<int>(ev.batch.data->num_rows());
+            } else if (ev.kind == PollEventKind::kEof) {
+                saw_eof = true;
+                break;
+            }
+        }
+        ASSERT_EQ(rows, 3);
+        ASSERT_TRUE(saw_eof);
+    }
+    std::puts("[PASS] T38A");
+
     // T39: 流式 execute/status/list + 数据流转
     {
         std::string rsp;
@@ -949,7 +1044,7 @@ int main() {
         }
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out"),
+                              MakeStreamReq("SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out"),
                               rsp),
                   error::OK);
         const std::string task_id = ParseTaskId(rsp);
@@ -1004,7 +1099,7 @@ int main() {
         }
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM ring.stop_in USING builtin.passthrough_stream INTO stream.stop_out"),
+                              MakeStreamReq("SELECT * FROM ring.stop_in USING builtin.passthrough_stream INTO stream.stop_out"),
                               rsp),
                   error::OK);
         const std::string task_id = ParseTaskId(rsp);
@@ -1055,7 +1150,7 @@ int main() {
         }
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.tcp_service_merge_stream INTO stream.svc_out"),
                               rsp),
                   error::OK);
@@ -1120,7 +1215,7 @@ int main() {
         ASSERT_EQ(activate("/operators/activate", R"({"name":"custom.parallel_passthrough_stream"})", rsp), error::OK);
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src_stateless "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src_stateless "
                                       "USING custom.parallel_passthrough_stream INTO dataframe.stream_single_writer"),
                               rsp),
                   error::BAD_REQUEST);
@@ -1169,7 +1264,7 @@ int main() {
         const int64_t src_rows_before = QueryCount(db, "SELECT * FROM src");
         ASSERT_EQ(src_rows_before, 3);
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream "
                                       "INTO sqlite.local.t44_into"),
                               rsp),
@@ -1184,7 +1279,7 @@ int main() {
 
         // case 2: WITH sink_table 不再作为框架兜底语义
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream WITH sink_table=t44_with "
                                       "INTO sqlite.local"),
                               rsp),
@@ -1193,7 +1288,7 @@ int main() {
 
         // case 3: builtin + 两段式 DB 目标失败（要求显式三段式）
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream INTO sqlite.local"),
                               rsp),
                   error::BAD_REQUEST);
@@ -1201,7 +1296,7 @@ int main() {
 
         // case 4: 普通算子可接收两段式 DB 通道并自行写入
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING custom.db_direct_writer_stream INTO sqlite.local"),
                               rsp),
                   error::OK);
@@ -1294,35 +1389,35 @@ int main() {
         })", rsp), error::OK);
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream INTO stream.source_only_ring"),
                               rsp),
                   error::BAD_REQUEST);
         ASSERT_TRUE(rsp.find("STREAM_CHANNEL_ROLE_MISMATCH") != std::string::npos);
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM stream.sink_only_ring "
+                              MakeStreamReq("SELECT * FROM stream.sink_only_ring "
                                       "USING builtin.passthrough_stream INTO dataframe.sink_role_bad"),
                               rsp),
                   error::BAD_REQUEST);
         ASSERT_TRUE(rsp.find("STREAM_CHANNEL_ROLE_MISMATCH") != std::string::npos);
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream INTO stream.npm_hub[0]"),
                               rsp),
                   error::BAD_REQUEST);
         ASSERT_TRUE(rsp.find("STREAM_HUB_SELECTOR_NOT_ALLOWED_INTO") != std::string::npos);
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM stream.npm_merge[*] "
+                              MakeStreamReq("SELECT * FROM stream.npm_merge[*] "
                                       "USING builtin.passthrough_stream INTO dataframe.npm_merge_bad"),
                               rsp),
                   error::BAD_REQUEST);
         ASSERT_TRUE(rsp.find("STREAM_HUB_SELECTOR_NOT_ALLOWED_MERGE") != std::string::npos);
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM tcp_session_mock.tcp_src "
+                              MakeStreamReq("SELECT * FROM tcp_session_mock.tcp_src "
                                       "USING builtin.passthrough_stream INTO stream.npm_hub"),
                               rsp),
                   error::OK);
@@ -1350,7 +1445,7 @@ int main() {
         ASSERT_EQ(terminal_status, "stopped");
 
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
-                              MakeReq("SELECT * FROM stream.npm_hub "
+                              MakeStreamReq("SELECT * FROM stream.npm_hub "
                                       "USING builtin.passthrough_stream INTO dataframe.npm_auto"),
                               rsp),
                   error::OK);
@@ -1442,6 +1537,789 @@ int main() {
         std::filesystem::remove(web_db_path);
     }
     std::puts("[PASS] T47");
+
+    // T48: Stream Group DAG（线性两节点）执行/状态/列表
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+
+        const std::string group_src_name = "group_src_" + suffix;
+        const std::string group_mid_name = "group_mid_" + suffix;
+        const std::string group_out_name = "group_out_" + suffix;
+
+        auto make_add_ring_req = [](const std::string& name) {
+            rapidjson::StringBuffer buf;
+            rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+            w.StartObject();
+            w.Key("type");
+            w.String("ring");
+            w.Key("name");
+            w.String(name.c_str());
+            w.Key("role");
+            w.String("both");
+            w.Key("options");
+            w.StartObject();
+            w.Key("ring_mode");
+            w.String("spsc");
+            w.Key("ring_size");
+            w.Int(256);
+            w.Key("overflow");
+            w.String("drop");
+            w.Key("finite");
+            w.Bool(false);
+            w.EndObject();
+            w.EndObject();
+            return std::string(buf.GetString());
+        };
+
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(group_src_name), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(group_mid_name), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(group_out_name), rsp), error::OK);
+
+        auto* group_src = stream_factory->Get("ring", group_src_name.c_str());
+        auto* group_out = stream_factory->Get("ring", group_out_name.c_str());
+        ASSERT_TRUE(group_src != nullptr);
+        ASSERT_TRUE(group_out != nullptr);
+
+        while (true) {
+            PollEvent ev = group_out->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+
+        const std::string sql1 =
+            "SELECT * FROM ring." + group_src_name +
+            " USING builtin.passthrough_stream INTO stream." + group_mid_name;
+        const std::string sql2 =
+            "SELECT * FROM stream." + group_mid_name +
+            " USING builtin.passthrough_stream INTO stream." + group_out_name;
+
+        const std::string group_sql_text = sql1 + ";\n" + sql2 + ";";
+
+        rapidjson::StringBuffer req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(req_buf);
+        w.StartObject();
+        w.Key("execution_kind");
+        w.String("group");
+        w.Key("group_mode");
+        w.String("dag");
+        w.Key("sql_text");
+        w.String(group_sql_text.c_str());
+        w.EndObject();
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute", req_buf.GetString(), rsp), error::OK);
+        rapidjson::Document submit_doc;
+        submit_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!submit_doc.HasParseError() && submit_doc.IsObject());
+        ASSERT_TRUE(submit_doc.HasMember("runtime_kind") && submit_doc["runtime_kind"].IsString());
+        ASSERT_EQ(std::string(submit_doc["runtime_kind"].GetString()), "group");
+        ASSERT_TRUE(submit_doc.HasMember("node_count") && submit_doc["node_count"].IsUint());
+        ASSERT_EQ(submit_doc["node_count"].GetUint(), 2u);
+        const std::string group_task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!group_task_id.empty());
+
+        ASSERT_EQ(group_src->Put(MakeStreamBatch(11), 2001), 0);
+        ASSERT_EQ(group_src->Put(MakeStreamBatch(12), 2002), 0);
+        ASSERT_EQ(group_src->Put(MakeStreamBatch(13), 2003), 0);
+        group_src->CloseStream();
+
+        bool group_running_seen = false;
+        for (int i = 0; i < 300; ++i) {
+            std::string status_rsp;
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(group_task_id), status_rsp), error::OK);
+            rapidjson::Document status_doc;
+            status_doc.Parse(status_rsp.c_str());
+            ASSERT_TRUE(!status_doc.HasParseError() && status_doc.IsObject());
+            ASSERT_TRUE(status_doc.HasMember("runtime_kind") && status_doc["runtime_kind"].IsString());
+            ASSERT_EQ(std::string(status_doc["runtime_kind"].GetString()), "group");
+            ASSERT_TRUE(status_doc.HasMember("nodes") && status_doc["nodes"].IsArray());
+            ASSERT_EQ(status_doc["nodes"].Size(), 2u);
+            ASSERT_TRUE(status_doc.HasMember("resolved_sources") && status_doc["resolved_sources"].IsArray());
+            ASSERT_EQ(status_doc["resolved_sources"].Size(), 2u);
+            bool found_n1_sources = false;
+            bool found_n2_sources = false;
+            for (const auto& rs : status_doc["resolved_sources"].GetArray()) {
+                ASSERT_TRUE(rs.IsObject());
+                ASSERT_TRUE(rs.HasMember("node_id") && rs["node_id"].IsString());
+                ASSERT_TRUE(rs.HasMember("sources") && rs["sources"].IsArray());
+                const std::string node_id = rs["node_id"].GetString();
+                if (node_id == "n1") {
+                    found_n1_sources = true;
+                    ASSERT_TRUE(rs["sources"].Size() >= 1u);
+                } else if (node_id == "n2") {
+                    found_n2_sources = true;
+                    ASSERT_TRUE(rs["sources"].Size() >= 1u);
+                }
+            }
+            ASSERT_TRUE(found_n1_sources);
+            ASSERT_TRUE(found_n2_sources);
+            const std::string st = ParseStatus(status_rsp);
+            if (st == "running" || st == "preparing" || st == "stopping") {
+                group_running_seen = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(group_running_seen);
+
+        int out_rows = 0;
+        for (int i = 0; i < 300 && out_rows < 3; ++i) {
+            PollEvent ev = group_out->PollNext(10);
+            if (ev.kind == PollEventKind::kData && ev.batch.data) {
+                out_rows += static_cast<int>(ev.batch.data->num_rows());
+            }
+        }
+        ASSERT_EQ(out_rows, 3);
+
+        std::string stop_rsp;
+        ASSERT_EQ(stream_stop("/scheduler/stream/stop", MakeTaskReq(group_task_id), stop_rsp), error::OK);
+        ASSERT_EQ(ParseStatus(stop_rsp), "stopped");
+        rapidjson::Document stop_doc;
+        stop_doc.Parse(stop_rsp.c_str());
+        ASSERT_TRUE(!stop_doc.HasParseError() && stop_doc.IsObject());
+        ASSERT_TRUE(stop_doc.HasMember("resolved_sources") && stop_doc["resolved_sources"].IsArray());
+        ASSERT_EQ(stop_doc["resolved_sources"].Size(), 2u);
+
+        std::string list_rsp;
+        ASSERT_EQ(stream_list("/scheduler/stream/list", "{}", list_rsp), error::OK);
+        ASSERT_TRUE(ListContainsTaskId(list_rsp, group_task_id));
+    }
+    std::puts("[PASS] T48");
+
+    // T49: Stream Group DAG source_share_sets 同源广播（单读多分支）
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+
+        const std::string src_name = "share_src_" + suffix;
+        const std::string out1_name = "share_out1_" + suffix;
+        const std::string out2_name = "share_out2_" + suffix;
+
+        auto make_add_ring_req = [](const std::string& name) {
+            rapidjson::StringBuffer buf;
+            rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+            w.StartObject();
+            w.Key("type");
+            w.String("ring");
+            w.Key("name");
+            w.String(name.c_str());
+            w.Key("role");
+            w.String("both");
+            w.Key("options");
+            w.StartObject();
+            w.Key("ring_mode");
+            w.String("spsc");
+            w.Key("ring_size");
+            w.Int(256);
+            w.Key("overflow");
+            w.String("drop");
+            w.Key("finite");
+            w.Bool(false);
+            w.EndObject();
+            w.EndObject();
+            return std::string(buf.GetString());
+        };
+
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(src_name), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(out1_name), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(out2_name), rsp), error::OK);
+
+        auto* src = stream_factory->Get("ring", src_name.c_str());
+        auto* out1 = stream_factory->Get("ring", out1_name.c_str());
+        auto* out2 = stream_factory->Get("ring", out2_name.c_str());
+        ASSERT_TRUE(src != nullptr);
+        ASSERT_TRUE(out1 != nullptr);
+        ASSERT_TRUE(out2 != nullptr);
+
+        while (true) {
+            PollEvent ev = out1->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+        while (true) {
+            PollEvent ev = out2->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+
+        const std::string sql1 =
+            "SELECT * FROM ring." + src_name +
+            " USING builtin.passthrough_stream INTO stream." + out1_name;
+        const std::string sql2 =
+            "SELECT * FROM ring." + src_name +
+            " USING builtin.passthrough_stream INTO stream." + out2_name;
+
+        const std::string group_sql_text = sql1 + ";\n" + sql2 + ";";
+
+        rapidjson::StringBuffer req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(req_buf);
+        w.StartObject();
+        w.Key("execution_kind");
+        w.String("group");
+        w.Key("group_mode");
+        w.String("dag");
+        w.Key("sql_text");
+        w.String(group_sql_text.c_str());
+        w.EndObject();
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute", req_buf.GetString(), rsp), error::OK);
+        rapidjson::Document submit_doc;
+        submit_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!submit_doc.HasParseError() && submit_doc.IsObject());
+        ASSERT_TRUE(submit_doc.HasMember("runtime_kind") && submit_doc["runtime_kind"].IsString());
+        ASSERT_EQ(std::string(submit_doc["runtime_kind"].GetString()), "group");
+        ASSERT_TRUE(submit_doc.HasMember("share_set_count") && submit_doc["share_set_count"].IsUint());
+        ASSERT_EQ(submit_doc["share_set_count"].GetUint(), 1u);
+        const std::string group_task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!group_task_id.empty());
+
+        ASSERT_EQ(src->Put(MakeStreamBatch(21), 3001), 0);
+        ASSERT_EQ(src->Put(MakeStreamBatch(22), 3002), 0);
+        ASSERT_EQ(src->Put(MakeStreamBatch(23), 3003), 0);
+        src->CloseStream();
+
+        bool group_done = false;
+        for (int i = 0; i < 800; ++i) {
+            std::string status_rsp;
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(group_task_id), status_rsp), error::OK);
+            rapidjson::Document status_doc;
+            status_doc.Parse(status_rsp.c_str());
+            ASSERT_TRUE(!status_doc.HasParseError() && status_doc.IsObject());
+            ASSERT_TRUE(status_doc.HasMember("share_sets") && status_doc["share_sets"].IsArray());
+            ASSERT_TRUE(!status_doc["share_sets"].Empty());
+            ASSERT_TRUE(status_doc.HasMember("resolved_sources") && status_doc["resolved_sources"].IsArray());
+            ASSERT_EQ(status_doc["resolved_sources"].Size(), 2u);
+            for (const auto& rs : status_doc["resolved_sources"].GetArray()) {
+                ASSERT_TRUE(rs.IsObject());
+                ASSERT_TRUE(rs.HasMember("sources") && rs["sources"].IsArray());
+                ASSERT_TRUE(rs["sources"].Size() >= 1u);
+            }
+            const std::string st = ParseStatus(status_rsp);
+            if (st == "stopped" || st == "failed" || st == "cancelled") {
+                ASSERT_EQ(st, "stopped");
+                group_done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(group_done);
+
+        int rows1 = 0;
+        int rows2 = 0;
+        for (int i = 0; i < 300 && (rows1 < 3 || rows2 < 3); ++i) {
+            PollEvent ev1 = out1->PollNext(10);
+            if (ev1.kind == PollEventKind::kData && ev1.batch.data) {
+                rows1 += static_cast<int>(ev1.batch.data->num_rows());
+            }
+            PollEvent ev2 = out2->PollNext(10);
+            if (ev2.kind == PollEventKind::kData && ev2.batch.data) {
+                rows2 += static_cast<int>(ev2.batch.data->num_rows());
+            }
+        }
+        ASSERT_EQ(rows1, 3);
+        ASSERT_EQ(rows2, 3);
+    }
+    std::puts("[PASS] T49");
+
+    // T49.1: source_share_set 高压下 coordinated drop 指标一致性
+    {
+        std::string rsp;
+        ASSERT_EQ(op_registry->Register("custom.slow_passthrough_stream", []() -> IOperator* {
+            return new SlowPassthroughStreamOperator();
+        }), 0);
+        ASSERT_EQ(upsert_batch("/operators/upsert_batch", R"({
+            "operators":[
+                {
+                    "category":"custom",
+                    "name":"slow_passthrough_stream",
+                    "type":"cpp",
+                    "source":"e2e",
+                    "description":"e2e slow passthrough stream",
+                    "position":"DATA"
+                }
+            ]
+        })", rsp), error::OK);
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"custom.slow_passthrough_stream"})", rsp), error::OK);
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+
+        const std::string src_name = "share_pressure_src_" + suffix;
+        const std::string out_fast_name = "share_pressure_fast_" + suffix;
+        const std::string out_slow_name = "share_pressure_slow_" + suffix;
+
+        auto make_add_ring_req = [](const std::string& name, int ring_size) {
+            rapidjson::StringBuffer buf;
+            rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+            w.StartObject();
+            w.Key("type");
+            w.String("ring");
+            w.Key("name");
+            w.String(name.c_str());
+            w.Key("role");
+            w.String("both");
+            w.Key("options");
+            w.StartObject();
+            w.Key("ring_mode");
+            w.String("spsc");
+            w.Key("ring_size");
+            w.Int(ring_size);
+            w.Key("overflow");
+            w.String("drop");
+            w.Key("finite");
+            w.Bool(false);
+            w.EndObject();
+            w.EndObject();
+            return std::string(buf.GetString());
+        };
+
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(src_name, 16384), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(out_fast_name, 16384), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(out_slow_name, 16384), rsp), error::OK);
+
+        auto* src = stream_factory->Get("ring", src_name.c_str());
+        auto* out_fast = stream_factory->Get("ring", out_fast_name.c_str());
+        auto* out_slow = stream_factory->Get("ring", out_slow_name.c_str());
+        ASSERT_TRUE(src != nullptr);
+        ASSERT_TRUE(out_fast != nullptr);
+        ASSERT_TRUE(out_slow != nullptr);
+
+        while (true) {
+            PollEvent ev = out_fast->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+        while (true) {
+            PollEvent ev = out_slow->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+
+        const std::string sql_fast =
+            "SELECT * FROM ring." + src_name +
+            " USING builtin.passthrough_stream INTO stream." + out_fast_name;
+        const std::string sql_slow =
+            "SELECT * FROM ring." + src_name +
+            " USING custom.slow_passthrough_stream INTO stream." + out_slow_name;
+        const std::string group_sql_text = sql_fast + ";\n" + sql_slow + ";";
+
+        rapidjson::StringBuffer req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(req_buf);
+        w.StartObject();
+        w.Key("execution_kind");
+        w.String("group");
+        w.Key("group_mode");
+        w.String("dag");
+        w.Key("timeout_s");
+        w.Int(40);
+        w.Key("sql_text");
+        w.String(group_sql_text.c_str());
+        w.EndObject();
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute", req_buf.GetString(), rsp), error::OK);
+        const std::string group_task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!group_task_id.empty());
+
+        constexpr int kInputBatches = 2600;
+        int accepted_batches = 0;
+        for (int i = 0; i < kInputBatches; ++i) {
+            if (src->Put(MakeStreamBatch(100000 + i), 7000 + i) == 0) {
+                ++accepted_batches;
+            }
+        }
+        src->CloseStream();
+        ASSERT_TRUE(accepted_batches > 0);
+
+        bool done = false;
+        std::string final_rsp;
+        for (int i = 0; i < 1800; ++i) {
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(group_task_id), final_rsp), error::OK);
+            const std::string st = ParseStatus(final_rsp);
+            if (st == "stopped" || st == "failed" || st == "cancelled") {
+                ASSERT_EQ(st, "stopped");
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(done);
+
+        rapidjson::Document final_doc;
+        final_doc.Parse(final_rsp.c_str());
+        ASSERT_TRUE(!final_doc.HasParseError() && final_doc.IsObject());
+        ASSERT_TRUE(final_doc.HasMember("share_sets") && final_doc["share_sets"].IsArray());
+        ASSERT_EQ(final_doc["share_sets"].Size(), 1u);
+        const auto& ss = final_doc["share_sets"][0];
+        ASSERT_TRUE(ss.IsObject());
+        ASSERT_TRUE(ss.HasMember("input_batches") && ss["input_batches"].IsUint64());
+        ASSERT_TRUE(ss.HasMember("delivered_batches") && ss["delivered_batches"].IsUint64());
+        ASSERT_TRUE(ss.HasMember("dropped_batches_shared") && ss["dropped_batches_shared"].IsUint64());
+        ASSERT_TRUE(ss.HasMember("input_rows") && ss["input_rows"].IsUint64());
+        ASSERT_TRUE(ss.HasMember("delivered_rows") && ss["delivered_rows"].IsUint64());
+        ASSERT_TRUE(ss.HasMember("dropped_rows_shared") && ss["dropped_rows_shared"].IsUint64());
+        ASSERT_TRUE(ss.HasMember("last_delivered_seq") && ss["last_delivered_seq"].IsUint64());
+        ASSERT_TRUE(ss.HasMember("last_dropped_seq") && ss["last_dropped_seq"].IsUint64());
+
+        const uint64_t input_batches = ss["input_batches"].GetUint64();
+        const uint64_t delivered_batches = ss["delivered_batches"].GetUint64();
+        const uint64_t dropped_batches = ss["dropped_batches_shared"].GetUint64();
+        const uint64_t input_rows = ss["input_rows"].GetUint64();
+        const uint64_t delivered_rows = ss["delivered_rows"].GetUint64();
+        const uint64_t dropped_rows = ss["dropped_rows_shared"].GetUint64();
+        const uint64_t last_delivered_seq = ss["last_delivered_seq"].GetUint64();
+        const uint64_t last_dropped_seq = ss["last_dropped_seq"].GetUint64();
+
+        ASSERT_EQ(input_batches, delivered_batches + dropped_batches);
+        ASSERT_EQ(input_rows, delivered_rows + dropped_rows);
+        ASSERT_TRUE(input_batches > 0);
+        ASSERT_TRUE(dropped_batches > 0);
+        ASSERT_TRUE(last_delivered_seq <= input_batches);
+        ASSERT_TRUE(last_dropped_seq > 0 && last_dropped_seq <= input_batches);
+
+        ASSERT_TRUE(final_doc.HasMember("nodes") && final_doc["nodes"].IsArray());
+        ASSERT_EQ(final_doc["nodes"].Size(), 2u);
+        uint64_t node1_processed_rows = 0;
+        uint64_t node2_processed_rows = 0;
+        uint64_t node1_output_rows = 0;
+        uint64_t node2_output_rows = 0;
+        bool found_n1 = false;
+        bool found_n2 = false;
+        for (const auto& node : final_doc["nodes"].GetArray()) {
+            ASSERT_TRUE(node.IsObject());
+            ASSERT_TRUE(node.HasMember("id") && node["id"].IsString());
+            ASSERT_TRUE(node.HasMember("processed_rows") && node["processed_rows"].IsUint64());
+            ASSERT_TRUE(node.HasMember("output_rows") && node["output_rows"].IsUint64());
+            const std::string node_id = node["id"].GetString();
+            if (node_id == "n1") {
+                found_n1 = true;
+                node1_processed_rows = node["processed_rows"].GetUint64();
+                node1_output_rows = node["output_rows"].GetUint64();
+            } else if (node_id == "n2") {
+                found_n2 = true;
+                node2_processed_rows = node["processed_rows"].GetUint64();
+                node2_output_rows = node["output_rows"].GetUint64();
+            }
+        }
+        ASSERT_TRUE(found_n1);
+        ASSERT_TRUE(found_n2);
+        ASSERT_EQ(node1_processed_rows, node2_processed_rows);
+        ASSERT_EQ(node1_output_rows, node2_output_rows);
+        ASSERT_EQ(node1_processed_rows, delivered_rows);
+        ASSERT_EQ(node2_processed_rows, delivered_rows);
+    }
+    std::puts("[PASS] T49.1");
+
+    // T50: Group 共享 stream sink 并发写能力校验（SPSC 拒绝，MPSC 允许）
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+
+        const std::string src1_name = "sink_cap_src1_" + suffix;
+        const std::string src2_name = "sink_cap_src2_" + suffix;
+        const std::string spsc_sink_name = "sink_cap_spsc_" + suffix;
+        const std::string mpsc_sink_name = "sink_cap_mpsc_" + suffix;
+
+        auto make_add_ring_req = [](const std::string& name, const char* mode) {
+            rapidjson::StringBuffer buf;
+            rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+            w.StartObject();
+            w.Key("type");
+            w.String("ring");
+            w.Key("name");
+            w.String(name.c_str());
+            w.Key("role");
+            w.String("both");
+            w.Key("options");
+            w.StartObject();
+            w.Key("ring_mode");
+            w.String(mode);
+            w.Key("ring_size");
+            w.Int(256);
+            w.Key("overflow");
+            w.String("drop");
+            w.Key("finite");
+            w.Bool(false);
+            w.EndObject();
+            w.EndObject();
+            return std::string(buf.GetString());
+        };
+
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(src1_name, "spsc"), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(src2_name, "spsc"), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(spsc_sink_name, "spsc"), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(mpsc_sink_name, "mpsc"), rsp), error::OK);
+
+        const std::string sql1 =
+            "SELECT * FROM ring." + src1_name +
+            " USING builtin.passthrough_stream INTO stream." + spsc_sink_name;
+        const std::string sql2 =
+            "SELECT * FROM ring." + src2_name +
+            " USING builtin.passthrough_stream INTO stream." + spsc_sink_name;
+
+        const std::string invalid_sql_text = sql1 + ";\n" + sql2 + ";";
+        rapidjson::StringBuffer req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(req_buf);
+        w.StartObject();
+        w.Key("execution_kind");
+        w.String("group");
+        w.Key("group_mode");
+        w.String("dag");
+        w.Key("sql_text");
+        w.String(invalid_sql_text.c_str());
+        w.EndObject();
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute", req_buf.GetString(), rsp), error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SINK_CAPABILITY_MISMATCH") != std::string::npos);
+        rapidjson::Document invalid_doc;
+        invalid_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!invalid_doc.HasParseError() && invalid_doc.IsObject());
+        ASSERT_TRUE(invalid_doc.HasMember("sink_key") && invalid_doc["sink_key"].IsString());
+        ASSERT_TRUE(invalid_doc.HasMember("required") && invalid_doc["required"].IsObject());
+        ASSERT_TRUE(invalid_doc["required"].HasMember("writers") && invalid_doc["required"]["writers"].IsUint());
+        ASSERT_EQ(invalid_doc["required"]["writers"].GetUint(), 2u);
+        ASSERT_TRUE(invalid_doc.HasMember("actual") && invalid_doc["actual"].IsObject());
+        ASSERT_TRUE(invalid_doc["actual"].HasMember("put_mode") && invalid_doc["actual"]["put_mode"].IsString());
+        ASSERT_EQ(std::string(invalid_doc["actual"]["put_mode"].GetString()), "SINGLE");
+
+        const std::string sql3 =
+            "SELECT * FROM ring." + src1_name +
+            " USING builtin.passthrough_stream INTO stream." + mpsc_sink_name;
+        const std::string sql4 =
+            "SELECT * FROM ring." + src2_name +
+            " USING builtin.passthrough_stream INTO stream." + mpsc_sink_name;
+
+        const std::string valid_sql_text = sql3 + ";\n" + sql4 + ";";
+        rapidjson::StringBuffer req_ok_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w_ok(req_ok_buf);
+        w_ok.StartObject();
+        w_ok.Key("execution_kind");
+        w_ok.String("group");
+        w_ok.Key("group_mode");
+        w_ok.String("dag");
+        w_ok.Key("sql_text");
+        w_ok.String(valid_sql_text.c_str());
+        w_ok.EndObject();
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute", req_ok_buf.GetString(), rsp), error::OK);
+        const std::string task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!task_id.empty());
+
+        auto* src1 = stream_factory->Get("ring", src1_name.c_str());
+        auto* src2 = stream_factory->Get("ring", src2_name.c_str());
+        auto* sink = stream_factory->Get("ring", mpsc_sink_name.c_str());
+        ASSERT_TRUE(src1 != nullptr);
+        ASSERT_TRUE(src2 != nullptr);
+        ASSERT_TRUE(sink != nullptr);
+
+        while (true) {
+            PollEvent ev = sink->PollNext(0);
+            if (ev.kind != PollEventKind::kData) break;
+        }
+
+        ASSERT_EQ(src1->Put(MakeStreamBatch(31), 4001), 0);
+        ASSERT_EQ(src2->Put(MakeStreamBatch(32), 4002), 0);
+        src1->CloseStream();
+        src2->CloseStream();
+
+        bool done = false;
+        for (int i = 0; i < 600; ++i) {
+            std::string status_rsp;
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(task_id), status_rsp), error::OK);
+            const std::string st = ParseStatus(status_rsp);
+            if (st == "stopped" || st == "failed" || st == "cancelled") {
+                ASSERT_EQ(st, "stopped");
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(done);
+
+        int rows = 0;
+        for (int i = 0; i < 200 && rows < 2; ++i) {
+            PollEvent ev = sink->PollNext(10);
+            if (ev.kind == PollEventKind::kData && ev.batch.data) {
+                rows += static_cast<int>(ev.batch.data->num_rows());
+            }
+        }
+        ASSERT_EQ(rows, 2);
+    }
+    std::puts("[PASS] T50");
+
+    // T51: Group timeout 返回语义错误码 STREAM_GROUP_TIMEOUT
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+
+        const std::string timeout_src_name = "timeout_src_" + suffix;
+        const std::string timeout_mid_name = "timeout_mid_" + suffix;
+        const std::string timeout_out_name = "timeout_out_" + suffix;
+
+        auto make_add_ring_req = [](const std::string& name) {
+            rapidjson::StringBuffer buf;
+            rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+            w.StartObject();
+            w.Key("type");
+            w.String("ring");
+            w.Key("name");
+            w.String(name.c_str());
+            w.Key("role");
+            w.String("both");
+            w.Key("options");
+            w.StartObject();
+            w.Key("ring_mode");
+            w.String("spsc");
+            w.Key("ring_size");
+            w.Int(256);
+            w.Key("overflow");
+            w.String("drop");
+            w.Key("finite");
+            w.Bool(false);
+            w.EndObject();
+            w.EndObject();
+            return std::string(buf.GetString());
+        };
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(timeout_src_name), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(timeout_mid_name), rsp), error::OK);
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_ring_req(timeout_out_name), rsp), error::OK);
+        auto* timeout_src = stream_factory->Get("ring", timeout_src_name.c_str());
+        ASSERT_TRUE(timeout_src != nullptr);
+
+        const std::string sql1 =
+            "SELECT * FROM ring." + timeout_src_name +
+            " USING builtin.passthrough_stream INTO stream." + timeout_mid_name;
+        const std::string sql2 =
+            "SELECT * FROM stream." + timeout_mid_name +
+            " USING builtin.passthrough_stream INTO stream." + timeout_out_name;
+        const std::string group_sql_text = sql1 + ";\n" + sql2 + ";";
+
+        rapidjson::StringBuffer req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(req_buf);
+        w.StartObject();
+        w.Key("execution_kind");
+        w.String("group");
+        w.Key("group_mode");
+        w.String("dag");
+        w.Key("timeout_s");
+        w.Int(1);
+        w.Key("sql_text");
+        w.String(group_sql_text.c_str());
+        w.EndObject();
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute", req_buf.GetString(), rsp), error::OK);
+        const std::string task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!task_id.empty());
+        ASSERT_EQ(timeout_src->Put(MakeStreamBatch(99), 5001), 0);
+
+        bool done = false;
+        std::string final_status;
+        std::string final_rsp;
+        for (int i = 0; i < 600; ++i) {
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(task_id), final_rsp), error::OK);
+            final_status = ParseStatus(final_rsp);
+            if (final_status == "failed" || final_status == "stopped" || final_status == "cancelled") {
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(done);
+        ASSERT_EQ(final_status, "failed");
+
+        rapidjson::Document final_doc;
+        final_doc.Parse(final_rsp.c_str());
+        ASSERT_TRUE(!final_doc.HasParseError() && final_doc.IsObject());
+        ASSERT_TRUE(final_doc.HasMember("error_code") && final_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(final_doc["error_code"].GetString()), "STREAM_GROUP_TIMEOUT");
+        ASSERT_TRUE(final_doc.HasMember("error_message") && final_doc["error_message"].IsString());
+        ASSERT_TRUE(std::string(final_doc["error_message"].GetString()).find("unfinished_nodes=") != std::string::npos);
+    }
+    std::puts("[PASS] T51");
+
+    // T52: Scheduler stream execute 契约护栏（拒绝 legacy/dag 冲突输入）
+    {
+        std::string rsp;
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              R"({
+                                  "execution_kind":"group",
+                                  "group_mode":"dag",
+                                  "sql_text":"SELECT * FROM ring.a USING builtin.passthrough_stream INTO stream.b;SELECT * FROM stream.b USING builtin.passthrough_stream INTO stream.c;",
+                                  "dag":{"nodes":[]}
+                              })",
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              R"({
+                                  "execution_kind":"group",
+                                  "group_mode":"dag",
+                                  "sql_text":"SELECT * FROM ring.a USING builtin.passthrough_stream INTO stream.b;"
+                              })",
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              R"({
+                                  "execution_kind":"single",
+                                  "group_mode":"dag",
+                                  "sql_text":"SELECT * FROM ring.a USING builtin.passthrough_stream INTO stream.b"
+                              })",
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              R"({
+                                  "execution_kind":"single",
+                                  "sql_text":"SELECT * FROM ring.a USING builtin.passthrough_stream INTO stream.b;SELECT * FROM ring.c USING builtin.passthrough_stream INTO stream.d;"
+                              })",
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+
+        // sql_text split error should expose 0-based sql_index.
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              R"({
+                                  "execution_kind":"single",
+                                  "sql_text":"SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out;;SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out;"
+                              })",
+                              rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document split_doc;
+        split_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!split_doc.HasParseError() && split_doc.IsObject());
+        ASSERT_TRUE(split_doc.HasMember("error_code") && split_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(split_doc["error_code"].GetString()), "STREAM_GROUP_SQL_TEXT_INVALID");
+        ASSERT_TRUE(split_doc.HasMember("sql_index") && split_doc["sql_index"].IsUint64());
+        ASSERT_EQ(split_doc["sql_index"].GetUint64(), 1u);
+
+        // Group node parse error should expose 0-based sql_index.
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              R"({
+                                  "execution_kind":"group",
+                                  "group_mode":"dag",
+                                  "sql_text":"SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out;SELECT FROM ring.in USING builtin.passthrough_stream INTO stream.out;"
+                              })",
+                              rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document node_parse_doc;
+        node_parse_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!node_parse_doc.HasParseError() && node_parse_doc.IsObject());
+        ASSERT_TRUE(node_parse_doc.HasMember("error_code") && node_parse_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(node_parse_doc["error_code"].GetString()), "STREAM_GROUP_DAG_INVALID");
+        ASSERT_TRUE(node_parse_doc.HasMember("sql_index") && node_parse_doc["sql_index"].IsUint64());
+        ASSERT_EQ(node_parse_doc["sql_index"].GetUint64(), 1u);
+
+        // timeout_s must not exceed max_stream_group_timeout_s (default 86400).
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              R"({
+                                  "execution_kind":"group",
+                                  "group_mode":"dag",
+                                  "timeout_s":86401,
+                                  "sql_text":"SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out;SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out;"
+                              })",
+                              rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+        ASSERT_TRUE(rsp.find("max_stream_group_timeout_s") != std::string::npos);
+    }
+    std::puts("[PASS] T52");
 
     exec = fnRouterHandler();
     stream_exec = fnRouterHandler();

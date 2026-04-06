@@ -77,7 +77,21 @@ export default {
   deleteTask: (id) => api.post('/api/tasks/delete', { task_id: id }),
   cancelTask: (id) => api.post('/api/tasks/cancel', { task_id: id }),
   getTaskDiagnostics: (id) => api.post('/api/tasks/diagnostics', { task_id: id }),
-  executeStreamTask: (sql, timeout_s = 0) => api.post('/api/tasks/stream/execute', { sql, timeout_s }),
+  executeStreamTask: (sqlTextOrPayload, timeout_s = 0) => {
+    let payload
+    if (typeof sqlTextOrPayload === 'string') {
+      payload = { execution_kind: 'single', sql_text: sqlTextOrPayload, timeout_s }
+    } else {
+      payload = (sqlTextOrPayload && typeof sqlTextOrPayload === 'object')
+        ? { ...sqlTextOrPayload }
+        : { execution_kind: 'single', sql_text: '', timeout_s }
+      if (!payload.execution_kind) payload.execution_kind = 'single'
+      if (typeof timeout_s === 'number' && payload.timeout_s === undefined) {
+        payload.timeout_s = timeout_s
+      }
+    }
+    return api.post('/api/tasks/stream/execute', payload)
+  },
   stopStreamTask: (taskId) => api.post('/api/tasks/stream/stop', { task_id: taskId }),
   getStreamTaskStatus: (taskId) => api.post('/api/tasks/stream/status', { task_id: taskId }),
   listStreamTasks: (params = {}) => api.post('/api/tasks/stream/list', params),

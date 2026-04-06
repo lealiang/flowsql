@@ -501,7 +501,7 @@ Sprint 14 边界：
 ```json
 {
   "execution_kind": "single",
-  "sql": "SELECT ...",
+  "sql_text": "SELECT ...",
   "timeout_s": 0
 }
 ```
@@ -512,74 +512,39 @@ Sprint 14 边界：
 {
   "execution_kind": "group",
   "group_mode": "dag",
-  "dag": { ... },
+  "sql_text": "SELECT ...; SELECT ...;",
   "timeout_s": 0
 }
 ```
 
-`dag` 结构（Sprint 14 最小可用规范）：
+`sql_text` 解析规则（强制）：
 
-```json
-{
-  "nodes": [
-    {
-      "id": "n1",
-      "sql": "SELECT ...",
-      "depends_on": [],
-      "start_condition": "on_running"
-    },
-    {
-      "id": "n2",
-      "sql": "SELECT ...",
-      "depends_on": ["n1"],
-      "start_condition": "on_finished"
-    },
-    {
-      "id": "n3",
-      "sql": "SELECT ...",
-      "depends_on": [],
-      "start_condition": "on_running"
-    },
-    {
-      "id": "n4",
-      "sql": "SELECT ...",
-      "depends_on": [],
-      "start_condition": "on_running"
-    }
-  ],
-  "source_share_sets": [
-    {
-      "id": "s1",
-      "source_ref": "netcard.eth1",
-      "members": ["n3", "n4"]
-    }
-  ]
-}
-```
+1. 多 SQL 只允许使用分号 `;` 切分；换行仅用于排版，不参与语义切分。
+2. 后端按词法状态机切分（字符串/注释中的 `;` 不切分）：
+- 状态：`normal`、单引号、双引号、反引号、行注释 `--`、块注释 `/* */`。
+3. 仅在 `normal` 状态命中 `;` 才切分语句。
+4. 尾部分号允许；中间空语句（如 `;;`）直接拒绝并返回语句序号。
+5. `single`：切分后语句数必须为 `1`；`group`：切分后语句数必须 `>=2`。
 
 字段规则：
 
-1. `nodes`：必填，长度 `>=2`；
-2. `node.id`：必填、唯一、仅 `[a-zA-Z0-9_-]`；
-3. `node.sql`：必填、非空；
-4. `node.depends_on`：可选，默认空；
-5. `node.start_condition`：可选，默认 `on_running`，枚举 `on_running|on_finished`；
-6. `source_share_sets`：可选，默认空数组；
-7. `source_share_sets[i].members`：长度 `>=2`。
-8. `timeout_s`：可选，默认 `0`；`0` 表示不设组级超时，`>0` 表示秒级超时，需满足 `0 <= timeout_s <= max_stream_group_timeout_s`（配置项，默认 `86400`）。
-9. DAG 规模需满足护栏：`nodes <= max_group_nodes`、`edges <= max_group_edges`、`source_share_sets <= max_group_share_sets`、`sum(sql_bytes) <= max_group_sql_bytes`（默认建议：`64/256/16/262144`）。
+1. `sql_text`：必填、非空。
+2. `group_mode`：仅 `group` 需要，当前固定为 `dag`。
+3. `timeout_s`：可选，默认 `0`；`0` 表示不设组级超时，`>0` 表示秒级超时，需满足 `0 <= timeout_s <= max_stream_group_timeout_s`（配置项，默认 `86400`）。
+4. `share_set_ready_timeout_s`：可选，默认 `30`；`timeout_s>0` 时取 `min(share_set_ready_timeout_s, timeout_s)`。
+5. DAG 规模需满足护栏：`nodes <= max_group_nodes`、`edges <= max_group_edges`、`source_share_sets <= max_group_share_sets`、`sum(sql_bytes) <= max_group_sql_bytes`（默认建议：`64/256/16/262144`）。
 
 严格校验（不做隐式猜测）：
 
-1. `single` 必须携带 `sql`，不得携带 `dag/group_mode`；
-2. `group` 必须携带 `group_mode=dag` 与 `dag.nodes`；
-3. `dag` 必须无环，节点 ID 唯一，依赖节点存在；
-4. `source_share_sets` 仅约束输入 source，不约束节点输出通道类型；
-5. `source_share_sets` 中同一 node 不可重复出现在多个 set；
-6. 每个 share set 的成员节点必须解析到同一 canonical `resolved_source_keys` 集合（去重 + 排序后完全相等）。
-7. `timeout_s` 非法（负数、超上限、非整数）直接 `BAD_REQUEST`。
-8. DAG 规模越界直接 `STREAM_GROUP_DAG_TOO_LARGE`。
-9. share set 成员节点若声明 `start_condition=on_finished`，直接拒绝（Sprint 14 限制为 `on_running`，避免启动屏障不可满足）。
+1. `single` 必须携带 `sql_text`，不得携带 `group_mode/dag/sql/sqls`。
+2. `group` 必须携带 `group_mode=dag` 与 `sql_text`，不得携带 `dag/nodes/source_share_sets/sql/sqls`。
+3. 后端负责 DAG 构建与校验；前端不参与 DAG 语义构建。
+4. `timeout_s` 非法（负数、超上限、非整数）直接 `BAD_REQUEST`。
+5. DAG 规模越界直接 `STREAM_GROUP_DAG_TOO_LARGE`。
+6. 多节点共享同一 `resolved_sink_key` 时按 sink 能力做并发写预算校验（能力不足才拒绝，不做“一刀切单写者”限制）：
+- `stream sink`：严格按 `IStreamChannel::Capabilities().concurrency` 判定（`put_mode/max_producers`）；
+- `dataframe sink`：默认允许多写（append 语义）；
+- `database sink`：默认允许多写（并发表写入）；若后续驱动声明并发写上限，则按上限判定。
 
 说明：
 
@@ -615,22 +580,34 @@ Sprint 14 边界：
 
 在执行前，统一做 `NormalizeDagPlan`：
 
-1. 规范化节点 ID（trim、大小写保持、唯一性检查）；
-2. 构建邻接表与入度表；
-3. Kahn 拓扑排序校验无环；
-4. 解析每个节点 SQL 并提取：
+1. 从 `sql_text` 切分得到 `sqls[]`，按输入顺序生成节点 `n1..nN`；
+2. 逐节点解析 SQL 并提取：
 - `resolved_source_bindings`
 - `resolved_source_keys`
 - `resolved_sink_key`
 - `operator_ref`
-5. 校验 share set（按 canonical 集合比较）：
+3. 自动构建依赖边：
+- 若 `node_j` 的 source 引用了前序节点 `node_i` 写入的 `stream sink`，则加边 `i -> j`，`start_condition=on_running`；
+- 若同一 source 可匹配多个前序生产者，直接拒绝并返回 `STREAM_GROUP_DAG_INVALID`（歧义上游）；
+- 无上游依赖的节点作为 DAG root。
+4. 自动构建 `source_share_sets`：
+- 在 root 节点中，按 canonical `resolved_source_keys` 分组；
+- 同组且成员数 `>=2` 自动生成一个 share set；
+- share set 成员 `start_condition` 固定 `on_running`。
+5. 构建邻接表与入度表，Kahn 拓扑排序校验无环。
+6. 校验 share set（按 canonical 集合比较）：
 - `members` 全部存在；
 - 对每个成员节点：将 `resolved_source_keys` 做“去重 + 字典序排序”，得到 `canonical_keys(node)`；
 - `canonical_keys(node)` 在同一 set 内必须完全相等（顺序不同视为相等）；
-- `source_ref` 也通过同一解析与展开流程得到 `canonical_keys(source_ref)`；
-- `canonical_keys(source_ref)` 必须与成员节点 canonical 集合完全相等（禁止悬空或部分覆盖）；
+- 返回差异明细：`missing_keys/extra_keys`；
+- `source_ref`（若由规则推导）同样按 canonical 校验；
 - 成员节点在 set 外不得再声明“同源广播”输入；
 - 成员节点 `start_condition` 必须为 `on_running`。
+7. 校验共享 sink 写预算（按 `resolved_sink_key` 聚合）：
+- `required_writers = group 中写该 sink_key 的 node 数`；
+- `stream sink`：`put_mode` 必须为 `MULTI` 或 `required_writers==1`，且 `max_producers==0 || max_producers>=required_writers`；
+- `dataframe/database sink`：Sprint 14 默认 `required_writers` 不设上限（后续可由驱动/策略收紧）；
+- 预算不满足返回 `STREAM_GROUP_SINK_CAPABILITY_MISMATCH`，并回传 `sink_key/required/actual`。
 
 失败即拒绝，不进入运行态。
 
@@ -649,7 +626,13 @@ Sprint 14 边界：
 - 同一 set 内成员节点必须解析到同一个 `resolved_source_keys` 集合；
 - 不在 set 内的节点按自身 source 独立消费。
 
-4. 特例映射：
+4. 共享 sink 写语义（能力驱动）：
+- 多个节点写同一 sink 在能力满足时允许（平台能力优先，不做静态禁用）；
+- `stream sink` 共享写时，顺序语义按通道能力降级为 `PER_PRODUCER_FIFO`，不承诺全局 FIFO；
+- `dataframe/database sink` 共享写时，不承诺跨节点 wall-clock 顺序；
+- 上层可通过任务模板/审批/配额策略约束使用，不在内核做语义外兜底限制。
+
+5. 特例映射：
 - 纯串行链式：DAG 中仅边、无 `source_share_sets`；
 - 纯同源并发：多个入度为 0 节点 + 同一个 `source_share_set`；
 - 串并组合：同时存在依赖边和 share set。
@@ -657,20 +640,26 @@ Sprint 14 边界：
 ### 14.13.6 执行流程（Scheduler）
 
 1. 解析与拓扑校验：
-- 解析所有 `dag.nodes[i].sql`；
+- 对 `sql_text` 切分后的每条 SQL 做解析；
 - 每个节点必须是合法 stream SQL；
-- 校验 DAG 无环、依赖合法、`source_share_sets` 合法。
+- 校验 DAG 无环、依赖合法、自动构建后的 `source_share_sets` 合法。
 
 2. source/sink 解析与租约：
 - 对每个节点执行 `ResolveStreamSourceBindings(..., stage=execute)`；
 - 对每个节点执行 `ResolveStreamSink(...)`；
 - `source_share_set` 成员按 canonical `resolved_source_keys` 做同源一致性校验（错误返回 `missing_keys/extra_keys` 差异明细）；
-- 在 `stream_channel_refs_mu_` 下执行“版本复核 + 冲突检测 + 引用登记”原子提交，失败即整体拒绝（TOCTOU 防护）。
-- 组级一次性申请 source/sink 租约并集，失败则整批回滚引用登记并返回冲突。
+- 按 `resolved_sink_key` 聚合执行写预算校验（`STREAM_GROUP_SINK_CAPABILITY_MISMATCH`）；
+- 在 `stream_channel_refs_mu_` 下执行“版本快照复核 + 冲突检测 + 引用登记”原子提交，失败即整体拒绝（TOCTOU 防护）；
+- 组级一次性申请 source/sink 租约并集（`lease_owner_id=runtime_task_id`），失败则整批回滚并返回冲突；
+- group 内部节点执行复用组级租约，禁止逐节点二次租约申请（避免部分成功导致占用残留）。
 
 3. 运行装配：
 - 为每个 DAG 节点创建 `DagNodeRuntime`；
 - 为每个 `source_share_set` 创建 `BroadcastHub`；
+- 为共享 `stream sink` 创建 `SharedStreamSinkWriterGroup`（引用计数 close 协议）：
+  - 每个 node 注入独立 writer view；
+  - writer view 的 `CloseStream()` 仅做引用递减，最后一个 writer 才关闭底层 sink；
+  - 防止“先结束节点提前关闭 sink”导致其余节点写失败；
 - 将 set 成员节点输入绑定到 `BroadcastHub` 视图；
 - 非 set 节点沿用现有 source 直连。
 
@@ -685,6 +674,9 @@ Sprint 14 边界：
 2. `BroadcastHub` 仅在 share set 全成员 ready 后才开始消费 source（防“晚加入”丢数据）；
 3. 组级租约申请与释放必须成对（异常路径同样释放）。
 4. share set ready 屏障必须有超时（`share_set_ready_timeout_s`，默认 `30`；若 `timeout_s>0`，取 `min(share_set_ready_timeout_s, timeout_s)`）；超时直接 fail-fast 并返回 `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`。
+5. 共享 `stream sink` 在最后一个 writer 结束前不得进入 closed 状态，避免误触发 `ECANCELED/EOF`。
+6. `timeout/share_set_ready_timeout` 统一写入语义错误码（`STREAM_GROUP_TIMEOUT` / `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`），不得仅返回数值 errno。
+7. group 停止序列固定为“先停 hub，再停 node，再 join，再释放租约”。
 
 ### 14.13.7 一致性与完整性保证
 
@@ -756,11 +748,13 @@ for each input batch from shared source:
 - `stream/stop(group_id)`：先停所有 `BroadcastHub`，再停节点任务，等待 join；
 - 正常 stop 终态为 `stopped`；
 - 用户取消与故障失败语义分离（`cancelled` vs `failed`）。
+- 实现约束：`StreamTaskGroup` 需提供“停 node 前置回调”，由 Scheduler 注入并执行“停 hub”动作，禁止在 node stop 之后再停 hub。
 
 3. timeout：
 - `timeout_s=0`：不启用组级超时；
 - `timeout_s>0`：从 group 进入 `preparing` 开始计时，超时触发与 fail-fast 同级收敛（先停 hub，再停 node）；
 - 超时终态统一为 `failed`，错误码 `STREAM_GROUP_TIMEOUT`，错误信息包含超时秒数与未完成节点列表。
+- `share_set_ready_timeout_s` 触发时终态统一为 `failed`，错误码 `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`。
 
 4. 资源回收：
 - group 终态后统一释放 source/sink 租约；
@@ -807,6 +801,7 @@ for each input batch from shared source:
 3. `nodes`（每个 node 的 `id/status/error/processed_rows/output_rows`）
 4. `share_sets`（`id/source_ref/members/input_batches/delivered_batches/dropped_batches_shared/drop_ratio/last_delivered_seq/last_dropped_seq`）
 5. `resolved_sources`（按 node 展示）
+6. `error_code` 统一为语义字符串错误码（如 `STREAM_GROUP_TIMEOUT`）；可选保留 `error_no`（整数 errno）用于底层诊断。
 
 `POST /scheduler/stream/status` 返回样例（group 明细）：
 
@@ -825,7 +820,7 @@ for each input batch from shared source:
   "started_ms": 1712200000123,
   "last_active_ms": 1712200002456,
   "finished_ms": 0,
-  "error_code": 0,
+  "error_code": "",
   "error_message": "",
   "resolved_sources": [
     {
@@ -951,44 +946,96 @@ for each input batch from shared source:
 
 1. 调度影响：
 - `Scheduler` 在现有 `/scheduler/stream/execute` 中新增 `execution_kind` 分发；
-- `single` 路径保持现状；
-- `group` 路径走 DAG 编排层（新增 `StreamTaskGroup`、`DagNodeRuntime`、`BroadcastHub`）。
+- `single` 与 `group` 均统一接收 `sql_text`；
+- `single`：`sql_text` 切分后必须为单语句，复用现有单任务执行链路；
+- `group`：由后端执行“切分 + DAG 归一化 + 执行编排”（`StreamTaskGroup`、`BroadcastHub`）。
 
 2. parser 影响：
 - 不新增 SQL 语法；
-- 复用现有 parser 对每个 node SQL 独立解析；
-- 14.13 不引入 parser 风险面扩张。
+- 复用现有 parser 对每条切分后的 SQL 独立解析；
+- 新增 `sql_text` 切分器（词法状态机），仅负责语句边界判定；
+- 不改 `SqlParser` 核心 token 规则（如 `ReadIdentifier/ReadChannelRef`），避免核心解析回归风险。
 
 ### 14.13.11 前端与交互影响
 
 1. `Tasks.vue`：
 - 流式执行时显式提交 `execution_kind`；
 - 单 SQL -> `single`；
-- 多 SQL -> 由前端组装 `group + dag`（默认线性 DAG）；
-- 高级模式可编辑 `depends_on/start_condition/source_share_sets`（JSON 编辑器或 DAG 面板）。
+- 多 SQL -> 提交 `group`，但不再由前端构建 `dag`；
+- 前端仅提交 `sql_text`，DAG 结构由后端构建并回传用于展示。
 
 2. 分号输入说明：
-- 分号仅作为“输入拆分辅助”，不作为后端模式判定依据；
-- 最终执行语义由 `execution_kind/group_mode/dag` 决定。
+- 多 SQL 必须用分号 `;` 分隔；换行不作为切分依据；
+- 前端需给出明确提示（占位符/帮助文案）；
+- 最终执行语义由后端解析与 DAG 归一化决定。
 
 3. 任务展示：
 - 列表保留现有 `task_id/runtime_task_id/status`；
-- 详情页新增 DAG 摘要（节点数、运行中节点、失败节点、share set 数）。
+- 详情页展示后端返回的 DAG 摘要与明细（`nodes/share_sets/resolved_sources`），前端不做二次推导。
+
+4. 前端请求模型与默认值（无歧义约束）：
+- `single` 请求：
+- 必填：`execution_kind="single"`、`sql_text`；
+- 可选：`timeout_s`（默认 `0`）；
+- 禁止：`group_mode`、`dag`、`sql`、`sqls`。
+- `group` 请求：
+- 必填：`execution_kind="group"`、`group_mode="dag"`、`sql_text`；
+- 可选：`timeout_s`（默认 `0`）、`share_set_ready_timeout_s`（默认 `30`）；
+- 禁止发送 `dag/nodes/source_share_sets/sql/sqls/null`，避免双语义与歧义分支。
+
+5. 前端本地校验（提交前）：
+- 仅做输入级校验：`sql_text` 非空；
+- `group` 模式需在本地检测“分号切分后语句数 >= 2”；
+- 不在前端做 DAG 语义校验（依赖、share set、环检测等全部交给后端）。
+
+6. 错误码到 UI 提示映射（最小闭环）：
+- `STREAM_GROUP_SQL_TEXT_INVALID`：多 SQL 切分或语句边界非法（提示用户使用分号分隔）；
+- `STREAM_GROUP_DAG_INVALID`：DAG 配置非法（节点/依赖/字段）；
+- `STREAM_GROUP_DAG_CYCLE_DETECTED`：存在依赖环；
+- `STREAM_GROUP_SOURCE_MISMATCH`：share set 同源不一致；
+- `STREAM_GROUP_SINK_CAPABILITY_MISMATCH`：共享 sink 并发写能力不足（展示 `sink_key/required/actual`）；
+- `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`：广播组就绪超时；
+- `STREAM_GROUP_TIMEOUT`：组级执行超时；
+- 其他错误码统一回退为“执行失败”，并显示原始 `error_code/error_message`。
+
+7. 执行交互与状态轮询：
+- 提交后立即进入“已提交/准备中”态；
+- `running/preparing/stopping` 期间按固定周期轮询 `status`（建议 1s）；
+- 终态（`stopped/failed/cancelled`）停止轮询；
+- `stop` 按钮在 `running/preparing/stopping` 可见，提交中与终态禁用；
+- 详情页固定展示：
+  - `nodes`（`id/status/processed_rows/output_rows/last_error`）；
+  - `share_sets`（`input_batches/delivered_batches/dropped_batches_shared/drop_ratio`）；
+  - `resolved_sources/source_expand_rule`（排障信息）。
+
+8. 组件落位建议（实现指引）：
+- `Tasks.vue` 保留现有列表与单任务入口；
+- `StreamTasks.vue`（或等价子组件）承载 group 详情与观测，不承载 DAG 语义编辑；
+- 若不拆页，需在 `Tasks.vue` 内按 `runtime_kind` 分区渲染，避免 batch/stream/group 状态字段混淆。
 
 ### 14.13.12 关键错误码（新增）
 
-1. `STREAM_GROUP_MODE_INVALID`
-2. `STREAM_GROUP_DAG_INVALID`
-3. `STREAM_GROUP_DAG_CYCLE_DETECTED`
-4. `STREAM_GROUP_NODE_NOT_FOUND`
-5. `STREAM_GROUP_SOURCE_MISMATCH`
-6. `STREAM_GROUP_BRANCH_BUILD_FAILED`
-7. `STREAM_GROUP_DISPATCH_FAILED`
-8. `STREAM_GROUP_STOP_FAILED`
-9. `STREAM_GROUP_MIXED_TASK_KIND`
-10. `STREAM_GROUP_TIMEOUT`
-11. `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`
-12. `STREAM_GROUP_DAG_TOO_LARGE`
+1. `STREAM_GROUP_SQL_TEXT_INVALID`
+2. `STREAM_GROUP_MODE_INVALID`
+3. `STREAM_GROUP_DAG_INVALID`
+4. `STREAM_GROUP_DAG_CYCLE_DETECTED`
+5. `STREAM_GROUP_NODE_NOT_FOUND`
+6. `STREAM_GROUP_SOURCE_MISMATCH`
+7. `STREAM_GROUP_BRANCH_BUILD_FAILED`
+8. `STREAM_GROUP_DISPATCH_FAILED`
+9. `STREAM_GROUP_STOP_FAILED`
+10. `STREAM_GROUP_MIXED_TASK_KIND`
+11. `STREAM_GROUP_TIMEOUT`
+12. `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`
+13. `STREAM_GROUP_DAG_TOO_LARGE`
+14. `STREAM_GROUP_SINK_CAPABILITY_MISMATCH`
+
+### 14.13.13 文档同步要求
+
+1. Sprint 14 功能验收通过后，必须同步更新功能 README：
+- 多 SQL 输入必须使用分号 `;` 切分（换行不切分）；
+- `single/group` 请求体示例（统一 `sql_text`）；
+- 常见错误码与排障示例（含 `STREAM_GROUP_TIMEOUT`、`STREAM_GROUP_SHARE_SET_READY_TIMEOUT`、`STREAM_GROUP_SQL_TEXT_INVALID`）。
 
 ---
 
@@ -1001,18 +1048,20 @@ for each input batch from shared source:
 5. `STREAM_HUB_SELECTOR_OUT_OF_RANGE`
 6. `STREAM_HUB_SELECTOR_NOT_ALLOWED_INTO`
 7. `STREAM_HUB_SELECTOR_NOT_ALLOWED_MERGE`
-8. `STREAM_GROUP_MODE_INVALID`
-9. `STREAM_GROUP_DAG_INVALID`
-10. `STREAM_GROUP_DAG_CYCLE_DETECTED`
-11. `STREAM_GROUP_NODE_NOT_FOUND`
-12. `STREAM_GROUP_SOURCE_MISMATCH`
-13. `STREAM_GROUP_BRANCH_BUILD_FAILED`
-14. `STREAM_GROUP_DISPATCH_FAILED`
-15. `STREAM_GROUP_STOP_FAILED`
-16. `STREAM_GROUP_MIXED_TASK_KIND`
-17. `STREAM_GROUP_TIMEOUT`
-18. `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`
-19. `STREAM_GROUP_DAG_TOO_LARGE`
+8. `STREAM_GROUP_SQL_TEXT_INVALID`
+9. `STREAM_GROUP_MODE_INVALID`
+10. `STREAM_GROUP_DAG_INVALID`
+11. `STREAM_GROUP_DAG_CYCLE_DETECTED`
+12. `STREAM_GROUP_NODE_NOT_FOUND`
+13. `STREAM_GROUP_SOURCE_MISMATCH`
+14. `STREAM_GROUP_BRANCH_BUILD_FAILED`
+15. `STREAM_GROUP_DISPATCH_FAILED`
+16. `STREAM_GROUP_STOP_FAILED`
+17. `STREAM_GROUP_MIXED_TASK_KIND`
+18. `STREAM_GROUP_TIMEOUT`
+19. `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`
+20. `STREAM_GROUP_DAG_TOO_LARGE`
+21. `STREAM_GROUP_SINK_CAPABILITY_MISMATCH`
 
 ---
 
@@ -1068,55 +1117,69 @@ for each input batch from shared source:
 ### 14.13 测试
 
 1. API 契约：
-- `execution_kind=single` + `sql` 成功；
-- `execution_kind=group` + `group_mode=dag` + `dag.nodes` 成功；
-- 字段不匹配（如 single 带 dag）报 `BAD_REQUEST`。
+- `execution_kind=single` + `sql_text`（单语句）成功；
+- `execution_kind=group` + `group_mode=dag` + `sql_text`（多语句）成功；
+- `group` 传 `dag/nodes/source_share_sets/sql/sqls` 必须拒绝；
+- `single` 传 `group_mode/dag` 必须拒绝；
 - `execute/status/list` 均返回 `task_id/runtime_task_id`，且 `stop/status` 仅接受 `task_id`。
 - `stop/status` 传 `runtime_task_id` 必须拒绝（`BAD_REQUEST` 或等价错误码），避免主键语义漂移。
 
-2. DAG 校验：
-- 节点 ID 冲突、缺失依赖节点、成环依赖分别报错；
-- `group_mode` 非 `dag` 报 `STREAM_GROUP_MODE_INVALID`。
-- share set 同源比较按 canonical 集合执行（顺序差异视为相等；缺失/多余 key 报 `STREAM_GROUP_SOURCE_MISMATCH` 并返回差异）。
-- canonical 同源比较细分用例：
-  - 相同集合但顺序不同（应通过）；
-  - 相同集合但含重复 key（去重后应通过）；
-  - `source_ref` 与成员集合不一致（应报 `STREAM_GROUP_SOURCE_MISMATCH`，并返回 `missing_keys/extra_keys`）。
+2. `sql_text` 切分与解析：
+- 多 SQL 必须用分号切分；换行不切分；
+- 字符串/注释中的分号不得误切分；
+- 中间空语句（`;;`）拒绝并返回 `STREAM_GROUP_SQL_TEXT_INVALID`；
+- 语句级解析失败返回 `sql_index`（统一 `0-based`）与原始错误上下文。
 
-3. 纯串行链式：
-- 线性 DAG（A->B->C）按依赖推进；
-- `on_running/on_finished` 语义符合预期。
+3. DAG 构建与校验：
+- 后端按 `sql_text` 自动构建 DAG（节点顺序稳定）；
+- 依赖推导正确（前序 sink -> 后续 source）；
+- 同源 share set 自动识别正确；
+- share set 同源比较按 canonical 集合执行（顺序差异视为相等；缺失/多余 key 报 `STREAM_GROUP_SOURCE_MISMATCH` 并返回 `missing_keys/extra_keys`）。
 
-4. 纯同源广播：
+4. 纯串行链式：
+- 线性链（A->B->C）按依赖推进；
+- `on_running` 语义符合预期（本 Sprint 自动构建不引入前端 `on_finished` 配置入口）。
+
+5. 纯同源广播：
 - 同一 `source_share_set` 多节点共享 source；
 - 固定 N 批输入下各节点消费数据集合一致（允许全分支一致 drop）；
 - 高压下允许丢批，但必须“全分支一致 drop”（各节点 `delivered_batches` 一致，`dropped_batches_shared` 一致）。
 - 校验 `last_delivered_seq/last_dropped_seq` 单调递增且跨分支一致。
 - 校验 `coordinated drop` 下 `delivered_*` 仅在全分支写入成功时累计。
 
-5. 串并组合：
+6. 串并组合：
 - 覆盖“先并后串、先串后并”两类拓扑；
 - 校验组级状态推进与最终收敛正确。
 
-6. 异常与收敛：
+7. 异常与收敛：
 - 任一节点失败触发 group fail-fast；
 - stop/cancel 后其余节点可收敛到终态；
 - source/sink 租约全部释放。
-- `timeout_s` 触发后终态为 `failed`，错误码为 `STREAM_GROUP_TIMEOUT`。
+- `timeout_s` 触发后终态为 `failed`，错误码为 `STREAM_GROUP_TIMEOUT`（语义字符串）。
+- `share_set_ready_timeout_s` 触发后错误码为 `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`（语义字符串）。
 - `stop/cancel/node_failed/timeout` 并发竞态按优先级收敛（`failed > cancelled > stopped`）。
 - group 进入终态后不可再次迁移（终态幂等校验）；
 - `skipped` 仅出现在 group `failed/cancelled` 时未启动节点，且不得由 `running` 转入。
+- 停止顺序校验：`stop/timeout/fail-fast` 路径均满足“先停 hub，再停 node”。
 
-7. 冲突与并发：
+8. 冲突与并发：
 - group 运行时对 source/相关 sink `modify/remove` 返回 in-use；
 - 同源冲突 group 提交返回冲突。
 - `execute` 与 `modify/remove` 并发下无 TOCTOU 误判（版本校验与租约登记原子）。
+- 组级一次性租约并集申请成功/失败语义正确；失败时无残留租约。
 - `stream_hub(split)` 冲突粒度按分区键生效（不同分区可并发、相同分区冲突）；
 - `stream_hub(merge)` 冲突粒度按 hub root 键生效（root 独占冲突）。
+- 共享 sink 能力矩阵：
+  - `ring(spsc/spmc)` 被多个 node 共享写时拒绝（`STREAM_GROUP_SINK_CAPABILITY_MISMATCH`）；
+  - `ring(mpsc/mpmc)` 被多个 node 共享写时通过；
+  - `database` 同表多 node 写默认通过；
+  - `dataframe` 同名多 node append 默认通过（顺序不保证）。
+- 共享 `stream sink` close 协议校验：
+  - 任一 node 先结束不得提前关闭底层 sink；
+  - 最后一个 node 结束后 sink 才进入 closed/finished。
 
-8. DAG 护栏与可启动性：
+9. DAG 护栏与可启动性：
 - `max_group_nodes/max_group_edges/max_group_share_sets/max_group_sql_bytes` 超限拒绝；
-- share set 成员声明 `on_finished` 被拒绝；
 - share set ready 屏障超时返回 `STREAM_GROUP_SHARE_SET_READY_TIMEOUT`。
 - `timeout_s` 边界矩阵：
   - `timeout_s < 0` / 非整数 / 超上限拒绝；
@@ -1124,18 +1187,27 @@ for each input batch from shared source:
   - `timeout_s > 0` 时按秒触发并返回 `STREAM_GROUP_TIMEOUT`；
   - 当 `timeout_s > 0` 且 `share_set_ready_timeout_s` 更大时，屏障按 `min(...)` 生效。
 
-9. parser 无回归：
+10. parser 无回归：
 - node SQL 仍复用既有 parser，历史 SQL 解析行为保持不变。
 
-10. 可观测性校验：
+11. 可观测性校验：
 - `share_sets.input_batches/delivered_batches/dropped_batches_shared/drop_ratio` 字段完整且数值自洽；
 - 校验 `input_batches = delivered_batches + dropped_batches_shared`。
+- `error_code` 为语义字符串；可选 `error_no` 为整数诊断字段。
 
-11. 错误码映射回归（关键码）：
+12. 错误码映射回归（关键码）：
 - `STREAM_HUB_SELECTOR_INVALID`、`STREAM_HUB_SELECTOR_OUT_OF_RANGE`、`STREAM_HUB_SELECTOR_NOT_ALLOWED_INTO`、`STREAM_HUB_SELECTOR_NOT_ALLOWED_MERGE`；
-- `STREAM_GROUP_DAG_INVALID`、`STREAM_GROUP_DAG_CYCLE_DETECTED`、`STREAM_GROUP_SOURCE_MISMATCH`；
-- `STREAM_GROUP_TIMEOUT`、`STREAM_GROUP_SHARE_SET_READY_TIMEOUT`、`STREAM_GROUP_DAG_TOO_LARGE`；
+- `STREAM_GROUP_DAG_INVALID`、`STREAM_GROUP_DAG_CYCLE_DETECTED`、`STREAM_GROUP_SOURCE_MISMATCH`、`STREAM_GROUP_SINK_CAPABILITY_MISMATCH`；
+- `STREAM_GROUP_SQL_TEXT_INVALID`、`STREAM_GROUP_TIMEOUT`、`STREAM_GROUP_SHARE_SET_READY_TIMEOUT`、`STREAM_GROUP_DAG_TOO_LARGE`；
 - 每个关键错误码至少 1 个稳定触发用例，并校验错误信息包含定位上下文（node/source_ref/selector）。
+
+13. 前端交互回归：
+- 多 SQL 提交仅发送 `execution_kind/group_mode/sql_text`，不发送 `dag`；
+- 前端显示“多 SQL 必须分号分隔”；换行不作为切分；
+- 本地校验仅覆盖输入级规则（非空、多语句数量）；
+- 错误码映射提示准确，`STREAM_GROUP_SINK_CAPABILITY_MISMATCH` 可展示能力差异；
+- 提交/轮询/停止按钮状态机正确（终态停止轮询）；
+- 详情页 `nodes/share_sets/resolved_sources` 展示完整且字段不缺失。
 
 ---
 
@@ -1144,4 +1216,4 @@ for each input batch from shared source:
 1. 先实现 `BuiltinRegistry` 与后端注册改造（Story 14.11）。
 2. 再实现 `definitions/query`、结构化通道管理 API 与动态表单联调（Story 14.12 后端+前端）。
 3. 实现 `StreamTaskGroup + DagNodeRuntime + BroadcastHub` 与组级执行/停止/状态（Story 14.13 后端）。
-4. 最后实现 Group DAG 提交交互与组级观测展示（Story 14.13 前端），并完成全链路回归。
+4. 最后实现 `sql_text` 提交交互（前端不构建 DAG）与组级观测展示（Story 14.13 前端），并完成全链路回归。

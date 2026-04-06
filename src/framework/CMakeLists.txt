@@ -16,6 +16,7 @@ add_library(${PROJECT_NAME} SHARED
     core/fan_out_stream_channel.cpp
     core/memory_channel.cpp
     core/ring_stream_channel.cpp
+    core/sql_text_splitter.cpp
     core/stream_channel_adapter.cpp
     core/sql_parser.cpp
 )

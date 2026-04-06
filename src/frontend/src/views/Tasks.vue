@@ -9,10 +9,11 @@
           <span>SQL 编辑器</span>
           <div class="header-actions">
             <el-button @click="fillStreamDemoSql">流式示例 SQL</el-button>
-            <el-tag v-if="sqlTaskKind === 'stream'" type="warning">流式 SQL（仅异步）</el-tag>
+            <el-tag v-if="isMultiSql" type="warning">多 SQL（Group，仅异步）</el-tag>
+            <el-tag v-else-if="sqlTaskKind === 'stream'" type="warning">流式 SQL（仅异步）</el-tag>
             <el-tag v-else-if="sqlTaskKind === 'batch'" type="info">批任务 SQL</el-tag>
             <el-radio-group v-model="executeMode" size="small">
-              <el-radio-button v-if="!isStreamSql" label="sync">同步</el-radio-button>
+              <el-radio-button v-if="allowSyncMode" label="sync">同步</el-radio-button>
               <el-radio-button label="async">异步</el-radio-button>
             </el-radio-group>
             <el-button type="primary" @click="executeSQL" :loading="executing">
@@ -27,7 +28,7 @@
         v-model="sqlText"
         type="textarea"
         :rows="8"
-        placeholder="输入 SQL 查询，例如：SELECT * FROM test_data USING explore.chisquare WITH threshold=0.05"
+        placeholder="输入 SQL。多 SQL（Group）请使用分号 ; 分隔，换行不切分。"
         class="sql-textarea"
       />
 
@@ -86,15 +87,15 @@
         <el-table-column prop="created_at" label="创建时间" width="180" />
         <el-table-column label="操作" width="280">
           <template #default="scope">
-            <el-button
-              type="primary"
-              size="small"
-              :disabled="!isTerminal(scope.row.status)"
-              :loading="resultLoadingId === (scope.row.id || scope.row.task_id)"
-              @click="viewResult(scope.row.id || scope.row.task_id)"
-            >
-              查看结果
-            </el-button>
+              <el-button
+                type="primary"
+                size="small"
+                :disabled="!isTerminal(scope.row.status)"
+                :loading="resultLoadingId === (scope.row.id || scope.row.task_id)"
+                @click="viewResult(scope.row)"
+              >
+                查看结果
+              </el-button>
             <el-button
               type="warning"
               size="small"
@@ -175,7 +176,145 @@ const POLL_INTERVAL_MS = 2000
 const STREAM_DEMO_SQL = `SELECT * FROM tcp_session_mock.tcp_src
 USING builtin.tcp_service_merge_stream
 INTO dataframe.serviceaccess`
+const splitSqlStatements = (sql) => {
+  const statements = []
+  let current = ''
+  let inSingle = false
+  let inDouble = false
+  let inBacktick = false
+  let inLineComment = false
+  let inBlockComment = false
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i]
+    const next = i + 1 < sql.length ? sql[i + 1] : ''
+
+    if (inLineComment) {
+      current += ch
+      if (ch === '\n') inLineComment = false
+      continue
+    }
+    if (inBlockComment) {
+      current += ch
+      if (ch === '*' && next === '/') {
+        current += next
+        i++
+        inBlockComment = false
+      }
+      continue
+    }
+
+    if (inSingle) {
+      current += ch
+      if (ch === '\'' && next === '\'') {
+        current += next
+        i++
+        continue
+      }
+      if (ch === '\'') inSingle = false
+      continue
+    }
+    if (inDouble) {
+      current += ch
+      if (ch === '"' && next === '"') {
+        current += next
+        i++
+        continue
+      }
+      if (ch === '"') inDouble = false
+      continue
+    }
+    if (inBacktick) {
+      current += ch
+      if (ch === '`' && next === '`') {
+        current += next
+        i++
+        continue
+      }
+      if (ch === '`') inBacktick = false
+      continue
+    }
+
+    if (!inSingle && !inDouble && !inBacktick) {
+      if (ch === '-' && next === '-') {
+        current += ch + next
+        i++
+        inLineComment = true
+        continue
+      }
+      if (ch === '/' && next === '*') {
+        current += ch + next
+        i++
+        inBlockComment = true
+        continue
+      }
+    }
+
+    if (ch === '\'') {
+      current += ch
+      inSingle = true
+      continue
+    }
+    if (ch === '"') {
+      current += ch
+      inDouble = true
+      continue
+    }
+    if (ch === '`') {
+      current += ch
+      inBacktick = true
+      continue
+    }
+
+    if (ch === ';') {
+      const stmt = current.trim()
+      if (stmt) statements.push(stmt)
+      current = ''
+      continue
+    }
+
+    current += ch
+  }
+  const tail = current.trim()
+  if (tail) statements.push(tail)
+  return statements
+}
+
+const buildStreamGroupPayload = (sqls) => {
+  const sqlText = sqls.join(';\n') + ';'
+  return {
+    execution_kind: 'group',
+    group_mode: 'dag',
+    timeout_s: 0,
+    sql_text: sqlText
+  }
+}
+
+const parseApiError = (error) => {
+  const payload = error?.response?.data || {}
+  const code = payload.error_code || ''
+  const raw = payload.error || error?.message || '未知错误'
+  const codeTips = {
+    STREAM_GROUP_SQL_TEXT_INVALID: 'SQL 文本格式错误：多 SQL 请使用分号分隔，且 single/group 入参需符合契约',
+    STREAM_GROUP_TIMEOUT: '流式组任务执行超时',
+    STREAM_GROUP_SHARE_SET_READY_TIMEOUT: '同源分支就绪超时，请检查上游数据与节点启动状态',
+    STREAM_GROUP_DAG_INVALID: 'DAG 构建失败，请检查 SQL 之间的依赖关系',
+    STREAM_GROUP_DAG_CYCLE_DETECTED: 'DAG 存在环路依赖，请调整 SQL 拓扑',
+    STREAM_GROUP_SINK_CAPABILITY_MISMATCH: '共享 sink 并发写能力不足，请检查 sink 通道并发模式',
+    STREAM_CHANNEL_VERSION_CHANGED: '通道配置在执行前被并发修改，请重试',
+    STREAM_CHANNEL_MUTATING: '通道正在被修改，请稍后重试',
+    STREAM_SOURCE_IN_USE: 'source 通道正在被其他任务占用'
+  }
+  if (!code) return raw
+  const tip = codeTips[code]
+  if (!tip) return `${raw} [${code}]`
+  if (raw && raw !== tip) return `${tip}（${raw}） [${code}]`
+  return `${tip} [${code}]`
+}
+
 const isStreamSql = computed(() => sqlTaskKind.value === 'stream')
+const sqlStatements = computed(() => splitSqlStatements(sqlText.value))
+const isMultiSql = computed(() => sqlStatements.value.length > 1)
+const allowSyncMode = computed(() => !isStreamSql.value && !isMultiSql.value)
 
 const isTerminal = (status) => ['completed', 'failed', 'stopped', 'cancelled', 'timeout'].includes(status)
 
@@ -216,6 +355,14 @@ const classifyCurrentSql = async ({ silent = false } = {}) => {
   if (!sql) {
     applySqlTaskKind('unknown')
     return 'unknown'
+  }
+  const sqls = splitSqlStatements(sql)
+  if (sqls.length > 1) {
+    if (seq === classifySeq) {
+      applySqlTaskKind('unknown')
+      executeMode.value = 'async'
+    }
+    return 'multi'
   }
 
   try {
@@ -262,6 +409,8 @@ const syncActiveStreamTaskStatuses = async (rows) => {
         taskId,
         status,
         runtime_status: res?.data?.runtime_status,
+        runtime_kind: res?.data?.runtime_kind || row.runtime_kind || '',
+        group_mode: res?.data?.group_mode || row.group_mode || '',
         error_code: String(res?.data?.error_code ?? row.error_code ?? ''),
         error_message: res?.data?.error_message || row.error_message || ''
       }
@@ -284,6 +433,8 @@ const syncActiveStreamTaskStatuses = async (rows) => {
       ...row,
       status: next.status,
       runtime_status: next.runtime_status,
+      runtime_kind: next.runtime_kind,
+      group_mode: next.group_mode,
       error_code: next.error_code,
       error_message: next.error_message
     }
@@ -343,7 +494,8 @@ const formatTaskResult = (result, runningMessage = '') => {
 }
 
 const executeSQL = async () => {
-  if (!sqlText.value.trim()) {
+  const sql = sqlText.value.trim()
+  if (!sql) {
     ElMessage.warning('请输入 SQL 语句')
     return
   }
@@ -356,9 +508,32 @@ const executeSQL = async () => {
       clearTimeout(classifyTimer)
       classifyTimer = null
     }
+    const sqls = splitSqlStatements(sql)
+    if (sqls.length > 1) {
+      executeMode.value = 'async'
+      const payload = buildStreamGroupPayload(sqls)
+      const streamRes = await api.executeStreamTask(payload)
+      const submit = streamRes.data || {}
+      const taskId = submit.task_id
+      currentTaskId.value = taskId
+      const nodeCount = submit.node_count || sqls.length
+      ElMessage.success(`流式组任务已提交 (ID: ${taskId})`)
+      currentResult.value = {
+        columns: [],
+        rows: [],
+        message: `流式组任务 ${taskId} 已提交，节点数 ${nodeCount}`
+      }
+      await loadTasks()
+      startPolling()
+      return
+    }
     const taskKind = await classifyCurrentSql()
     if (taskKind === 'stream') {
-      const streamRes = await api.executeStreamTask(sqlText.value, 0)
+      const streamRes = await api.executeStreamTask({
+        execution_kind: 'single',
+        sql_text: sqls[0],
+        timeout_s: 0
+      })
       const submit = streamRes.data || {}
       const taskId = submit.task_id
       currentTaskId.value = taskId
@@ -373,7 +548,7 @@ const executeSQL = async () => {
       return
     }
 
-    const res = await api.executeBatchTask(sqlText.value, executeMode.value)
+    const res = await api.executeBatchTask(sqls[0], executeMode.value)
     const submit = res.data || {}
     const taskId = submit.task_id
 
@@ -401,8 +576,7 @@ const executeSQL = async () => {
     await loadTasks()
     startPolling()
   } catch (error) {
-    // 提取后端返回的具体错误信息
-    const detail = error.response?.data?.error || error.message || '未知错误'
+    const detail = parseApiError(error)
     ElMessage.error('执行失败: ' + detail)
     currentResult.value = { error: detail }
   } finally {
@@ -430,8 +604,26 @@ const loadTasks = async () => {
     if (currentTaskId.value) {
       const current = tasks.value.find(t => (t.id || t.task_id) === currentTaskId.value)
       if (current && isTerminal(current.status)) {
-        const resultRes = await api.getTaskResult(currentTaskId.value)
-        currentResult.value = formatTaskResult(resultRes.data)
+        if ((current.task_kind || '') === 'stream') {
+          const statusRes = await api.getStreamTaskStatus(currentTaskId.value)
+          const statusPayload = statusRes?.data || {}
+          const runtimeKind = statusPayload.runtime_kind || 'single'
+          const groupMode = statusPayload.group_mode || ''
+          const runtimeStatus = statusPayload.runtime_status || statusPayload.status || 'unknown'
+          const nodeCount = Array.isArray(statusPayload.nodes) ? statusPayload.nodes.length : 0
+          const shareSetCount = Array.isArray(statusPayload.share_sets) ? statusPayload.share_sets.length : 0
+          const suffix = runtimeKind === 'group'
+            ? `，group_mode=${groupMode || 'dag'}，nodes=${nodeCount}，share_sets=${shareSetCount}`
+            : ''
+          currentResult.value = {
+            columns: [],
+            rows: [],
+            message: `流任务已结束（status=${runtimeStatus}${suffix}）`
+          }
+        } else {
+          const resultRes = await api.getTaskResult(currentTaskId.value)
+          currentResult.value = formatTaskResult(resultRes.data)
+        }
         currentTaskId.value = ''
       }
     }
@@ -442,12 +634,58 @@ const loadTasks = async () => {
   }
 }
 
-const viewResult = async (taskId) => {
+const viewResult = async (rowOrTaskId) => {
+  const row = (rowOrTaskId && typeof rowOrTaskId === 'object') ? rowOrTaskId : null
+  const taskId = row
+    ? (row.id || row.task_id)
+    : rowOrTaskId
+  const isStreamTask = row
+    ? ((row.task_kind || '') === 'stream')
+    : false
+
   resultLoadingId.value = String(taskId || '')
   try {
-    const res = await api.getTaskResult(taskId)
-    const result = res.data
-    dialogResult.value = formatTaskResult(result)
+    if (isStreamTask) {
+      const res = await api.getStreamTaskStatus(taskId)
+      const payload = res?.data || {}
+      const runtimeKind = payload.runtime_kind || 'single'
+      if (runtimeKind === 'group') {
+        const nodes = Array.isArray(payload.nodes) ? payload.nodes : []
+        const rows = nodes.map((n) => ({
+          node_id: n.id || n.node_id || '',
+          status: n.status || '',
+          start_condition: n.start_condition || '',
+          depends_on: Array.isArray(n.depends_on) ? n.depends_on.join(',') : '',
+          processed_rows: n.processed_rows ?? 0,
+          output_rows: n.output_rows ?? 0,
+          error_code: n.error_code || '',
+          error_message: n.last_error || n.error_message || ''
+        }))
+        const shareSetCount = Array.isArray(payload.share_sets) ? payload.share_sets.length : 0
+        const resolvedCount = Array.isArray(payload.resolved_sources) ? payload.resolved_sources.length : 0
+        dialogResult.value = rows.length > 0
+          ? {
+              columns: ['node_id', 'status', 'start_condition', 'depends_on', 'processed_rows', 'output_rows', 'error_code', 'error_message'],
+              rows
+            }
+          : {
+              columns: [],
+              rows: [],
+              message: `Group 状态：${payload.status || 'unknown'}，group_mode=${payload.group_mode || 'dag'}，share_sets=${shareSetCount}，resolved_sources=${resolvedCount}`
+            }
+      } else {
+        const message = `流任务状态：${payload.status || 'unknown'}，processed_rows=${payload.processed_rows ?? 0}，output_rows=${payload.output_rows ?? 0}`
+        dialogResult.value = {
+          columns: [],
+          rows: [],
+          message
+        }
+      }
+    } else {
+      const res = await api.getTaskResult(taskId)
+      const result = res.data
+      dialogResult.value = formatTaskResult(result)
+    }
 
     resultDialogVisible.value = true
   } catch (error) {

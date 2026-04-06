@@ -2,6 +2,7 @@
 
 #include <common/error_code.h>
 #include <common/log.h>
+#include <framework/core/sql_text_splitter.h>
 #include <framework/core/sql_parser.h>
 #include <framework/interfaces/ichannel_registry.h>
 #include <framework/interfaces/irouter_handle.h>
@@ -174,6 +175,44 @@ static std::string JsonErrorWithCode(const std::string& error_text, const std::s
     w.String(error_code.c_str());
     w.EndObject();
     return buf.GetString();
+}
+
+static std::string JsonErrorWithCodeAndSqlIndex(const std::string& error_text,
+                                                const std::string& error_code,
+                                                size_t sql_index) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("error");
+    w.String(error_text.c_str());
+    w.Key("error_code");
+    w.String(error_code.c_str());
+    w.Key("sql_index");
+    w.Uint64(static_cast<uint64_t>(sql_index));
+    w.EndObject();
+    return buf.GetString();
+}
+
+static void ParseRuntimeErrorCode(const rapidjson::Value& value,
+                                  std::string* error_code_out,
+                                  int* error_no_out) {
+    if (error_code_out) error_code_out->clear();
+    if (error_no_out) *error_no_out = 0;
+    if (value.IsString()) {
+        if (error_code_out) *error_code_out = value.GetString();
+        return;
+    }
+    if (value.IsInt()) {
+        const int v = value.GetInt();
+        if (error_no_out) *error_no_out = v;
+        if (error_code_out && v != 0) *error_code_out = std::to_string(v);
+        return;
+    }
+    if (value.IsUint()) {
+        const int v = static_cast<int>(value.GetUint());
+        if (error_no_out) *error_no_out = v;
+        if (error_code_out && v != 0) *error_code_out = std::to_string(v);
+    }
 }
 
 }  // namespace
@@ -1671,10 +1710,8 @@ int32_t TaskPlugin::HandleCancel(const std::string&, const std::string& req, std
 int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& req, std::string& rsp) {
     rapidjson::Document doc;
     doc.Parse(req.c_str());
-    if (doc.HasParseError() || !doc.IsObject() ||
-        !doc.HasMember("sql") || !doc["sql"].IsString() ||
-        std::string(doc["sql"].GetString()).empty()) {
-        rsp = JsonError("invalid request, expected {\"sql\":\"...\"}");
+    if (doc.HasParseError() || !doc.IsObject()) {
+        rsp = JsonError("invalid request body");
         return error::BAD_REQUEST;
     }
 
@@ -1690,36 +1727,158 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
             return error::BAD_REQUEST;
         }
     }
-
-    rapidjson::StringBuffer classify_req_buf;
-    rapidjson::Writer<rapidjson::StringBuffer> classify_req_w(classify_req_buf);
-    classify_req_w.StartObject();
-    classify_req_w.Key("sql");
-    classify_req_w.String(doc["sql"].GetString());
-    classify_req_w.EndObject();
-
-    std::string classify_rsp;
-    const int32_t classify_rc = ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &classify_rsp);
-    if (classify_rc != error::OK) {
-        rsp = classify_rsp.empty() ? JsonError("scheduler sql classify failed") : classify_rsp;
-        return classify_rc;
+    int share_set_ready_timeout_s = 30;
+    bool has_share_set_ready_timeout_s = false;
+    if (doc.HasMember("share_set_ready_timeout_s")) {
+        if (!doc["share_set_ready_timeout_s"].IsInt()) {
+            rsp = JsonErrorWithCode("invalid request, share_set_ready_timeout_s must be integer",
+                                    "STREAM_GROUP_SQL_TEXT_INVALID");
+            return error::BAD_REQUEST;
+        }
+        has_share_set_ready_timeout_s = true;
+        share_set_ready_timeout_s = doc["share_set_ready_timeout_s"].GetInt();
+        if (share_set_ready_timeout_s <= 0) {
+            rsp = JsonErrorWithCode("invalid request, share_set_ready_timeout_s must be > 0",
+                                    "STREAM_GROUP_SQL_TEXT_INVALID");
+            return error::BAD_REQUEST;
+        }
     }
-    rapidjson::Document classify_doc;
-    classify_doc.Parse(classify_rsp.c_str());
-    if (classify_doc.HasParseError() || !classify_doc.IsObject() ||
-        !classify_doc.HasMember("task_kind") || !classify_doc["task_kind"].IsString()) {
-        rsp = JsonError("invalid scheduler classify response");
-        return error::INTERNAL_ERROR;
+
+    std::string execution_kind = "single";
+    if (doc.HasMember("execution_kind")) {
+        if (!doc["execution_kind"].IsString()) {
+            rsp = JsonError("invalid request, execution_kind must be string");
+            return error::BAD_REQUEST;
+        }
+        execution_kind = doc["execution_kind"].GetString();
+        std::transform(execution_kind.begin(), execution_kind.end(), execution_kind.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     }
-    if (std::string(classify_doc["task_kind"].GetString()) != "stream") {
-        rsp = JsonErrorWithCode(
-            "batch SQL must use /tasks/batch/execute",
-            "BATCH_SQL_USE_BATCH_API");
+
+    if (!doc.HasMember("sql_text") || !doc["sql_text"].IsString()) {
+        rsp = JsonErrorWithCode("invalid request, expected {\"sql_text\":\"...\"}",
+                                "STREAM_GROUP_SQL_TEXT_INVALID");
+        return error::BAD_REQUEST;
+    }
+    const std::string sql_text = doc["sql_text"].GetString();
+
+    const bool has_legacy_sql = doc.HasMember("sql");
+    const bool has_legacy_sqls = doc.HasMember("sqls");
+    const bool has_legacy_dag = doc.HasMember("dag") || doc.HasMember("nodes") || doc.HasMember("source_share_sets");
+
+    std::vector<std::string> sqls;
+    SqlTextSplitError split_err;
+    if (SplitSqlText(sql_text, &sqls, &split_err) != 0) {
+        std::string err = "invalid request, sql_text split failed";
+        if (!split_err.message.empty()) {
+            err += ": " + split_err.message;
+        }
+        rsp = JsonErrorWithCodeAndSqlIndex(
+            err,
+            "STREAM_GROUP_SQL_TEXT_INVALID",
+            split_err.statement_index);
         return error::BAD_REQUEST;
     }
 
+    if (execution_kind == "single") {
+        if (doc.HasMember("group_mode") || has_legacy_dag || has_legacy_sql || has_legacy_sqls) {
+            rsp = JsonErrorWithCode(
+                "single execution accepts only sql_text/timeout_s",
+                "STREAM_GROUP_SQL_TEXT_INVALID");
+            return error::BAD_REQUEST;
+        }
+        if (has_share_set_ready_timeout_s) {
+            rsp = JsonErrorWithCode(
+                "single execution must not contain share_set_ready_timeout_s",
+                "STREAM_GROUP_SQL_TEXT_INVALID");
+            return error::BAD_REQUEST;
+        }
+        if (sqls.size() != 1) {
+            rsp = JsonErrorWithCode(
+                "single execution requires exactly one SQL statement in sql_text",
+                "STREAM_GROUP_SQL_TEXT_INVALID");
+            return error::BAD_REQUEST;
+        }
+
+        rapidjson::StringBuffer classify_req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> classify_req_w(classify_req_buf);
+        classify_req_w.StartObject();
+        classify_req_w.Key("sql");
+        classify_req_w.String(sqls.front().c_str());
+        classify_req_w.EndObject();
+
+        std::string classify_rsp;
+        const int32_t classify_rc =
+            ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &classify_rsp);
+        if (classify_rc != error::OK) {
+            rsp = classify_rsp.empty() ? JsonError("scheduler sql classify failed") : classify_rsp;
+            return classify_rc;
+        }
+        rapidjson::Document classify_doc;
+        classify_doc.Parse(classify_rsp.c_str());
+        if (classify_doc.HasParseError() || !classify_doc.IsObject() ||
+            !classify_doc.HasMember("task_kind") || !classify_doc["task_kind"].IsString()) {
+            rsp = JsonError("invalid scheduler classify response");
+            return error::INTERNAL_ERROR;
+        }
+        if (std::string(classify_doc["task_kind"].GetString()) != "stream") {
+            rsp = JsonErrorWithCode(
+                "batch SQL must use /tasks/batch/execute",
+                "BATCH_SQL_USE_BATCH_API");
+            return error::BAD_REQUEST;
+        }
+    } else if (execution_kind == "group") {
+        if (has_legacy_sql || has_legacy_sqls || has_legacy_dag) {
+            rsp = JsonErrorWithCode(
+                "group execution accepts only sql_text/group_mode/timeout fields",
+                "STREAM_GROUP_SQL_TEXT_INVALID");
+            return error::BAD_REQUEST;
+        }
+        if (!doc.HasMember("group_mode") || !doc["group_mode"].IsString()) {
+            rsp = JsonError("invalid request, group execution requires group_mode");
+            return error::BAD_REQUEST;
+        }
+        if (std::string(doc["group_mode"].GetString()) != "dag") {
+            rsp = JsonErrorWithCode("invalid request, group_mode must be dag",
+                                    "STREAM_GROUP_MODE_INVALID");
+            return error::BAD_REQUEST;
+        }
+        if (sqls.size() < 2) {
+            rsp = JsonErrorWithCode(
+                "group execution requires at least two SQL statements in sql_text",
+                "STREAM_GROUP_SQL_TEXT_INVALID");
+            return error::BAD_REQUEST;
+        }
+    } else {
+        rsp = JsonErrorWithCode(
+            "invalid request, execution_kind must be single or group",
+            "STREAM_GROUP_SQL_TEXT_INVALID");
+        return error::BAD_REQUEST;
+    }
+
+    rapidjson::StringBuffer scheduler_req_buf;
+    rapidjson::Writer<rapidjson::StringBuffer> scheduler_req_w(scheduler_req_buf);
+    scheduler_req_w.StartObject();
+    scheduler_req_w.Key("execution_kind");
+    scheduler_req_w.String(execution_kind.c_str());
+    scheduler_req_w.Key("sql_text");
+    scheduler_req_w.String(sql_text.c_str());
+    scheduler_req_w.Key("timeout_s");
+    scheduler_req_w.Int(timeout_s);
+    if (execution_kind == "group") {
+        scheduler_req_w.Key("group_mode");
+        scheduler_req_w.String("dag");
+        if (has_share_set_ready_timeout_s) {
+            scheduler_req_w.Key("share_set_ready_timeout_s");
+            scheduler_req_w.Int(share_set_ready_timeout_s);
+        }
+    }
+    scheduler_req_w.EndObject();
+
     std::string scheduler_rsp;
-    const int32_t rc = ProxySchedulerPost("/scheduler/stream/execute", req, &scheduler_rsp);
+    const int32_t rc = ProxySchedulerPost("/scheduler/stream/execute",
+                                          scheduler_req_buf.GetString(),
+                                          &scheduler_rsp);
     if (rc != error::OK) {
         rsp = scheduler_rsp.empty() ? JsonError("scheduler stream execute failed") : scheduler_rsp;
         return rc;
@@ -1739,11 +1898,14 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     }
 
     std::string task_id;
-    const std::string sql = doc["sql"].GetString();
-    const std::string sqls_json = BuildSqlsJson({sql});
-    if (CreateTaskInternal(TruncateSummary(sql),
+    const std::string request_summary =
+        (execution_kind == "single")
+            ? sqls.front()
+            : ("[group] " + std::to_string(sqls.size()) + " SQL nodes");
+    const std::string sqls_json = BuildSqlsJson(sqls);
+    if (CreateTaskInternal(TruncateSummary(request_summary),
                            sqls_json,
-                           1,
+                           static_cast<int>(sqls.size()),
                            timeout_s,
                            &task_id,
                            false,
@@ -1772,6 +1934,24 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     w.String(runtime_task_id.c_str());
     w.Key("status");
     w.String("submitted");
+    w.Key("runtime_kind");
+    if (exec_doc.HasMember("runtime_kind") && exec_doc["runtime_kind"].IsString()) {
+        w.String(exec_doc["runtime_kind"].GetString());
+    } else {
+        w.String(execution_kind == "group" ? "group" : "single");
+    }
+    if (exec_doc.HasMember("group_mode") && exec_doc["group_mode"].IsString()) {
+        w.Key("group_mode");
+        w.String(exec_doc["group_mode"].GetString());
+    }
+    if (exec_doc.HasMember("node_count") && exec_doc["node_count"].IsUint()) {
+        w.Key("node_count");
+        w.Uint(exec_doc["node_count"].GetUint());
+    }
+    if (exec_doc.HasMember("share_set_count") && exec_doc["share_set_count"].IsUint()) {
+        w.Key("share_set_count");
+        w.Uint(exec_doc["share_set_count"].GetUint());
+    }
     w.EndObject();
     rsp = out.GetString();
     return error::OK;
@@ -1816,17 +1996,29 @@ int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req,
     rapidjson::Document stop_doc;
     stop_doc.Parse(scheduler_rsp.c_str());
     std::string runtime_status = "stopped";
+    std::string runtime_kind = "single";
+    std::string group_mode;
     std::string error_message;
-    int error_code = 0;
+    std::string runtime_error_code;
+    int runtime_error_no = 0;
     if (!stop_doc.HasParseError() && stop_doc.IsObject()) {
         if (stop_doc.HasMember("status") && stop_doc["status"].IsString()) {
             runtime_status = stop_doc["status"].GetString();
         }
+        if (stop_doc.HasMember("runtime_kind") && stop_doc["runtime_kind"].IsString()) {
+            runtime_kind = stop_doc["runtime_kind"].GetString();
+        }
+        if (stop_doc.HasMember("group_mode") && stop_doc["group_mode"].IsString()) {
+            group_mode = stop_doc["group_mode"].GetString();
+        }
         if (stop_doc.HasMember("error_message") && stop_doc["error_message"].IsString()) {
             error_message = stop_doc["error_message"].GetString();
         }
-        if (stop_doc.HasMember("error_code") && stop_doc["error_code"].IsInt()) {
-            error_code = stop_doc["error_code"].GetInt();
+        if (stop_doc.HasMember("error_code")) {
+            ParseRuntimeErrorCode(stop_doc["error_code"], &runtime_error_code, &runtime_error_no);
+        }
+        if (stop_doc.HasMember("error_no") && stop_doc["error_no"].IsInt()) {
+            runtime_error_no = stop_doc["error_no"].GetInt();
         }
     }
 
@@ -1836,9 +2028,7 @@ int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req,
         runtime_status = "stopped";
     }
     if (mapped == TaskStatus::kStopped || mapped == TaskStatus::kCancelled || mapped == TaskStatus::kFailed) {
-        const std::string err_code = (mapped == TaskStatus::kFailed && error_code != 0)
-            ? std::to_string(error_code)
-            : "";
+        const std::string err_code = (mapped == TaskStatus::kFailed) ? runtime_error_code : "";
         (void)UpdateStatus(task_id,
                            mapped,
                            err_code,
@@ -1860,6 +2050,16 @@ int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req,
     w.String(StatusName(mapped));
     w.Key("runtime_status");
     w.String(runtime_status.c_str());
+    w.Key("runtime_kind");
+    w.String(runtime_kind.c_str());
+    w.Key("error_code");
+    w.String(runtime_error_code.c_str());
+    w.Key("error_no");
+    w.Int(runtime_error_no);
+    if (!group_mode.empty()) {
+        w.Key("group_mode");
+        w.String(group_mode.c_str());
+    }
     w.EndObject();
     rsp = out.GetString();
     return error::OK;
@@ -1885,12 +2085,21 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
     }
 
     std::string runtime_status = RuntimeStatusName(rec.status);
-    int runtime_error_code = 0;
+    std::string runtime_kind = "single";
+    std::string group_mode;
+    std::string runtime_error_code = rec.error_code;
+    int runtime_error_no = 0;
     std::string runtime_error_message = rec.error_message;
     int64_t processed_rows = 0;
     int64_t output_rows = rec.result_row_count;
     rapidjson::Document op_stats_doc;
     bool has_op_stats = false;
+    rapidjson::Document nodes_doc;
+    bool has_nodes = false;
+    rapidjson::Document share_sets_doc;
+    bool has_share_sets = false;
+    rapidjson::Document resolved_sources_doc;
+    bool has_resolved_sources = false;
 
     if (!rec.runtime_task_id.empty()) {
         rapidjson::StringBuffer req_buf;
@@ -1909,11 +2118,20 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
                 if (runtime_doc.HasMember("status") && runtime_doc["status"].IsString()) {
                     runtime_status = runtime_doc["status"].GetString();
                 }
+                if (runtime_doc.HasMember("runtime_kind") && runtime_doc["runtime_kind"].IsString()) {
+                    runtime_kind = runtime_doc["runtime_kind"].GetString();
+                }
+                if (runtime_doc.HasMember("group_mode") && runtime_doc["group_mode"].IsString()) {
+                    group_mode = runtime_doc["group_mode"].GetString();
+                }
                 if (runtime_doc.HasMember("error_message") && runtime_doc["error_message"].IsString()) {
                     runtime_error_message = runtime_doc["error_message"].GetString();
                 }
-                if (runtime_doc.HasMember("error_code") && runtime_doc["error_code"].IsInt()) {
-                    runtime_error_code = runtime_doc["error_code"].GetInt();
+                if (runtime_doc.HasMember("error_code")) {
+                    ParseRuntimeErrorCode(runtime_doc["error_code"], &runtime_error_code, &runtime_error_no);
+                }
+                if (runtime_doc.HasMember("error_no") && runtime_doc["error_no"].IsInt()) {
+                    runtime_error_no = runtime_doc["error_no"].GetInt();
                 }
                 if (runtime_doc.HasMember("processed_rows") && runtime_doc["processed_rows"].IsUint64()) {
                     processed_rows = static_cast<int64_t>(runtime_doc["processed_rows"].GetUint64());
@@ -1925,6 +2143,18 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
                     op_stats_doc.CopyFrom(runtime_doc["op_stats"], op_stats_doc.GetAllocator());
                     has_op_stats = true;
                 }
+                if (runtime_doc.HasMember("nodes")) {
+                    nodes_doc.CopyFrom(runtime_doc["nodes"], nodes_doc.GetAllocator());
+                    has_nodes = true;
+                }
+                if (runtime_doc.HasMember("share_sets")) {
+                    share_sets_doc.CopyFrom(runtime_doc["share_sets"], share_sets_doc.GetAllocator());
+                    has_share_sets = true;
+                }
+                if (runtime_doc.HasMember("resolved_sources")) {
+                    resolved_sources_doc.CopyFrom(runtime_doc["resolved_sources"], resolved_sources_doc.GetAllocator());
+                    has_resolved_sources = true;
+                }
             }
 
             const TaskStatus mapped = MapStreamRuntimeStatus(runtime_status);
@@ -1932,9 +2162,7 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
                 if (mapped == TaskStatus::kStopped ||
                     mapped == TaskStatus::kCancelled ||
                     mapped == TaskStatus::kFailed) {
-                    const std::string err_code = (mapped == TaskStatus::kFailed && runtime_error_code != 0)
-                        ? std::to_string(runtime_error_code)
-                        : "";
+                    const std::string err_code = (mapped == TaskStatus::kFailed) ? runtime_error_code : "";
                     (void)UpdateStatus(task_id,
                                        mapped,
                                        err_code,
@@ -1966,20 +2194,25 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
     w.String(StatusName(rec.status));
     w.Key("runtime_status");
     w.String(runtime_status.c_str());
+    w.Key("runtime_kind");
+    w.String(runtime_kind.c_str());
+    if (!group_mode.empty()) {
+        w.Key("group_mode");
+        w.String(group_mode.c_str());
+    }
     w.Key("terminal_reason");
     w.String(rec.error_stage.c_str());
     w.Key("error_code");
+    const std::string out_error_code = rec.error_code.empty() ? runtime_error_code : rec.error_code;
+    w.String(out_error_code.c_str());
+    w.Key("error_no");
+    int out_error_no = runtime_error_no;
     if (!rec.error_code.empty()) {
         char* endptr = nullptr;
         const long v = std::strtol(rec.error_code.c_str(), &endptr, 10);
-        if (endptr && *endptr == '\0') {
-            w.Int(static_cast<int>(v));
-        } else {
-            w.Int(runtime_error_code);
-        }
-    } else {
-        w.Int(runtime_error_code);
+        if (endptr && *endptr == '\0') out_error_no = static_cast<int>(v);
     }
+    w.Int(out_error_no);
     w.Key("error_message");
     w.String(rec.error_message.empty() ? runtime_error_message.c_str() : rec.error_message.c_str());
     w.Key("processed_rows");
@@ -1992,6 +2225,27 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
     } else {
         w.StartObject();
         w.EndObject();
+    }
+    w.Key("resolved_sources");
+    if (has_resolved_sources) {
+        resolved_sources_doc.Accept(w);
+    } else {
+        w.StartArray();
+        w.EndArray();
+    }
+    w.Key("nodes");
+    if (has_nodes) {
+        nodes_doc.Accept(w);
+    } else {
+        w.StartArray();
+        w.EndArray();
+    }
+    w.Key("share_sets");
+    if (has_share_sets) {
+        share_sets_doc.Accept(w);
+    } else {
+        w.StartArray();
+        w.EndArray();
     }
     w.EndObject();
     rsp = out.GetString();

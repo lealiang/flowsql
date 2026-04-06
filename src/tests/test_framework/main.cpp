@@ -18,6 +18,7 @@
 #include <framework/builtin/dataframe/passthrough_operator.h>
 #include <framework/core/pipeline.h>
 #include <framework/core/sql_parser.h>
+#include <framework/core/sql_text_splitter.h>
 #include <framework/interfaces/ichannel.h>
 #include <framework/interfaces/idataframe_channel.h>
 #include <framework/interfaces/ioperator.h>
@@ -32,6 +33,7 @@ void test_dataframe_clear();
 void test_dataframe_channel();
 void test_dataframe_channel_append();
 void test_sql_parser();
+void test_sql_text_splitter();
 void test_operator_multi_input_fallback();
 void test_span_safety();
 void test_normalize_from_table_name();
@@ -486,6 +488,67 @@ void test_sql_parser() {
 }
 
 // ============================================================
+// Test 7.1: sql_text splitter（Story 14.13）
+// ============================================================
+void test_sql_text_splitter() {
+    printf("[TEST] sql_text splitter...\n");
+
+    {
+        std::vector<std::string> sqls;
+        SqlTextSplitError err;
+        assert(SplitSqlText("SELECT 1; SELECT 2;", &sqls, &err) == 0);
+        assert(sqls.size() == 2);
+        assert(sqls[0] == "SELECT 1");
+        assert(sqls[1] == "SELECT 2");
+    }
+
+    {
+        std::vector<std::string> sqls;
+        SqlTextSplitError err;
+        assert(SplitSqlText("SELECT 1\nSELECT 2", &sqls, &err) == 0);
+        assert(sqls.size() == 1);
+        assert(sqls[0] == "SELECT 1\nSELECT 2");
+    }
+
+    {
+        std::vector<std::string> sqls;
+        SqlTextSplitError err;
+        const std::string text =
+            "SELECT ';' AS a, \"x;\" AS b, `c;d` AS c;\n"
+            "SELECT 2;";
+        assert(SplitSqlText(text, &sqls, &err) == 0);
+        assert(sqls.size() == 2);
+    }
+
+    {
+        std::vector<std::string> sqls;
+        SqlTextSplitError err;
+        const std::string text =
+            "SELECT 1 -- ; in line comment\n"
+            ";\n"
+            "SELECT /* ; in block comment */ 2;";
+        assert(SplitSqlText(text, &sqls, &err) == 0);
+        assert(sqls.size() == 2);
+    }
+
+    {
+        std::vector<std::string> sqls;
+        SqlTextSplitError err;
+        assert(SplitSqlText("SELECT 1;;SELECT 2", &sqls, &err) != 0);
+        assert(err.statement_index == 1);
+    }
+
+    {
+        std::vector<std::string> sqls;
+        SqlTextSplitError err;
+        assert(SplitSqlText("SELECT 'abc; SELECT 2", &sqls, &err) != 0);
+        assert(err.statement_index == 0);
+    }
+
+    printf("[PASS] sql_text splitter\n");
+}
+
+// ============================================================
 // Test 8: IOperator 多输入默认回退（Span -> inputs[0]）
 // ============================================================
 void test_operator_multi_input_fallback() {
@@ -734,6 +797,7 @@ int main(int argc, char* argv[]) {
     test_dataframe_channel();
     test_dataframe_channel_append();
     test_sql_parser();
+    test_sql_text_splitter();
     test_operator_multi_input_fallback();
     test_span_safety();
     test_normalize_from_table_name();

@@ -849,6 +849,17 @@ int main() {
         }
         ASSERT_TRUE(saw_running);
 
+        // running 状态早于首条 SQL 真正调用，先等待首条执行启动，避免取消竞态导致 exec_count=0。
+        bool first_sql_started = false;
+        for (int i = 0; i < 80; ++i) {
+            if (exec_count.load() >= 1) {
+                first_sql_started = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        ASSERT_TRUE(first_sql_started);
+
         ASSERT_EQ(local_routes["POST:/tasks/cancel"]("/tasks/cancel", MakeTaskIdReq(task_id), rsp), error::OK);
         ASSERT_TRUE(rsp.find("cancelling") != std::string::npos);
 
@@ -939,7 +950,9 @@ int main() {
                  rapidjson::Document d;
                  d.Parse(req.c_str());
                  ASSERT_TRUE(!d.HasParseError() && d.IsObject());
-                 ASSERT_TRUE(d.HasMember("sql") && d["sql"].IsString());
+                 ASSERT_TRUE(d.HasMember("execution_kind") && d["execution_kind"].IsString());
+                 ASSERT_EQ(std::string(d["execution_kind"].GetString()), "single");
+                 ASSERT_TRUE(d.HasMember("sql_text") && d["sql_text"].IsString());
                  stream_execute_calls.fetch_add(1);
                  rsp = R"({"runtime_task_id":"stream_task_1001"})";
                  return error::OK;
@@ -992,14 +1005,14 @@ int main() {
         // 非法 timeout 参数应在调度前拦截。
         ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
                       "/tasks/stream/execute",
-                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","timeout_s":-1})",
+                      R"({"sql_text":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","timeout_s":-1})",
                       rsp),
                   error::BAD_REQUEST);
         ASSERT_EQ(stream_execute_calls.load(), 0);
 
         ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
                       "/tasks/stream/execute",
-                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","timeout_s":30})",
+                      R"({"sql_text":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","timeout_s":30})",
                       rsp),
                   error::OK);
         rapidjson::Document exec_ret;
@@ -1102,7 +1115,9 @@ int main() {
                  rapidjson::Document d;
                  d.Parse(req.c_str());
                  ASSERT_TRUE(!d.HasParseError() && d.IsObject());
-                 ASSERT_TRUE(d.HasMember("sql") && d["sql"].IsString());
+                 ASSERT_TRUE(d.HasMember("execution_kind") && d["execution_kind"].IsString());
+                 ASSERT_EQ(std::string(d["execution_kind"].GetString()), "single");
+                 ASSERT_TRUE(d.HasMember("sql_text") && d["sql_text"].IsString());
                  stream_execute_calls.fetch_add(1);
                  rsp = R"({"runtime_task_id":"stream_task_classify_001"})";
                  return error::OK;
@@ -1166,7 +1181,7 @@ int main() {
 
         ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
                       "/tasks/stream/execute",
-                      R"({"sql":"SELECT * FROM sqlite.local.src INTO dataframe.tmp"})",
+                      R"({"sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp"})",
                       rsp),
                   error::BAD_REQUEST);
         rapidjson::Document stream_err;
@@ -1185,11 +1200,360 @@ int main() {
 
         ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
                       "/tasks/stream/execute",
-                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc"})",
+                      R"({"sql_text":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc"})",
                       rsp),
                   error::OK);
         ASSERT_EQ(stream_execute_calls.load(), 1);
         ASSERT_TRUE(classify_calls.load() >= 4);
+
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
+        const std::string stream_errcode_dir = MakeTempDir("stream_errcode_routes");
+        std::atomic<int> stream_execute_calls{0};
+        std::atomic<int> stream_status_calls{0};
+        std::atomic<int> stream_stop_calls{0};
+
+        MockRouterHandle scheduler({
+            {"POST", "/scheduler/sql/classify",
+             [](const std::string&, const std::string&, std::string& rsp) {
+                 rsp = R"({"task_kind":"stream"})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/execute",
+             [&stream_execute_calls](const std::string&, const std::string&, std::string& rsp) {
+                 stream_execute_calls.fetch_add(1);
+                 rsp = R"({"runtime_task_id":"stream_task_errcode_1"})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/status",
+             [&stream_status_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
+                 ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_task_errcode_1");
+                 stream_status_calls.fetch_add(1);
+                 rsp = R"({
+                     "task_id":"stream_task_errcode_1",
+                     "runtime_task_id":"stream_task_errcode_1",
+                     "status":"failed",
+                     "error_code":"STREAM_GROUP_TIMEOUT",
+                     "error_message":"stream group timeout: 1s, unfinished_nodes=n1"
+                 })";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/stop",
+             [&stream_stop_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
+                 ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_task_errcode_1");
+                 stream_stop_calls.fetch_add(1);
+                 rsp = R"({
+                     "task_id":"stream_task_errcode_1",
+                     "status":"failed",
+                     "error_code":"STREAM_GROUP_TIMEOUT",
+                     "error_message":"stream group timeout: 1s, unfinished_nodes=n1"
+                 })";
+                 return error::OK;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + stream_errcode_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        std::unordered_map<std::string, fnRouterHandler> local_routes;
+        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"sql_text":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document exec_doc;
+        exec_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!exec_doc.HasParseError() && exec_doc.IsObject());
+        ASSERT_TRUE(exec_doc.HasMember("task_id") && exec_doc["task_id"].IsString());
+        const std::string task_id = exec_doc["task_id"].GetString();
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/status"](
+                      "/tasks/stream/status", MakeTaskIdReq(task_id), rsp),
+                  error::OK);
+        rapidjson::Document status_doc;
+        status_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!status_doc.HasParseError() && status_doc.IsObject());
+        ASSERT_EQ(std::string(status_doc["status"].GetString()), "failed");
+        ASSERT_TRUE(status_doc.HasMember("error_code") && status_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(status_doc["error_code"].GetString()), "STREAM_GROUP_TIMEOUT");
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/stop"](
+                      "/tasks/stream/stop", MakeTaskIdReq(task_id), rsp),
+                  error::OK);
+        rapidjson::Document stop_doc;
+        stop_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!stop_doc.HasParseError() && stop_doc.IsObject());
+        ASSERT_EQ(std::string(stop_doc["status"].GetString()), "failed");
+        ASSERT_TRUE(stop_doc.HasMember("error_code") && stop_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(stop_doc["error_code"].GetString()), "STREAM_GROUP_TIMEOUT");
+
+        ASSERT_EQ(stream_execute_calls.load(), 1);
+        ASSERT_TRUE(stream_status_calls.load() >= 1);
+        ASSERT_EQ(stream_stop_calls.load(), 1);
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
+        const std::string stream_group_dir = MakeTempDir("stream_group_routes");
+        std::atomic<int> classify_calls{0};
+        std::atomic<int> stream_execute_calls{0};
+        std::atomic<int> stream_status_calls{0};
+        std::atomic<int> stream_stop_calls{0};
+
+        MockRouterHandle scheduler({
+            {"POST", "/scheduler/sql/classify",
+             [&classify_calls](const std::string&, const std::string&, std::string& rsp) {
+                 classify_calls.fetch_add(1);
+                 rsp = R"({"task_kind":"stream"})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/execute",
+             [&stream_execute_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("execution_kind") && d["execution_kind"].IsString());
+                 ASSERT_EQ(std::string(d["execution_kind"].GetString()), "group");
+                 ASSERT_TRUE(d.HasMember("group_mode") && d["group_mode"].IsString());
+                 ASSERT_EQ(std::string(d["group_mode"].GetString()), "dag");
+                 ASSERT_TRUE(d.HasMember("sql_text") && d["sql_text"].IsString());
+                 ASSERT_TRUE(std::string(d["sql_text"].GetString()).find(';') != std::string::npos);
+                 stream_execute_calls.fetch_add(1);
+                 rsp = R"({
+                     "runtime_task_id":"stream_group_2001",
+                     "runtime_kind":"group",
+                     "group_mode":"dag",
+                     "node_count":2,
+                     "share_set_count":0
+                 })";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/status",
+             [&stream_status_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
+                 ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_group_2001");
+                 const int n = stream_status_calls.fetch_add(1);
+                 if (n == 0) {
+                     rsp = R"({
+                         "task_id":"stream_group_2001",
+                         "runtime_task_id":"stream_group_2001",
+                         "runtime_kind":"group",
+                         "group_mode":"dag",
+                         "status":"running",
+                         "nodes":[{"id":"n1","status":"running"},{"id":"n2","status":"pending"}],
+                         "share_sets":[],
+                         "resolved_sources":[]
+                     })";
+                 } else {
+                     rsp = R"({
+                         "task_id":"stream_group_2001",
+                         "runtime_task_id":"stream_group_2001",
+                         "runtime_kind":"group",
+                         "group_mode":"dag",
+                         "status":"stopped",
+                         "nodes":[{"id":"n1","status":"stopped"},{"id":"n2","status":"stopped"}],
+                         "share_sets":[],
+                         "resolved_sources":[]
+                     })";
+                 }
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/stop",
+             [&stream_stop_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
+                 ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_group_2001");
+                 stream_stop_calls.fetch_add(1);
+                 rsp = R"({
+                     "task_id":"stream_group_2001",
+                     "runtime_task_id":"stream_group_2001",
+                     "runtime_kind":"group",
+                     "group_mode":"dag",
+                     "status":"stopped"
+                 })";
+                 return error::OK;
+             }},
+        });
+
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + stream_group_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        std::unordered_map<std::string, fnRouterHandler> local_routes;
+        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/execute") == 1);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/status") == 1);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/stop") == 1);
+
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({
+                          "execution_kind":"group",
+                          "group_mode":"dag",
+                          "timeout_s":30,
+                          "sql_text":"SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.mid;SELECT * FROM stream.mid USING builtin.passthrough_stream INTO stream.out;"
+                      })",
+                      rsp),
+                  error::OK);
+        rapidjson::Document submit_doc;
+        submit_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!submit_doc.HasParseError() && submit_doc.IsObject());
+        ASSERT_TRUE(submit_doc.HasMember("task_id") && submit_doc["task_id"].IsString());
+        ASSERT_TRUE(submit_doc.HasMember("runtime_task_id") && submit_doc["runtime_task_id"].IsString());
+        ASSERT_TRUE(submit_doc.HasMember("runtime_kind") && submit_doc["runtime_kind"].IsString());
+        ASSERT_EQ(std::string(submit_doc["runtime_kind"].GetString()), "group");
+        ASSERT_TRUE(submit_doc.HasMember("group_mode") && submit_doc["group_mode"].IsString());
+        ASSERT_EQ(std::string(submit_doc["group_mode"].GetString()), "dag");
+        ASSERT_TRUE(submit_doc.HasMember("node_count") && submit_doc["node_count"].IsUint());
+        ASSERT_EQ(submit_doc["node_count"].GetUint(), 2u);
+        const std::string group_task_id = submit_doc["task_id"].GetString();
+        ASSERT_TRUE(!group_task_id.empty());
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/status"](
+                      "/tasks/stream/status", MakeTaskIdReq(group_task_id), rsp),
+                  error::OK);
+        rapidjson::Document status_doc;
+        status_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!status_doc.HasParseError() && status_doc.IsObject());
+        ASSERT_TRUE(status_doc.HasMember("runtime_kind") && status_doc["runtime_kind"].IsString());
+        ASSERT_EQ(std::string(status_doc["runtime_kind"].GetString()), "group");
+        ASSERT_TRUE(status_doc.HasMember("nodes") && status_doc["nodes"].IsArray());
+        ASSERT_EQ(status_doc["nodes"].Size(), rapidjson::SizeType(2));
+        ASSERT_TRUE(status_doc.HasMember("share_sets") && status_doc["share_sets"].IsArray());
+        ASSERT_TRUE(status_doc.HasMember("resolved_sources") && status_doc["resolved_sources"].IsArray());
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/stop"](
+                      "/tasks/stream/stop", MakeTaskIdReq(group_task_id), rsp),
+                  error::OK);
+        rapidjson::Document stop_doc;
+        stop_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!stop_doc.HasParseError() && stop_doc.IsObject());
+        ASSERT_TRUE(stop_doc.HasMember("runtime_kind") && stop_doc["runtime_kind"].IsString());
+        ASSERT_EQ(std::string(stop_doc["runtime_kind"].GetString()), "group");
+        ASSERT_EQ(std::string(stop_doc["status"].GetString()), "stopped");
+
+        ASSERT_EQ(stream_execute_calls.load(), 1);
+        ASSERT_TRUE(stream_status_calls.load() >= 1);
+        ASSERT_EQ(stream_stop_calls.load(), 1);
+        ASSERT_EQ(classify_calls.load(), 0);
+
+        ASSERT_EQ(local_routes["POST:/tasks/delete"](
+                      "/tasks/delete", MakeTaskIdReq(group_task_id), rsp),
+                  error::OK);
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
+        const std::string stream_contract_dir = MakeTempDir("stream_contract_guard");
+        std::atomic<int> stream_execute_calls{0};
+        std::atomic<int> classify_calls{0};
+
+        MockRouterHandle scheduler({
+            {"POST", "/scheduler/sql/classify",
+             [&classify_calls](const std::string&, const std::string&, std::string& rsp) {
+                 classify_calls.fetch_add(1);
+                 rsp = R"({"task_kind":"stream"})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/stream/execute",
+             [&stream_execute_calls](const std::string&, const std::string&, std::string& rsp) {
+                 stream_execute_calls.fetch_add(1);
+                 rsp = R"({"runtime_task_id":"stream_contract_guard_1"})";
+                 return error::OK;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + stream_contract_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        std::unordered_map<std::string, fnRouterHandler> local_routes;
+        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        ASSERT_TRUE(local_routes.count("POST:/tasks/stream/execute") == 1);
+
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({
+                          "execution_kind":"group",
+                          "group_mode":"dag",
+                          "sql_text":"SELECT * FROM ring.a USING builtin.passthrough_stream INTO stream.b;SELECT * FROM stream.b USING builtin.passthrough_stream INTO stream.c;",
+                          "dag":{"nodes":[]}
+                      })",
+                      rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+        ASSERT_EQ(stream_execute_calls.load(), 0);
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({
+                          "execution_kind":"group",
+                          "group_mode":"dag",
+                          "sql_text":"SELECT * FROM ring.a USING builtin.passthrough_stream INTO stream.b;"
+                      })",
+                      rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+        ASSERT_EQ(stream_execute_calls.load(), 0);
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({
+                          "execution_kind":"single",
+                          "group_mode":"dag",
+                          "sql_text":"SELECT * FROM ring.a USING builtin.passthrough_stream INTO stream.b"
+                      })",
+                      rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+        ASSERT_EQ(stream_execute_calls.load(), 0);
+        ASSERT_EQ(classify_calls.load(), 0);
+
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({
+                          "execution_kind":"single",
+                          "sql_text":"SELECT * FROM ring.a USING builtin.passthrough_stream INTO stream.b;SELECT * FROM ring.c USING builtin.passthrough_stream INTO stream.d;"
+                      })",
+                      rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
+        ASSERT_EQ(stream_execute_calls.load(), 0);
+        ASSERT_EQ(classify_calls.load(), 0);
 
         ASSERT_EQ(p.Stop(), 0);
     }

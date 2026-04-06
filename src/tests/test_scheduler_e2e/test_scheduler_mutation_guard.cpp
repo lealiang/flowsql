@@ -1,7 +1,9 @@
 #include <cassert>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <services/scheduler/scheduler_plugin.h>
@@ -44,17 +46,30 @@ struct SchedulerPluginTestAccessor {
                                           const std::vector<std::string>& source_keys,
                                           const std::vector<std::string>& sink_keys,
                                           std::string* conflict_key_out,
-                                          bool* blocked_by_mutation_out) {
+                                          bool* blocked_by_mutation_out,
+                                          const std::string& lease_owner_id = "",
+                                          const std::unordered_map<std::string, uint64_t>* expected_versions = nullptr,
+                                          std::string* version_conflict_key_out = nullptr) {
         return plugin->TryAcquireStreamTaskLeases(runtime_task_id,
                                                   source_keys,
                                                   sink_keys,
                                                   conflict_key_out,
-                                                  blocked_by_mutation_out);
+                                                  blocked_by_mutation_out,
+                                                  lease_owner_id,
+                                                  expected_versions,
+                                                  version_conflict_key_out);
     }
 
     static void ReleaseStreamTaskLeases(SchedulerPlugin* plugin,
                                         const std::string& runtime_task_id) {
         plugin->ReleaseStreamTaskLeases(runtime_task_id);
+    }
+
+    static void CaptureStreamChannelVersionSnapshot(
+        SchedulerPlugin* plugin,
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, uint64_t>* snapshot_out) {
+        plugin->CaptureStreamChannelVersionSnapshot(keys, snapshot_out);
     }
 };
 }  // namespace scheduler
@@ -96,6 +111,198 @@ int main() {
 
     flowsql::scheduler::SchedulerPluginTestAccessor::ReleaseStreamTaskLeases(&plugin, "stream_task_2");
     flowsql::scheduler::SchedulerPluginTestAccessor::EndStreamChannelMutation(&plugin, source_key);
+
+    // Group lease owner reuse: same owner can share source lease across nodes.
+    conflict_key.clear();
+    blocked_by_mutation = false;
+    ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::TryAcquireStreamTaskLeases(
+                  &plugin,
+                  "stream_group_node_1",
+                  source_keys,
+                  sink_keys,
+                  &conflict_key,
+                  &blocked_by_mutation,
+                  "stream_group_1"),
+              0);
+    ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::TryAcquireStreamTaskLeases(
+                  &plugin,
+                  "stream_group_node_2",
+                  source_keys,
+                  sink_keys,
+                  &conflict_key,
+                  &blocked_by_mutation,
+                  "stream_group_1"),
+              0);
+    conflict_key.clear();
+    ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::TryAcquireStreamTaskLeases(
+                  &plugin,
+                  "stream_group_other",
+                  source_keys,
+                  sink_keys,
+                  &conflict_key,
+                  &blocked_by_mutation,
+                  "stream_group_2"),
+              EBUSY);
+    ASSERT_EQ(conflict_key, source_key);
+    flowsql::scheduler::SchedulerPluginTestAccessor::ReleaseStreamTaskLeases(&plugin, "stream_group_node_1");
+    flowsql::scheduler::SchedulerPluginTestAccessor::ReleaseStreamTaskLeases(&plugin, "stream_group_node_2");
+
+    // TOCTOU version guard: stale snapshot should be rejected with EAGAIN.
+    const std::vector<std::string> lease_keys = {source_key, sink_key};
+    std::unordered_map<std::string, uint64_t> snapshot_before;
+    flowsql::scheduler::SchedulerPluginTestAccessor::CaptureStreamChannelVersionSnapshot(
+        &plugin, lease_keys, &snapshot_before);
+    const uint64_t baseline_version = snapshot_before[source_key];
+
+    reason.clear();
+    ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::TryBeginStreamChannelMutation(
+                  &plugin, source_key, &reason),
+              0);
+    flowsql::scheduler::SchedulerPluginTestAccessor::EndStreamChannelMutation(&plugin, source_key);
+
+    std::string version_conflict_key;
+    conflict_key.clear();
+    blocked_by_mutation = false;
+    ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::TryAcquireStreamTaskLeases(
+                  &plugin,
+                  "stream_task_version_old",
+                  source_keys,
+                  sink_keys,
+                  &conflict_key,
+                  &blocked_by_mutation,
+                  "",
+                  &snapshot_before,
+                  &version_conflict_key),
+              EAGAIN);
+    ASSERT_EQ(conflict_key, source_key);
+    ASSERT_EQ(version_conflict_key, source_key);
+
+    std::unordered_map<std::string, uint64_t> snapshot_after;
+    flowsql::scheduler::SchedulerPluginTestAccessor::CaptureStreamChannelVersionSnapshot(
+        &plugin, lease_keys, &snapshot_after);
+    ASSERT_EQ(snapshot_after[source_key], baseline_version + 1u);
+    conflict_key.clear();
+    version_conflict_key.clear();
+    blocked_by_mutation = false;
+    ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::TryAcquireStreamTaskLeases(
+                  &plugin,
+                  "stream_task_version_new",
+                  source_keys,
+                  sink_keys,
+                  &conflict_key,
+                  &blocked_by_mutation,
+                  "",
+                  &snapshot_after,
+                  &version_conflict_key),
+              0);
+    flowsql::scheduler::SchedulerPluginTestAccessor::ReleaseStreamTaskLeases(&plugin, "stream_task_version_new");
+
+    // StreamTaskGroup stop semantics: stopped group must not mark non-submitted nodes as skipped.
+    {
+        std::vector<flowsql::scheduler::GroupNodePlan> nodes;
+        flowsql::scheduler::GroupNodePlan n1;
+        n1.id = "n1";
+        n1.sql = "SELECT 1";
+        nodes.push_back(n1);
+
+        std::atomic<int> submit_calls{0};
+        flowsql::scheduler::StreamTaskGroup group(
+            "g_stop",
+            "g_stop",
+            nodes,
+            0,
+            [&submit_calls](const std::string&, const std::string&, std::string* runtime_task_id, std::string*) {
+                submit_calls.fetch_add(1);
+                if (runtime_task_id) *runtime_task_id = "node_rt";
+                return 0;
+            },
+            [](const std::string&, flowsql::scheduler::TaskSnapshot* out) {
+                if (!out) return EINVAL;
+                out->status = flowsql::scheduler::StreamTaskStatus::kRunning;
+                return 0;
+            },
+            [](const std::string&) {});
+
+        group.RequestStop(false);
+        std::string start_err;
+        ASSERT_EQ(group.Start(&start_err), 0);
+        group.Join();
+        auto snapshot = group.Snapshot();
+        ASSERT_EQ(snapshot.status, flowsql::scheduler::StreamGroupStatus::kStopped);
+        ASSERT_EQ(snapshot.nodes.size(), 1u);
+        ASSERT_EQ(snapshot.nodes[0].status, flowsql::scheduler::GroupNodeStatus::kStopped);
+        ASSERT_EQ(submit_calls.load(), 0);
+    }
+
+    // StreamTaskGroup cancel semantics: cancelled group can mark non-submitted nodes as skipped.
+    {
+        std::vector<flowsql::scheduler::GroupNodePlan> nodes;
+        flowsql::scheduler::GroupNodePlan n1;
+        n1.id = "n1";
+        n1.sql = "SELECT 1";
+        nodes.push_back(n1);
+
+        flowsql::scheduler::StreamTaskGroup group(
+            "g_cancel",
+            "g_cancel",
+            nodes,
+            0,
+            [](const std::string&, const std::string&, std::string* runtime_task_id, std::string*) {
+                if (runtime_task_id) *runtime_task_id = "node_rt";
+                return 0;
+            },
+            [](const std::string&, flowsql::scheduler::TaskSnapshot* out) {
+                if (!out) return EINVAL;
+                out->status = flowsql::scheduler::StreamTaskStatus::kRunning;
+                return 0;
+            },
+            [](const std::string&) {});
+
+        group.RequestStop(true);
+        std::string start_err;
+        ASSERT_EQ(group.Start(&start_err), 0);
+        group.Join();
+        auto snapshot = group.Snapshot();
+        ASSERT_EQ(snapshot.status, flowsql::scheduler::StreamGroupStatus::kCancelled);
+        ASSERT_EQ(snapshot.nodes.size(), 1u);
+        ASSERT_EQ(snapshot.nodes[0].status, flowsql::scheduler::GroupNodeStatus::kSkipped);
+    }
+
+    // StreamTaskGroup timeout message should contain unfinished node ids.
+    {
+        std::vector<flowsql::scheduler::GroupNodePlan> nodes;
+        flowsql::scheduler::GroupNodePlan n1;
+        n1.id = "n1";
+        n1.sql = "SELECT 1";
+        nodes.push_back(n1);
+
+        std::atomic<bool> stop_called{false};
+        flowsql::scheduler::StreamTaskGroup group(
+            "g_timeout",
+            "g_timeout",
+            nodes,
+            1,
+            [](const std::string&, const std::string&, std::string* runtime_task_id, std::string*) {
+                if (runtime_task_id) *runtime_task_id = "node_rt";
+                return 0;
+            },
+            [&stop_called](const std::string&, flowsql::scheduler::TaskSnapshot* out) {
+                if (!out) return EINVAL;
+                out->status = stop_called.load()
+                                  ? flowsql::scheduler::StreamTaskStatus::kStopped
+                                  : flowsql::scheduler::StreamTaskStatus::kRunning;
+                return 0;
+            },
+            [&stop_called](const std::string&) { stop_called.store(true); });
+
+        std::string start_err;
+        ASSERT_EQ(group.Start(&start_err), 0);
+        group.Join();
+        auto snapshot = group.Snapshot();
+        ASSERT_EQ(snapshot.status, flowsql::scheduler::StreamGroupStatus::kFailed);
+        ASSERT_EQ(snapshot.error_code, "STREAM_GROUP_TIMEOUT");
+        ASSERT_TRUE(snapshot.error_message.find("unfinished_nodes=n1") != std::string::npos);
+    }
 
     std::puts("=== Scheduler mutation guard tests passed ===");
     return 0;

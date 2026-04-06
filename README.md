@@ -101,6 +101,8 @@ export FLOWSQL_SECRET_KEY="your-32-byte-secret-key-here!!"
 ./test_clickhouse   # 需运行中的 ClickHouse
 ./test_router       # 路由表单元测试
 ./test_builtin      # Catalog/BinAddon/算子管理链路
+./test_stream       # 流式通道与运行时
+./test_scheduler_e2e # Stream Group DAG 端到端回归
 ```
 
 ## 架构
@@ -117,7 +119,8 @@ WebPlugin (8081) ── 静态文件 / API 代理入口
 GatewayPlugin (18800) ── Trie 最长前缀匹配转发
   ├── /api      → RouterAgencyPlugin (18802) → WebPlugin 路由
   ├── /channels → RouterAgencyPlugin (18803) → DatabasePlugin / SchedulerPlugin 路由
-  ├── /tasks    → RouterAgencyPlugin (18803) → SchedulerPlugin 路由
+  ├── /tasks    → RouterAgencyPlugin (18803) → TaskPlugin 路由
+  ├── /scheduler→ RouterAgencyPlugin (18803) → SchedulerPlugin 内部调度路由
   └── /operators→ RouterAgencyPlugin (18803) → CatalogPlugin 统一入口
                                              → BinAddonHostPlugin（C++ 插件生命周期）
                                              → BridgePlugin / PyWorker（Python 算子发现与执行）
@@ -140,7 +143,7 @@ IPlugin（生命周期）
 ├── IChannel（数据通道）
 │   ├── IDataFrameChannel（批处理）
 │   ├── IDatabaseChannel（数据库 Reader/Writer 工厂）
-│   └── IStreamChannel（流式，设计中）
+│   └── IStreamChannel（流式，已实现）
 └── IOperator（数据算子：Work(in, out)）
 ```
 
@@ -153,7 +156,7 @@ IPlugin（生命周期）
 | 层 | 格式 | 示例 |
 |---|---|---|
 | 前端对外（WebPlugin 8081） | `/api/{资源}[/{动作}]` | `/api/channels`, `/api/tasks/result` |
-| 内部服务间（RouterAgencyPlugin） | `/{资源类型}/{子类型}/{动作}` | `/channels/database/add`, `/tasks/instant/execute` |
+| 内部服务间（RouterAgencyPlugin） | `/{资源}[/{子类型}]/{动作}` | `/channels/database/add`, `/tasks/batch/execute`, `/tasks/stream/execute` |
 | Gateway 管理（内部专用） | `/gateway/{动作}` | `/gateway/register`, `/gateway/routes` |
 
 动作词汇：`query` / `add` / `remove` / `modify` / `execute` / `refresh` / `reload`
@@ -174,6 +177,77 @@ WHERE time = '[2024/07/14 00:00:00 - 2024/07/14 23:59:59]'
 -- C++ 插件算子（示例）
 SELECT * FROM dataframe.input USING sample.column_stats INTO dataframe.stats
 ```
+
+## SQL 任务能力矩阵（当前）
+
+| 任务类型 | SQL 数量 | 当前支持 | 提交入口 | 关键约束 | 未来规划 |
+|---|---|---|---|---|---|
+| Batch | 单 SQL | ✅ 支持 | `POST /api/tasks/batch/execute`（内部：`/tasks/batch/execute`） | 可 `mode=sync/async`；若 SQL 被判定为 stream，将拒绝并提示使用 stream API | 持续支持 |
+| Batch | 多 SQL | ✅ 支持（顺序执行） | `POST /api/tasks/batch/execute`（`sqls[]`） | 仅支持 `sql`/`sqls[]` 入参；不支持 `sql_text` 分号切分；不允许混入 stream SQL | `Hybrid DAG`（batch+stream 混编）为后续候选 |
+| Stream | 单 SQL | ✅ 支持 | `POST /api/tasks/stream/execute`（内部：`/tasks/stream/execute`） | 仅异步；`execution_kind=single`；必须是 stream SQL；必须包含 `USING` 流式算子 | 持续支持 |
+| Stream | 多 SQL | ✅ 支持（Group DAG） | `POST /api/tasks/stream/execute`（`execution_kind=group` + `group_mode=dag` + `sql_text`） | 仅异步；多 SQL 必须用分号 `;` 切分；至少 2 条；仅支持 stream task kind（不支持 batch/stream 混合） | `Hybrid DAG`（batch+stream 混编）为后续候选 |
+
+说明：
+- Stream 当前仅支持异步执行。
+- Stream 多 SQL 的 `group` 当前仅支持 `group_mode=dag`。
+- `Hybrid DAG`（batch+stream 混合编排）当前未实现，已列为后续候选能力。
+
+## 流式任务执行契约（Sprint 14）
+
+### API 入口
+
+- 对外统一：`POST /api/tasks/stream/execute`
+- 内部调度：`POST /scheduler/stream/execute`
+
+### 请求字段
+
+- `execution_kind`：`single` 或 `group`
+- `group_mode`：仅当 `execution_kind=group` 时必填，目前固定 `dag`
+- `sql_text`：SQL 文本
+  - `single`：必须是 1 条 SQL（不允许多语句）
+  - `group`：必须是多条 SQL，并且使用分号 `;` 作为语句分隔符
+  - 仅换行不作为切分符；字符串/注释中的分号不会被误切分
+
+### 请求示例
+
+单条流式任务（single）：
+
+```json
+{
+  "execution_kind": "single",
+  "sql_text": "SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.serviceaccess"
+}
+```
+
+多条流式 DAG 任务（group）：
+
+```json
+{
+  "execution_kind": "group",
+  "group_mode": "dag",
+  "timeout_s": 120,
+  "share_set_ready_timeout_s": 30,
+  "sql_text": "SELECT * FROM ring.src USING builtin.passthrough_stream INTO stream.mid;SELECT * FROM stream.mid USING builtin.passthrough_stream INTO dataframe.out;"
+}
+```
+
+### 状态与控制
+
+- `POST /api/tasks/stream/status`
+- `POST /api/tasks/stream/list`
+- `POST /api/tasks/stream/stop`
+
+说明：`stop/status` 使用 `task_id` 查询，不接受 `runtime_task_id`。
+
+### 常见错误码
+
+| 错误码 | 含义 | 常见原因 |
+|---|---|---|
+| `STREAM_GROUP_SQL_TEXT_INVALID` | `sql_text` 不合法 | `single` 传了多语句；`group` 语句不足 2 条；存在空语句（`;;`） |
+| `STREAM_GROUP_TIMEOUT` | group 运行超时 | `timeout_s` 到期仍有节点未收敛 |
+| `STREAM_GROUP_SHARE_SET_READY_TIMEOUT` | share set ready 屏障超时 | 同源广播组未在限定时间内全部就绪 |
+| `STREAM_GROUP_SOURCE_MISMATCH` | 同源校验不一致 | `source_share_set` 成员解析源集合不一致（返回 `missing_keys/extra_keys`） |
+| `STREAM_GROUP_SINK_CAPABILITY_MISMATCH` | sink 并发写能力不足 | 多节点写同一 stream sink，但通道能力不满足 |
 
 ## 算子扩展能力
 
@@ -237,6 +311,7 @@ flowSQL/
 │   │   ├── router/         # RouterAgencyPlugin（路由收集 + HTTP 分发）
 │   │   ├── web/            # WebPlugin（静态文件 + API 代理）
 │   │   ├── scheduler/      # SchedulerPlugin（SQL 执行 + 通道管理）
+│   │   ├── task/           # TaskPlugin（任务管理与执行入口）
 │   │   ├── database/       # DatabasePlugin（MySQL/SQLite/PostgreSQL/ClickHouse）
 │   │   ├── catalog/        # CatalogPlugin（通道目录 + 算子目录 + /operators/*）
 │   │   ├── binaddon/       # BinAddonHostPlugin（C++ 算子插件管理）

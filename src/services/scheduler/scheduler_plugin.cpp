@@ -29,6 +29,7 @@
 #include "framework/core/pipeline.h"
 #include "framework/core/ring_stream_channel.h"
 #include "framework/core/sql_parser.h"
+#include "framework/core/sql_text_splitter.h"
 #include "framework/interfaces/ichannel.h"
 #include "framework/interfaces/ichannel_registry.h"
 #include "framework/interfaces/idatabase_channel.h"
@@ -351,6 +352,25 @@ static std::string MakeExecutionErrorJson(const std::string& error,
     return buf.GetString();
 }
 
+static std::string MakeExecutionErrorWithSqlIndexJson(const std::string& error,
+                                                      const std::string& error_code,
+                                                      const std::string& error_stage,
+                                                      size_t sql_index) {
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("error");
+    w.String(error.c_str());
+    w.Key("error_code");
+    w.String(error_code.c_str());
+    w.Key("error_stage");
+    w.String(error_stage.c_str());
+    w.Key("sql_index");
+    w.Uint64(static_cast<uint64_t>(sql_index));
+    w.EndObject();
+    return buf.GetString();
+}
+
 static std::string ExtractStageFromExecutionError(const std::string& error) {
     // Pipeline::Run 失败消息：operator <category>.<name> execution failed
     static const std::regex kPattern(R"(^operator\s+([^.]+)\.([^\s]+)\s+execution failed$)",
@@ -497,6 +517,10 @@ static void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
     w->StartObject();
     w->Key("task_id");
     w->String(s.task_id.c_str());
+    w->Key("runtime_task_id");
+    w->String(s.task_id.c_str());
+    w->Key("runtime_kind");
+    w->String("single");
     w->Key("status");
     w->String(StreamTaskStatusName(s.status));
     w->Key("stop_requested");
@@ -563,6 +587,182 @@ static void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
         w->RawValue(stats_buf.GetString(), stats_buf.GetSize(),
                     stats_doc.IsArray() ? rapidjson::kArrayType : rapidjson::kObjectType);
     }
+    w->EndObject();
+}
+
+static void WriteGroupSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
+                                   const StreamGroupSnapshot& s,
+                                   const std::vector<BroadcastHubSnapshot>* share_sets,
+                                   const std::unordered_map<std::string, GroupNodeResolvedSourceMeta>* node_sources) {
+    if (!w) return;
+    uint64_t processed_rows = 0;
+    uint64_t output_rows = 0;
+    uint64_t dropped_batches = 0;
+    uint64_t poll_errors = 0;
+    for (const auto& node : s.nodes) {
+        processed_rows += node.processed_rows;
+        output_rows += node.output_rows;
+        dropped_batches += node.dropped_batches;
+        poll_errors += node.poll_errors;
+    }
+
+    w->StartObject();
+    w->Key("task_id");
+    w->String(s.task_id.c_str());
+    w->Key("runtime_task_id");
+    w->String(s.runtime_task_id.c_str());
+    w->Key("runtime_kind");
+    w->String("group");
+    w->Key("group_mode");
+    w->String(s.group_mode.c_str());
+    w->Key("status");
+    w->String(StreamGroupStatusName(s.status));
+    w->Key("group_status");
+    w->String(StreamGroupStatusName(s.status));
+    w->Key("stop_requested");
+    w->Bool(s.stop_requested);
+    w->Key("joined");
+    w->Bool(IsTerminalStreamGroupStatus(s.status));
+    w->Key("node_count");
+    w->Uint(s.node_count);
+    w->Key("active_nodes");
+    w->Uint(s.active_nodes);
+    w->Key("share_set_count");
+    w->Uint(static_cast<unsigned>(share_sets ? share_sets->size() : 0));
+    w->Key("processed_rows");
+    w->Uint64(processed_rows);
+    w->Key("output_rows");
+    w->Uint64(output_rows);
+    w->Key("dropped_batches_shared");
+    w->Uint64(dropped_batches);
+    w->Key("poll_errors");
+    w->Uint64(poll_errors);
+    w->Key("started_ms");
+    w->Int64(s.started_ms);
+    w->Key("last_active_ms");
+    w->Int64(s.last_active_ms);
+    w->Key("finished_ms");
+    w->Int64(s.finished_ms);
+    w->Key("error_code");
+    w->String(s.error_code.c_str());
+    w->Key("error_no");
+    w->Int(s.error_no);
+    w->Key("error_message");
+    w->String(s.error_message.c_str());
+
+    w->Key("resolved_sources");
+    w->StartArray();
+    for (const auto& node : s.nodes) {
+        w->StartObject();
+        w->Key("node_id");
+        w->String(node.node_id.c_str());
+        const GroupNodeResolvedSourceMeta* source_meta = nullptr;
+        if (node_sources) {
+            auto it = node_sources->find(node.node_id);
+            if (it != node_sources->end()) {
+                source_meta = &it->second;
+            }
+        }
+        w->Key("sources");
+        w->StartArray();
+        if (source_meta) {
+            for (const auto& source : source_meta->sources) {
+                w->String(source.c_str());
+            }
+        }
+        w->EndArray();
+        w->Key("expand_rule");
+        w->String(source_meta ? source_meta->expand_rule.c_str() : "explicit");
+        w->EndObject();
+    }
+    w->EndArray();
+
+    w->Key("nodes");
+    w->StartArray();
+    for (const auto& node : s.nodes) {
+        w->StartObject();
+        w->Key("id");
+        w->String(node.node_id.c_str());
+        w->Key("runtime_task_id");
+        w->String(node.runtime_task_id.c_str());
+        w->Key("status");
+        w->String(GroupNodeStatusName(node.status));
+        w->Key("depends_on");
+        w->StartArray();
+        for (const auto& dep : node.depends_on) {
+            w->String(dep.c_str());
+        }
+        w->EndArray();
+        w->Key("start_condition");
+        w->String(GroupStartConditionName(node.start_condition));
+        w->Key("processed_rows");
+        w->Uint64(node.processed_rows);
+        w->Key("output_rows");
+        w->Uint64(node.output_rows);
+        w->Key("dropped_batches");
+        w->Uint64(node.dropped_batches);
+        w->Key("poll_errors");
+        w->Uint64(node.poll_errors);
+        w->Key("error_code");
+        w->String(node.error_code.c_str());
+        w->Key("error_no");
+        w->Int(node.error_no);
+        w->Key("last_error");
+        w->String(node.error_message.c_str());
+        w->Key("started_ms");
+        w->Int64(node.started_ms);
+        w->Key("last_active_ms");
+        w->Int64(node.last_active_ms);
+        w->Key("finished_ms");
+        w->Int64(node.finished_ms);
+        w->EndObject();
+    }
+    w->EndArray();
+
+    w->Key("share_sets");
+    w->StartArray();
+    if (share_sets) {
+        for (const auto& ss : *share_sets) {
+            w->StartObject();
+            w->Key("id");
+            w->String(ss.id.c_str());
+            w->Key("source_ref");
+            w->String(ss.source_ref.c_str());
+            w->Key("status");
+            w->String(BroadcastHubStatusName(ss.status));
+            w->Key("members");
+            w->StartArray();
+            for (const auto& member : ss.members) {
+                w->String(member.c_str());
+            }
+            w->EndArray();
+            w->Key("input_batches");
+            w->Uint64(ss.input_batches);
+            w->Key("delivered_batches");
+            w->Uint64(ss.delivered_batches);
+            w->Key("dropped_batches_shared");
+            w->Uint64(ss.dropped_batches_shared);
+            w->Key("drop_ratio");
+            w->Double(ss.drop_ratio);
+            w->Key("input_rows");
+            w->Uint64(ss.input_rows);
+            w->Key("delivered_rows");
+            w->Uint64(ss.delivered_rows);
+            w->Key("dropped_rows_shared");
+            w->Uint64(ss.dropped_rows_shared);
+            w->Key("last_delivered_seq");
+            w->Uint64(ss.last_delivered_seq);
+            w->Key("last_dropped_seq");
+            w->Uint64(ss.last_dropped_seq);
+            w->Key("error_code");
+            w->Int(ss.error_code);
+            w->Key("error_message");
+            w->String(ss.error_message.c_str());
+            w->EndObject();
+        }
+    }
+    w->EndArray();
+
     w->EndObject();
 }
 
@@ -797,6 +997,9 @@ int SchedulerPlugin::Option(const char* arg) {
         else if (key == "max_resolved_sources") {
             const size_t parsed = static_cast<size_t>(std::stoull(val));
             max_resolved_sources_ = std::max<size_t>(1, parsed);
+        } else if (key == "max_stream_group_timeout_s") {
+            const int parsed = std::stoi(val);
+            max_stream_group_timeout_s_ = std::max(1, parsed);
         }
 
         pos = (end < opts.size()) ? end + 1 : opts.size();
@@ -887,6 +1090,30 @@ int SchedulerPlugin::Start() {
 }
 
 int SchedulerPlugin::Stop() {
+    std::vector<std::pair<std::string, std::shared_ptr<StreamTaskGroup>>> groups;
+    {
+        std::lock_guard<std::mutex> lock(stream_task_groups_mu_);
+        groups.reserve(stream_task_groups_.size());
+        for (const auto& kv : stream_task_groups_) {
+            groups.push_back(kv);
+        }
+    }
+    for (const auto& entry : groups) {
+        if (entry.second) entry.second->RequestStop();
+    }
+    for (const auto& entry : groups) {
+        if (entry.second) entry.second->Join();
+    }
+    for (const auto& entry : groups) {
+        StreamGroupSnapshot snapshot;
+        StreamGroupSnapshot* snapshot_ptr = nullptr;
+        if (entry.second) {
+            snapshot = entry.second->Snapshot();
+            snapshot_ptr = &snapshot;
+        }
+        CleanupGroupRuntimeResources(entry.first, snapshot_ptr);
+    }
+
     std::vector<std::shared_ptr<StreamTask>> tasks;
     {
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
@@ -909,6 +1136,26 @@ int SchedulerPlugin::Stop() {
     }
     stream_runtime_.Stop();
 
+    {
+        std::lock_guard<std::mutex> lock(stream_task_groups_mu_);
+        stream_task_groups_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
+        stream_group_node_owners_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(stream_group_node_sources_mu_);
+        stream_group_node_sources_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(stream_group_share_sets_mu_);
+        stream_group_share_sets_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(stream_group_share_set_snapshots_mu_);
+        stream_group_share_set_snapshots_.clear();
+    }
     {
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
         stream_tasks_.clear();
@@ -1236,6 +1483,39 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
         int64_t rows = ChannelAdapter::WriteFromDataFrame(src, dst, table.c_str(), error);
         if (rows_affected) *rows_affected = rows;
         return (rows < 0) ? -1 : 0;
+    }
+
+    if (source_type == ChannelType::kDataFrame && sink_type == ChannelType::kStream) {
+        auto* src = dynamic_cast<IDataFrameChannel*>(source);
+        auto* dst = dynamic_cast<IStreamChannel*>(sink);
+        if (!src || !dst) return -1;
+
+        IDataFrameChannel* payload_src = src;
+        std::shared_ptr<DataFrameChannel> filtered;
+        if (!stmt.where_clause.empty()) {
+            filtered = ApplyDataFrameFilter(src, stmt.where_clause, ++tmp_channel_seq_);
+            if (!filtered) return -1;
+            payload_src = filtered.get();
+        }
+
+        DataFrame data;
+        if (payload_src->Read(&data) != 0) return -1;
+        if (rows_affected) *rows_affected = data.RowCount();
+
+        if (data.RowCount() == 0) {
+            dst->CloseStream();
+            return 0;
+        }
+
+        auto batch = data.ToArrow();
+        if (!batch) return -1;
+        const int rc = dst->Put(std::move(batch), CurrentTimeMs());
+        if (rc != 0) {
+            if (error) *error = "write dataframe to stream failed, rc=" + std::to_string(rc);
+            return -1;
+        }
+        dst->CloseStream();
+        return 0;
     }
 
     if (source_type == ChannelType::kDatabase && sink_type == ChannelType::kDataFrame) {
@@ -1752,14 +2032,33 @@ int SchedulerPlugin::TryAcquireStreamTaskLeases(const std::string& runtime_task_
                                                 const std::vector<std::string>& source_keys,
                                                 const std::vector<std::string>& sink_keys,
                                                 std::string* conflict_key_out,
-                                                bool* blocked_by_mutation_out) {
+                                                bool* blocked_by_mutation_out,
+                                                const std::string& lease_owner_id,
+                                                const std::unordered_map<std::string, uint64_t>* expected_versions,
+                                                std::string* version_conflict_key_out) {
     if (runtime_task_id.empty()) return EINVAL;
     if (blocked_by_mutation_out) *blocked_by_mutation_out = false;
+    if (version_conflict_key_out) version_conflict_key_out->clear();
+    const std::string owner_id = lease_owner_id.empty() ? runtime_task_id : lease_owner_id;
     std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
 
     std::unordered_set<std::string> unique_all;
     for (const auto& key : source_keys) unique_all.insert(key);
     for (const auto& key : sink_keys) unique_all.insert(key);
+
+    if (expected_versions) {
+        for (const auto& key : unique_all) {
+            const auto expected_it = expected_versions->find(key);
+            const uint64_t expected = (expected_it == expected_versions->end()) ? 0 : expected_it->second;
+            const auto version_it = stream_channel_versions_.find(key);
+            const uint64_t current = (version_it == stream_channel_versions_.end()) ? 0 : version_it->second;
+            if (current != expected) {
+                if (conflict_key_out) *conflict_key_out = key;
+                if (version_conflict_key_out) *version_conflict_key_out = key;
+                return EAGAIN;
+            }
+        }
+    }
 
     for (const auto& key : unique_all) {
         if (stream_channel_mutating_.count(key) > 0) {
@@ -1771,7 +2070,8 @@ int SchedulerPlugin::TryAcquireStreamTaskLeases(const std::string& runtime_task_
 
     for (const auto& key : source_keys) {
         auto lease_it = stream_source_leases_.find(key);
-        if (lease_it != stream_source_leases_.end() && lease_it->second != runtime_task_id) {
+        if (lease_it != stream_source_leases_.end() &&
+            lease_it->second.owner_id != owner_id) {
             if (conflict_key_out) *conflict_key_out = key;
             return EBUSY;
         }
@@ -1780,15 +2080,33 @@ int SchedulerPlugin::TryAcquireStreamTaskLeases(const std::string& runtime_task_
     StreamTaskLeaseInfo info;
     info.all_keys.assign(unique_all.begin(), unique_all.end());
     info.source_keys = source_keys;
+    info.lease_owner_id = owner_id;
 
     for (const auto& key : info.all_keys) {
         stream_channel_ref_counts_[key] += 1;
     }
     for (const auto& key : source_keys) {
-        stream_source_leases_[key] = runtime_task_id;
+        auto& state = stream_source_leases_[key];
+        if (state.owner_id.empty()) {
+            state.owner_id = owner_id;
+        }
+        state.ref_count += 1;
     }
     stream_task_leases_[runtime_task_id] = std::move(info);
     return 0;
+}
+
+void SchedulerPlugin::CaptureStreamChannelVersionSnapshot(
+    const std::vector<std::string>& keys,
+    std::unordered_map<std::string, uint64_t>* snapshot_out) {
+    if (!snapshot_out) return;
+    snapshot_out->clear();
+    std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
+    for (const auto& key : keys) {
+        if (key.empty()) continue;
+        auto it = stream_channel_versions_.find(key);
+        snapshot_out->emplace(key, it == stream_channel_versions_.end() ? 0 : it->second);
+    }
 }
 
 int SchedulerPlugin::TryBeginStreamChannelMutation(const std::string& key, std::string* reason_out) {
@@ -1809,6 +2127,7 @@ int SchedulerPlugin::TryBeginStreamChannelMutation(const std::string& key, std::
         if (reason_out) *reason_out = "mutating";
         return EBUSY;
     }
+    stream_channel_versions_[key] += 1;
     stream_channel_mutating_.insert(key);
     return 0;
 }
@@ -1836,8 +2155,13 @@ void SchedulerPlugin::ReleaseStreamTaskLeases(const std::string& runtime_task_id
     }
     for (const auto& key : it->second.source_keys) {
         auto lease_it = stream_source_leases_.find(key);
-        if (lease_it != stream_source_leases_.end() && lease_it->second == runtime_task_id) {
-            stream_source_leases_.erase(lease_it);
+        if (lease_it != stream_source_leases_.end() &&
+            lease_it->second.owner_id == it->second.lease_owner_id) {
+            if (lease_it->second.ref_count <= 1) {
+                stream_source_leases_.erase(lease_it);
+            } else {
+                --lease_it->second.ref_count;
+            }
         }
     }
     stream_task_leases_.erase(it);
@@ -1860,9 +2184,149 @@ void SchedulerPlugin::SweepFinishedTaskLeases() {
     for (const auto& task_id : to_release) {
         ReleaseStreamTaskLeases(task_id);
     }
+    if (!to_release.empty()) {
+        std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
+        for (const auto& task_id : to_release) {
+            stream_group_node_owners_.erase(task_id);
+        }
+    }
 }
 
-int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string& rsp) {
+int SchedulerPlugin::QueryStreamTaskSnapshotByRuntimeId(const std::string& runtime_task_id,
+                                                        TaskSnapshot* snapshot_out) {
+    if (!snapshot_out || runtime_task_id.empty()) return EINVAL;
+    std::shared_ptr<StreamTask> task;
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        auto it = stream_tasks_.find(runtime_task_id);
+        if (it == stream_tasks_.end() || !it->second) return ENOENT;
+        task = it->second;
+    }
+    *snapshot_out = task->Snapshot();
+    return 0;
+}
+
+void SchedulerPlugin::RequestStopStreamTaskByRuntimeId(const std::string& runtime_task_id) {
+    if (runtime_task_id.empty()) return;
+    std::shared_ptr<StreamTask> task;
+    {
+        std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+        auto it = stream_tasks_.find(runtime_task_id);
+        if (it == stream_tasks_.end() || !it->second) return;
+        task = it->second;
+    }
+    task->RequestStop();
+}
+
+std::vector<BroadcastHubSnapshot> SchedulerPlugin::QueryGroupShareSetSnapshots(
+    const std::string& group_runtime_task_id) {
+    std::vector<BroadcastHubSnapshot> out;
+    {
+        std::lock_guard<std::mutex> lock(stream_group_share_set_snapshots_mu_);
+        auto it = stream_group_share_set_snapshots_.find(group_runtime_task_id);
+        if (it != stream_group_share_set_snapshots_.end()) {
+            return it->second;
+        }
+    }
+    std::vector<StreamGroupShareSetRuntime> runtimes;
+    {
+        std::lock_guard<std::mutex> lock(stream_group_share_sets_mu_);
+        auto it = stream_group_share_sets_.find(group_runtime_task_id);
+        if (it == stream_group_share_sets_.end()) {
+            return out;
+        }
+        runtimes = it->second;
+    }
+    out.reserve(runtimes.size());
+    for (const auto& runtime : runtimes) {
+        BroadcastHubSnapshot snap;
+        if (runtime.hub) {
+            snap = runtime.hub->Snapshot();
+        }
+        if (snap.id.empty()) {
+            snap.id = runtime.id;
+            snap.source_ref = runtime.source_ref;
+            snap.members = runtime.members;
+        }
+        out.push_back(std::move(snap));
+    }
+    return out;
+}
+
+std::unordered_map<std::string, GroupNodeResolvedSourceMeta> SchedulerPlugin::QueryGroupNodeResolvedSources(
+    const std::string& group_runtime_task_id) {
+    std::unordered_map<std::string, GroupNodeResolvedSourceMeta> out;
+    if (group_runtime_task_id.empty()) return out;
+    std::lock_guard<std::mutex> lock(stream_group_node_sources_mu_);
+    auto it = stream_group_node_sources_.find(group_runtime_task_id);
+    if (it == stream_group_node_sources_.end()) {
+        return out;
+    }
+    out = it->second;
+    return out;
+}
+
+void SchedulerPlugin::CleanupGroupRuntimeResources(const std::string& group_runtime_task_id,
+                                                   const StreamGroupSnapshot* group_snapshot) {
+    if (group_runtime_task_id.empty()) return;
+
+    std::vector<StreamGroupShareSetRuntime> share_sets;
+    {
+        std::lock_guard<std::mutex> lock(stream_group_share_sets_mu_);
+        auto it = stream_group_share_sets_.find(group_runtime_task_id);
+        if (it != stream_group_share_sets_.end()) {
+            share_sets = std::move(it->second);
+            stream_group_share_sets_.erase(it);
+        }
+    }
+
+    std::vector<BroadcastHubSnapshot> final_snapshots;
+    final_snapshots.reserve(share_sets.size());
+    for (auto& ss : share_sets) {
+        if (ss.hub) {
+            final_snapshots.push_back(ss.hub->Snapshot());
+            ss.hub->RequestStop();
+            ss.hub->Join();
+            final_snapshots.back() = ss.hub->Snapshot();
+        } else {
+            BroadcastHubSnapshot snap;
+            snap.id = ss.id;
+            snap.source_ref = ss.source_ref;
+            snap.members = ss.members;
+            final_snapshots.push_back(std::move(snap));
+        }
+        for (const auto& channel_ref : ss.internal_channel_refs) {
+            channels_.erase(channel_ref);
+        }
+    }
+    if (!final_snapshots.empty()) {
+        std::lock_guard<std::mutex> lock(stream_group_share_set_snapshots_mu_);
+        stream_group_share_set_snapshots_[group_runtime_task_id] = std::move(final_snapshots);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
+        for (auto it = stream_group_node_owners_.begin(); it != stream_group_node_owners_.end();) {
+            if (it->second == group_runtime_task_id) {
+                it = stream_group_node_owners_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    if (group_snapshot) {
+        for (const auto& node : group_snapshot->nodes) {
+            ReleaseStreamTaskLeases(node.runtime_task_id);
+        }
+    }
+    ReleaseStreamTaskLeases(group_runtime_task_id);
+}
+
+int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
+                                           std::string& rsp,
+                                           const std::string& lease_owner_id,
+                                           bool skip_lease_acquire) {
     if (!querier_) {
         rsp = MakeErrorJson("querier not initialized");
         return error::INTERNAL_ERROR;
@@ -1966,40 +2430,66 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
         }
     }
 
-    SweepFinishedTaskLeases();
-    std::string conflict_key;
-    bool blocked_by_mutation = false;
-    const int lease_rc =
-        TryAcquireStreamTaskLeases(task_id, source_keys, sink_keys, &conflict_key, &blocked_by_mutation);
-    if (lease_rc != 0) {
-        if (lease_rc == EBUSY) {
-            if (blocked_by_mutation) {
+    bool release_lease_on_fail = !skip_lease_acquire;
+    std::unique_ptr<void, std::function<void(void*)>> lease_guard(
+        nullptr, [](void*) {});
+    if (!skip_lease_acquire) {
+        SweepFinishedTaskLeases();
+        std::vector<std::string> lease_keys;
+        lease_keys.reserve(source_keys.size() + sink_keys.size());
+        lease_keys.insert(lease_keys.end(), source_keys.begin(), source_keys.end());
+        lease_keys.insert(lease_keys.end(), sink_keys.begin(), sink_keys.end());
+
+        std::unordered_map<std::string, uint64_t> version_snapshot;
+        CaptureStreamChannelVersionSnapshot(lease_keys, &version_snapshot);
+
+        std::string conflict_key;
+        std::string version_conflict_key;
+        bool blocked_by_mutation = false;
+        const int lease_rc = TryAcquireStreamTaskLeases(task_id,
+                                                        source_keys,
+                                                        sink_keys,
+                                                        &conflict_key,
+                                                        &blocked_by_mutation,
+                                                        lease_owner_id,
+                                                        &version_snapshot,
+                                                        &version_conflict_key);
+        if (lease_rc != 0) {
+            if (lease_rc == EBUSY) {
+                if (blocked_by_mutation) {
+                    rsp = MakeExecutionErrorJson(
+                        "stream channel is being modified: " + conflict_key,
+                        "STREAM_CHANNEL_MUTATING",
+                        "lease");
+                    return error::CONFLICT;
+                }
                 rsp = MakeExecutionErrorJson(
-                    "stream channel is being modified: " + conflict_key,
-                    "STREAM_CHANNEL_MUTATING",
+                    "stream source is in use: " + conflict_key,
+                    "STREAM_SOURCE_IN_USE",
+                    "lease");
+                return error::CONFLICT;
+            }
+            if (lease_rc == EAGAIN) {
+                rsp = MakeExecutionErrorJson(
+                    "stream channel changed during execute prepare: " + version_conflict_key,
+                    "STREAM_CHANNEL_VERSION_CHANGED",
                     "lease");
                 return error::CONFLICT;
             }
             rsp = MakeExecutionErrorJson(
-                "stream source is in use: " + conflict_key,
-                "STREAM_SOURCE_IN_USE",
+                "stream channel lease acquire failed",
+                "STREAM_LEASE_FAILED",
                 "lease");
-            return error::CONFLICT;
+            return MapStreamManagerErrorToStatus(lease_rc);
         }
-        rsp = MakeExecutionErrorJson(
-            "stream channel lease acquire failed",
-            "STREAM_LEASE_FAILED",
-            "lease");
-        return MapStreamManagerErrorToStatus(lease_rc);
+        lease_guard = std::unique_ptr<void, std::function<void(void*)>>(
+            reinterpret_cast<void*>(1),
+            [this, task_id, &release_lease_on_fail](void*) {
+                if (release_lease_on_fail) {
+                    ReleaseStreamTaskLeases(task_id);
+                }
+            });
     }
-    bool release_lease_on_fail = true;
-    auto lease_guard = std::unique_ptr<void, std::function<void(void*)>>(
-        reinterpret_cast<void*>(1),
-        [this, task_id, &release_lease_on_fail](void*) {
-            if (release_lease_on_fail) {
-                ReleaseStreamTaskLeases(task_id);
-            }
-        });
 
     std::shared_ptr<FanInStreamChannel> fanin;
     std::shared_ptr<IStreamChannel> source = source_channels[0];
@@ -2225,8 +2715,10 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     for (const auto& shard : task->Shards()) {
         stream_runtime_.TrySchedule(shard);
     }
-    release_lease_on_fail = false;
-    lease_guard.reset();
+    if (!skip_lease_acquire) {
+        release_lease_on_fail = false;
+        lease_guard.reset();
+    }
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
@@ -2237,6 +2729,8 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt, std::string
     w.String(task->Id().c_str());
     w.Key("task_id");
     w.String(task->Id().c_str());
+    w.Key("runtime_kind");
+    w.String("single");
     w.Key("resolved_sources");
     w.StartArray();
     for (const auto& source_name : source_resolved.resolved_sources) {
@@ -2318,21 +2812,49 @@ int32_t SchedulerPlugin::HandleSqlClassify(const std::string&, const std::string
     return error::OK;
 }
 
-int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::string& req_body, std::string& rsp) {
-    rapidjson::Document doc;
-    doc.Parse(req_body.c_str());
-    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("sql") || !doc["sql"].IsString()) {
-        rsp = MakeErrorJson("invalid request, expected {\"sql\":\"...\"}");
+int32_t SchedulerPlugin::HandleStreamExecuteSingle(const rapidjson::Document& doc, std::string& rsp) {
+    if (doc.HasMember("group_mode") ||
+        doc.HasMember("dag") ||
+        doc.HasMember("sql") ||
+        doc.HasMember("sqls") ||
+        doc.HasMember("share_set_ready_timeout_s")) {
+        rsp = MakeExecutionErrorJson(
+            "single execution accepts only sql_text and timeout_s",
+            "STREAM_GROUP_SQL_TEXT_INVALID",
+            "request");
         return error::BAD_REQUEST;
     }
-    if (doc.HasMember("task_id")) {
-        rsp = MakeErrorJson("external task_id is not allowed");
+    if (!doc.HasMember("sql_text") || !doc["sql_text"].IsString()) {
+        rsp = MakeExecutionErrorJson(
+            "invalid request, expected {\"sql_text\":\"...\"}",
+            "STREAM_GROUP_SQL_TEXT_INVALID",
+            "request");
+        return error::BAD_REQUEST;
+    }
+    std::vector<std::string> sqls;
+    SqlTextSplitError split_err;
+    if (SplitSqlText(doc["sql_text"].GetString(), &sqls, &split_err) != 0) {
+        std::string err = "invalid sql_text";
+        if (!split_err.message.empty()) {
+            err += ": " + split_err.message;
+        }
+        rsp = MakeExecutionErrorWithSqlIndexJson(
+            err,
+            "STREAM_GROUP_SQL_TEXT_INVALID",
+            "request",
+            split_err.statement_index);
+        return error::BAD_REQUEST;
+    }
+    if (sqls.size() != 1) {
+        rsp = MakeExecutionErrorJson(
+            "single execution requires exactly one SQL statement",
+            "STREAM_GROUP_SQL_TEXT_INVALID",
+            "request");
         return error::BAD_REQUEST;
     }
 
-    const std::string sql_text = doc["sql"].GetString();
     SqlParser parser;
-    SqlStatement stmt = parser.Parse(sql_text);
+    SqlStatement stmt = parser.Parse(sqls.front());
     if (!stmt.error.empty()) {
         rsp = MakeErrorJson(stmt.error);
         return error::BAD_REQUEST;
@@ -2347,6 +2869,44 @@ int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::stri
     return ExecuteStreamTask(stmt, rsp);
 }
 
+int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::string& req_body, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req_body.c_str());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        rsp = MakeErrorJson("invalid request body");
+        return error::BAD_REQUEST;
+    }
+    if (doc.HasMember("task_id")) {
+        rsp = MakeErrorJson("external task_id is not allowed");
+        return error::BAD_REQUEST;
+    }
+
+    std::string execution_kind = "single";
+    if (doc.HasMember("execution_kind")) {
+        if (!doc["execution_kind"].IsString()) {
+            rsp = MakeExecutionErrorJson(
+                "execution_kind must be string",
+                "STREAM_GROUP_SQL_TEXT_INVALID",
+                "request");
+            return error::BAD_REQUEST;
+        }
+        execution_kind = ToLowerAscii(doc["execution_kind"].GetString());
+    }
+
+    if (execution_kind == "single") {
+        return HandleStreamExecuteSingle(doc, rsp);
+    }
+    if (execution_kind == "group") {
+        return HandleStreamExecuteGroup(doc, rsp);
+    }
+
+    rsp = MakeExecutionErrorJson(
+        "unsupported execution_kind: " + execution_kind,
+        "STREAM_GROUP_SQL_TEXT_INVALID",
+        "request");
+    return error::BAD_REQUEST;
+}
+
 int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string& req, std::string& rsp) {
     SweepFinishedTaskLeases();
     rapidjson::Document doc;
@@ -2356,6 +2916,36 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
         return error::BAD_REQUEST;
     }
     const std::string task_id = doc["task_id"].GetString();
+    {
+        std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
+        if (stream_group_node_owners_.find(task_id) != stream_group_node_owners_.end()) {
+            rsp = MakeErrorJson("group node runtime_task_id is internal; use group task_id");
+            return error::BAD_REQUEST;
+        }
+    }
+
+    std::shared_ptr<StreamTaskGroup> group;
+    {
+        std::lock_guard<std::mutex> lock(stream_task_groups_mu_);
+        auto it = stream_task_groups_.find(task_id);
+        if (it != stream_task_groups_.end()) {
+            group = it->second;
+        }
+    }
+    if (group) {
+        group->RequestStop();
+        group->Join();
+        StreamGroupSnapshot snapshot = group->Snapshot();
+        const auto node_sources = QueryGroupNodeResolvedSources(task_id);
+        const auto share_sets = QueryGroupShareSetSnapshots(task_id);
+        CleanupGroupRuntimeResources(task_id, &snapshot);
+        rapidjson::StringBuffer buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+        WriteGroupSnapshotJson(&w, snapshot, &share_sets,
+                               node_sources.empty() ? nullptr : &node_sources);
+        rsp = buf.GetString();
+        return error::OK;
+    }
 
     std::shared_ptr<StreamTask> task;
     {
@@ -2388,6 +2978,36 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
         return error::BAD_REQUEST;
     }
     const std::string task_id = doc["task_id"].GetString();
+    {
+        std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
+        if (stream_group_node_owners_.find(task_id) != stream_group_node_owners_.end()) {
+            rsp = MakeErrorJson("group node runtime_task_id is internal; use group task_id");
+            return error::BAD_REQUEST;
+        }
+    }
+
+    std::shared_ptr<StreamTaskGroup> group;
+    {
+        std::lock_guard<std::mutex> lock(stream_task_groups_mu_);
+        auto it = stream_task_groups_.find(task_id);
+        if (it != stream_task_groups_.end()) {
+            group = it->second;
+        }
+    }
+    if (group) {
+        StreamGroupSnapshot snapshot = group->Snapshot();
+        const auto node_sources = QueryGroupNodeResolvedSources(task_id);
+        const auto share_sets = QueryGroupShareSetSnapshots(task_id);
+        if (IsTerminalStreamGroupStatus(snapshot.status)) {
+            CleanupGroupRuntimeResources(task_id, &snapshot);
+        }
+        rapidjson::StringBuffer buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+        WriteGroupSnapshotJson(&w, snapshot, &share_sets,
+                               node_sources.empty() ? nullptr : &node_sources);
+        rsp = buf.GetString();
+        return error::OK;
+    }
 
     std::shared_ptr<StreamTask> task;
     {
@@ -2415,17 +3035,41 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
 int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&, std::string& rsp) {
     SweepFinishedTaskLeases();
     std::vector<TaskSnapshot> snapshots;
+    std::vector<StreamGroupSnapshot> group_snapshots;
     std::vector<std::string> terminal_tasks;
+    std::unordered_set<std::string> internal_node_ids;
+    {
+        std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
+        internal_node_ids.reserve(stream_group_node_owners_.size());
+        for (const auto& kv : stream_group_node_owners_) {
+            internal_node_ids.insert(kv.first);
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
         snapshots.reserve(stream_tasks_.size());
         for (const auto& kv : stream_tasks_) {
+            if (internal_node_ids.count(kv.first) > 0) continue;
             if (!kv.second) continue;
             TaskSnapshot s = kv.second->Snapshot();
             if (IsTerminalStreamTaskStatus(s.status)) {
                 terminal_tasks.push_back(kv.first);
             }
             snapshots.push_back(std::move(s));
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(stream_task_groups_mu_);
+        group_snapshots.reserve(stream_task_groups_.size());
+        for (const auto& kv : stream_task_groups_) {
+            if (!kv.second) continue;
+            StreamGroupSnapshot s = kv.second->Snapshot();
+            if (IsTerminalStreamGroupStatus(s.status)) {
+                for (const auto& node : s.nodes) {
+                    terminal_tasks.push_back(node.runtime_task_id);
+                }
+            }
+            group_snapshots.push_back(std::move(s));
         }
     }
     for (const auto& task_id : terminal_tasks) {
@@ -2439,6 +3083,14 @@ int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&
     w.StartArray();
     for (const auto& s : snapshots) {
         WriteTaskSnapshotJson(&w, s);
+    }
+    for (const auto& s : group_snapshots) {
+        const auto node_sources = QueryGroupNodeResolvedSources(s.task_id);
+        const auto share_sets = QueryGroupShareSetSnapshots(s.task_id);
+        if (IsTerminalStreamGroupStatus(s.status)) {
+            CleanupGroupRuntimeResources(s.task_id, &s);
+        }
+        WriteGroupSnapshotJson(&w, s, &share_sets, node_sources.empty() ? nullptr : &node_sources);
     }
     w.EndArray();
     w.EndObject();
@@ -3044,6 +3696,10 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
     if (rc != 0) {
         rsp = MakeErrorJson("add stream channel failed: " + type + "." + name);
         return MapStreamManagerErrorToStatus(rc);
+    }
+    {
+        std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
+        stream_channel_versions_[MakeStreamChannelKey(type, name)] += 1;
     }
     rsp = R"({"ok":true})";
     return error::OK;

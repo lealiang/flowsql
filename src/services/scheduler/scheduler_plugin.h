@@ -16,7 +16,11 @@
 #include <framework/interfaces/ibridge.h>
 #include <framework/interfaces/istream_channel.h>
 
+#include <rapidjson/document.h>
+
 #include "stream_runtime.h"
+#include "broadcast_hub.h"
+#include "stream_task_group.h"
 
 namespace flowsql {
 
@@ -25,6 +29,11 @@ class IOperator;
 struct SqlStatement;
 
 namespace scheduler {
+
+struct GroupNodeResolvedSourceMeta {
+    std::vector<std::string> sources;
+    std::string expand_rule = "explicit";
+};
 
 // SchedulerPlugin — SQL 执行调度插件
 // 通过 IRouterHandle 声明路由，对 HTTP 完全无感知
@@ -85,8 +94,20 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
                                  const SqlStatement& stmt, int64_t* rows_affected = nullptr,
                                  std::string* error = nullptr);
 
-    int32_t ExecuteStreamTask(const SqlStatement& stmt, std::string& rsp);
+    int32_t ExecuteStreamTask(const SqlStatement& stmt,
+                              std::string& rsp,
+                              const std::string& lease_owner_id = "",
+                              bool skip_lease_acquire = false);
+    int32_t HandleStreamExecuteSingle(const rapidjson::Document& doc, std::string& rsp);
+    int32_t HandleStreamExecuteGroup(const rapidjson::Document& doc, std::string& rsp);
     int32_t ClassifySqlTaskKind(const std::string& sql_text, std::string* task_kind, std::string* err_rsp);
+    int QueryStreamTaskSnapshotByRuntimeId(const std::string& runtime_task_id, TaskSnapshot* snapshot_out);
+    void RequestStopStreamTaskByRuntimeId(const std::string& runtime_task_id);
+    std::vector<BroadcastHubSnapshot> QueryGroupShareSetSnapshots(const std::string& group_runtime_task_id);
+    std::unordered_map<std::string, GroupNodeResolvedSourceMeta> QueryGroupNodeResolvedSources(
+        const std::string& group_runtime_task_id);
+    void CleanupGroupRuntimeResources(const std::string& group_runtime_task_id,
+                                      const StreamGroupSnapshot* group_snapshot = nullptr);
     std::string NextStreamTaskId();
 
     struct SinkBinding {
@@ -117,7 +138,13 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
                                    const std::vector<std::string>& source_keys,
                                    const std::vector<std::string>& sink_keys,
                                    std::string* conflict_key_out,
-                                   bool* blocked_by_mutation_out = nullptr);
+                                   bool* blocked_by_mutation_out = nullptr,
+                                   const std::string& lease_owner_id = "",
+                                   const std::unordered_map<std::string, uint64_t>* expected_versions = nullptr,
+                                   std::string* version_conflict_key_out = nullptr);
+    void CaptureStreamChannelVersionSnapshot(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, uint64_t>* snapshot_out);
     int TryBeginStreamChannelMutation(const std::string& key, std::string* reason_out);
     void EndStreamChannelMutation(const std::string& key);
     void ReleaseStreamTaskLeases(const std::string& runtime_task_id);
@@ -131,6 +158,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     std::string host_ = "127.0.0.1";
     int port_ = 18803;
     size_t max_resolved_sources_ = 64;
+    int max_stream_group_timeout_s_ = 86400;
 
     // 用于生成唯一临时通道名
     std::atomic<uint64_t> tmp_channel_seq_{0};
@@ -141,14 +169,38 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     std::atomic<uint64_t> stream_task_seq_{0};
     mutable std::mutex stream_tasks_mu_;
     std::unordered_map<std::string, std::shared_ptr<StreamTask>> stream_tasks_;
+    mutable std::mutex stream_task_groups_mu_;
+    std::unordered_map<std::string, std::shared_ptr<StreamTaskGroup>> stream_task_groups_;
+    mutable std::mutex stream_group_nodes_mu_;
+    std::unordered_map<std::string, std::string> stream_group_node_owners_;
+    mutable std::mutex stream_group_node_sources_mu_;
+    std::unordered_map<std::string, std::unordered_map<std::string, GroupNodeResolvedSourceMeta>>
+        stream_group_node_sources_;
+    struct StreamGroupShareSetRuntime {
+        std::string id;
+        std::string source_ref;
+        std::vector<std::string> members;
+        std::vector<std::string> internal_channel_refs;
+        std::shared_ptr<BroadcastHub> hub;
+    };
+    mutable std::mutex stream_group_share_sets_mu_;
+    std::unordered_map<std::string, std::vector<StreamGroupShareSetRuntime>> stream_group_share_sets_;
+    mutable std::mutex stream_group_share_set_snapshots_mu_;
+    std::unordered_map<std::string, std::vector<BroadcastHubSnapshot>> stream_group_share_set_snapshots_;
 
     struct StreamTaskLeaseInfo {
         std::vector<std::string> all_keys;
         std::vector<std::string> source_keys;
+        std::string lease_owner_id;
+    };
+    struct StreamSourceLeaseState {
+        std::string owner_id;
+        uint32_t ref_count = 0;
     };
     std::mutex stream_channel_refs_mu_;
     std::unordered_map<std::string, uint32_t> stream_channel_ref_counts_;
-    std::unordered_map<std::string, std::string> stream_source_leases_;
+    std::unordered_map<std::string, uint64_t> stream_channel_versions_;
+    std::unordered_map<std::string, StreamSourceLeaseState> stream_source_leases_;
     std::unordered_set<std::string> stream_channel_mutating_;
     std::unordered_map<std::string, StreamTaskLeaseInfo> stream_task_leases_;
 };
