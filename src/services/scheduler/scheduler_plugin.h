@@ -14,6 +14,7 @@
 #include <common/span.h>
 #include <framework/interfaces/irouter_handle.h>
 #include <framework/interfaces/ibridge.h>
+#include <framework/interfaces/ischeduler_control_service.h>
 #include <framework/interfaces/istream_channel.h>
 
 #include <rapidjson/document.h>
@@ -37,7 +38,7 @@ struct GroupNodeResolvedSourceMeta {
 
 // SchedulerPlugin — SQL 执行调度插件
 // 通过 IRouterHandle 声明路由，对 HTTP 完全无感知
-class SchedulerPlugin : public IPlugin, public IRouterHandle {
+class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerControlService {
  public:
     SchedulerPlugin() = default;
     ~SchedulerPlugin() override = default;
@@ -51,6 +52,13 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
 
     // IRouterHandle — 声明路由
     void EnumRoutes(std::function<void(const RouteItem&)> callback) override;
+
+    // ISchedulerControlService
+    int32_t ClassifySql(const std::string& req_json, std::string* rsp_json) override;
+    int32_t ExecuteBatch(const std::string& req_json, std::string* rsp_json) override;
+    int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) override;
+    int32_t StopStream(const std::string& req_json, std::string* rsp_json) override;
+    int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) override;
 
  private:
     friend struct SchedulerPluginTestAccessor;

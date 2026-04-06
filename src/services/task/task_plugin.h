@@ -83,8 +83,6 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     static TaskStatus MapStreamRuntimeStatus(const std::string& runtime_status);
     static bool IsTerminal(TaskStatus s);
     static std::string MakeNowTaskId(uint64_t seq);
-    static std::string JsonError(const std::string& error);
-    fnRouterHandler FindRoute(const char* method, const char* uri);
     int32_t ProxySchedulerPost(const char* uri, const std::string& req, std::string* rsp);
     int UpdateRuntimeTaskId(const std::string& task_id, const std::string& runtime_task_id);
     int UpdateTaskKindAndRuntimeId(const std::string& task_id,

@@ -14,6 +14,7 @@
 #include <framework/core/channel_adapter.h>
 #include <framework/core/dataframe.h>
 #include <framework/core/dataframe_channel.h>
+#include <framework/core/json_error_builder.h>
 #include <framework/core/memory_channel.h>
 #include <framework/builtin/dataframe/passthrough_operator.h>
 #include <framework/core/pipeline.h>
@@ -22,6 +23,7 @@
 #include <framework/interfaces/ichannel.h>
 #include <framework/interfaces/idataframe_channel.h>
 #include <framework/interfaces/ioperator.h>
+#include <rapidjson/document.h>
 
 using namespace flowsql;
 
@@ -39,6 +41,7 @@ void test_span_safety();
 void test_normalize_from_table_name();
 void test_channel_adapter_copy();
 void test_channel_type_constants();
+void test_json_error_builder();
 void test_pipeline();
 
 // ============================================================
@@ -785,6 +788,101 @@ void test_channel_adapter_copy() {
 }
 
 // ============================================================
+// Test 12: JSON Error Builder（Sprint15 P2-2）
+// ============================================================
+void test_json_error_builder() {
+    printf("[TEST] JSON error builder...\n");
+
+    {
+        rapidjson::Document d;
+        const std::string json = BuildErrorJson("simple");
+        d.Parse(json.c_str());
+        assert(!d.HasParseError() && d.IsObject());
+        assert(d.HasMember("error") && d["error"].IsString());
+        assert(std::string(d["error"].GetString()) == "simple");
+        assert(!d.HasMember("error_code"));
+    }
+
+    {
+        rapidjson::Document d;
+        const std::string json = BuildExecutionErrorWithSqlIndexJson(
+            "exec failed", "OP_EXEC_FAIL", "execute", 3);
+        d.Parse(json.c_str());
+        assert(!d.HasParseError() && d.IsObject());
+        assert(std::string(d["error"].GetString()) == "exec failed");
+        assert(std::string(d["error_code"].GetString()) == "OP_EXEC_FAIL");
+        assert(std::string(d["error_stage"].GetString()) == "execute");
+        assert(d["sql_index"].IsUint64() && d["sql_index"].GetUint64() == 3);
+    }
+
+    {
+        StreamChannelCapabilities source_caps;
+        source_caps.channel_type = "ring";
+        source_caps.concurrency.put_mode = ProducerMode::SINGLE;
+        source_caps.concurrency.poll_mode = ConsumerMode::MULTI;
+        source_caps.concurrency.max_producers = 1;
+        source_caps.concurrency.max_consumers = 4;
+        source_caps.concurrency.lock_free_put = true;
+        source_caps.concurrency.lock_free_poll = true;
+        source_caps.concurrency.cancel_wakeup_guaranteed = true;
+
+        StreamChannelCapabilities sink_caps;
+        sink_caps.channel_type = "ring";
+        sink_caps.concurrency.put_mode = ProducerMode::MULTI;
+        sink_caps.concurrency.poll_mode = ConsumerMode::SINGLE;
+        sink_caps.concurrency.max_producers = 8;
+        sink_caps.concurrency.max_consumers = 1;
+        sink_caps.concurrency.lock_free_put = true;
+        sink_caps.concurrency.lock_free_poll = false;
+        sink_caps.concurrency.cancel_wakeup_guaranteed = true;
+
+        rapidjson::Document d;
+        const std::string json = BuildCapabilityMismatchJson(
+            "cap mismatch", "STREAM_SOURCE_CAPABILITY_MISMATCH", &source_caps, &sink_caps);
+        d.Parse(json.c_str());
+        assert(!d.HasParseError() && d.IsObject());
+        assert(std::string(d["error_stage"].GetString()) == "capability_check");
+        assert(d.HasMember("details") && d["details"].IsObject());
+        assert(d["details"].HasMember("capabilities") && d["details"]["capabilities"].IsObject());
+        assert(d["details"]["capabilities"].HasMember("source"));
+        assert(d["details"]["capabilities"].HasMember("sink"));
+    }
+
+    {
+        rapidjson::Document d;
+        const std::string json = BuildSinkCapabilityMismatchJson(
+            "sink mismatch", "capability_check", "stream.out", 3, ProducerMode::SINGLE, 1);
+        d.Parse(json.c_str());
+        assert(!d.HasParseError() && d.IsObject());
+        assert(std::string(d["error_code"].GetString()) == "STREAM_GROUP_SINK_CAPABILITY_MISMATCH");
+        assert(std::string(d["sink_key"].GetString()) == "stream.out");
+        assert(d["required"].IsObject());
+        assert(d["required"]["writers"].GetUint() == 3);
+        assert(d["actual"].IsObject());
+        assert(std::string(d["actual"]["put_mode"].GetString()) == "SINGLE");
+    }
+
+    {
+        rapidjson::Document d;
+        const std::vector<std::string> expected = {"stream.a", "stream.c"};
+        const std::vector<std::string> actual = {"stream.d", "stream.c"};
+        const std::string json = BuildSourceMismatchErrorJson(
+            "source mismatch", "share_set_validate", "s1", "node1", expected, actual);
+        d.Parse(json.c_str());
+        assert(!d.HasParseError() && d.IsObject());
+        assert(std::string(d["error_code"].GetString()) == "STREAM_GROUP_SOURCE_MISMATCH");
+        assert(d["missing_keys"].IsArray());
+        assert(d["missing_keys"].Size() == 1);
+        assert(std::string(d["missing_keys"][0].GetString()) == "stream.a");
+        assert(d["extra_keys"].IsArray());
+        assert(d["extra_keys"].Size() == 1);
+        assert(std::string(d["extra_keys"][0].GetString()) == "stream.d");
+    }
+
+    printf("[PASS] JSON error builder\n");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
@@ -804,6 +902,7 @@ int main(int argc, char* argv[]) {
     test_build_query_integration();
     test_channel_adapter_copy();
     test_channel_type_constants();
+    test_json_error_builder();
 
     test_pipeline();
 

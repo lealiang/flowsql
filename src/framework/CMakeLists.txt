@@ -14,6 +14,7 @@ add_library(${PROJECT_NAME} SHARED
     core/dataframe_channel.cpp
     core/fan_in_stream_channel.cpp
     core/fan_out_stream_channel.cpp
+    core/json_error_builder.cpp
     core/memory_channel.cpp
     core/ring_stream_channel.cpp
     core/sql_text_splitter.cpp

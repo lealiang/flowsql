@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -14,6 +15,7 @@
 #include <common/iquerier.hpp>
 #include <framework/interfaces/ichannel_registry.h>
 #include <framework/interfaces/irouter_handle.h>
+#include <framework/interfaces/ischeduler_control_service.h>
 #include <services/task/task_plugin.h>
 #include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
@@ -152,6 +154,15 @@ static bool WaitUntil(Fn&& pred, int timeout_ms, int interval_ms = 50) {
     return pred();
 }
 
+static std::unordered_map<std::string, fnRouterHandler> CollectRoutes(IRouterHandle* router) {
+    std::unordered_map<std::string, fnRouterHandler> routes;
+    if (!router) return routes;
+    router->EnumRoutes([&](const RouteItem& item) {
+        routes[item.method + ":" + item.uri] = item.handler;
+    });
+    return routes;
+}
+
 class MockRouterHandle : public IRouterHandle {
  public:
     explicit MockRouterHandle(std::vector<RouteItem> items) : items_(std::move(items)) {}
@@ -161,6 +172,51 @@ class MockRouterHandle : public IRouterHandle {
 
  private:
     std::vector<RouteItem> items_;
+};
+
+class RouterBackedSchedulerControlService : public ISchedulerControlService {
+ public:
+    explicit RouterBackedSchedulerControlService(IRouterHandle* router) : router_(router) {}
+
+    int32_t ClassifySql(const std::string& req_json, std::string* rsp_json) override {
+        return Dispatch("/scheduler/sql/classify", req_json, rsp_json);
+    }
+
+    int32_t ExecuteBatch(const std::string& req_json, std::string* rsp_json) override {
+        return Dispatch("/scheduler/batch/execute", req_json, rsp_json);
+    }
+
+    int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) override {
+        return Dispatch("/scheduler/stream/execute", req_json, rsp_json);
+    }
+
+    int32_t StopStream(const std::string& req_json, std::string* rsp_json) override {
+        return Dispatch("/scheduler/stream/stop", req_json, rsp_json);
+    }
+
+    int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) override {
+        return Dispatch("/scheduler/stream/status", req_json, rsp_json);
+    }
+
+ private:
+    int32_t Dispatch(const char* uri, const std::string& req_json, std::string* rsp_json) {
+        if (!rsp_json) return error::INTERNAL_ERROR;
+        if (!router_) {
+            *rsp_json = R"({"error":"scheduler route not found"})";
+            return error::UNAVAILABLE;
+        }
+        fnRouterHandler handler;
+        router_->EnumRoutes([&](const RouteItem& item) {
+            if (item.method == "POST" && item.uri == uri) handler = item.handler;
+        });
+        if (!handler) {
+            *rsp_json = std::string(R"({"error":"scheduler route not found: )") + uri + "\"}";
+            return error::UNAVAILABLE;
+        }
+        return handler(uri, req_json, *rsp_json);
+    }
+
+    IRouterHandle* router_ = nullptr;
 };
 
 class MockChannelRegistry : public IChannelRegistry {
@@ -182,8 +238,18 @@ class MockChannelRegistry : public IChannelRegistry {
 
 class MockQuerier : public IQuerier {
  public:
-    void AddHandle(IRouterHandle* h) { handles_.push_back(h); }
+    void AddHandle(IRouterHandle* h) {
+        handles_.push_back(h);
+        if (!scheduler_control_service_ && h) {
+            route_scheduler_control_service_ = std::make_unique<RouterBackedSchedulerControlService>(h);
+            scheduler_control_service_ = route_scheduler_control_service_.get();
+        }
+    }
     void SetChannelRegistry(IChannelRegistry* r) { channel_registry_ = r; }
+    void SetSchedulerControlService(ISchedulerControlService* s) {
+        route_scheduler_control_service_.reset();
+        scheduler_control_service_ = s;
+    }
 
     int Traverse(const Guid& iid, fntraverse proc) override {
         if (memcmp(&iid, &IID_ROUTER_HANDLE, sizeof(Guid)) != 0) return 0;
@@ -195,12 +261,62 @@ class MockQuerier : public IQuerier {
 
     void* First(const Guid& iid) override {
         if (memcmp(&iid, &IID_CHANNEL_REGISTRY, sizeof(Guid)) == 0) return channel_registry_;
+        if (memcmp(&iid, &IID_SCHEDULER_CONTROL_SERVICE, sizeof(Guid)) == 0) return scheduler_control_service_;
         return nullptr;
     }
 
  private:
     std::vector<IRouterHandle*> handles_;
     IChannelRegistry* channel_registry_ = nullptr;
+    std::unique_ptr<RouterBackedSchedulerControlService> route_scheduler_control_service_;
+    ISchedulerControlService* scheduler_control_service_ = nullptr;
+};
+
+class MockSchedulerControlService : public ISchedulerControlService {
+ public:
+    int32_t ClassifySql(const std::string& req_json, std::string* rsp_json) override {
+        ++classify_calls;
+        if (!rsp_json) return error::INTERNAL_ERROR;
+        rapidjson::Document d;
+        d.Parse(req_json.c_str());
+        if (d.HasParseError() || !d.IsObject() || !d.HasMember("sql") || !d["sql"].IsString()) {
+            *rsp_json = R"({"error":"invalid request, expected {\"sql\":\"...\"}"})";
+            return error::BAD_REQUEST;
+        }
+        *rsp_json = R"({"task_kind":"batch"})";
+        return error::OK;
+    }
+
+    int32_t ExecuteBatch(const std::string& req_json, std::string* rsp_json) override {
+        ++execute_batch_calls;
+        if (!rsp_json) return error::INTERNAL_ERROR;
+        rapidjson::Document d;
+        d.Parse(req_json.c_str());
+        if (d.HasParseError() || !d.IsObject() || !d.HasMember("sql") || !d["sql"].IsString()) {
+            *rsp_json = R"({"error":"invalid request, expected {\"sql\":\"...\"}"})";
+            return error::BAD_REQUEST;
+        }
+        *rsp_json = R"({"status":"completed","result_row_count":9,"result_col_count":1,"result_target":"dataframe.iface","data":[]})";
+        return error::OK;
+    }
+
+    int32_t ExecuteStream(const std::string&, std::string* rsp_json) override {
+        if (rsp_json) *rsp_json = R"({"error":"not implemented"})";
+        return error::BAD_REQUEST;
+    }
+
+    int32_t StopStream(const std::string&, std::string* rsp_json) override {
+        if (rsp_json) *rsp_json = R"({"error":"not implemented"})";
+        return error::BAD_REQUEST;
+    }
+
+    int32_t QueryStreamStatus(const std::string&, std::string* rsp_json) override {
+        if (rsp_json) *rsp_json = R"({"error":"not implemented"})";
+        return error::BAD_REQUEST;
+    }
+
+    int classify_calls = 0;
+    int execute_batch_calls = 0;
 };
 
 int main() {
@@ -213,6 +329,39 @@ int main() {
     const std::string db_path = dir + "/task_store.db";
 
     {
+        const std::string iface_dir = MakeTempDir("scheduler_control_service");
+        MockSchedulerControlService scheduler_service;
+        MockQuerier querier;
+        querier.SetSchedulerControlService(&scheduler_service);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + iface_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        auto local_routes = CollectRoutes(&p);
+
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
+                      R"({"sql_text":"SELECT 123","mode":"sync"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document d;
+        d.Parse(rsp.c_str());
+        ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+        ASSERT_TRUE(d.HasMember("status") && d["status"].IsString());
+        ASSERT_EQ(std::string(d["status"].GetString()), "completed");
+        ASSERT_TRUE(d.HasMember("rows") && d["rows"].IsInt64());
+        ASSERT_EQ(d["rows"].GetInt64(), 9);
+        ASSERT_EQ(scheduler_service.classify_calls, 1);
+        ASSERT_EQ(scheduler_service.execute_batch_calls, 1);
+
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
         MockRouterHandle scheduler({MakeSqlClassifyRoute()});
         MockQuerier querier;
         querier.AddHandle(&scheduler);
@@ -222,7 +371,7 @@ int main() {
         ASSERT_EQ(p.Option(opt.c_str()), 0);
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
-        p.EnumRoutes([&](const RouteItem& item) { routes[item.method + ":" + item.uri] = item.handler; });
+        routes = CollectRoutes(&p);
         ASSERT_TRUE(routes.count("POST:/tasks/batch/execute") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/sql/classify") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/sql/analyze") == 1);
@@ -274,8 +423,7 @@ int main() {
         ASSERT_EQ(p.Option(opt.c_str()), 0);
         ASSERT_EQ(p.Load(nullptr), 0);
         ASSERT_EQ(p.Start(), 0);
-        routes.clear();
-        p.EnumRoutes([&](const RouteItem& item) { routes[item.method + ":" + item.uri] = item.handler; });
+        routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(routes["POST:/tasks/detail"]("/tasks/detail",
@@ -311,8 +459,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1"})", rsp), error::OK);
         ASSERT_TRUE(std::filesystem::exists(db_path));
@@ -341,8 +488,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
         ASSERT_TRUE(local_routes.count("POST:/tasks/batch/execute") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/detail") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/delete") == 1);
@@ -412,8 +558,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 99","mode":"async"})", rsp), error::OK);
@@ -479,8 +624,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
@@ -555,8 +699,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
@@ -635,8 +778,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
@@ -710,8 +852,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::vector<std::string> task_ids;
         std::vector<std::string> expected_targets;
@@ -785,8 +926,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"async"})", rsp), error::OK);
@@ -832,8 +972,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
@@ -913,8 +1052,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
@@ -1004,8 +1142,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
         ASSERT_TRUE(local_routes.count("POST:/tasks/stream/execute") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/stream/stop") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/stream/status") == 1);
@@ -1148,8 +1285,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
         ASSERT_TRUE(local_routes.count("POST:/tasks/sql/classify") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/batch/execute") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/stream/execute") == 1);
@@ -1295,8 +1431,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
@@ -1432,8 +1567,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
         ASSERT_TRUE(local_routes.count("POST:/tasks/stream/execute") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/stream/status") == 1);
         ASSERT_TRUE(local_routes.count("POST:/tasks/stream/stop") == 1);
@@ -1525,8 +1659,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
         ASSERT_TRUE(local_routes.count("POST:/tasks/stream/execute") == 1);
 
         std::string rsp;
@@ -1618,8 +1751,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
         ASSERT_TRUE(local_routes.count("POST:/tasks/sql/analyze") == 1);
 
         std::string rsp;
@@ -1696,8 +1828,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         for (int i = 0; i < 4; ++i) {
@@ -1722,8 +1853,7 @@ int main() {
         ASSERT_EQ(p.Load(&querier), 0);
         ASSERT_EQ(p.Start(), 0);
 
-        std::unordered_map<std::string, fnRouterHandler> local_routes;
-        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        auto local_routes = CollectRoutes(&p);
 
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);

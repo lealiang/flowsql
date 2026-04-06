@@ -26,6 +26,7 @@
 #include "framework/core/dataframe_channel.h"
 #include "framework/core/fan_in_stream_channel.h"
 #include "framework/core/fan_out_stream_channel.h"
+#include "framework/core/json_error_builder.h"
 #include "framework/core/pipeline.h"
 #include "framework/core/ring_stream_channel.h"
 #include "framework/core/sql_parser.h"
@@ -43,6 +44,7 @@
 #include "framework/interfaces/istream_channel.h"
 #include "framework/interfaces/istream_factory.h"
 #include "framework/interfaces/istream_manager.h"
+#include "scheduler_json_codec.h"
 
 namespace flowsql {
 namespace scheduler {
@@ -340,52 +342,6 @@ static std::string ReadRoleFromOption(const std::string& option) {
     return role.empty() ? "both" : role;
 }
 
-// --- JSON 辅助 ---
-static std::string MakeErrorJson(const std::string& error) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error.c_str());
-    w.EndObject();
-    return buf.GetString();
-}
-
-static std::string MakeExecutionErrorJson(const std::string& error,
-                                          const std::string& error_code,
-                                          const std::string& error_stage) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error.c_str());
-    w.Key("error_code");
-    w.String(error_code.c_str());
-    w.Key("error_stage");
-    w.String(error_stage.c_str());
-    w.EndObject();
-    return buf.GetString();
-}
-
-static std::string MakeExecutionErrorWithSqlIndexJson(const std::string& error,
-                                                      const std::string& error_code,
-                                                      const std::string& error_stage,
-                                                      size_t sql_index) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error.c_str());
-    w.Key("error_code");
-    w.String(error_code.c_str());
-    w.Key("error_stage");
-    w.String(error_stage.c_str());
-    w.Key("sql_index");
-    w.Uint64(static_cast<uint64_t>(sql_index));
-    w.EndObject();
-    return buf.GetString();
-}
-
 static std::string ExtractStageFromExecutionError(const std::string& error) {
     // Pipeline::Run 失败消息：operator <category>.<name> execution failed
     static const std::regex kPattern(R"(^operator\s+([^.]+)\.([^\s]+)\s+execution failed$)",
@@ -441,344 +397,6 @@ static size_t NextPowerOfTwo(size_t value) {
         v |= v >> 32;
     }
     return v + 1;
-}
-
-static const char* StreamTaskStatusName(StreamTaskStatus status) {
-    switch (status) {
-        case StreamTaskStatus::kCreated: return "created";
-        case StreamTaskStatus::kRunning: return "running";
-        case StreamTaskStatus::kStopping: return "stopping";
-        case StreamTaskStatus::kStopped: return "stopped";
-        case StreamTaskStatus::kCancelled: return "cancelled";
-        case StreamTaskStatus::kFailed: return "failed";
-        default: return "unknown";
-    }
-}
-
-static bool IsTerminalStreamTaskStatus(StreamTaskStatus status) {
-    return status == StreamTaskStatus::kStopped ||
-           status == StreamTaskStatus::kCancelled ||
-           status == StreamTaskStatus::kFailed;
-}
-
-static const char* ProducerModeName(ProducerMode mode) {
-    return mode == ProducerMode::MULTI ? "MULTI" : "SINGLE";
-}
-
-static const char* ConsumerModeName(ConsumerMode mode) {
-    return mode == ConsumerMode::MULTI ? "MULTI" : "SINGLE";
-}
-
-static void WriteCapabilitiesObject(rapidjson::Writer<rapidjson::StringBuffer>* w,
-                                    const StreamChannelCapabilities& caps) {
-    if (!w) return;
-    w->StartObject();
-    w->Key("channel_type");
-    w->String(caps.channel_type.c_str());
-    w->Key("concurrency");
-    w->StartObject();
-    w->Key("put_mode");
-    w->String(ProducerModeName(caps.concurrency.put_mode));
-    w->Key("poll_mode");
-    w->String(ConsumerModeName(caps.concurrency.poll_mode));
-    w->Key("max_producers");
-    w->Uint(caps.concurrency.max_producers);
-    w->Key("max_consumers");
-    w->Uint(caps.concurrency.max_consumers);
-    w->Key("lock_free_put");
-    w->Bool(caps.concurrency.lock_free_put);
-    w->Key("lock_free_poll");
-    w->Bool(caps.concurrency.lock_free_poll);
-    w->Key("cancel_wakeup_guaranteed");
-    w->Bool(caps.concurrency.cancel_wakeup_guaranteed);
-    w->EndObject();
-    w->EndObject();
-}
-
-static std::string MakeCapabilityMismatchJson(const std::string& error_message,
-                                              const std::string& error_code,
-                                              const StreamChannelCapabilities* source_caps,
-                                              const StreamChannelCapabilities* sink_caps) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error_message.c_str());
-    w.Key("error_code");
-    w.String(error_code.c_str());
-    w.Key("error_stage");
-    w.String("capability_check");
-    w.Key("details");
-    w.StartObject();
-    w.Key("capabilities");
-    w.StartObject();
-    if (source_caps) {
-        w.Key("source");
-        WriteCapabilitiesObject(&w, *source_caps);
-    }
-    if (sink_caps) {
-        w.Key("sink");
-        WriteCapabilitiesObject(&w, *sink_caps);
-    }
-    w.EndObject();
-    w.EndObject();
-    w.EndObject();
-    return buf.GetString();
-}
-
-static void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
-                                  const TaskSnapshot& s) {
-    if (!w) return;
-    w->StartObject();
-    w->Key("task_id");
-    w->String(s.task_id.c_str());
-    w->Key("runtime_task_id");
-    w->String(s.task_id.c_str());
-    w->Key("runtime_kind");
-    w->String("single");
-    w->Key("status");
-    w->String(StreamTaskStatusName(s.status));
-    w->Key("stop_requested");
-    w->Bool(s.stop_requested);
-    w->Key("joined");
-    w->Bool(s.joined);
-    w->Key("shard_count");
-    w->Uint(s.shard_count);
-    w->Key("active_shards");
-    w->Uint(s.active_shards);
-
-    w->Key("processed_batches");
-    w->Uint64(s.processed_batches);
-    w->Key("processed_rows");
-    w->Uint64(s.processed_rows);
-    w->Key("processed_bytes");
-    w->Uint64(s.processed_bytes);
-    w->Key("output_rows");
-    w->Uint64(s.output_rows);
-    w->Key("output_batches");
-    w->Uint64(s.output_batches);
-    w->Key("dropped_batches");
-    w->Uint64(s.dropped_batches);
-    w->Key("poll_timeouts");
-    w->Uint64(s.poll_timeouts);
-    w->Key("poll_errors");
-    w->Uint64(s.poll_errors);
-    w->Key("queue_depth");
-    w->Uint64(s.queue_depth);
-    w->Key("queue_depth_peak");
-    w->Uint64(s.queue_depth_peak);
-    w->Key("uptime_ms");
-    w->Int64(s.uptime_ms);
-    w->Key("started_ms");
-    w->Int64(s.started_ms);
-    w->Key("last_active_ms");
-    w->Int64(s.last_active_ms);
-    w->Key("finished_ms");
-    w->Int64(s.finished_ms);
-    w->Key("error_code");
-    w->Int(s.error_code);
-    w->Key("error_message");
-    w->String(s.error_message.c_str());
-    w->Key("resolved_sources");
-    w->StartArray();
-    for (const auto& source : s.resolved_sources) {
-        w->String(source.c_str());
-    }
-    w->EndArray();
-    w->Key("source_expand_rule");
-    w->String(s.source_expand_rule.c_str());
-
-    rapidjson::Document stats_doc;
-    if (!s.op_stats_json.empty()) {
-        stats_doc.Parse(s.op_stats_json.c_str());
-    }
-    w->Key("op_stats");
-    if (stats_doc.HasParseError()) {
-        w->String(s.op_stats_json.c_str());
-    } else {
-        rapidjson::StringBuffer stats_buf;
-        rapidjson::Writer<rapidjson::StringBuffer> stats_writer(stats_buf);
-        stats_doc.Accept(stats_writer);
-        w->RawValue(stats_buf.GetString(), stats_buf.GetSize(),
-                    stats_doc.IsArray() ? rapidjson::kArrayType : rapidjson::kObjectType);
-    }
-    w->EndObject();
-}
-
-static void WriteGroupSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
-                                   const StreamGroupSnapshot& s,
-                                   const std::vector<BroadcastHubSnapshot>* share_sets,
-                                   const std::unordered_map<std::string, GroupNodeResolvedSourceMeta>* node_sources) {
-    if (!w) return;
-    uint64_t processed_rows = 0;
-    uint64_t output_rows = 0;
-    uint64_t dropped_batches = 0;
-    uint64_t poll_errors = 0;
-    for (const auto& node : s.nodes) {
-        processed_rows += node.processed_rows;
-        output_rows += node.output_rows;
-        dropped_batches += node.dropped_batches;
-        poll_errors += node.poll_errors;
-    }
-
-    w->StartObject();
-    w->Key("task_id");
-    w->String(s.task_id.c_str());
-    w->Key("runtime_task_id");
-    w->String(s.runtime_task_id.c_str());
-    w->Key("runtime_kind");
-    w->String("group");
-    w->Key("group_mode");
-    w->String(s.group_mode.c_str());
-    w->Key("status");
-    w->String(StreamGroupStatusName(s.status));
-    w->Key("group_status");
-    w->String(StreamGroupStatusName(s.status));
-    w->Key("stop_requested");
-    w->Bool(s.stop_requested);
-    w->Key("joined");
-    w->Bool(IsTerminalStreamGroupStatus(s.status));
-    w->Key("node_count");
-    w->Uint(s.node_count);
-    w->Key("active_nodes");
-    w->Uint(s.active_nodes);
-    w->Key("share_set_count");
-    w->Uint(static_cast<unsigned>(share_sets ? share_sets->size() : 0));
-    w->Key("processed_rows");
-    w->Uint64(processed_rows);
-    w->Key("output_rows");
-    w->Uint64(output_rows);
-    w->Key("dropped_batches_shared");
-    w->Uint64(dropped_batches);
-    w->Key("poll_errors");
-    w->Uint64(poll_errors);
-    w->Key("started_ms");
-    w->Int64(s.started_ms);
-    w->Key("last_active_ms");
-    w->Int64(s.last_active_ms);
-    w->Key("finished_ms");
-    w->Int64(s.finished_ms);
-    w->Key("error_code");
-    w->String(s.error_code.c_str());
-    w->Key("error_no");
-    w->Int(s.error_no);
-    w->Key("error_message");
-    w->String(s.error_message.c_str());
-
-    w->Key("resolved_sources");
-    w->StartArray();
-    for (const auto& node : s.nodes) {
-        w->StartObject();
-        w->Key("node_id");
-        w->String(node.node_id.c_str());
-        const GroupNodeResolvedSourceMeta* source_meta = nullptr;
-        if (node_sources) {
-            auto it = node_sources->find(node.node_id);
-            if (it != node_sources->end()) {
-                source_meta = &it->second;
-            }
-        }
-        w->Key("sources");
-        w->StartArray();
-        if (source_meta) {
-            for (const auto& source : source_meta->sources) {
-                w->String(source.c_str());
-            }
-        }
-        w->EndArray();
-        w->Key("expand_rule");
-        w->String(source_meta ? source_meta->expand_rule.c_str() : "explicit");
-        w->EndObject();
-    }
-    w->EndArray();
-
-    w->Key("nodes");
-    w->StartArray();
-    for (const auto& node : s.nodes) {
-        w->StartObject();
-        w->Key("id");
-        w->String(node.node_id.c_str());
-        w->Key("runtime_task_id");
-        w->String(node.runtime_task_id.c_str());
-        w->Key("status");
-        w->String(GroupNodeStatusName(node.status));
-        w->Key("depends_on");
-        w->StartArray();
-        for (const auto& dep : node.depends_on) {
-            w->String(dep.c_str());
-        }
-        w->EndArray();
-        w->Key("start_condition");
-        w->String(GroupStartConditionName(node.start_condition));
-        w->Key("processed_rows");
-        w->Uint64(node.processed_rows);
-        w->Key("output_rows");
-        w->Uint64(node.output_rows);
-        w->Key("dropped_batches");
-        w->Uint64(node.dropped_batches);
-        w->Key("poll_errors");
-        w->Uint64(node.poll_errors);
-        w->Key("error_code");
-        w->String(node.error_code.c_str());
-        w->Key("error_no");
-        w->Int(node.error_no);
-        w->Key("last_error");
-        w->String(node.error_message.c_str());
-        w->Key("started_ms");
-        w->Int64(node.started_ms);
-        w->Key("last_active_ms");
-        w->Int64(node.last_active_ms);
-        w->Key("finished_ms");
-        w->Int64(node.finished_ms);
-        w->EndObject();
-    }
-    w->EndArray();
-
-    w->Key("share_sets");
-    w->StartArray();
-    if (share_sets) {
-        for (const auto& ss : *share_sets) {
-            w->StartObject();
-            w->Key("id");
-            w->String(ss.id.c_str());
-            w->Key("source_ref");
-            w->String(ss.source_ref.c_str());
-            w->Key("status");
-            w->String(BroadcastHubStatusName(ss.status));
-            w->Key("members");
-            w->StartArray();
-            for (const auto& member : ss.members) {
-                w->String(member.c_str());
-            }
-            w->EndArray();
-            w->Key("input_batches");
-            w->Uint64(ss.input_batches);
-            w->Key("delivered_batches");
-            w->Uint64(ss.delivered_batches);
-            w->Key("dropped_batches_shared");
-            w->Uint64(ss.dropped_batches_shared);
-            w->Key("drop_ratio");
-            w->Double(ss.drop_ratio);
-            w->Key("input_rows");
-            w->Uint64(ss.input_rows);
-            w->Key("delivered_rows");
-            w->Uint64(ss.delivered_rows);
-            w->Key("dropped_rows_shared");
-            w->Uint64(ss.dropped_rows_shared);
-            w->Key("last_delivered_seq");
-            w->Uint64(ss.last_delivered_seq);
-            w->Key("last_dropped_seq");
-            w->Uint64(ss.last_dropped_seq);
-            w->Key("error_code");
-            w->Int(ss.error_code);
-            w->Key("error_message");
-            w->String(ss.error_message.c_str());
-            w->EndObject();
-        }
-    }
-    w->EndArray();
-
-    w->EndObject();
 }
 
 class SharedSourceState final : public std::enable_shared_from_this<SharedSourceState> {
@@ -1298,6 +916,31 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
         }});
 }
 
+int32_t SchedulerPlugin::ClassifySql(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleSqlClassify("/scheduler/sql/classify", req_json, *rsp_json);
+}
+
+int32_t SchedulerPlugin::ExecuteBatch(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleExecute("/scheduler/batch/execute", req_json, *rsp_json);
+}
+
+int32_t SchedulerPlugin::ExecuteStream(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleStreamExecute("/scheduler/stream/execute", req_json, *rsp_json);
+}
+
+int32_t SchedulerPlugin::StopStream(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleStreamStop("/scheduler/stream/stop", req_json, *rsp_json);
+}
+
+int32_t SchedulerPlugin::QueryStreamStatus(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleStreamStatus("/scheduler/stream/status", req_json, *rsp_json);
+}
+
 // --- 通道查找辅助 ---
 IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
     return FindChannel(name, nullptr);
@@ -1765,7 +1408,7 @@ int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
                                                SourceResolveResult* out,
                                                std::string* err_rsp) {
     if (!out) {
-        if (err_rsp) *err_rsp = MakeErrorJson("source resolve target is null");
+        if (err_rsp) *err_rsp = BuildErrorJson("source resolve target is null");
         return error::INTERNAL_ERROR;
     }
     out->channels.clear();
@@ -1783,9 +1426,9 @@ int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
                     const std::string& error_code = "") -> int32_t {
         if (err_rsp) {
             if (error_code.empty()) {
-                *err_rsp = MakeErrorJson(message);
+                *err_rsp = BuildErrorJson(message);
             } else {
-                *err_rsp = MakeExecutionErrorJson(message, error_code, "source_resolve");
+                *err_rsp = BuildExecutionErrorJson(message, error_code, "source_resolve");
             }
         }
         return status;
@@ -1954,7 +1597,7 @@ int32_t SchedulerPlugin::ResolveStreamSink(
     }
     if (dest_ref.has_selector && IsStreamRef(dest_ref.base)) {
         if (err_out) {
-            *err_out = MakeExecutionErrorJson(
+            *err_out = BuildExecutionErrorJson(
                 "INTO stream selector is not allowed: " + stmt.dest,
                 "STREAM_HUB_SELECTOR_NOT_ALLOWED_INTO",
                 "sink_resolve");
@@ -1973,7 +1616,7 @@ int32_t SchedulerPlugin::ResolveStreamSink(
         const std::string sink_role = QueryStreamChannelRole(matched->Category(), matched->Name());
         if (!IsSinkRoleAllowed(sink_role)) {
             if (err_out) {
-                *err_out = MakeExecutionErrorJson(
+                *err_out = BuildExecutionErrorJson(
                     "stream channel role does not allow sink: " +
                         std::string(matched->Category()) + "." + matched->Name(),
                     "STREAM_CHANNEL_ROLE_MISMATCH",
@@ -2547,16 +2190,16 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
                                            const std::string& lease_owner_id,
                                            bool skip_lease_acquire) {
     if (!querier_) {
-        rsp = MakeErrorJson("querier not initialized");
+        rsp = BuildErrorJson("querier not initialized");
         return error::INTERNAL_ERROR;
     }
 
     if (stmt.dest.empty()) {
-        rsp = MakeErrorJson("stream task requires INTO destination");
+        rsp = BuildErrorJson("stream task requires INTO destination");
         return error::BAD_REQUEST;
     }
     if (!IsQualifiedDestination(stmt.dest)) {
-        rsp = MakeErrorJson("invalid INTO destination: " + stmt.dest);
+        rsp = BuildErrorJson("invalid INTO destination: " + stmt.dest);
         return error::BAD_REQUEST;
     }
 
@@ -2565,27 +2208,27 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         parsed_ops.push_back({stmt.op_category, stmt.op_name});
     }
     if (parsed_ops.empty()) {
-        rsp = MakeErrorJson("stream task requires USING stream operator");
+        rsp = BuildErrorJson("stream task requires USING stream operator");
         return error::BAD_REQUEST;
     }
     if (parsed_ops.size() != 1) {
-        rsp = MakeErrorJson("stream task currently supports single USING operator");
+        rsp = BuildErrorJson("stream task currently supports single USING operator");
         return error::BAD_REQUEST;
     }
     const OperatorRef& op_ref = parsed_ops[0];
 
     auto* catalog = static_cast<IOperatorCatalog*>(querier_->First(IID_OPERATOR_CATALOG));
     if (!catalog) {
-        rsp = MakeErrorJson("operator catalog unavailable");
+        rsp = BuildErrorJson("operator catalog unavailable");
         return error::UNAVAILABLE;
     }
     OperatorStatus status = catalog->QueryStatus(op_ref.category, op_ref.name);
     if (status == OperatorStatus::kNotFound) {
-        rsp = MakeErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
+        rsp = BuildErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
         return error::NOT_FOUND;
     }
     if (status == OperatorStatus::kDeactivated) {
-        rsp = MakeErrorJson("operator is deactivated: " + op_ref.category + "." + op_ref.name);
+        rsp = BuildErrorJson("operator is deactivated: " + op_ref.category + "." + op_ref.name);
         return error::CONFLICT;
     }
 
@@ -2593,17 +2236,17 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
     std::string source_err_rsp;
     const int32_t source_rc = ResolveSourceBindings(stmt, &source_resolved, &source_err_rsp);
     if (source_rc != error::OK) {
-        rsp = source_err_rsp.empty() ? MakeErrorJson("source resolve failed") : source_err_rsp;
+        rsp = source_err_rsp.empty() ? BuildErrorJson("source resolve failed") : source_err_rsp;
         return source_rc;
     }
     if (!source_resolved.has_stream_source || source_resolved.has_non_stream_source) {
-        rsp = MakeErrorJson("stream task requires stream source only");
+        rsp = BuildErrorJson("stream task requires stream source only");
         return error::BAD_REQUEST;
     }
     std::vector<std::shared_ptr<IStreamChannel>> source_channels = source_resolved.stream_channels;
     std::vector<std::string> source_keys = source_resolved.source_keys;
     if (source_channels.empty()) {
-        rsp = MakeErrorJson("source channel not found");
+        rsp = BuildErrorJson("source channel not found");
         return error::BAD_REQUEST;
     }
 
@@ -2612,7 +2255,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
             ? stmt.operator_with_params[0]
             : stmt.with_params;
     if (with_params.find("sink_table") != with_params.end()) {
-        rsp = MakeErrorJson("sink_table is not supported for stream tasks; use INTO <db_type>.<db_name>.<table>");
+        rsp = BuildErrorJson("sink_table is not supported for stream tasks; use INTO <db_type>.<db_name>.<table>");
         return error::BAD_REQUEST;
     }
 
@@ -2623,13 +2266,13 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         if (!sink_error.empty() && sink_error.front() == '{') {
             rsp = sink_error;
         } else {
-            rsp = MakeErrorJson(sink_error);
+            rsp = BuildErrorJson(sink_error);
         }
         return sink_rc;
     }
     auto output = sink_binding.sink_channel;
     if (!output) {
-        rsp = MakeErrorJson("resolve stream sink failed: output channel is null");
+        rsp = BuildErrorJson("resolve stream sink failed: output channel is null");
         return error::INTERNAL_ERROR;
     }
     StreamSinkContext sink_ctx;
@@ -2676,26 +2319,26 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         if (lease_rc != 0) {
             if (lease_rc == EBUSY) {
                 if (blocked_by_mutation) {
-                    rsp = MakeExecutionErrorJson(
+                    rsp = BuildExecutionErrorJson(
                         "stream channel is being modified: " + conflict_key,
                         "STREAM_CHANNEL_MUTATING",
                         "lease");
                     return error::CONFLICT;
                 }
-                rsp = MakeExecutionErrorJson(
+                rsp = BuildExecutionErrorJson(
                     "stream source is in use: " + conflict_key,
                     "STREAM_SOURCE_IN_USE",
                     "lease");
                 return error::CONFLICT;
             }
             if (lease_rc == EAGAIN) {
-                rsp = MakeExecutionErrorJson(
+                rsp = BuildExecutionErrorJson(
                     "stream channel changed during execute prepare: " + version_conflict_key,
                     "STREAM_CHANNEL_VERSION_CHANGED",
                     "lease");
                 return error::CONFLICT;
             }
-            rsp = MakeExecutionErrorJson(
+            rsp = BuildExecutionErrorJson(
                 "stream channel lease acquire failed",
                 "STREAM_LEASE_FAILED",
                 "lease");
@@ -2719,7 +2362,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
             if (!sc || !caps.semantics.supports_timeout_poll || !caps.concurrency.lock_free_poll) {
                 const std::string src_name = (sc ? (std::string(sc->Category()) + "." + sc->Name())
                                                  : source_keys[i]);
-                rsp = MakeExecutionErrorJson(
+                rsp = BuildExecutionErrorJson(
                     "stream fanin capability mismatch: source=" + src_name +
                     ", reason=source must support timeout poll and lock-free poll",
                     "STREAM_FANIN_CAPABILITY_MISMATCH",
@@ -2736,7 +2379,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         std::vector<std::string> unsupported;
         const int filter_rc = source->SetFilter(stmt.where_clause.c_str(), &unsupported);
         if (filter_rc != 0) {
-            rsp = MakeErrorJson("stream source SetFilter failed");
+            rsp = BuildErrorJson("stream source SetFilter failed");
             return error::BAD_REQUEST;
         }
         if (!unsupported.empty()) {
@@ -2745,19 +2388,19 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
             for (size_t i = 0; i < unsupported.size(); ++i) {
                 oss << (i == 0 ? " " : ", ") << unsupported[i];
             }
-            rsp = MakeErrorJson(oss.str());
+            rsp = BuildErrorJson(oss.str());
             return error::BAD_REQUEST;
         }
     }
 
     auto first_holder = CreateOperator(op_ref.category, op_ref.name);
     if (!first_holder) {
-        rsp = MakeErrorJson("operator create failed: " + op_ref.category + "." + op_ref.name);
+        rsp = BuildErrorJson("operator create failed: " + op_ref.category + "." + op_ref.name);
         return error::NOT_FOUND;
     }
     auto first_stream_op = std::dynamic_pointer_cast<IStreamOperator>(first_holder);
     if (!first_stream_op) {
-        rsp = MakeErrorJson("operator is not stream operator: " + op_ref.category + "." + op_ref.name);
+        rsp = BuildErrorJson("operator is not stream operator: " + op_ref.category + "." + op_ref.name);
         return error::BAD_REQUEST;
     }
 
@@ -2773,7 +2416,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
     if (sink_ctx.sink_type == ChannelType::kStream) {
         auto* sink_stream = dynamic_cast<IStreamChannel*>(output.get());
         if (!sink_stream) {
-            rsp = MakeErrorJson("stream sink cast to IStreamChannel failed");
+            rsp = BuildErrorJson("stream sink cast to IStreamChannel failed");
             return error::BAD_REQUEST;
         }
         sink_caps = sink_stream->Capabilities();
@@ -2793,9 +2436,10 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         const bool consumers_ok = source_caps.concurrency.max_consumers == 0 ||
                                   source_caps.concurrency.max_consumers >= static_cast<uint32_t>(parallelism);
         if (!poll_mode_ok || !consumers_ok) {
-            rsp = MakeCapabilityMismatchJson(
+            rsp = BuildCapabilityMismatchJson(
                 "stream source capability mismatch: strategy=STATELESS, parallelism=" + std::to_string(parallelism) +
-                ", required.poll_mode=MULTI, actual.poll_mode=" + std::string(ConsumerModeName(source_caps.concurrency.poll_mode)) +
+                ", required.poll_mode=MULTI, actual.poll_mode=" +
+                    std::string(StreamConsumerModeName(source_caps.concurrency.poll_mode)) +
                 ", actual.max_consumers=" + std::to_string(source_caps.concurrency.max_consumers),
                 "STREAM_SOURCE_CAPABILITY_MISMATCH",
                 &source_caps,
@@ -2809,10 +2453,11 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         const bool producers_ok = sink_caps.concurrency.max_producers == 0 ||
                                   sink_caps.concurrency.max_producers >= static_cast<uint32_t>(parallelism);
         if (!put_mode_ok || !producers_ok) {
-            rsp = MakeCapabilityMismatchJson(
+            rsp = BuildCapabilityMismatchJson(
                 "stream sink capability mismatch: strategy=" + std::to_string(static_cast<int>(strategy)) +
                 ", parallelism=" + std::to_string(parallelism) +
-                ", required.put_mode=MULTI, actual.put_mode=" + std::string(ProducerModeName(sink_caps.concurrency.put_mode)) +
+                ", required.put_mode=MULTI, actual.put_mode=" +
+                    std::string(StreamProducerModeName(sink_caps.concurrency.put_mode)) +
                 ", actual.max_producers=" + std::to_string(sink_caps.concurrency.max_producers),
                 "STREAM_SINK_CAPABILITY_MISMATCH",
                 &source_caps,
@@ -2852,18 +2497,18 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         for (int i = 0; i < parallelism; ++i) {
             auto part = fanout->GetPartition(static_cast<size_t>(i));
             if (!part) {
-                rsp = MakeErrorJson("fanout partition create failed");
+                rsp = BuildErrorJson("fanout partition create failed");
                 return error::INTERNAL_ERROR;
             }
             input_ports.push_back(std::make_shared<FanOutPartitionView>(fanout, part));
         }
     } else {
-        rsp = MakeErrorJson("unsupported stream parallel strategy");
+        rsp = BuildErrorJson("unsupported stream parallel strategy");
         return error::BAD_REQUEST;
     }
 
     if (input_ports.empty()) {
-        rsp = MakeErrorJson("stream input ports build failed");
+        rsp = BuildErrorJson("stream input ports build failed");
         return error::INTERNAL_ERROR;
     }
 
@@ -2880,13 +2525,13 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
             op_holder = CreateOperator(op_ref.category, op_ref.name);
         }
         if (!op_holder) {
-            rsp = MakeErrorJson("operator create failed for shard");
+            rsp = BuildErrorJson("operator create failed for shard");
             return error::INTERNAL_ERROR;
         }
 
         auto stream_op = std::dynamic_pointer_cast<IStreamOperator>(op_holder);
         if (!stream_op) {
-            rsp = MakeErrorJson("stream operator cast failed for shard");
+            rsp = BuildErrorJson("stream operator cast failed for shard");
             return error::INTERNAL_ERROR;
         }
 
@@ -2895,7 +2540,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
             const std::string err = stream_op->LastError().empty()
                 ? "stream operator Init failed"
                 : stream_op->LastError();
-            rsp = MakeErrorJson(err);
+            rsp = BuildErrorJson(err);
             return error::BAD_REQUEST;
         }
 
@@ -2905,7 +2550,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
                 const std::string err = stream_op->LastError().empty()
                     ? "stream operator OnSchemaReady failed"
                     : stream_op->LastError();
-                rsp = MakeErrorJson(err);
+                rsp = BuildErrorJson(err);
                 return error::BAD_REQUEST;
             }
         }
@@ -2923,7 +2568,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
 
     const int open_rc = open_target->Open();
     if (open_rc != 0) {
-        rsp = MakeErrorJson("open stream source failed");
+        rsp = BuildErrorJson("open stream source failed");
         return error::INTERNAL_ERROR;
     }
 
@@ -2973,21 +2618,21 @@ int32_t SchedulerPlugin::ClassifySqlTaskKind(const std::string& sql_text,
 
     static constexpr size_t kMaxSqlLength = 64 * 1024;
     if (sql_text.size() > kMaxSqlLength) {
-        *err_rsp = MakeErrorJson("SQL too long (max 64KB)");
+        *err_rsp = BuildErrorJson("SQL too long (max 64KB)");
         return error::BAD_REQUEST;
     }
 
     SqlParser parser;
     SqlStatement stmt = parser.Parse(sql_text);
     if (!stmt.error.empty()) {
-        *err_rsp = MakeErrorJson(stmt.error);
+        *err_rsp = BuildErrorJson(stmt.error);
         return error::BAD_REQUEST;
     }
     if (stmt.sources.empty() && !stmt.source.empty()) {
         stmt.sources.push_back(stmt.source);
     }
     if (stmt.sources.empty()) {
-        *err_rsp = MakeErrorJson("source channel not found");
+        *err_rsp = BuildErrorJson("source channel not found");
         return error::BAD_REQUEST;
     }
 
@@ -2998,7 +2643,7 @@ int32_t SchedulerPlugin::ClassifySqlTaskKind(const std::string& sql_text,
     }
 
     if (source_resolved.has_stream_source && source_resolved.has_non_stream_source) {
-        *err_rsp = MakeErrorJson("mixed stream and non-stream sources are not supported");
+        *err_rsp = BuildErrorJson("mixed stream and non-stream sources are not supported");
         return error::BAD_REQUEST;
     }
 
@@ -3010,7 +2655,7 @@ int32_t SchedulerPlugin::HandleSqlClassify(const std::string&, const std::string
     rapidjson::Document doc;
     doc.Parse(req_body.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("sql") || !doc["sql"].IsString()) {
-        rsp = MakeErrorJson("invalid request, expected {\"sql\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"sql\":\"...\"}");
         return error::BAD_REQUEST;
     }
 
@@ -3018,7 +2663,7 @@ int32_t SchedulerPlugin::HandleSqlClassify(const std::string&, const std::string
     std::string err_rsp;
     const int32_t rc = ClassifySqlTaskKind(doc["sql"].GetString(), &task_kind, &err_rsp);
     if (rc != error::OK) {
-        rsp = err_rsp.empty() ? MakeErrorJson("sql classify failed") : err_rsp;
+        rsp = err_rsp.empty() ? BuildErrorJson("sql classify failed") : err_rsp;
         return rc;
     }
 
@@ -3038,14 +2683,14 @@ int32_t SchedulerPlugin::HandleStreamExecuteSingle(const rapidjson::Document& do
         doc.HasMember("sql") ||
         doc.HasMember("sqls") ||
         doc.HasMember("share_set_ready_timeout_s")) {
-        rsp = MakeExecutionErrorJson(
+        rsp = BuildExecutionErrorJson(
             "single execution accepts only sql_text and timeout_s",
             "STREAM_GROUP_SQL_TEXT_INVALID",
             "request");
         return error::BAD_REQUEST;
     }
     if (!doc.HasMember("sql_text") || !doc["sql_text"].IsString()) {
-        rsp = MakeExecutionErrorJson(
+        rsp = BuildExecutionErrorJson(
             "invalid request, expected {\"sql_text\":\"...\"}",
             "STREAM_GROUP_SQL_TEXT_INVALID",
             "request");
@@ -3058,7 +2703,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteSingle(const rapidjson::Document& do
         if (!split_err.message.empty()) {
             err += ": " + split_err.message;
         }
-        rsp = MakeExecutionErrorWithSqlIndexJson(
+        rsp = BuildExecutionErrorWithSqlIndexJson(
             err,
             "STREAM_GROUP_SQL_TEXT_INVALID",
             "request",
@@ -3066,7 +2711,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteSingle(const rapidjson::Document& do
         return error::BAD_REQUEST;
     }
     if (sqls.size() != 1) {
-        rsp = MakeExecutionErrorJson(
+        rsp = BuildExecutionErrorJson(
             "single execution requires exactly one SQL statement",
             "STREAM_GROUP_SQL_TEXT_INVALID",
             "request");
@@ -3076,14 +2721,14 @@ int32_t SchedulerPlugin::HandleStreamExecuteSingle(const rapidjson::Document& do
     SqlParser parser;
     SqlStatement stmt = parser.Parse(sqls.front());
     if (!stmt.error.empty()) {
-        rsp = MakeErrorJson(stmt.error);
+        rsp = BuildErrorJson(stmt.error);
         return error::BAD_REQUEST;
     }
     if (stmt.sources.empty() && !stmt.source.empty()) {
         stmt.sources.push_back(stmt.source);
     }
     if (stmt.sources.empty()) {
-        rsp = MakeErrorJson("source channel not found");
+        rsp = BuildErrorJson("source channel not found");
         return error::BAD_REQUEST;
     }
     return ExecuteStreamTask(stmt, rsp);
@@ -3093,18 +2738,18 @@ int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::stri
     rapidjson::Document doc;
     doc.Parse(req_body.c_str());
     if (doc.HasParseError() || !doc.IsObject()) {
-        rsp = MakeErrorJson("invalid request body");
+        rsp = BuildErrorJson("invalid request body");
         return error::BAD_REQUEST;
     }
     if (doc.HasMember("task_id")) {
-        rsp = MakeErrorJson("external task_id is not allowed");
+        rsp = BuildErrorJson("external task_id is not allowed");
         return error::BAD_REQUEST;
     }
 
     std::string execution_kind = "single";
     if (doc.HasMember("execution_kind")) {
         if (!doc["execution_kind"].IsString()) {
-            rsp = MakeExecutionErrorJson(
+            rsp = BuildExecutionErrorJson(
                 "execution_kind must be string",
                 "STREAM_GROUP_SQL_TEXT_INVALID",
                 "request");
@@ -3120,7 +2765,7 @@ int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::stri
         return HandleStreamExecuteGroup(doc, rsp);
     }
 
-    rsp = MakeExecutionErrorJson(
+    rsp = BuildExecutionErrorJson(
         "unsupported execution_kind: " + execution_kind,
         "STREAM_GROUP_SQL_TEXT_INVALID",
         "request");
@@ -3133,14 +2778,14 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
-        rsp = MakeErrorJson("invalid request, expected {\"task_id\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"task_id\":\"...\"}");
         return error::BAD_REQUEST;
     }
     const std::string task_id = doc["task_id"].GetString();
     {
         std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
         if (stream_group_node_owners_.find(task_id) != stream_group_node_owners_.end()) {
-            rsp = MakeErrorJson("group node runtime_task_id is internal; use group task_id");
+            rsp = BuildErrorJson("group node runtime_task_id is internal; use group task_id");
             return error::BAD_REQUEST;
         }
     }
@@ -3178,7 +2823,7 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
         auto it = stream_tasks_.find(task_id);
         if (it == stream_tasks_.end()) {
-            rsp = MakeErrorJson("stream task not found: " + task_id);
+            rsp = BuildErrorJson("stream task not found: " + task_id);
             return error::NOT_FOUND;
         }
         task = it->second;
@@ -3204,14 +2849,14 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
-        rsp = MakeErrorJson("invalid request, expected {\"task_id\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"task_id\":\"...\"}");
         return error::BAD_REQUEST;
     }
     const std::string task_id = doc["task_id"].GetString();
     {
         std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
         if (stream_group_node_owners_.find(task_id) != stream_group_node_owners_.end()) {
-            rsp = MakeErrorJson("group node runtime_task_id is internal; use group task_id");
+            rsp = BuildErrorJson("group node runtime_task_id is internal; use group task_id");
             return error::BAD_REQUEST;
         }
     }
@@ -3249,7 +2894,7 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
         auto it = stream_tasks_.find(task_id);
         if (it == stream_tasks_.end()) {
-            rsp = MakeErrorJson("stream task not found: " + task_id);
+            rsp = BuildErrorJson("stream task not found: " + task_id);
             return error::NOT_FOUND;
         }
         task = it->second;
@@ -3348,21 +2993,21 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
     rapidjson::Document doc;
     doc.Parse(req_body.c_str());
     if (doc.HasParseError() || !doc.HasMember("sql") || !doc["sql"].IsString()) {
-        rsp = MakeErrorJson("invalid request, expected {\"sql\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"sql\":\"...\"}");
         return error::BAD_REQUEST;
     }
     std::string sql_text = doc["sql"].GetString();
 
     static constexpr size_t kMaxSqlLength = 64 * 1024;
     if (sql_text.size() > kMaxSqlLength) {
-        rsp = MakeErrorJson("SQL too long (max 64KB)");
+        rsp = BuildErrorJson("SQL too long (max 64KB)");
         return error::BAD_REQUEST;
     }
 
     SqlParser parser;
     auto stmt = parser.Parse(sql_text);
     if (!stmt.error.empty()) {
-        rsp = MakeErrorJson(stmt.error);
+        rsp = BuildErrorJson(stmt.error);
         return error::BAD_REQUEST;
     }
 
@@ -3370,7 +3015,7 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
         stmt.sources.push_back(stmt.source);
     }
     if (stmt.sources.empty()) {
-        rsp = MakeErrorJson("source channel not found");
+        rsp = BuildErrorJson("source channel not found");
         return error::BAD_REQUEST;
     }
 
@@ -3378,11 +3023,11 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
     std::string source_err_rsp;
     const int32_t source_rc = ResolveSourceBindings(stmt, &source_resolved, &source_err_rsp);
     if (source_rc != error::OK) {
-        rsp = source_err_rsp.empty() ? MakeErrorJson("source resolve failed") : source_err_rsp;
+        rsp = source_err_rsp.empty() ? BuildErrorJson("source resolve failed") : source_err_rsp;
         return source_rc;
     }
     if (source_resolved.has_stream_source && source_resolved.has_non_stream_source) {
-        rsp = MakeErrorJson("mixed stream and non-stream sources are not supported");
+        rsp = BuildErrorJson("mixed stream and non-stream sources are not supported");
         return error::BAD_REQUEST;
     }
     if (source_resolved.has_stream_source) {
@@ -3400,22 +3045,22 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
     if (!parsed_ops.empty()) {
         auto* catalog = querier_ ? static_cast<IOperatorCatalog*>(querier_->First(IID_OPERATOR_CATALOG)) : nullptr;
         if (!catalog) {
-            rsp = MakeErrorJson("operator catalog unavailable");
+            rsp = BuildErrorJson("operator catalog unavailable");
             return error::UNAVAILABLE;
         }
         for (const auto& op_ref : parsed_ops) {
             OperatorStatus status = catalog->QueryStatus(op_ref.category, op_ref.name);
             if (status == OperatorStatus::kNotFound) {
-                rsp = MakeErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
+                rsp = BuildErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
                 return error::NOT_FOUND;
             }
             if (status == OperatorStatus::kDeactivated) {
-                rsp = MakeErrorJson("operator is deactivated: " + op_ref.category + "." + op_ref.name);
+                rsp = BuildErrorJson("operator is deactivated: " + op_ref.category + "." + op_ref.name);
                 return error::CONFLICT;
             }
             auto holder = FindOperator(op_ref.category, op_ref.name);
             if (!holder) {
-                rsp = MakeErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
+                rsp = BuildErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
                 return error::NOT_FOUND;
             }
             op_chain.push_back(holder.get());
@@ -3442,13 +3087,13 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
 
         if (!stmt.dest.empty()) {
             if (!IsQualifiedDestination(stmt.dest)) {
-                rsp = MakeErrorJson("invalid INTO destination: " + stmt.dest +
+                rsp = BuildErrorJson("invalid INTO destination: " + stmt.dest +
                                     ", expected dataframe.<name> or <type>.<name>[.<table>]");
                 return error::BAD_REQUEST;
             }
             if (IsDataFrameRef(stmt.dest)) {
                 if (!ch_registry) {
-                    rsp = MakeErrorJson("channel registry unavailable");
+                    rsp = BuildErrorJson("channel registry unavailable");
                     return error::INTERNAL_ERROR;
                 }
                 std::string df_name = DataFrameNamePart(stmt.dest);
@@ -3459,7 +3104,7 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
             } else {
                 sink = FindChannel(stmt.dest, &named_sink_holder);
                 if (!sink) {
-                    rsp = MakeErrorJson("destination channel not found: " + stmt.dest);
+                    rsp = BuildErrorJson("destination channel not found: " + stmt.dest);
                     return error::NOT_FOUND;
                 }
             }
@@ -3475,25 +3120,25 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
         std::string sink_type(sink->Type());
 
         if (input_channels.size() > 1 && op_chain.empty()) {
-            rsp = MakeErrorJson("multi-source FROM requires USING operator");
+            rsp = BuildErrorJson("multi-source FROM requires USING operator");
             return error::BAD_REQUEST;
         }
         if (input_channels.size() > 1) {
             for (const auto& source_name : stmt.sources) {
                 if (!IsDataFrameRef(source_name)) {
-                    rsp = MakeErrorJson("multi-source FROM only supports dataframe.* in Sprint 10");
+                    rsp = BuildErrorJson("multi-source FROM only supports dataframe.* in Sprint 10");
                     return error::BAD_REQUEST;
                 }
             }
             if (!stmt.where_clause.empty()) {
-                rsp = MakeErrorJson("multi-source FROM does not support WHERE in Sprint 10");
+                rsp = BuildErrorJson("multi-source FROM does not support WHERE in Sprint 10");
                 return error::BAD_REQUEST;
             }
         }
 
         if (op_chain.empty()) {
             if (input_channels.size() != 1) {
-                rsp = MakeErrorJson("invalid source count");
+                rsp = BuildErrorJson("invalid source count");
                 return error::BAD_REQUEST;
             }
             IChannel* source = input_channels[0];
@@ -3510,7 +3155,7 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
             if (err.empty()) err = "execution failed";
             std::string stage = ExtractStageFromExecutionError(err);
             if (stage.empty()) stage = "execute";
-            rsp = MakeExecutionErrorJson(err, "OP_EXEC_FAIL", stage);
+            rsp = BuildExecutionErrorJson(err, "OP_EXEC_FAIL", stage);
             return error::INTERNAL_ERROR;
         }
 
@@ -3521,17 +3166,17 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
                 (void)ch_registry->Unregister(df_name.c_str());
             }
             if (ch_registry->Register(df_name.c_str(), std::static_pointer_cast<IChannel>(named_df_sink)) != 0) {
-                rsp = MakeErrorJson("failed to register dataframe channel: " + df_name);
+                rsp = BuildErrorJson("failed to register dataframe channel: " + df_name);
                 return error::INTERNAL_ERROR;
             }
             auto registered = ch_registry->Get(df_name.c_str());
             if (!registered) {
-                rsp = MakeErrorJson("failed to fetch registered dataframe channel: " + df_name);
+                rsp = BuildErrorJson("failed to fetch registered dataframe channel: " + df_name);
                 return error::INTERNAL_ERROR;
             }
             auto* registered_df = dynamic_cast<IDataFrameChannel*>(registered.get());
             if (!registered_df) {
-                rsp = MakeErrorJson("registered channel is not dataframe: " + df_name);
+                rsp = BuildErrorJson("registered channel is not dataframe: " + df_name);
                 return error::INTERNAL_ERROR;
             }
             sink = registered_df;
@@ -3564,11 +3209,11 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
     } catch (const std::exception& e) {
         std::string err = std::string("internal error: ") + e.what();
         LOG_ERROR("SchedulerPlugin::HandleExecute: exception: %s", err.c_str());
-        rsp = MakeErrorJson(err);
+        rsp = BuildErrorJson(err);
         return error::INTERNAL_ERROR;
     } catch (...) {
         LOG_ERROR("SchedulerPlugin::HandleExecute: unknown exception");
-        rsp = MakeErrorJson("internal error: unknown exception");
+        rsp = BuildErrorJson("internal error: unknown exception");
         return error::INTERNAL_ERROR;
     }
 }
@@ -3670,7 +3315,7 @@ int32_t SchedulerPlugin::HandleQueryStreamChannelDefinitions(const std::string&,
                                                              std::string& rsp) {
     auto* builtin_registry = querier_ ? static_cast<IBuiltinRegistry*>(querier_->First(IID_BUILTIN_REGISTRY)) : nullptr;
     if (!builtin_registry) {
-        rsp = MakeErrorJson("builtin registry unavailable");
+        rsp = BuildErrorJson("builtin registry unavailable");
         return error::UNAVAILABLE;
     }
 
@@ -3853,14 +3498,14 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
                                                 std::string& rsp) {
     auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
     if (!stream_manager) {
-        rsp = MakeErrorJson("stream manager unavailable");
+        rsp = BuildErrorJson("stream manager unavailable");
         return error::UNAVAILABLE;
     }
 
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject()) {
-        rsp = MakeErrorJson("invalid request body");
+        rsp = BuildErrorJson("invalid request body");
         return error::BAD_REQUEST;
     }
 
@@ -3891,12 +3536,12 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
         options_obj = &(*cfg)["options"];
     }
     if (type.empty() || name.empty()) {
-        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"role\":\"...\",\"options\":{...}}");
+        rsp = BuildErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"role\":\"...\",\"options\":{...}}");
         return error::BAD_REQUEST;
     }
     std::string role = role_raw.empty() ? "both" : NormalizeStreamRole(role_raw);
     if (role.empty()) {
-        rsp = MakeErrorJson("invalid role, expected source|sink|both");
+        rsp = BuildErrorJson("invalid role, expected source|sink|both");
         return error::BAD_REQUEST;
     }
     if (!option_legacy.empty() && role_raw.empty()) {
@@ -3907,7 +3552,7 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
     if (builtin_registry) {
         StreamChannelTypeDescriptor def;
         if (builtin_registry->FindStreamChannelType(type, &def) != 0) {
-            rsp = MakeErrorJson("unsupported stream channel type: " + type);
+            rsp = BuildErrorJson("unsupported stream channel type: " + type);
             return error::BAD_REQUEST;
         }
         bool allowed = def.allowed_roles.empty();
@@ -3918,7 +3563,7 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
             }
         }
         if (!allowed) {
-            rsp = MakeErrorJson("role is not allowed for stream type: " + type);
+            rsp = BuildErrorJson("role is not allowed for stream type: " + type);
             return error::BAD_REQUEST;
         }
     }
@@ -3930,7 +3575,7 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
         rapidjson::Document option_doc;
         std::string parse_err;
         if (ParseOptionObject(option_legacy, &option_doc, &parse_err) != 0 || !option_doc.IsObject()) {
-            rsp = MakeErrorJson("invalid option: " + parse_err);
+            rsp = BuildErrorJson("invalid option: " + parse_err);
             return error::BAD_REQUEST;
         }
         option = BuildOptionWithRoleJson(&option_doc, role);
@@ -3940,7 +3585,7 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
 
     const int rc = stream_manager->AddChannel(ToLowerAscii(type), name, option);
     if (rc != 0) {
-        rsp = MakeErrorJson("add stream channel failed: " + type + "." + name);
+        rsp = BuildErrorJson("add stream channel failed: " + type + "." + name);
         return MapStreamManagerErrorToStatus(rc);
     }
     {
@@ -3956,14 +3601,14 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
                                                    std::string& rsp) {
     auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
     if (!stream_manager) {
-        rsp = MakeErrorJson("stream manager unavailable");
+        rsp = BuildErrorJson("stream manager unavailable");
         return error::UNAVAILABLE;
     }
 
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject()) {
-        rsp = MakeErrorJson("invalid request body");
+        rsp = BuildErrorJson("invalid request body");
         return error::BAD_REQUEST;
     }
 
@@ -3994,12 +3639,12 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
         options_obj = &(*cfg)["options"];
     }
     if (type.empty() || name.empty()) {
-        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"role\":\"...\",\"options\":{...}}");
+        rsp = BuildErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"role\":\"...\",\"options\":{...}}");
         return error::BAD_REQUEST;
     }
     std::string role = role_raw.empty() ? "both" : NormalizeStreamRole(role_raw);
     if (role.empty()) {
-        rsp = MakeErrorJson("invalid role, expected source|sink|both");
+        rsp = BuildErrorJson("invalid role, expected source|sink|both");
         return error::BAD_REQUEST;
     }
     if (!option_legacy.empty() && role_raw.empty()) {
@@ -4010,7 +3655,7 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
     if (builtin_registry) {
         StreamChannelTypeDescriptor def;
         if (builtin_registry->FindStreamChannelType(type, &def) != 0) {
-            rsp = MakeErrorJson("unsupported stream channel type: " + type);
+            rsp = BuildErrorJson("unsupported stream channel type: " + type);
             return error::BAD_REQUEST;
         }
         bool allowed = def.allowed_roles.empty();
@@ -4021,7 +3666,7 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
             }
         }
         if (!allowed) {
-            rsp = MakeErrorJson("role is not allowed for stream type: " + type);
+            rsp = BuildErrorJson("role is not allowed for stream type: " + type);
             return error::BAD_REQUEST;
         }
     }
@@ -4032,7 +3677,7 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
         rapidjson::Document option_doc;
         std::string parse_err;
         if (ParseOptionObject(option_legacy, &option_doc, &parse_err) != 0 || !option_doc.IsObject()) {
-            rsp = MakeErrorJson("invalid option: " + parse_err);
+            rsp = BuildErrorJson("invalid option: " + parse_err);
             return error::BAD_REQUEST;
         }
         option = BuildOptionWithRoleJson(&option_doc, role);
@@ -4046,14 +3691,14 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
     const int mutation_rc = TryBeginStreamChannelMutation(key, &mutation_reason);
     if (mutation_rc != 0) {
         if (mutation_reason == "source_in_use") {
-            rsp = MakeExecutionErrorJson("stream source is in use", "STREAM_SOURCE_IN_USE", "modify");
+            rsp = BuildExecutionErrorJson("stream source is in use", "STREAM_SOURCE_IN_USE", "modify");
             return error::CONFLICT;
         }
         if (mutation_reason == "mutating") {
-            rsp = MakeExecutionErrorJson("stream channel is mutating", "STREAM_CHANNEL_MUTATING", "modify");
+            rsp = BuildExecutionErrorJson("stream channel is mutating", "STREAM_CHANNEL_MUTATING", "modify");
             return error::CONFLICT;
         }
-        rsp = MakeExecutionErrorJson("stream channel is in use", "STREAM_CHANNEL_IN_USE", "modify");
+        rsp = BuildExecutionErrorJson("stream channel is in use", "STREAM_CHANNEL_IN_USE", "modify");
         return error::CONFLICT;
     }
     auto mutation_guard = std::unique_ptr<void, std::function<void(void*)>>(
@@ -4062,7 +3707,7 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
 
     const int rc = stream_manager->ModifyChannel(ToLowerAscii(type), name, option);
     if (rc != 0) {
-        rsp = MakeErrorJson("modify stream channel failed: " + type + "." + name);
+        rsp = BuildErrorJson("modify stream channel failed: " + type + "." + name);
         return MapStreamManagerErrorToStatus(rc);
     }
     mutation_guard.reset();
@@ -4075,7 +3720,7 @@ int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
                                                    std::string& rsp) {
     auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
     if (!stream_manager) {
-        rsp = MakeErrorJson("stream manager unavailable");
+        rsp = BuildErrorJson("stream manager unavailable");
         return error::UNAVAILABLE;
     }
 
@@ -4084,7 +3729,7 @@ int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
     if (doc.HasParseError() || !doc.IsObject() ||
         !doc.HasMember("type") || !doc["type"].IsString() ||
         !doc.HasMember("name") || !doc["name"].IsString()) {
-        rsp = MakeErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\"}");
         return error::BAD_REQUEST;
     }
     const std::string type = doc["type"].GetString();
@@ -4096,14 +3741,14 @@ int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
     const int mutation_rc = TryBeginStreamChannelMutation(key, &mutation_reason);
     if (mutation_rc != 0) {
         if (mutation_reason == "source_in_use") {
-            rsp = MakeExecutionErrorJson("stream source is in use", "STREAM_SOURCE_IN_USE", "remove");
+            rsp = BuildExecutionErrorJson("stream source is in use", "STREAM_SOURCE_IN_USE", "remove");
             return error::CONFLICT;
         }
         if (mutation_reason == "mutating") {
-            rsp = MakeExecutionErrorJson("stream channel is mutating", "STREAM_CHANNEL_MUTATING", "remove");
+            rsp = BuildExecutionErrorJson("stream channel is mutating", "STREAM_CHANNEL_MUTATING", "remove");
             return error::CONFLICT;
         }
-        rsp = MakeExecutionErrorJson("stream channel is in use", "STREAM_CHANNEL_IN_USE", "remove");
+        rsp = BuildExecutionErrorJson("stream channel is in use", "STREAM_CHANNEL_IN_USE", "remove");
         return error::CONFLICT;
     }
     auto mutation_guard = std::unique_ptr<void, std::function<void(void*)>>(
@@ -4112,7 +3757,7 @@ int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
 
     const int rc = stream_manager->RemoveChannel(ToLowerAscii(type), name);
     if (rc != 0) {
-        rsp = MakeErrorJson("remove stream channel failed: " + type + "." + name);
+        rsp = BuildErrorJson("remove stream channel failed: " + type + "." + name);
         return MapStreamManagerErrorToStatus(rc);
     }
     mutation_guard.reset();

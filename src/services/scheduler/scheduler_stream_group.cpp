@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <framework/core/fan_in_stream_channel.h>
+#include <framework/core/json_error_builder.h>
 #include <framework/core/ring_stream_channel.h>
 #include <framework/core/sql_parser.h>
 #include <framework/core/sql_text_splitter.h>
@@ -66,87 +67,6 @@ bool StartsWithIgnoreCaseLocal(const std::string& s, const std::string& prefix) 
         }
     }
     return true;
-}
-
-std::string MakeErrorJsonLocal(const std::string& error) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error.c_str());
-    w.EndObject();
-    return buf.GetString();
-}
-
-std::string MakeExecutionErrorJsonLocal(const std::string& error,
-                                        const std::string& error_code,
-                                        const std::string& error_stage) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error.c_str());
-    w.Key("error_code");
-    w.String(error_code.c_str());
-    w.Key("error_stage");
-    w.String(error_stage.c_str());
-    w.EndObject();
-    return buf.GetString();
-}
-
-std::string MakeExecutionErrorWithSqlIndexJsonLocal(const std::string& error,
-                                                    const std::string& error_code,
-                                                    const std::string& error_stage,
-                                                    size_t sql_index) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error.c_str());
-    w.Key("error_code");
-    w.String(error_code.c_str());
-    w.Key("error_stage");
-    w.String(error_stage.c_str());
-    w.Key("sql_index");
-    w.Uint64(static_cast<uint64_t>(sql_index));
-    w.EndObject();
-    return buf.GetString();
-}
-
-std::string MakeSinkCapabilityMismatchErrorJsonLocal(
-    const std::string& error,
-    const std::string& error_stage,
-    const std::string& sink_key,
-    uint32_t required_writers,
-    ProducerMode actual_put_mode,
-    uint32_t actual_max_producers) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error.c_str());
-    w.Key("error_code");
-    w.String("STREAM_GROUP_SINK_CAPABILITY_MISMATCH");
-    w.Key("error_stage");
-    w.String(error_stage.c_str());
-    w.Key("sink_key");
-    w.String(sink_key.c_str());
-    w.Key("required");
-    w.StartObject();
-    w.Key("writers");
-    w.Uint(required_writers);
-    w.Key("put_mode");
-    w.String("MULTI");
-    w.EndObject();
-    w.Key("actual");
-    w.StartObject();
-    w.Key("put_mode");
-    w.String(actual_put_mode == ProducerMode::MULTI ? "MULTI" : "SINGLE");
-    w.Key("max_producers");
-    w.Uint(actual_max_producers);
-    w.EndObject();
-    w.EndObject();
-    return buf.GetString();
 }
 
 std::string ExtractErrorMessage(const std::string& json) {
@@ -204,67 +124,6 @@ std::vector<std::string> CanonicalSourceKeySet(const std::vector<std::string>& k
         if (!k.empty()) uniq.insert(k);
     }
     return std::vector<std::string>(uniq.begin(), uniq.end());
-}
-
-void ComputeSetDiff(const std::vector<std::string>& expected,
-                    const std::vector<std::string>& actual,
-                    std::vector<std::string>* missing,
-                    std::vector<std::string>* extra) {
-    if (missing) {
-        missing->clear();
-        std::set_difference(expected.begin(), expected.end(),
-                            actual.begin(), actual.end(),
-                            std::back_inserter(*missing));
-    }
-    if (extra) {
-        extra->clear();
-        std::set_difference(actual.begin(), actual.end(),
-                            expected.begin(), expected.end(),
-                            std::back_inserter(*extra));
-    }
-}
-
-std::string MakeSourceMismatchErrorJsonLocal(const std::string& error,
-                                             const std::string& error_stage,
-                                             const std::string& share_set_id,
-                                             const std::string& node_id,
-                                             const std::vector<std::string>& expected_keys,
-                                             const std::vector<std::string>& actual_keys) {
-    std::vector<std::string> missing_keys;
-    std::vector<std::string> extra_keys;
-    ComputeSetDiff(expected_keys, actual_keys, &missing_keys, &extra_keys);
-
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error.c_str());
-    w.Key("error_code");
-    w.String("STREAM_GROUP_SOURCE_MISMATCH");
-    w.Key("error_stage");
-    w.String(error_stage.c_str());
-    if (!share_set_id.empty()) {
-        w.Key("share_set_id");
-        w.String(share_set_id.c_str());
-    }
-    if (!node_id.empty()) {
-        w.Key("node_id");
-        w.String(node_id.c_str());
-    }
-    w.Key("missing_keys");
-    w.StartArray();
-    for (const auto& key : missing_keys) {
-        w.String(key.c_str());
-    }
-    w.EndArray();
-    w.Key("extra_keys");
-    w.StartArray();
-    for (const auto& key : extra_keys) {
-        w.String(key.c_str());
-    }
-    w.EndArray();
-    w.EndObject();
-    return buf.GetString();
 }
 
 std::string JoinStrings(const std::vector<std::string>& values, const char* sep) {
@@ -332,7 +191,7 @@ std::string MakeStreamChannelKeyLocal(const std::string& type, const std::string
 }  // namespace
 int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc, std::string& rsp) {
     if (!doc.HasMember("group_mode") || !doc["group_mode"].IsString()) {
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "group_mode must be provided for group execution",
             "STREAM_GROUP_MODE_INVALID",
             "request");
@@ -340,7 +199,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
     }
     const std::string group_mode = ToLowerAsciiLocal(doc["group_mode"].GetString());
     if (group_mode != "dag") {
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "only group_mode=dag is supported",
             "STREAM_GROUP_MODE_INVALID",
             "request");
@@ -352,14 +211,14 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         doc.HasMember("source_share_sets") ||
         doc.HasMember("sql") ||
         doc.HasMember("sqls")) {
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "group execution accepts only sql_text/group_mode/timeout fields",
             "STREAM_GROUP_SQL_TEXT_INVALID",
             "request");
         return error::BAD_REQUEST;
     }
     if (!doc.HasMember("sql_text") || !doc["sql_text"].IsString()) {
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "group execution requires sql_text",
             "STREAM_GROUP_SQL_TEXT_INVALID",
             "request");
@@ -369,7 +228,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
     int timeout_s = 0;
     if (doc.HasMember("timeout_s")) {
         if (!doc["timeout_s"].IsInt()) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "timeout_s must be integer",
                 "STREAM_GROUP_SQL_TEXT_INVALID",
                 "request");
@@ -377,14 +236,14 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         }
         timeout_s = doc["timeout_s"].GetInt();
         if (timeout_s < 0) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "timeout_s must be >= 0",
                 "STREAM_GROUP_SQL_TEXT_INVALID",
                 "request");
             return error::BAD_REQUEST;
         }
         if (timeout_s > max_stream_group_timeout_s_) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "timeout_s exceeds max_stream_group_timeout_s: " +
                     std::to_string(max_stream_group_timeout_s_),
                 "STREAM_GROUP_SQL_TEXT_INVALID",
@@ -396,7 +255,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
     int share_set_ready_timeout_s = kDefaultShareSetReadyTimeoutS;
     if (doc.HasMember("share_set_ready_timeout_s")) {
         if (!doc["share_set_ready_timeout_s"].IsInt()) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "share_set_ready_timeout_s must be integer",
                 "STREAM_GROUP_SQL_TEXT_INVALID",
                 "request");
@@ -404,7 +263,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         }
         share_set_ready_timeout_s = doc["share_set_ready_timeout_s"].GetInt();
         if (share_set_ready_timeout_s <= 0) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "share_set_ready_timeout_s must be > 0",
                 "STREAM_GROUP_SQL_TEXT_INVALID",
                 "request");
@@ -422,7 +281,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (!split_err.message.empty()) {
             err += ": " + split_err.message;
         }
-        rsp = MakeExecutionErrorWithSqlIndexJsonLocal(
+        rsp = BuildExecutionErrorWithSqlIndexJson(
             err,
             "STREAM_GROUP_SQL_TEXT_INVALID",
             "request",
@@ -430,14 +289,14 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         return error::BAD_REQUEST;
     }
     if (sqls.size() < 2) {
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "group execution requires at least two SQL statements",
             "STREAM_GROUP_SQL_TEXT_INVALID",
             "request");
         return error::BAD_REQUEST;
     }
     if (sqls.size() > kDefaultMaxGroupNodes) {
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "group nodes exceed max_group_nodes",
             "STREAM_GROUP_DAG_TOO_LARGE",
             "dag_validate");
@@ -465,7 +324,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
 
         sql_bytes += plan.sql.size();
         if (sql_bytes > kDefaultMaxGroupSqlBytes) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "group sql bytes exceed max_group_sql_bytes",
                 "STREAM_GROUP_DAG_TOO_LARGE",
                 "dag_validate");
@@ -475,7 +334,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         SqlParser parser;
         SqlStatement parsed = parser.Parse(plan.sql);
         if (!parsed.error.empty()) {
-            rsp = MakeExecutionErrorWithSqlIndexJsonLocal(
+            rsp = BuildExecutionErrorWithSqlIndexJson(
                 "group node SQL parse failed: node=" + plan.id + ", " + parsed.error,
                 "STREAM_GROUP_DAG_INVALID",
                 "dag_validate",
@@ -486,7 +345,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             parsed.sources.push_back(parsed.source);
         }
         if (parsed.sources.empty()) {
-            rsp = MakeExecutionErrorWithSqlIndexJsonLocal(
+            rsp = BuildExecutionErrorWithSqlIndexJson(
                 "group node source channel not found: node=" + plan.id,
                 "STREAM_GROUP_DAG_INVALID",
                 "dag_validate",
@@ -499,7 +358,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             std::string source_base;
             std::string source_base_err;
             if (!ParseChannelBaseLocal(source_ref, &source_base, &source_base_err)) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "group node source selector invalid: node=" + plan.id + ", source=" + source_ref,
                     "STREAM_GROUP_DAG_INVALID",
                     "dag_validate");
@@ -509,7 +368,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             auto it = stream_sink_producers.find(ToLowerAsciiLocal(source_base));
             if (it == stream_sink_producers.end()) continue;
             if (it->second.size() > 1) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "ambiguous upstream stream source: node=" + plan.id + ", source=" + source_base,
                     "STREAM_GROUP_DAG_INVALID",
                     "dag_validate");
@@ -517,7 +376,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             }
             const size_t dep_idx = it->second.front();
             if (dep_idx >= plans.size()) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "dependency index out of range: node=" + plan.id,
                     "STREAM_GROUP_DAG_INVALID",
                     "dag_validate");
@@ -542,7 +401,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
 
         edges += plan.depends_on.size();
         if (edges > kDefaultMaxGroupEdges) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "group edges exceed max_group_edges",
                 "STREAM_GROUP_DAG_TOO_LARGE",
                 "dag_validate");
@@ -554,7 +413,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         const int32_t source_rc = ResolveSourceBindings(parsed, &source_resolved, &source_err_rsp);
         if (source_rc != error::OK) {
             const std::string node_err = ExtractErrorMessage(source_err_rsp);
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "group node source resolve failed: node=" + plan.id +
                     (node_err.empty() ? "" : (", " + node_err)),
                 "STREAM_GROUP_DAG_INVALID",
@@ -562,7 +421,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             return source_rc;
         }
         if (!source_resolved.has_stream_source || source_resolved.has_non_stream_source) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "group node must be stream task kind: node=" + plan.id,
                 "STREAM_GROUP_MIXED_TASK_KIND",
                 "dag_validate");
@@ -579,7 +438,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         std::string sink_base;
         std::string sink_base_err;
         if (!ParseChannelBaseLocal(parsed.dest, &sink_base, &sink_base_err)) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "group node sink selector invalid: node=" + plan.id + ", sink=" + parsed.dest,
                 "STREAM_GROUP_DAG_INVALID",
                 "dag_validate");
@@ -591,7 +450,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             IChannel* sink_ch = FindChannel(sink_base, &sink_owner);
             auto* sink_stream = dynamic_cast<IStreamChannel*>(sink_ch);
             if (!sink_stream) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "group node stream sink not found: node=" + plan.id + ", sink=" + sink_base,
                     "STREAM_GROUP_DAG_INVALID",
                     "dag_validate");
@@ -618,7 +477,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         const bool producers_ok = caps.concurrency.max_producers == 0 ||
                                   caps.concurrency.max_producers >= kv.second;
         if (!put_mode_ok || !producers_ok) {
-            rsp = MakeSinkCapabilityMismatchErrorJsonLocal(
+            rsp = BuildSinkCapabilityMismatchJson(
                 "shared stream sink capability mismatch: sink=" + kv.first +
                     ", writers=" + std::to_string(kv.second) +
                     ", required.put_mode=MULTI, actual.put_mode=" +
@@ -639,7 +498,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         std::unordered_set<std::string> dep_dedup;
         for (const auto& dep : plans[i].depends_on) {
             if (dep == plans[i].id) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "self dependency is not allowed: node=" + plans[i].id,
                     "STREAM_GROUP_DAG_INVALID",
                     "dag_validate");
@@ -648,7 +507,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (!dep_dedup.insert(dep).second) continue;
             auto dep_it = node_index.find(dep);
             if (dep_it == node_index.end()) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "dependency node not found: " + dep + ", node=" + plans[i].id,
                     "STREAM_GROUP_NODE_NOT_FOUND",
                     "dag_validate");
@@ -673,7 +532,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         }
     }
     if (visited != plans.size()) {
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "dag has cycle dependency",
             "STREAM_GROUP_DAG_CYCLE_DETECTED",
             "dag_validate");
@@ -688,7 +547,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (resolved_it == node_resolved.end()) continue;
         const auto canonical = CanonicalSourceKeySet(resolved_it->second.source_keys);
         if (canonical.empty()) {
-            rsp = MakeSourceMismatchErrorJsonLocal(
+            rsp = BuildSourceMismatchErrorJson(
                 "root node has empty canonical source keys: node=" + plans[i].id,
                 "dag_validate",
                 "",
@@ -716,7 +575,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         ss.source_ref = JoinStrings(resolved_it->second.resolved_sources, ",");
         ss.source_channels = resolved_it->second.stream_channels;
         if (ss.source_channels.empty()) {
-            rsp = MakeSourceMismatchErrorJsonLocal(
+            rsp = BuildSourceMismatchErrorJson(
                 "auto source_share_set has empty source channels: set=" + ss.id,
                 "dag_validate",
                 ss.id,
@@ -732,7 +591,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (member_it == node_resolved.end()) continue;
             const auto member_keys = CanonicalSourceKeySet(member_it->second.source_keys);
             if (member_keys != ss.canonical_source_keys) {
-                rsp = MakeSourceMismatchErrorJsonLocal(
+                rsp = BuildSourceMismatchErrorJson(
                     "source_share_set canonical source mismatch: set=" + ss.id + ", node=" + member_node_id,
                     "dag_validate",
                     ss.id,
@@ -746,7 +605,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         share_set_plans.push_back(std::move(ss));
     }
     if (share_set_plans.size() > kDefaultMaxGroupShareSets) {
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "auto source_share_sets exceed max_group_share_sets",
             "STREAM_GROUP_DAG_TOO_LARGE",
             "dag_validate");
@@ -790,26 +649,26 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
     if (lease_rc != 0) {
         if (lease_rc == EBUSY) {
             if (blocked_by_mutation) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "stream channel is being modified: " + conflict_key,
                     "STREAM_CHANNEL_MUTATING",
                     "lease");
                 return error::CONFLICT;
             }
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "stream source is in use: " + conflict_key,
                 "STREAM_SOURCE_IN_USE",
                 "lease");
             return error::CONFLICT;
         }
         if (lease_rc == EAGAIN) {
-            rsp = MakeExecutionErrorJsonLocal(
+            rsp = BuildExecutionErrorJson(
                 "stream channel changed during group prepare: " + version_conflict_key,
                 "STREAM_CHANNEL_VERSION_CHANGED",
                 "lease");
             return error::CONFLICT;
         }
-        rsp = MakeExecutionErrorJsonLocal(
+        rsp = BuildExecutionErrorJson(
             "stream group lease acquire failed",
             "STREAM_LEASE_FAILED",
             "lease");
@@ -865,7 +724,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
                 runtime_task_id + "_" + ss.id + "_" + ss.members[mi] + "_in");
             const std::string channel_ref = "stream." + internal_name;
             if (!channel_ref_dedup.insert(channel_ref).second) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "duplicate internal stream channel reference: " + channel_ref,
                     "STREAM_GROUP_BRANCH_BUILD_FAILED",
                     "branch_build");
@@ -881,7 +740,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             auto internal = std::make_shared<RingStreamChannel>("ring", internal_name, opts);
             const int open_rc = internal->Open();
             if (open_rc != 0) {
-                rsp = MakeExecutionErrorJsonLocal(
+                rsp = BuildExecutionErrorJson(
                     "open internal stream channel failed: " + channel_ref,
                     "STREAM_GROUP_BRANCH_BUILD_FAILED",
                     "branch_build");
@@ -1022,7 +881,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             stream_group_node_sources_.erase(runtime_task_id);
         }
         cleanup_local_resources();
-        rsp = MakeErrorJsonLocal("start stream group failed: " +
+        rsp = BuildErrorJson("start stream group failed: " +
                                  (start_err.empty() ? std::to_string(start_rc) : start_err));
         return error::INTERNAL_ERROR;
     }

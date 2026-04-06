@@ -2,10 +2,11 @@
 
 #include <common/error_code.h>
 #include <common/log.h>
+#include <framework/core/json_error_builder.h>
 #include <framework/core/sql_text_splitter.h>
 #include <framework/core/sql_parser.h>
 #include <framework/interfaces/ichannel_registry.h>
-#include <framework/interfaces/irouter_handle.h>
+#include <framework/interfaces/ischeduler_control_service.h>
 
 #include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
@@ -19,6 +20,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <set>
+
+#include "task_sql_utils.h"
 
 namespace fs = std::filesystem;
 
@@ -71,149 +74,6 @@ static const char* kSchemaSql =
     "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_task_diag_task_id ON task_diagnostics(task_id, sql_index);";
-
-static std::string TruncateSql(const std::string& sql) {
-    static constexpr size_t kMaxSql = 4096;
-    if (sql.size() <= kMaxSql) return sql;
-    return sql.substr(0, kMaxSql);
-}
-
-static std::string TruncateSummary(const std::string& sql) {
-    static constexpr size_t kMaxSummary = 200;
-    if (sql.size() <= kMaxSummary) return sql;
-    return sql.substr(0, kMaxSummary);
-}
-
-static std::string BuildSqlsJson(const std::vector<std::string>& sqls) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartArray();
-    for (const auto& sql : sqls) w.String(sql.c_str());
-    w.EndArray();
-    return buf.GetString();
-}
-
-static bool ParseSqlsJson(const std::string& sqls_json, std::vector<std::string>* sqls) {
-    if (!sqls) return false;
-    sqls->clear();
-    if (sqls_json.empty()) return false;
-
-    rapidjson::Document doc;
-    doc.Parse(sqls_json.c_str());
-    if (doc.HasParseError() || !doc.IsArray()) return false;
-    for (rapidjson::SizeType i = 0; i < doc.Size(); ++i) {
-        if (!doc[i].IsString()) return false;
-        std::string sql = doc[i].GetString();
-        if (sql.empty()) return false;
-        sqls->push_back(std::move(sql));
-    }
-    return !sqls->empty();
-}
-
-static bool IsDataFrameRef(const std::string& name) {
-    static const std::string prefix = "dataframe.";
-    if (name.size() < prefix.size()) return false;
-    for (size_t i = 0; i < prefix.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(name[i])) != prefix[i]) return false;
-    }
-    return true;
-}
-
-static std::string DataFrameNamePart(const std::string& full_name) {
-    static const std::string prefix = "dataframe.";
-    if (!IsDataFrameRef(full_name)) return full_name;
-    return full_name.substr(prefix.size());
-}
-
-static std::string ExtractStageFromErrorMessage(const std::string& error_message) {
-    // Pipeline 错误格式：operator <category>.<name> execution failed
-    static constexpr const char* kPrefix = "operator ";
-    static constexpr const char* kSuffix = " execution failed";
-    if (error_message.size() <= std::strlen(kPrefix) + std::strlen(kSuffix)) return "";
-    if (error_message.rfind(kPrefix, 0) != 0) return "";
-    if (error_message.size() < std::strlen(kSuffix)) return "";
-    if (error_message.compare(error_message.size() - std::strlen(kSuffix), std::strlen(kSuffix), kSuffix) != 0) {
-        return "";
-    }
-    const size_t begin = std::strlen(kPrefix);
-    const size_t end = error_message.size() - std::strlen(kSuffix);
-    if (end <= begin) return "";
-    return error_message.substr(begin, end - begin);
-}
-
-static std::string BuildOperatorChainFromSql(const std::string& sql) {
-    SqlParser p;
-    auto stmt = p.Parse(sql);
-    if (!stmt.error.empty()) return "";
-
-    std::vector<std::string> chain;
-    if (!stmt.operators.empty()) {
-        chain.reserve(stmt.operators.size());
-        for (const auto& op : stmt.operators) {
-            chain.push_back(op.category + "." + op.name);
-        }
-    } else if (!stmt.op_category.empty() && !stmt.op_name.empty()) {
-        chain.push_back(stmt.op_category + "." + stmt.op_name);
-    }
-
-    if (chain.empty()) return "";
-    std::string out;
-    for (size_t i = 0; i < chain.size(); ++i) {
-        if (i != 0) out += "->";
-        out += chain[i];
-    }
-    return out;
-}
-
-static std::string JsonErrorWithCode(const std::string& error_text, const std::string& error_code) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error_text.c_str());
-    w.Key("error_code");
-    w.String(error_code.c_str());
-    w.EndObject();
-    return buf.GetString();
-}
-
-static std::string JsonErrorWithCodeAndSqlIndex(const std::string& error_text,
-                                                const std::string& error_code,
-                                                size_t sql_index) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error_text.c_str());
-    w.Key("error_code");
-    w.String(error_code.c_str());
-    w.Key("sql_index");
-    w.Uint64(static_cast<uint64_t>(sql_index));
-    w.EndObject();
-    return buf.GetString();
-}
-
-static void ParseRuntimeErrorCode(const rapidjson::Value& value,
-                                  std::string* error_code_out,
-                                  int* error_no_out) {
-    if (error_code_out) error_code_out->clear();
-    if (error_no_out) *error_no_out = 0;
-    if (value.IsString()) {
-        if (error_code_out) *error_code_out = value.GetString();
-        return;
-    }
-    if (value.IsInt()) {
-        const int v = value.GetInt();
-        if (error_no_out) *error_no_out = v;
-        if (error_code_out && v != 0) *error_code_out = std::to_string(v);
-        return;
-    }
-    if (value.IsUint()) {
-        const int v = static_cast<int>(value.GetUint());
-        if (error_no_out) *error_no_out = v;
-        if (error_code_out && v != 0) *error_code_out = std::to_string(v);
-    }
-}
 
 }  // namespace
 
@@ -547,37 +407,35 @@ std::string TaskPlugin::MakeNowTaskId(uint64_t seq) {
     return std::string("tsk_") + ts + "_" + std::to_string(seq);
 }
 
-std::string TaskPlugin::JsonError(const std::string& error_text) {
-    rapidjson::StringBuffer buf;
-    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    w.StartObject();
-    w.Key("error");
-    w.String(error_text.c_str());
-    w.EndObject();
-    return buf.GetString();
-}
-
-fnRouterHandler TaskPlugin::FindRoute(const char* method, const char* uri) {
-    if (!querier_ || !method || !uri) return nullptr;
-    fnRouterHandler handler;
-    querier_->Traverse(IID_ROUTER_HANDLE, [&](void* p) -> int {
-        auto* rh = static_cast<IRouterHandle*>(p);
-        rh->EnumRoutes([&](const RouteItem& item) {
-            if (item.method == method && item.uri == uri) handler = item.handler;
-        });
-        return handler ? -1 : 0;
-    });
-    return handler;
-}
-
 int32_t TaskPlugin::ProxySchedulerPost(const char* uri, const std::string& req, std::string* rsp) {
     if (!uri || !rsp) return error::INTERNAL_ERROR;
-    fnRouterHandler handler = FindRoute("POST", uri);
-    if (!handler) {
-        *rsp = JsonError(std::string("scheduler route not found: ") + uri);
+    if (!querier_) {
+        *rsp = BuildErrorJson("scheduler control service unavailable");
         return error::UNAVAILABLE;
     }
-    return handler(uri, req, *rsp);
+    auto* control = static_cast<ISchedulerControlService*>(querier_->First(IID_SCHEDULER_CONTROL_SERVICE));
+    if (!control) {
+        *rsp = BuildErrorJson("scheduler control service unavailable");
+        return error::UNAVAILABLE;
+    }
+
+    if (std::strcmp(uri, "/scheduler/sql/classify") == 0) {
+        return control->ClassifySql(req, rsp);
+    }
+    if (std::strcmp(uri, "/scheduler/batch/execute") == 0) {
+        return control->ExecuteBatch(req, rsp);
+    }
+    if (std::strcmp(uri, "/scheduler/stream/execute") == 0) {
+        return control->ExecuteStream(req, rsp);
+    }
+    if (std::strcmp(uri, "/scheduler/stream/stop") == 0) {
+        return control->StopStream(req, rsp);
+    }
+    if (std::strcmp(uri, "/scheduler/stream/status") == 0) {
+        return control->QueryStreamStatus(req, rsp);
+    }
+    *rsp = BuildErrorJson(std::string("unsupported scheduler uri: ") + uri);
+    return error::BAD_REQUEST;
 }
 
 int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
@@ -586,7 +444,7 @@ int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
     if (task_kind_out) task_kind_out->clear();
     if (err_rsp) err_rsp->clear();
     if (sql.empty()) {
-        if (err_rsp) *err_rsp = JsonError("invalid request, sql must not be empty");
+        if (err_rsp) *err_rsp = BuildErrorJson("invalid request, sql must not be empty");
         return error::BAD_REQUEST;
     }
 
@@ -601,7 +459,7 @@ int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
     const int32_t classify_rc = ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &classify_rsp);
     if (classify_rc != error::OK) {
         if (err_rsp) {
-            *err_rsp = classify_rsp.empty() ? JsonError("scheduler sql classify failed") : classify_rsp;
+            *err_rsp = classify_rsp.empty() ? BuildErrorJson("scheduler sql classify failed") : classify_rsp;
         }
         return classify_rc;
     }
@@ -610,12 +468,12 @@ int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
     classify_doc.Parse(classify_rsp.c_str());
     if (classify_doc.HasParseError() || !classify_doc.IsObject() ||
         !classify_doc.HasMember("task_kind") || !classify_doc["task_kind"].IsString()) {
-        if (err_rsp) *err_rsp = JsonError("invalid scheduler classify response");
+        if (err_rsp) *err_rsp = BuildErrorJson("invalid scheduler classify response");
         return error::INTERNAL_ERROR;
     }
     const std::string task_kind = classify_doc["task_kind"].GetString();
     if (task_kind != "batch" && task_kind != "stream") {
-        if (err_rsp) *err_rsp = JsonError("invalid scheduler classify task_kind");
+        if (err_rsp) *err_rsp = BuildErrorJson("invalid scheduler classify task_kind");
         return error::INTERNAL_ERROR;
     }
     if (task_kind_out) *task_kind_out = task_kind;
@@ -1167,23 +1025,6 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
         if (IsDataFrameRef(stmt.dest)) intermediate_channels.insert(stmt.dest);
     }
 
-    fnRouterHandler exec_handler;
-    if (querier_) {
-        querier_->Traverse(IID_ROUTER_HANDLE, [&](void* p) -> int {
-            auto* rh = static_cast<IRouterHandle*>(p);
-            rh->EnumRoutes([&](const RouteItem& item) {
-                if (item.method == "POST" && item.uri == "/scheduler/batch/execute") exec_handler = item.handler;
-            });
-            return exec_handler ? -1 : 0;
-        });
-    }
-    if (!exec_handler) {
-        const int rc = UpdateStatus(task_id, TaskStatus::kFailed, "SCHEDULER_UNAVAILABLE", "execute route not found",
-                                    "dispatch", 0, 0, "");
-        CleanupIntermediateChannels(intermediate_channels);
-        return rc;
-    }
-
     auto update_current_index = [this, &task_id](int index) {
         std::lock_guard<std::mutex> lock(db_mu_);
         sqlite3_stmt* stmt = nullptr;
@@ -1244,7 +1085,7 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
         req_w.EndObject();
 
         std::string rsp;
-        int32_t rc = exec_handler("/scheduler/batch/execute", req_buf.GetString(), rsp);
+        int32_t rc = ProxySchedulerPost("/scheduler/batch/execute", req_buf.GetString(), &rsp);
         if (rc != error::OK) {
             const auto sql_end = std::chrono::steady_clock::now();
             const int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(sql_end - sql_start).count();
@@ -1261,6 +1102,13 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
             if (!d.HasParseError() && d.IsObject() && d.HasMember("error_stage") && d["error_stage"].IsString()) {
                 std::string v = d["error_stage"].GetString();
                 if (!v.empty()) err_stage = v;
+            }
+            if (rc == error::UNAVAILABLE) {
+                err_code = "SCHEDULER_UNAVAILABLE";
+                err_stage = "dispatch";
+                if (err.empty() || err == "execution failed") {
+                    err = "execute route not found";
+                }
             }
             if (err_stage == "execute") {
                 std::string inferred = ExtractStageFromErrorMessage(err);
@@ -1332,19 +1180,19 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject()) {
-        rsp = JsonError("invalid request body");
+        rsp = BuildErrorJson("invalid request body");
         return error::BAD_REQUEST;
     }
 
     if (d.HasMember("sql") || d.HasMember("sqls")) {
-        rsp = JsonErrorWithCode(
+        rsp = BuildErrorWithCodeJson(
             "batch execution accepts only sql_text/mode/timeout_s",
             "BATCH_SQL_TEXT_INVALID");
         return error::BAD_REQUEST;
     }
 
     if (!d.HasMember("sql_text") || !d["sql_text"].IsString()) {
-        rsp = JsonErrorWithCode(
+        rsp = BuildErrorWithCodeJson(
             "invalid request, expected {\"sql_text\":\"...\"}",
             "BATCH_SQL_TEXT_INVALID");
         return error::BAD_REQUEST;
@@ -1358,7 +1206,7 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
         if (!split_err.message.empty()) {
             err += ": " + split_err.message;
         }
-        rsp = JsonErrorWithCodeAndSqlIndex(
+        rsp = BuildErrorWithCodeAndSqlIndexJson(
             err,
             "BATCH_SQL_TEXT_INVALID",
             split_err.statement_index);
@@ -1371,11 +1219,11 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
         std::string classify_err_rsp;
         const int32_t classify_rc = ClassifySqlTaskKindViaScheduler(sql, &task_kind, &classify_err_rsp);
         if (classify_rc != error::OK) {
-            rsp = classify_err_rsp.empty() ? JsonError("sql classify failed") : classify_err_rsp;
+            rsp = classify_err_rsp.empty() ? BuildErrorJson("sql classify failed") : classify_err_rsp;
             return classify_rc;
         }
         if (task_kind == "stream") {
-            rsp = JsonErrorWithCodeAndSqlIndex(
+            rsp = BuildErrorWithCodeAndSqlIndexJson(
                 "stream SQL must use /tasks/stream/execute",
                 "STREAM_SQL_USE_STREAM_API",
                 i);
@@ -1386,7 +1234,7 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
     std::string mode = "async";
     if (d.HasMember("mode")) {
         if (!d["mode"].IsString()) {
-            rsp = JsonError("invalid request, mode must be string: sync|async");
+            rsp = BuildErrorJson("invalid request, mode must be string: sync|async");
             return error::BAD_REQUEST;
         }
         mode = d["mode"].GetString();
@@ -1394,7 +1242,7 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
             return static_cast<char>(std::tolower(c));
         });
         if (mode != "sync" && mode != "async") {
-            rsp = JsonError("invalid mode, expected sync|async");
+            rsp = BuildErrorJson("invalid mode, expected sync|async");
             return error::BAD_REQUEST;
         }
     }
@@ -1402,12 +1250,12 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
     int timeout_s = 0;
     if (d.HasMember("timeout_s")) {
         if (!d["timeout_s"].IsInt()) {
-            rsp = JsonError("invalid request, timeout_s must be integer seconds");
+            rsp = BuildErrorJson("invalid request, timeout_s must be integer seconds");
             return error::BAD_REQUEST;
         }
         timeout_s = d["timeout_s"].GetInt();
         if (timeout_s < 0) {
-            rsp = JsonError("invalid request, timeout_s must be >= 0");
+            rsp = BuildErrorJson("invalid request, timeout_s must be >= 0");
             return error::BAD_REQUEST;
         }
     }
@@ -1417,7 +1265,7 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
 
     std::string task_id;
     if (CreateTaskInternal(request_summary, sqls_json, static_cast<int>(sqls.size()), timeout_s, &task_id, !sync) != 0) {
-        rsp = JsonError("failed to create task");
+        rsp = BuildErrorJson("failed to create task");
         return error::INTERNAL_ERROR;
     }
 
@@ -1436,13 +1284,13 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
 
     std::string exec_rsp;
     if (ExecuteOneTask(task_id, &exec_rsp) != 0) {
-        rsp = JsonError("failed to execute task");
+        rsp = BuildErrorJson("failed to execute task");
         return error::INTERNAL_ERROR;
     }
 
     TaskRecord rec;
     if (GetTask(task_id, &rec) != 0) {
-        rsp = JsonError("failed to fetch task result");
+        rsp = BuildErrorJson("failed to fetch task result");
         return error::INTERNAL_ERROR;
     }
 
@@ -1506,7 +1354,7 @@ int32_t TaskPlugin::HandleSqlClassify(const std::string&, const std::string& req
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject() || !d.HasMember("sql") || !d["sql"].IsString() ||
         std::string(d["sql"].GetString()).empty()) {
-        rsp = JsonError("invalid request, expected {\"sql\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"sql\":\"...\"}");
         return error::BAD_REQUEST;
     }
 
@@ -1514,7 +1362,7 @@ int32_t TaskPlugin::HandleSqlClassify(const std::string&, const std::string& req
     std::string classify_err_rsp;
     const int32_t rc = ClassifySqlTaskKindViaScheduler(d["sql"].GetString(), &task_kind, &classify_err_rsp);
     if (rc != error::OK) {
-        rsp = classify_err_rsp.empty() ? JsonError("scheduler sql classify failed") : classify_err_rsp;
+        rsp = classify_err_rsp.empty() ? BuildErrorJson("scheduler sql classify failed") : classify_err_rsp;
         return rc;
     }
 
@@ -1532,7 +1380,7 @@ int32_t TaskPlugin::HandleSqlAnalyze(const std::string&, const std::string& req,
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject() || !d.HasMember("sql_text") || !d["sql_text"].IsString()) {
-        rsp = JsonErrorWithCode("invalid request, expected {\"sql_text\":\"...\"}", "SQL_TEXT_INVALID");
+        rsp = BuildErrorWithCodeJson("invalid request, expected {\"sql_text\":\"...\"}", "SQL_TEXT_INVALID");
         return error::BAD_REQUEST;
     }
     const std::string sql_text = d["sql_text"].GetString();
@@ -1544,7 +1392,7 @@ int32_t TaskPlugin::HandleSqlAnalyze(const std::string&, const std::string& req,
         if (!split_err.message.empty()) {
             err += ": " + split_err.message;
         }
-        rsp = JsonErrorWithCodeAndSqlIndex(err, "SQL_TEXT_INVALID", split_err.statement_index);
+        rsp = BuildErrorWithCodeAndSqlIndexJson(err, "SQL_TEXT_INVALID", split_err.statement_index);
         return error::BAD_REQUEST;
     }
 
@@ -1572,7 +1420,7 @@ int32_t TaskPlugin::HandleSqlAnalyze(const std::string&, const std::string& req,
                     err_text = classify_err_rsp;
                 }
             }
-            rsp = JsonErrorWithCodeAndSqlIndex(err_text, err_code, i);
+            rsp = BuildErrorWithCodeAndSqlIndexJson(err_text, err_code, i);
             return classify_rc;
         }
         statement_kinds.push_back(std::move(task_kind));
@@ -1627,7 +1475,7 @@ int32_t TaskPlugin::HandleList(const std::string&, const std::string& req, std::
     std::vector<TaskRecord> items;
     int64_t total = 0;
     if (ListTasks(page, page_size, status_filter, &items, &total) != 0) {
-        rsp = JsonError("failed to list tasks");
+        rsp = BuildErrorJson("failed to list tasks");
         return error::INTERNAL_ERROR;
     }
     rapidjson::StringBuffer buf;
@@ -1679,12 +1527,12 @@ int32_t TaskPlugin::HandleDetail(const std::string&, const std::string& req, std
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject() || !d.HasMember("task_id") || !d["task_id"].IsString()) {
-        rsp = JsonError("invalid request, expected {\"task_id\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"task_id\":\"...\"}");
         return error::BAD_REQUEST;
     }
     TaskRecord rec;
     if (GetTask(d["task_id"].GetString(), &rec) != 0) {
-        rsp = JsonError("task not found");
+        rsp = BuildErrorJson("task not found");
         return error::NOT_FOUND;
     }
     rapidjson::StringBuffer buf;
@@ -1729,13 +1577,13 @@ int32_t TaskPlugin::HandleDiagnostics(const std::string&, const std::string& req
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject() || !d.HasMember("task_id") || !d["task_id"].IsString()) {
-        rsp = JsonError("invalid request, expected {\"task_id\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"task_id\":\"...\"}");
         return error::BAD_REQUEST;
     }
     const std::string task_id = d["task_id"].GetString();
     TaskRecord rec;
     if (GetTask(task_id, &rec) != 0) {
-        rsp = JsonError("task not found");
+        rsp = BuildErrorJson("task not found");
         return error::NOT_FOUND;
     }
 
@@ -1745,7 +1593,7 @@ int32_t TaskPlugin::HandleDiagnostics(const std::string&, const std::string& req
         "SELECT sql_index, sql_text, duration_ms, source_rows, sink_rows, operator_chain, created_at "
         "FROM task_diagnostics WHERE task_id=?1 ORDER BY sql_index ASC;";
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        rsp = JsonError("failed to query diagnostics");
+        rsp = BuildErrorJson("failed to query diagnostics");
         return error::INTERNAL_ERROR;
     }
     sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -1790,16 +1638,16 @@ int32_t TaskPlugin::HandleDelete(const std::string&, const std::string& req, std
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject() || !d.HasMember("task_id") || !d["task_id"].IsString()) {
-        rsp = JsonError("invalid request, expected {\"task_id\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"task_id\":\"...\"}");
         return error::BAD_REQUEST;
     }
     const int rc = DeleteTask(d["task_id"].GetString());
     if (rc == 1) {
-        rsp = JsonError("non-terminal task cannot be deleted");
+        rsp = BuildErrorJson("non-terminal task cannot be deleted");
         return error::CONFLICT;
     }
     if (rc != 0) {
-        rsp = JsonError("task not found");
+        rsp = BuildErrorJson("task not found");
         return error::NOT_FOUND;
     }
     rsp = R"({"ok":true})";
@@ -1810,26 +1658,26 @@ int32_t TaskPlugin::HandleCancel(const std::string&, const std::string& req, std
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject() || !d.HasMember("task_id") || !d["task_id"].IsString()) {
-        rsp = JsonError("invalid request, expected {\"task_id\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"task_id\":\"...\"}");
         return error::BAD_REQUEST;
     }
     const std::string task_id = d["task_id"].GetString();
     if (task_id.empty()) {
-        rsp = JsonError("task_id is empty");
+        rsp = BuildErrorJson("task_id is empty");
         return error::BAD_REQUEST;
     }
 
     TaskRecord rec;
     if (GetTask(task_id, &rec) != 0) {
-        rsp = JsonError("task not found");
+        rsp = BuildErrorJson("task not found");
         return error::NOT_FOUND;
     }
     if (rec.task_kind == "stream") {
-        rsp = JsonError("stream task should use /tasks/stream/stop");
+        rsp = BuildErrorJson("stream task should use /tasks/stream/stop");
         return error::CONFLICT;
     }
     if (IsTerminal(rec.status)) {
-        rsp = JsonError("terminal task cannot be cancelled");
+        rsp = BuildErrorJson("terminal task cannot be cancelled");
         return error::CONFLICT;
     }
 
@@ -1837,7 +1685,7 @@ int32_t TaskPlugin::HandleCancel(const std::string&, const std::string& req, std
         const int urc = UpdateStatus(task_id, TaskStatus::kCancelled, "CANCELLED",
                                      "cancelled by user", "cancel", 0, 0, "");
         if (urc != 0) {
-            rsp = JsonError("failed to cancel pending task");
+            rsp = BuildErrorJson("failed to cancel pending task");
             return error::INTERNAL_ERROR;
         }
         rsp = R"({"status":"cancelled"})";
@@ -1853,7 +1701,7 @@ int32_t TaskPlugin::HandleCancel(const std::string&, const std::string& req, std
             "UPDATE tasks SET cancel_requested=1, updated_at=CURRENT_TIMESTAMP "
             "WHERE task_id=?1 AND status='running';";
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            rsp = JsonError("failed to prepare cancel statement");
+            rsp = BuildErrorJson("failed to prepare cancel statement");
             return error::INTERNAL_ERROR;
         }
         sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -1862,7 +1710,7 @@ int32_t TaskPlugin::HandleCancel(const std::string&, const std::string& req, std
         sqlite3_finalize(stmt);
     }
     if (rc != SQLITE_DONE || changed <= 0) {
-        rsp = JsonError("task is not cancellable at current state");
+        rsp = BuildErrorJson("task is not cancellable at current state");
         return error::CONFLICT;
     }
 
@@ -1875,19 +1723,19 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject()) {
-        rsp = JsonError("invalid request body");
+        rsp = BuildErrorJson("invalid request body");
         return error::BAD_REQUEST;
     }
 
     int timeout_s = 0;
     if (doc.HasMember("timeout_s")) {
         if (!doc["timeout_s"].IsInt()) {
-            rsp = JsonError("invalid request, timeout_s must be integer");
+            rsp = BuildErrorJson("invalid request, timeout_s must be integer");
             return error::BAD_REQUEST;
         }
         timeout_s = doc["timeout_s"].GetInt();
         if (timeout_s < 0) {
-            rsp = JsonError("invalid request, timeout_s must be >= 0");
+            rsp = BuildErrorJson("invalid request, timeout_s must be >= 0");
             return error::BAD_REQUEST;
         }
     }
@@ -1895,14 +1743,14 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     bool has_share_set_ready_timeout_s = false;
     if (doc.HasMember("share_set_ready_timeout_s")) {
         if (!doc["share_set_ready_timeout_s"].IsInt()) {
-            rsp = JsonErrorWithCode("invalid request, share_set_ready_timeout_s must be integer",
+            rsp = BuildErrorWithCodeJson("invalid request, share_set_ready_timeout_s must be integer",
                                     "STREAM_GROUP_SQL_TEXT_INVALID");
             return error::BAD_REQUEST;
         }
         has_share_set_ready_timeout_s = true;
         share_set_ready_timeout_s = doc["share_set_ready_timeout_s"].GetInt();
         if (share_set_ready_timeout_s <= 0) {
-            rsp = JsonErrorWithCode("invalid request, share_set_ready_timeout_s must be > 0",
+            rsp = BuildErrorWithCodeJson("invalid request, share_set_ready_timeout_s must be > 0",
                                     "STREAM_GROUP_SQL_TEXT_INVALID");
             return error::BAD_REQUEST;
         }
@@ -1911,7 +1759,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     std::string execution_kind = "single";
     if (doc.HasMember("execution_kind")) {
         if (!doc["execution_kind"].IsString()) {
-            rsp = JsonError("invalid request, execution_kind must be string");
+            rsp = BuildErrorJson("invalid request, execution_kind must be string");
             return error::BAD_REQUEST;
         }
         execution_kind = doc["execution_kind"].GetString();
@@ -1920,7 +1768,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     }
 
     if (!doc.HasMember("sql_text") || !doc["sql_text"].IsString()) {
-        rsp = JsonErrorWithCode("invalid request, expected {\"sql_text\":\"...\"}",
+        rsp = BuildErrorWithCodeJson("invalid request, expected {\"sql_text\":\"...\"}",
                                 "STREAM_GROUP_SQL_TEXT_INVALID");
         return error::BAD_REQUEST;
     }
@@ -1937,7 +1785,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         if (!split_err.message.empty()) {
             err += ": " + split_err.message;
         }
-        rsp = JsonErrorWithCodeAndSqlIndex(
+        rsp = BuildErrorWithCodeAndSqlIndexJson(
             err,
             "STREAM_GROUP_SQL_TEXT_INVALID",
             split_err.statement_index);
@@ -1946,19 +1794,19 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
 
     if (execution_kind == "single") {
         if (doc.HasMember("group_mode") || has_legacy_dag || has_legacy_sql || has_legacy_sqls) {
-            rsp = JsonErrorWithCode(
+            rsp = BuildErrorWithCodeJson(
                 "single execution accepts only sql_text/timeout_s",
                 "STREAM_GROUP_SQL_TEXT_INVALID");
             return error::BAD_REQUEST;
         }
         if (has_share_set_ready_timeout_s) {
-            rsp = JsonErrorWithCode(
+            rsp = BuildErrorWithCodeJson(
                 "single execution must not contain share_set_ready_timeout_s",
                 "STREAM_GROUP_SQL_TEXT_INVALID");
             return error::BAD_REQUEST;
         }
         if (sqls.size() != 1) {
-            rsp = JsonErrorWithCode(
+            rsp = BuildErrorWithCodeJson(
                 "single execution requires exactly one SQL statement in sql_text",
                 "STREAM_GROUP_SQL_TEXT_INVALID");
             return error::BAD_REQUEST;
@@ -1975,46 +1823,46 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         const int32_t classify_rc =
             ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &classify_rsp);
         if (classify_rc != error::OK) {
-            rsp = classify_rsp.empty() ? JsonError("scheduler sql classify failed") : classify_rsp;
+            rsp = classify_rsp.empty() ? BuildErrorJson("scheduler sql classify failed") : classify_rsp;
             return classify_rc;
         }
         rapidjson::Document classify_doc;
         classify_doc.Parse(classify_rsp.c_str());
         if (classify_doc.HasParseError() || !classify_doc.IsObject() ||
             !classify_doc.HasMember("task_kind") || !classify_doc["task_kind"].IsString()) {
-            rsp = JsonError("invalid scheduler classify response");
+            rsp = BuildErrorJson("invalid scheduler classify response");
             return error::INTERNAL_ERROR;
         }
         if (std::string(classify_doc["task_kind"].GetString()) != "stream") {
-            rsp = JsonErrorWithCode(
+            rsp = BuildErrorWithCodeJson(
                 "batch SQL must use /tasks/batch/execute",
                 "BATCH_SQL_USE_BATCH_API");
             return error::BAD_REQUEST;
         }
     } else if (execution_kind == "group") {
         if (has_legacy_sql || has_legacy_sqls || has_legacy_dag) {
-            rsp = JsonErrorWithCode(
+            rsp = BuildErrorWithCodeJson(
                 "group execution accepts only sql_text/group_mode/timeout fields",
                 "STREAM_GROUP_SQL_TEXT_INVALID");
             return error::BAD_REQUEST;
         }
         if (!doc.HasMember("group_mode") || !doc["group_mode"].IsString()) {
-            rsp = JsonError("invalid request, group execution requires group_mode");
+            rsp = BuildErrorJson("invalid request, group execution requires group_mode");
             return error::BAD_REQUEST;
         }
         if (std::string(doc["group_mode"].GetString()) != "dag") {
-            rsp = JsonErrorWithCode("invalid request, group_mode must be dag",
+            rsp = BuildErrorWithCodeJson("invalid request, group_mode must be dag",
                                     "STREAM_GROUP_MODE_INVALID");
             return error::BAD_REQUEST;
         }
         if (sqls.size() < 2) {
-            rsp = JsonErrorWithCode(
+            rsp = BuildErrorWithCodeJson(
                 "group execution requires at least two SQL statements in sql_text",
                 "STREAM_GROUP_SQL_TEXT_INVALID");
             return error::BAD_REQUEST;
         }
     } else {
-        rsp = JsonErrorWithCode(
+        rsp = BuildErrorWithCodeJson(
             "invalid request, execution_kind must be single or group",
             "STREAM_GROUP_SQL_TEXT_INVALID");
         return error::BAD_REQUEST;
@@ -2044,7 +1892,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
                                           scheduler_req_buf.GetString(),
                                           &scheduler_rsp);
     if (rc != error::OK) {
-        rsp = scheduler_rsp.empty() ? JsonError("scheduler stream execute failed") : scheduler_rsp;
+        rsp = scheduler_rsp.empty() ? BuildErrorJson("scheduler stream execute failed") : scheduler_rsp;
         return rc;
     }
 
@@ -2052,12 +1900,12 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     exec_doc.Parse(scheduler_rsp.c_str());
     if (exec_doc.HasParseError() || !exec_doc.IsObject() ||
         !exec_doc.HasMember("runtime_task_id") || !exec_doc["runtime_task_id"].IsString()) {
-        rsp = JsonError("invalid scheduler response: missing runtime_task_id");
+        rsp = BuildErrorJson("invalid scheduler response: missing runtime_task_id");
         return error::INTERNAL_ERROR;
     }
     const std::string runtime_task_id = exec_doc["runtime_task_id"].GetString();
     if (runtime_task_id.empty()) {
-        rsp = JsonError("invalid scheduler response: empty runtime_task_id");
+        rsp = BuildErrorJson("invalid scheduler response: empty runtime_task_id");
         return error::INTERNAL_ERROR;
     }
 
@@ -2085,7 +1933,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         std::string ignored;
         (void)ProxySchedulerPost("/scheduler/stream/stop", stop_req_buf.GetString(), &ignored);
 
-        rsp = JsonError("failed to create stream task");
+        rsp = BuildErrorJson("failed to create stream task");
         return error::INTERNAL_ERROR;
     }
 
@@ -2125,21 +1973,21 @@ int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req,
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
-        rsp = JsonError("invalid request, expected {\"task_id\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"task_id\":\"...\"}");
         return error::BAD_REQUEST;
     }
     const std::string task_id = doc["task_id"].GetString();
     TaskRecord rec;
     if (GetTask(task_id, &rec) != 0) {
-        rsp = JsonError("task not found");
+        rsp = BuildErrorJson("task not found");
         return error::NOT_FOUND;
     }
     if (rec.task_kind != "stream") {
-        rsp = JsonError("task is not stream type");
+        rsp = BuildErrorJson("task is not stream type");
         return error::BAD_REQUEST;
     }
     if (rec.runtime_task_id.empty()) {
-        rsp = JsonError("runtime_task_id is empty");
+        rsp = BuildErrorJson("runtime_task_id is empty");
         return error::CONFLICT;
     }
 
@@ -2153,7 +2001,7 @@ int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req,
     std::string scheduler_rsp;
     const int32_t rc = ProxySchedulerPost("/scheduler/stream/stop", req_buf.GetString(), &scheduler_rsp);
     if (rc != error::OK) {
-        rsp = scheduler_rsp.empty() ? JsonError("scheduler stream stop failed") : scheduler_rsp;
+        rsp = scheduler_rsp.empty() ? BuildErrorJson("scheduler stream stop failed") : scheduler_rsp;
         return rc;
     }
 
@@ -2233,18 +2081,18 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
-        rsp = JsonError("invalid request, expected {\"task_id\":\"...\"}");
+        rsp = BuildErrorJson("invalid request, expected {\"task_id\":\"...\"}");
         return error::BAD_REQUEST;
     }
 
     const std::string task_id = doc["task_id"].GetString();
     TaskRecord rec;
     if (GetTask(task_id, &rec) != 0) {
-        rsp = JsonError("task not found");
+        rsp = BuildErrorJson("task not found");
         return error::NOT_FOUND;
     }
     if (rec.task_kind != "stream") {
-        rsp = JsonError("task is not stream type");
+        rsp = BuildErrorJson("task is not stream type");
         return error::BAD_REQUEST;
     }
 
@@ -2342,7 +2190,7 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
                 }
             }
         } else if (!IsTerminal(rec.status)) {
-            rsp = scheduler_rsp.empty() ? JsonError("scheduler stream status failed") : scheduler_rsp;
+            rsp = scheduler_rsp.empty() ? BuildErrorJson("scheduler stream status failed") : scheduler_rsp;
             return rc;
         }
     }
@@ -2431,7 +2279,7 @@ int32_t TaskPlugin::HandleStreamList(const std::string&, const std::string& req,
     std::vector<TaskRecord> items;
     int64_t total = 0;
     if (ListTasksByKind("stream", page, page_size, status_filter, &items, &total) != 0) {
-        rsp = JsonError("failed to list stream tasks");
+        rsp = BuildErrorJson("failed to list stream tasks");
         return error::INTERNAL_ERROR;
     }
 

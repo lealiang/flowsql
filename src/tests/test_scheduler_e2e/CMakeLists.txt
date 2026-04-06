@@ -5,6 +5,7 @@ add_executable(${PROJECT_NAME} test_scheduler_e2e.cpp)
 add_executable(test_scheduler_mutation_guard
     test_scheduler_mutation_guard.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_plugin.cpp
+    ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_json_codec.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_stream_group.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/broadcast_hub.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/stream_runtime.cpp

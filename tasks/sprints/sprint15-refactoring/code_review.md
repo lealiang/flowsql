@@ -722,7 +722,7 @@
     - `ExecuteStream`
     - `StopStream`
     - `QueryStreamStatus`
-  - 路由代理作为降级路径（可在后续完全移除）。
+  - 本轮实现口径：移除 `TaskPlugin` 内部旧路由扫描回退，统一走类型化接口。
 
 #### 11.3.3 生命周期与安全约束
 
@@ -759,3 +759,34 @@
 2. 再做 `P2-3` 阶段 A（先消除重复扫描与重复实现）。  
 3. 再做 `P2-1`（组件拆分，改动面最大，建议在前两项稳定后推进）。  
 4. 最后做 `P2-3` 阶段 B（接口化替换 URI 调用）。
+
+---
+
+## 13. P2 实施结果（2026-04-07）
+
+### 13.1 已完成项
+
+- `P2-2`：错误 JSON 构造统一完成
+  - 新增 `src/framework/core/json_error_builder.{h,cpp}`，统一 `error/error_code/error_stage/sql_index` 响应构造。
+  - `scheduler_plugin.cpp`、`scheduler_stream_group.cpp`、`task_plugin.cpp` 已切换到公共 builder。
+  - capability/source/sink mismatch 也已下沉到公共 builder，移除服务侧局部 `Make*ErrorJson` 变体。
+- `P2-3` 阶段 A：Scheduler 调用入口收敛完成
+  - `TaskPlugin::ExecuteOneTask` 删除局部 `EnumRoutes` 扫描，统一复用 `ProxySchedulerPost("/scheduler/batch/execute", ...)`。
+  - 避免同一调用链中多处重复路由查找实现。
+- `P2-3` 阶段 B：接口化调用落地
+  - 新增 `ISchedulerControlService`（`IID_SCHEDULER_CONTROL_SERVICE`）。
+  - `SchedulerPlugin` 实现 `ClassifySql/ExecuteBatch/ExecuteStream/StopStream/QueryStreamStatus`。
+  - `TaskPlugin` 的 `ProxySchedulerPost` 仅通过 `querier_->First(IID_SCHEDULER_CONTROL_SERVICE)` 调用，旧 `Traverse + EnumRoutes` 路由扫描回退已移除。
+- `P2-1` 第一步：低风险拆分完成
+  - 新增 `src/services/scheduler/scheduler_json_codec.{h,cpp}`，迁移 stream task/group snapshot 序列化与状态字符串函数。
+  - 新增 `src/services/task/task_sql_utils.{h,cpp}`，迁移 SQL 相关无状态工具函数（`sqls_json`、stage 提取、operator chain 等）。
+  - `test_scheduler_mutation_guard` 补齐 `scheduler_json_codec.cpp` 链接，修复拆分后的未定义符号。
+
+### 13.2 验证结果
+
+- 构建验证：`cmake --build build -j4` 通过。
+- 回归测试：
+  - `./build/output/test_framework`（新增 `JSON error builder` 用例）通过。
+  - `./build/output/test_task`（新增 `ISchedulerControlService` 直连调用用例）通过。
+  - `./build/output/test_scheduler_mutation_guard` 通过。
+  - `./build/output/test_scheduler_e2e` 通过。
