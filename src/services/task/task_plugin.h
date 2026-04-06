@@ -3,6 +3,7 @@
 
 #include <common/iplugin.h>
 #include <framework/interfaces/irouter_handle.h>
+#include <framework/interfaces/ischeduler_control_service.h>
 #include <framework/interfaces/itask_store.h>
 
 #include <sqlite3.h>
@@ -83,7 +84,12 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     static TaskStatus MapStreamRuntimeStatus(const std::string& runtime_status);
     static bool IsTerminal(TaskStatus s);
     static std::string MakeNowTaskId(uint64_t seq);
-    int32_t ProxySchedulerPost(const char* uri, const std::string& req, std::string* rsp);
+    ISchedulerControlService* GetSchedulerControlService(std::string* err_rsp);
+    int32_t SchedulerClassifySql(const std::string& req, std::string* rsp);
+    int32_t SchedulerExecuteBatch(const std::string& req, std::string* rsp);
+    int32_t SchedulerExecuteStream(const std::string& req, std::string* rsp);
+    int32_t SchedulerStopStream(const std::string& req, std::string* rsp);
+    int32_t SchedulerQueryStreamStatus(const std::string& req, std::string* rsp);
     int UpdateRuntimeTaskId(const std::string& task_id, const std::string& runtime_task_id);
     int UpdateTaskKindAndRuntimeId(const std::string& task_id,
                                    const std::string& task_kind,

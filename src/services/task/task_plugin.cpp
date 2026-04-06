@@ -407,35 +407,52 @@ std::string TaskPlugin::MakeNowTaskId(uint64_t seq) {
     return std::string("tsk_") + ts + "_" + std::to_string(seq);
 }
 
-int32_t TaskPlugin::ProxySchedulerPost(const char* uri, const std::string& req, std::string* rsp) {
-    if (!uri || !rsp) return error::INTERNAL_ERROR;
+ISchedulerControlService* TaskPlugin::GetSchedulerControlService(std::string* err_rsp) {
     if (!querier_) {
-        *rsp = BuildErrorJson("scheduler control service unavailable");
-        return error::UNAVAILABLE;
+        if (err_rsp) *err_rsp = BuildErrorJson("scheduler control service unavailable");
+        return nullptr;
     }
     auto* control = static_cast<ISchedulerControlService*>(querier_->First(IID_SCHEDULER_CONTROL_SERVICE));
     if (!control) {
-        *rsp = BuildErrorJson("scheduler control service unavailable");
-        return error::UNAVAILABLE;
+        if (err_rsp) *err_rsp = BuildErrorJson("scheduler control service unavailable");
+        return nullptr;
     }
+    return control;
+}
 
-    if (std::strcmp(uri, "/scheduler/sql/classify") == 0) {
-        return control->ClassifySql(req, rsp);
-    }
-    if (std::strcmp(uri, "/scheduler/batch/execute") == 0) {
-        return control->ExecuteBatch(req, rsp);
-    }
-    if (std::strcmp(uri, "/scheduler/stream/execute") == 0) {
-        return control->ExecuteStream(req, rsp);
-    }
-    if (std::strcmp(uri, "/scheduler/stream/stop") == 0) {
-        return control->StopStream(req, rsp);
-    }
-    if (std::strcmp(uri, "/scheduler/stream/status") == 0) {
-        return control->QueryStreamStatus(req, rsp);
-    }
-    *rsp = BuildErrorJson(std::string("unsupported scheduler uri: ") + uri);
-    return error::BAD_REQUEST;
+int32_t TaskPlugin::SchedulerClassifySql(const std::string& req, std::string* rsp) {
+    if (!rsp) return error::INTERNAL_ERROR;
+    auto* control = GetSchedulerControlService(rsp);
+    if (!control) return error::UNAVAILABLE;
+    return control->ClassifySql(req, rsp);
+}
+
+int32_t TaskPlugin::SchedulerExecuteBatch(const std::string& req, std::string* rsp) {
+    if (!rsp) return error::INTERNAL_ERROR;
+    auto* control = GetSchedulerControlService(rsp);
+    if (!control) return error::UNAVAILABLE;
+    return control->ExecuteBatch(req, rsp);
+}
+
+int32_t TaskPlugin::SchedulerExecuteStream(const std::string& req, std::string* rsp) {
+    if (!rsp) return error::INTERNAL_ERROR;
+    auto* control = GetSchedulerControlService(rsp);
+    if (!control) return error::UNAVAILABLE;
+    return control->ExecuteStream(req, rsp);
+}
+
+int32_t TaskPlugin::SchedulerStopStream(const std::string& req, std::string* rsp) {
+    if (!rsp) return error::INTERNAL_ERROR;
+    auto* control = GetSchedulerControlService(rsp);
+    if (!control) return error::UNAVAILABLE;
+    return control->StopStream(req, rsp);
+}
+
+int32_t TaskPlugin::SchedulerQueryStreamStatus(const std::string& req, std::string* rsp) {
+    if (!rsp) return error::INTERNAL_ERROR;
+    auto* control = GetSchedulerControlService(rsp);
+    if (!control) return error::UNAVAILABLE;
+    return control->QueryStreamStatus(req, rsp);
 }
 
 int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
@@ -456,7 +473,7 @@ int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
     classify_req_w.EndObject();
 
     std::string classify_rsp;
-    const int32_t classify_rc = ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &classify_rsp);
+    const int32_t classify_rc = SchedulerClassifySql(classify_req_buf.GetString(), &classify_rsp);
     if (classify_rc != error::OK) {
         if (err_rsp) {
             *err_rsp = classify_rsp.empty() ? BuildErrorJson("scheduler sql classify failed") : classify_rsp;
@@ -1085,7 +1102,7 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
         req_w.EndObject();
 
         std::string rsp;
-        int32_t rc = ProxySchedulerPost("/scheduler/batch/execute", req_buf.GetString(), &rsp);
+        int32_t rc = SchedulerExecuteBatch(req_buf.GetString(), &rsp);
         if (rc != error::OK) {
             const auto sql_end = std::chrono::steady_clock::now();
             const int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(sql_end - sql_start).count();
@@ -1820,8 +1837,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         classify_req_w.EndObject();
 
         std::string classify_rsp;
-        const int32_t classify_rc =
-            ProxySchedulerPost("/scheduler/sql/classify", classify_req_buf.GetString(), &classify_rsp);
+        const int32_t classify_rc = SchedulerClassifySql(classify_req_buf.GetString(), &classify_rsp);
         if (classify_rc != error::OK) {
             rsp = classify_rsp.empty() ? BuildErrorJson("scheduler sql classify failed") : classify_rsp;
             return classify_rc;
@@ -1888,9 +1904,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     scheduler_req_w.EndObject();
 
     std::string scheduler_rsp;
-    const int32_t rc = ProxySchedulerPost("/scheduler/stream/execute",
-                                          scheduler_req_buf.GetString(),
-                                          &scheduler_rsp);
+    const int32_t rc = SchedulerExecuteStream(scheduler_req_buf.GetString(), &scheduler_rsp);
     if (rc != error::OK) {
         rsp = scheduler_rsp.empty() ? BuildErrorJson("scheduler stream execute failed") : scheduler_rsp;
         return rc;
@@ -1931,7 +1945,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         stop_w.String(runtime_task_id.c_str());
         stop_w.EndObject();
         std::string ignored;
-        (void)ProxySchedulerPost("/scheduler/stream/stop", stop_req_buf.GetString(), &ignored);
+        (void)SchedulerStopStream(stop_req_buf.GetString(), &ignored);
 
         rsp = BuildErrorJson("failed to create stream task");
         return error::INTERNAL_ERROR;
@@ -1999,7 +2013,7 @@ int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req,
     req_w.EndObject();
 
     std::string scheduler_rsp;
-    const int32_t rc = ProxySchedulerPost("/scheduler/stream/stop", req_buf.GetString(), &scheduler_rsp);
+    const int32_t rc = SchedulerStopStream(req_buf.GetString(), &scheduler_rsp);
     if (rc != error::OK) {
         rsp = scheduler_rsp.empty() ? BuildErrorJson("scheduler stream stop failed") : scheduler_rsp;
         return rc;
@@ -2122,7 +2136,7 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
         req_w.EndObject();
 
         std::string scheduler_rsp;
-        const int32_t rc = ProxySchedulerPost("/scheduler/stream/status", req_buf.GetString(), &scheduler_rsp);
+        const int32_t rc = SchedulerQueryStreamStatus(req_buf.GetString(), &scheduler_rsp);
         if (rc == error::OK) {
             rapidjson::Document runtime_doc;
             runtime_doc.Parse(scheduler_rsp.c_str());
