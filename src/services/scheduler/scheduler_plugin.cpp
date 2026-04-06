@@ -1015,6 +1015,12 @@ int SchedulerPlugin::Option(const char* arg) {
         } else if (key == "max_stream_group_timeout_s") {
             const int parsed = std::stoi(val);
             max_stream_group_timeout_s_ = std::max(1, parsed);
+        } else if (key == "stream_runtime_retention_s") {
+            const int parsed = std::stoi(val);
+            stream_runtime_retention_s_ = std::max(0, parsed);
+        } else if (key == "stream_runtime_max_count") {
+            const size_t parsed = static_cast<size_t>(std::stoull(val));
+            stream_runtime_max_count_ = std::max<size_t>(1, parsed);
         }
 
         pos = (end < opts.size()) ? end + 1 : opts.size();
@@ -1215,6 +1221,12 @@ int SchedulerPlugin::Stop() {
         stream_source_leases_.clear();
         stream_channel_ref_counts_.clear();
         stream_channel_mutating_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(stream_runtime_retention_mu_);
+        stream_runtime_terminal_ms_.clear();
+        stream_runtime_last_access_ms_.clear();
+        stream_runtime_kind_.clear();
     }
     ClearManagedChannels();
     LOG_INFO("SchedulerPlugin::Stop: done");
@@ -2229,6 +2241,7 @@ void SchedulerPlugin::SweepFinishedTaskLeases() {
         }
     }
     for (const auto& task_id : to_release) {
+        MarkRuntimeTerminal(task_id, "single");
         ReleaseStreamTaskLeases(task_id);
     }
     if (!to_release.empty()) {
@@ -2236,6 +2249,165 @@ void SchedulerPlugin::SweepFinishedTaskLeases() {
         for (const auto& task_id : to_release) {
             stream_group_node_owners_.erase(task_id);
         }
+    }
+}
+
+void SchedulerPlugin::MarkRuntimeTerminal(const std::string& runtime_task_id,
+                                          const std::string& runtime_kind,
+                                          int64_t terminal_ms) {
+    if (runtime_task_id.empty()) return;
+    const int64_t now_ms = terminal_ms > 0 ? terminal_ms : CurrentTimeMs();
+    std::lock_guard<std::mutex> lock(stream_runtime_retention_mu_);
+    stream_runtime_terminal_ms_[runtime_task_id] = now_ms;
+    stream_runtime_last_access_ms_[runtime_task_id] = now_ms;
+    stream_runtime_kind_[runtime_task_id] = runtime_kind.empty() ? "single" : runtime_kind;
+}
+
+void SchedulerPlugin::TouchRuntimeAccess(const std::string& runtime_task_id, int64_t now_ms) {
+    if (runtime_task_id.empty()) return;
+    const int64_t ts = now_ms > 0 ? now_ms : CurrentTimeMs();
+    std::lock_guard<std::mutex> lock(stream_runtime_retention_mu_);
+    stream_runtime_last_access_ms_[runtime_task_id] = ts;
+}
+
+void SchedulerPlugin::SweepRuntimeRetainedObjects(int64_t now_ms) {
+    struct RuntimeEntry {
+        std::string runtime_task_id;
+        std::string runtime_kind;
+        int64_t terminal_ms = 0;
+        int64_t last_access_ms = 0;
+    };
+
+    const int64_t now = now_ms > 0 ? now_ms : CurrentTimeMs();
+    std::vector<RuntimeEntry> terminal_entries;
+    {
+        std::lock_guard<std::mutex> lock(stream_runtime_retention_mu_);
+        terminal_entries.reserve(stream_runtime_terminal_ms_.size());
+        for (const auto& kv : stream_runtime_terminal_ms_) {
+            RuntimeEntry entry;
+            entry.runtime_task_id = kv.first;
+            entry.terminal_ms = kv.second;
+            auto it_access = stream_runtime_last_access_ms_.find(kv.first);
+            entry.last_access_ms = (it_access == stream_runtime_last_access_ms_.end())
+                                       ? kv.second
+                                       : it_access->second;
+            auto it_kind = stream_runtime_kind_.find(kv.first);
+            entry.runtime_kind = (it_kind == stream_runtime_kind_.end()) ? "single" : it_kind->second;
+            terminal_entries.push_back(std::move(entry));
+        }
+    }
+    if (terminal_entries.empty()) return;
+
+    std::unordered_set<std::string> remove_ids;
+    const int64_t retention_ms = static_cast<int64_t>(stream_runtime_retention_s_) * 1000;
+    if (stream_runtime_retention_s_ == 0) {
+        for (const auto& entry : terminal_entries) {
+            remove_ids.insert(entry.runtime_task_id);
+        }
+    } else {
+        for (const auto& entry : terminal_entries) {
+            if (now - entry.terminal_ms >= retention_ms) {
+                remove_ids.insert(entry.runtime_task_id);
+            }
+        }
+    }
+
+    std::vector<RuntimeEntry> keep_candidates;
+    keep_candidates.reserve(terminal_entries.size());
+    for (const auto& entry : terminal_entries) {
+        if (remove_ids.count(entry.runtime_task_id) != 0) continue;
+        keep_candidates.push_back(entry);
+    }
+    if (keep_candidates.size() > stream_runtime_max_count_) {
+        std::sort(keep_candidates.begin(), keep_candidates.end(),
+                  [](const RuntimeEntry& a, const RuntimeEntry& b) {
+                      if (a.last_access_ms != b.last_access_ms) {
+                          return a.last_access_ms < b.last_access_ms;
+                      }
+                      if (a.terminal_ms != b.terminal_ms) {
+                          return a.terminal_ms < b.terminal_ms;
+                      }
+                      return a.runtime_task_id < b.runtime_task_id;
+                  });
+        const size_t over = keep_candidates.size() - stream_runtime_max_count_;
+        for (size_t i = 0; i < over; ++i) {
+            remove_ids.insert(keep_candidates[i].runtime_task_id);
+        }
+    }
+    if (remove_ids.empty()) return;
+
+    std::vector<std::string> removed_ids;
+    removed_ids.reserve(remove_ids.size());
+    for (const auto& entry : terminal_entries) {
+        if (remove_ids.count(entry.runtime_task_id) == 0) continue;
+
+        const bool is_group = (entry.runtime_kind == "group");
+        if (is_group) {
+            std::shared_ptr<StreamTaskGroup> group;
+            {
+                std::lock_guard<std::mutex> lock(stream_task_groups_mu_);
+                auto it = stream_task_groups_.find(entry.runtime_task_id);
+                if (it != stream_task_groups_.end()) {
+                    group = it->second;
+                    stream_task_groups_.erase(it);
+                }
+            }
+            StreamGroupSnapshot snapshot;
+            StreamGroupSnapshot* snapshot_ptr = nullptr;
+            if (group) {
+                snapshot = group->Snapshot();
+                if (!IsTerminalStreamGroupStatus(snapshot.status)) {
+                    std::lock_guard<std::mutex> lock(stream_task_groups_mu_);
+                    stream_task_groups_[entry.runtime_task_id] = group;
+                    continue;
+                }
+                snapshot_ptr = &snapshot;
+            }
+            CleanupGroupRuntimeResources(entry.runtime_task_id, snapshot_ptr);
+            if (snapshot_ptr) {
+                std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+                for (const auto& node : snapshot.nodes) {
+                    stream_tasks_.erase(node.runtime_task_id);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(stream_group_node_sources_mu_);
+                stream_group_node_sources_.erase(entry.runtime_task_id);
+            }
+            {
+                std::lock_guard<std::mutex> lock(stream_group_share_set_snapshots_mu_);
+                stream_group_share_set_snapshots_.erase(entry.runtime_task_id);
+            }
+        } else {
+            std::shared_ptr<StreamTask> task;
+            {
+                std::lock_guard<std::mutex> lock(stream_tasks_mu_);
+                auto it = stream_tasks_.find(entry.runtime_task_id);
+                if (it != stream_tasks_.end()) {
+                    task = it->second;
+                }
+                if (task && !IsTerminalStreamTaskStatus(task->Status())) {
+                    continue;
+                }
+                if (it != stream_tasks_.end()) {
+                    stream_tasks_.erase(it);
+                }
+            }
+            ReleaseStreamTaskLeases(entry.runtime_task_id);
+            {
+                std::lock_guard<std::mutex> lock(stream_group_nodes_mu_);
+                stream_group_node_owners_.erase(entry.runtime_task_id);
+            }
+        }
+        removed_ids.push_back(entry.runtime_task_id);
+    }
+
+    if (removed_ids.empty()) return;
+    std::lock_guard<std::mutex> lock(stream_runtime_retention_mu_);
+    for (const auto& id : removed_ids) {
+        stream_runtime_terminal_ms_.erase(id);
+        stream_runtime_last_access_ms_.erase(id);
+        stream_runtime_kind_.erase(id);
     }
 }
 
@@ -2759,6 +2931,7 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         std::lock_guard<std::mutex> lock(stream_tasks_mu_);
         stream_tasks_[task->Id()] = task;
     }
+    TouchRuntimeAccess(task->Id());
     for (const auto& shard : task->Shards()) {
         stream_runtime_.TrySchedule(shard);
     }
@@ -2956,6 +3129,7 @@ int32_t SchedulerPlugin::HandleStreamExecute(const std::string&, const std::stri
 
 int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string& req, std::string& rsp) {
     SweepFinishedTaskLeases();
+    SweepRuntimeRetainedObjects();
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
@@ -2983,6 +3157,10 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
         group->RequestStop();
         group->Join();
         StreamGroupSnapshot snapshot = group->Snapshot();
+        TouchRuntimeAccess(task_id);
+        if (IsTerminalStreamGroupStatus(snapshot.status)) {
+            MarkRuntimeTerminal(task_id, "group");
+        }
         const auto node_sources = QueryGroupNodeResolvedSources(task_id);
         const auto share_sets = QueryGroupShareSetSnapshots(task_id);
         CleanupGroupRuntimeResources(task_id, &snapshot);
@@ -2991,6 +3169,7 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
         WriteGroupSnapshotJson(&w, snapshot, &share_sets,
                                node_sources.empty() ? nullptr : &node_sources);
         rsp = buf.GetString();
+        SweepRuntimeRetainedObjects();
         return error::OK;
     }
 
@@ -3008,16 +3187,20 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
     task->RequestStop();
     task->Join();
     ReleaseStreamTaskLeases(task_id);
+    TouchRuntimeAccess(task_id);
+    MarkRuntimeTerminal(task_id, "single");
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
     WriteTaskSnapshotJson(&w, task->Snapshot());
     rsp = buf.GetString();
+    SweepRuntimeRetainedObjects();
     return error::OK;
 }
 
 int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::string& req, std::string& rsp) {
     SweepFinishedTaskLeases();
+    SweepRuntimeRetainedObjects();
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
@@ -3043,6 +3226,10 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
     }
     if (group) {
         StreamGroupSnapshot snapshot = group->Snapshot();
+        TouchRuntimeAccess(task_id);
+        if (IsTerminalStreamGroupStatus(snapshot.status)) {
+            MarkRuntimeTerminal(task_id, "group");
+        }
         const auto node_sources = QueryGroupNodeResolvedSources(task_id);
         const auto share_sets = QueryGroupShareSetSnapshots(task_id);
         if (IsTerminalStreamGroupStatus(snapshot.status)) {
@@ -3053,6 +3240,7 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
         WriteGroupSnapshotJson(&w, snapshot, &share_sets,
                                node_sources.empty() ? nullptr : &node_sources);
         rsp = buf.GetString();
+        SweepRuntimeRetainedObjects();
         return error::OK;
     }
 
@@ -3068,7 +3256,9 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
     }
 
     TaskSnapshot snapshot = task->Snapshot();
+    TouchRuntimeAccess(task_id);
     if (IsTerminalStreamTaskStatus(snapshot.status)) {
+        MarkRuntimeTerminal(task_id, "single");
         ReleaseStreamTaskLeases(task_id);
     }
 
@@ -3076,11 +3266,13 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
     WriteTaskSnapshotJson(&w, snapshot);
     rsp = buf.GetString();
+    SweepRuntimeRetainedObjects();
     return error::OK;
 }
 
 int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&, std::string& rsp) {
     SweepFinishedTaskLeases();
+    SweepRuntimeRetainedObjects();
     std::vector<TaskSnapshot> snapshots;
     std::vector<StreamGroupSnapshot> group_snapshots;
     std::vector<std::string> terminal_tasks;
@@ -3099,8 +3291,10 @@ int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&
             if (internal_node_ids.count(kv.first) > 0) continue;
             if (!kv.second) continue;
             TaskSnapshot s = kv.second->Snapshot();
+            TouchRuntimeAccess(kv.first);
             if (IsTerminalStreamTaskStatus(s.status)) {
                 terminal_tasks.push_back(kv.first);
+                MarkRuntimeTerminal(kv.first, "single");
             }
             snapshots.push_back(std::move(s));
         }
@@ -3111,7 +3305,9 @@ int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&
         for (const auto& kv : stream_task_groups_) {
             if (!kv.second) continue;
             StreamGroupSnapshot s = kv.second->Snapshot();
+            TouchRuntimeAccess(kv.first);
             if (IsTerminalStreamGroupStatus(s.status)) {
+                MarkRuntimeTerminal(kv.first, "group");
                 for (const auto& node : s.nodes) {
                     terminal_tasks.push_back(node.runtime_task_id);
                 }
@@ -3142,6 +3338,7 @@ int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&
     w.EndArray();
     w.EndObject();
     rsp = buf.GetString();
+    SweepRuntimeRetainedObjects();
     return error::OK;
 }
 

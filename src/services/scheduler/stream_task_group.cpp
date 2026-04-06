@@ -219,28 +219,75 @@ void StreamTaskGroup::RunLoop() {
 }
 
 bool StreamTaskGroup::TrySubmitReadyNodes(int64_t now_ms) {
-    bool submitted_any = false;
-    std::lock_guard<std::mutex> lock(mu_);
-    for (auto& node : nodes_) {
-        if (node.submitted || IsNodeTerminal(node.status)) continue;
-        if (!DependenciesSatisfied(node)) continue;
-
-        node.status = GroupNodeStatus::kReady;
+    struct SubmitAction {
+        size_t index = 0;
+        uint64_t generation = 0;
+        std::string node_id;
+        std::string sql;
+    };
+    struct SubmitResult {
+        size_t index = 0;
+        uint64_t generation = 0;
+        int rc = EIO;
         std::string runtime_task_id;
         std::string err_msg;
-        const int rc = submit_fn_(node.plan.id, node.plan.sql, &runtime_task_id, &err_msg);
-        if (rc != 0 || runtime_task_id.empty()) {
+    };
+
+    std::vector<SubmitAction> actions;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        actions.reserve(nodes_.size());
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            auto& node = nodes_[i];
+            if (node.submitted || IsNodeTerminal(node.status) || node.submit_inflight) continue;
+            if (!DependenciesSatisfied(node)) continue;
+
+            node.status = GroupNodeStatus::kReady;
+            node.submit_inflight = true;
+            node.generation += 1;
+            SubmitAction action;
+            action.index = i;
+            action.generation = node.generation;
+            action.node_id = node.plan.id;
+            action.sql = node.plan.sql;
+            actions.push_back(std::move(action));
+        }
+    }
+    if (actions.empty()) return false;
+
+    std::vector<SubmitResult> results;
+    results.reserve(actions.size());
+    for (const auto& action : actions) {
+        SubmitResult result;
+        result.index = action.index;
+        result.generation = action.generation;
+        result.rc = submit_fn_(action.node_id, action.sql, &result.runtime_task_id, &result.err_msg);
+        results.push_back(std::move(result));
+    }
+
+    bool submitted_any = false;
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& result : results) {
+        if (result.index >= nodes_.size()) continue;
+        auto& node = nodes_[result.index];
+        if (!node.submit_inflight) continue;
+
+        node.submit_inflight = false;
+        if (node.generation != result.generation) {
+            continue;
+        }
+        if (result.rc != 0 || result.runtime_task_id.empty()) {
             node.status = GroupNodeStatus::kFailed;
-            node.error_no = rc != 0 ? rc : EIO;
+            node.error_no = result.rc != 0 ? result.rc : EIO;
             node.error_code = "STREAM_GROUP_NODE_SUBMIT_FAILED";
-            node.error_message = err_msg.empty() ? "submit group node failed" : err_msg;
+            node.error_message = result.err_msg.empty() ? "submit group node failed" : result.err_msg;
             MarkGroupFailed(node.error_no,
                             "group node submit failed: " + node.plan.id,
                             now_ms,
                             "STREAM_GROUP_NODE_SUBMIT_FAILED");
             continue;
         }
-        node.runtime_task_id = std::move(runtime_task_id);
+        node.runtime_task_id = result.runtime_task_id;
         node.submitted = true;
         node.status = GroupNodeStatus::kRunning;
         submitted_any = true;
@@ -249,15 +296,64 @@ bool StreamTaskGroup::TrySubmitReadyNodes(int64_t now_ms) {
 }
 
 void StreamTaskGroup::RefreshNodeStates() {
-    std::lock_guard<std::mutex> lock(mu_);
-    for (auto& node : nodes_) {
-        if (!node.submitted || node.runtime_task_id.empty()) continue;
-        if (IsNodeTerminal(node.status)) continue;
+    struct QueryAction {
+        size_t index = 0;
+        uint64_t generation = 0;
+        std::string runtime_task_id;
+    };
+    struct QueryResult {
+        size_t index = 0;
+        uint64_t generation = 0;
+        int rc = EIO;
         TaskSnapshot snapshot;
-        const int rc = query_fn_(node.runtime_task_id, &snapshot);
-        if (rc != 0) continue;
-        node.task_snapshot = std::move(snapshot);
-        node.status = MapTaskStatus(node.task_snapshot.status);
+    };
+
+    std::vector<QueryAction> actions;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        actions.reserve(nodes_.size());
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            auto& node = nodes_[i];
+            if (!node.submitted || node.runtime_task_id.empty()) continue;
+            if (IsNodeTerminal(node.status) || node.query_inflight) continue;
+            node.query_inflight = true;
+            QueryAction action;
+            action.index = i;
+            action.generation = node.generation;
+            action.runtime_task_id = node.runtime_task_id;
+            actions.push_back(std::move(action));
+        }
+    }
+    if (actions.empty()) return;
+
+    std::vector<QueryResult> results;
+    results.reserve(actions.size());
+    for (const auto& action : actions) {
+        QueryResult result;
+        result.index = action.index;
+        result.generation = action.generation;
+        result.rc = query_fn_(action.runtime_task_id, &result.snapshot);
+        results.push_back(std::move(result));
+    }
+
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& result : results) {
+        if (result.index >= nodes_.size()) continue;
+        auto& node = nodes_[result.index];
+        if (!node.query_inflight) continue;
+
+        node.query_inflight = false;
+        if (node.generation != result.generation) {
+            continue;
+        }
+        if (result.rc != 0) continue;
+
+        node.task_snapshot = result.snapshot;
+        GroupNodeStatus mapped = MapTaskStatus(node.task_snapshot.status);
+        if (node.stop_sent && mapped == GroupNodeStatus::kRunning) {
+            mapped = GroupNodeStatus::kStopping;
+        }
+        node.status = mapped;
         node.error_no = node.task_snapshot.error_code;
         if (node.status == GroupNodeStatus::kFailed && node.error_code.empty()) {
             node.error_code = "STREAM_NODE_RUNTIME_FAILED";
@@ -324,29 +420,67 @@ bool StreamTaskGroup::HandleFailureOrTimeout(int64_t now_ms) {
 }
 
 void StreamTaskGroup::HandleStopSignal() {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!pre_stop_invoked_ && pre_stop_fn_) {
-        pre_stop_invoked_ = true;
+    struct StopAction {
+        size_t index = 0;
+        uint64_t generation = 0;
+        std::string runtime_task_id;
+    };
+
+    bool need_pre_stop = false;
+    std::vector<StopAction> actions;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!pre_stop_invoked_ && pre_stop_fn_) {
+            pre_stop_invoked_ = true;
+            need_pre_stop = true;
+        }
+        actions.reserve(nodes_.size());
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            auto& node = nodes_[i];
+            if (!node.submitted || node.runtime_task_id.empty()) {
+                if (!IsNodeTerminal(node.status)) {
+                    const auto cur_status = status_.load(std::memory_order_acquire);
+                    const GroupNodeStatus next_status =
+                        (cur_status == StreamGroupStatus::kFailed ||
+                         cancel_requested_.load(std::memory_order_acquire))
+                            ? GroupNodeStatus::kSkipped
+                            : GroupNodeStatus::kStopped;
+                    if (node.status != next_status) {
+                        node.status = next_status;
+                        node.generation += 1;
+                    }
+                }
+                continue;
+            }
+            if (IsNodeTerminal(node.status)) continue;
+            if (node.stop_sent || node.stop_inflight) continue;
+            node.stop_sent = true;
+            node.stop_inflight = true;
+            node.status = GroupNodeStatus::kStopping;
+            node.generation += 1;
+
+            StopAction action;
+            action.index = i;
+            action.generation = node.generation;
+            action.runtime_task_id = node.runtime_task_id;
+            actions.push_back(std::move(action));
+        }
+    }
+
+    if (need_pre_stop) {
         pre_stop_fn_();
     }
-    for (auto& node : nodes_) {
-        if (!node.submitted || node.runtime_task_id.empty()) {
-            if (!IsNodeTerminal(node.status)) {
-                const auto cur_status = status_.load(std::memory_order_acquire);
-                if (cur_status == StreamGroupStatus::kFailed ||
-                    cancel_requested_.load(std::memory_order_acquire)) {
-                    node.status = GroupNodeStatus::kSkipped;
-                } else {
-                    node.status = GroupNodeStatus::kStopped;
-                }
-            }
-            continue;
-        }
-        if (IsNodeTerminal(node.status)) continue;
-        if (node.stop_sent) continue;
-        node.stop_sent = true;
-        node.status = GroupNodeStatus::kStopping;
-        stop_fn_(node.runtime_task_id);
+    for (const auto& action : actions) {
+        stop_fn_(action.runtime_task_id);
+    }
+
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& action : actions) {
+        if (action.index >= nodes_.size()) continue;
+        auto& node = nodes_[action.index];
+        if (!node.stop_inflight) continue;
+        node.stop_inflight = false;
+        if (node.generation != action.generation) continue;
     }
 }
 

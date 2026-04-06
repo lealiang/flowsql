@@ -129,6 +129,10 @@ class StreamTaskGroup final {
         std::string runtime_task_id;
         bool submitted = false;
         bool stop_sent = false;
+        bool submit_inflight = false;
+        bool query_inflight = false;
+        bool stop_inflight = false;
+        uint64_t generation = 0;
         std::string error_code;
         int error_no = 0;
         std::string error_message;

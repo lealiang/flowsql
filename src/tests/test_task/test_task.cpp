@@ -225,6 +225,7 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { routes[item.method + ":" + item.uri] = item.handler; });
         ASSERT_TRUE(routes.count("POST:/tasks/batch/execute") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/sql/classify") == 1);
+        ASSERT_TRUE(routes.count("POST:/tasks/sql/analyze") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/list") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/detail") == 1);
         ASSERT_TRUE(routes.count("POST:/tasks/diagnostics") == 1);
@@ -1579,6 +1580,106 @@ int main() {
         ASSERT_EQ(stream_execute_calls.load(), 0);
         ASSERT_EQ(classify_calls.load(), 0);
 
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
+        const std::string analyze_dir = MakeTempDir("sql_analyze_routes");
+        std::atomic<int> classify_calls{0};
+
+        MockRouterHandle scheduler({
+            {"POST", "/scheduler/sql/classify",
+             [&classify_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("sql") && d["sql"].IsString());
+                 const std::string sql = d["sql"].GetString();
+                 classify_calls.fetch_add(1);
+                 if (sql.find("BROKEN") != std::string::npos) {
+                     rsp = R"({"error":"bad sql","error_code":"BAD_SQL"})";
+                     return error::BAD_REQUEST;
+                 }
+                 if (sql.find("tcp_session_mock.tcp_src") != std::string::npos ||
+                     sql.find("stream.") != std::string::npos) {
+                     rsp = R"({"task_kind":"stream"})";
+                 } else {
+                     rsp = R"({"task_kind":"batch"})";
+                 }
+                 return error::OK;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + analyze_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        std::unordered_map<std::string, fnRouterHandler> local_routes;
+        p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
+        ASSERT_TRUE(local_routes.count("POST:/tasks/sql/analyze") == 1);
+
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/sql/analyze"](
+                      "/tasks/sql/analyze",
+                      R"({"sql":"SELECT 1"})",
+                      rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document invalid_req_doc;
+        invalid_req_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!invalid_req_doc.HasParseError() && invalid_req_doc.IsObject());
+        ASSERT_TRUE(invalid_req_doc.HasMember("error_code") && invalid_req_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(invalid_req_doc["error_code"].GetString()), "SQL_TEXT_INVALID");
+
+        ASSERT_EQ(local_routes["POST:/tasks/sql/analyze"](
+                      "/tasks/sql/analyze",
+                      R"({"sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc;"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document ok_doc;
+        ok_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!ok_doc.HasParseError() && ok_doc.IsObject());
+        ASSERT_TRUE(ok_doc.HasMember("statement_count") && ok_doc["statement_count"].IsUint());
+        ASSERT_EQ(ok_doc["statement_count"].GetUint(), 2u);
+        ASSERT_TRUE(ok_doc.HasMember("statements") && ok_doc["statements"].IsArray());
+        ASSERT_EQ(ok_doc["statements"].Size(), rapidjson::SizeType(2));
+        ASSERT_TRUE(ok_doc.HasMember("statement_kinds") && ok_doc["statement_kinds"].IsArray());
+        ASSERT_EQ(ok_doc["statement_kinds"].Size(), rapidjson::SizeType(2));
+        ASSERT_EQ(std::string(ok_doc["statement_kinds"][0].GetString()), "batch");
+        ASSERT_EQ(std::string(ok_doc["statement_kinds"][1].GetString()), "stream");
+        ASSERT_TRUE(ok_doc.HasMember("task_kind") && ok_doc["task_kind"].IsString());
+        ASSERT_EQ(std::string(ok_doc["task_kind"].GetString()), "mixed");
+
+        ASSERT_EQ(local_routes["POST:/tasks/sql/analyze"](
+                      "/tasks/sql/analyze",
+                      R"({"sql_text":"SELECT 1;;SELECT 2;"})",
+                      rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document split_err_doc;
+        split_err_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!split_err_doc.HasParseError() && split_err_doc.IsObject());
+        ASSERT_TRUE(split_err_doc.HasMember("error_code") && split_err_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(split_err_doc["error_code"].GetString()), "SQL_TEXT_INVALID");
+        ASSERT_TRUE(split_err_doc.HasMember("sql_index") && split_err_doc["sql_index"].IsInt());
+        ASSERT_EQ(split_err_doc["sql_index"].GetInt(), 1);
+
+        ASSERT_EQ(local_routes["POST:/tasks/sql/analyze"](
+                      "/tasks/sql/analyze",
+                      R"({"sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT BROKEN;"})",
+                      rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document classify_err_doc;
+        classify_err_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!classify_err_doc.HasParseError() && classify_err_doc.IsObject());
+        ASSERT_TRUE(classify_err_doc.HasMember("error_code") && classify_err_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(classify_err_doc["error_code"].GetString()), "BAD_SQL");
+        ASSERT_TRUE(classify_err_doc.HasMember("sql_index") && classify_err_doc["sql_index"].IsInt());
+        ASSERT_EQ(classify_err_doc["sql_index"].GetInt(), 1);
+
+        ASSERT_TRUE(classify_calls.load() >= 3);
         ASSERT_EQ(p.Stop(), 0);
     }
 

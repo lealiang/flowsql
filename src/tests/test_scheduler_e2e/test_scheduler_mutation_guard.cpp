@@ -1,9 +1,11 @@
 #include <cassert>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -110,6 +112,87 @@ struct SchedulerPluginTestAccessor {
                                           const std::string& key,
                                           std::shared_ptr<IChannel>* owner_out) {
         return plugin->FindChannel(key, owner_out);
+    }
+
+    static void AddStreamTaskRuntime(SchedulerPlugin* plugin,
+                                     const std::string& runtime_task_id,
+                                     std::shared_ptr<StreamTask> task) {
+        std::lock_guard<std::mutex> lock(plugin->stream_tasks_mu_);
+        plugin->stream_tasks_[runtime_task_id] = std::move(task);
+    }
+
+    static void AddStreamGroupRuntime(SchedulerPlugin* plugin,
+                                      const std::string& runtime_task_id,
+                                      std::shared_ptr<StreamTaskGroup> group) {
+        std::lock_guard<std::mutex> lock(plugin->stream_task_groups_mu_);
+        plugin->stream_task_groups_[runtime_task_id] = std::move(group);
+    }
+
+    static void AddGroupNodeOwner(SchedulerPlugin* plugin,
+                                  const std::string& node_runtime_task_id,
+                                  const std::string& group_runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_group_nodes_mu_);
+        plugin->stream_group_node_owners_[node_runtime_task_id] = group_runtime_task_id;
+    }
+
+    static void AddGroupNodeSources(SchedulerPlugin* plugin,
+                                    const std::string& group_runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_group_node_sources_mu_);
+        GroupNodeResolvedSourceMeta meta;
+        meta.sources = {"stream.a"};
+        meta.expand_rule = "explicit";
+        plugin->stream_group_node_sources_[group_runtime_task_id]["n1"] = std::move(meta);
+    }
+
+    static void AddGroupShareSnapshot(SchedulerPlugin* plugin,
+                                      const std::string& group_runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_group_share_set_snapshots_mu_);
+        BroadcastHubSnapshot snap;
+        snap.id = "ss1";
+        snap.source_ref = "stream.a";
+        plugin->stream_group_share_set_snapshots_[group_runtime_task_id] = {std::move(snap)};
+    }
+
+    static bool HasStreamTaskRuntime(SchedulerPlugin* plugin, const std::string& runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_tasks_mu_);
+        return plugin->stream_tasks_.find(runtime_task_id) != plugin->stream_tasks_.end();
+    }
+
+    static bool HasStreamGroupRuntime(SchedulerPlugin* plugin, const std::string& runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_task_groups_mu_);
+        return plugin->stream_task_groups_.find(runtime_task_id) != plugin->stream_task_groups_.end();
+    }
+
+    static bool HasGroupNodeOwner(SchedulerPlugin* plugin, const std::string& node_runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_group_nodes_mu_);
+        return plugin->stream_group_node_owners_.find(node_runtime_task_id) != plugin->stream_group_node_owners_.end();
+    }
+
+    static bool HasGroupNodeSources(SchedulerPlugin* plugin, const std::string& group_runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_group_node_sources_mu_);
+        return plugin->stream_group_node_sources_.find(group_runtime_task_id) != plugin->stream_group_node_sources_.end();
+    }
+
+    static bool HasGroupShareSnapshot(SchedulerPlugin* plugin, const std::string& group_runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_group_share_set_snapshots_mu_);
+        return plugin->stream_group_share_set_snapshots_.find(group_runtime_task_id) != plugin->stream_group_share_set_snapshots_.end();
+    }
+
+    static void MarkRuntimeTerminal(SchedulerPlugin* plugin,
+                                    const std::string& runtime_task_id,
+                                    const std::string& runtime_kind,
+                                    int64_t terminal_ms = 0) {
+        plugin->MarkRuntimeTerminal(runtime_task_id, runtime_kind, terminal_ms);
+    }
+
+    static void TouchRuntimeAccess(SchedulerPlugin* plugin,
+                                   const std::string& runtime_task_id,
+                                   int64_t now_ms = 0) {
+        plugin->TouchRuntimeAccess(runtime_task_id, now_ms);
+    }
+
+    static void SweepRuntimeRetainedObjects(SchedulerPlugin* plugin, int64_t now_ms = 0) {
+        plugin->SweepRuntimeRetainedObjects(now_ms);
     }
 };
 }  // namespace scheduler
@@ -360,6 +443,140 @@ int main() {
         ASSERT_EQ(snapshot.status, flowsql::scheduler::StreamGroupStatus::kFailed);
         ASSERT_EQ(snapshot.error_code, "STREAM_GROUP_TIMEOUT");
         ASSERT_TRUE(snapshot.error_message.find("unfinished_nodes=n1") != std::string::npos);
+    }
+
+    // StreamTaskGroup slow submit/query callback must not block Snapshot lock path.
+    {
+        std::vector<flowsql::scheduler::GroupNodePlan> nodes;
+        flowsql::scheduler::GroupNodePlan n1;
+        n1.id = "n1";
+        n1.sql = "SELECT 1";
+        nodes.push_back(n1);
+
+        std::atomic<bool> submit_entered{false};
+        flowsql::scheduler::StreamTaskGroup group(
+            "g_snapshot_latency",
+            "g_snapshot_latency",
+            nodes,
+            0,
+            [&submit_entered](const std::string&, const std::string&, std::string* runtime_task_id, std::string*) {
+                submit_entered.store(true, std::memory_order_release);
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                if (runtime_task_id) *runtime_task_id = "node_rt";
+                return 0;
+            },
+            [](const std::string&, flowsql::scheduler::TaskSnapshot* out) {
+                if (!out) return EINVAL;
+                out->status = flowsql::scheduler::StreamTaskStatus::kStopped;
+                return 0;
+            },
+            [](const std::string&) {});
+
+        std::string start_err;
+        ASSERT_EQ(group.Start(&start_err), 0);
+
+        bool observed_submit = false;
+        for (int i = 0; i < 200; ++i) {
+            if (submit_entered.load(std::memory_order_acquire)) {
+                observed_submit = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        ASSERT_TRUE(observed_submit);
+
+        const auto begin = std::chrono::steady_clock::now();
+        const auto snapshot_mid = group.Snapshot();
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+        ASSERT_EQ(snapshot_mid.nodes.size(), 1u);
+        ASSERT_TRUE(elapsed_ms < 120);
+
+        group.Join();
+        const auto final_snapshot = group.Snapshot();
+        ASSERT_EQ(final_snapshot.status, flowsql::scheduler::StreamGroupStatus::kStopped);
+    }
+
+    // Scheduler runtime retention: keep newest terminal runtime by max_count.
+    {
+        flowsql::scheduler::SchedulerPlugin retention_plugin;
+        ASSERT_EQ(retention_plugin.Option("stream_runtime_retention_s=3600;stream_runtime_max_count=1"), 0);
+
+        flowsql::scheduler::StreamRuntime runtime;
+        auto old_task = std::make_shared<flowsql::scheduler::StreamTask>("runtime_old", &runtime);
+        old_task->SetFailedOnce(EIO, "old failed");
+        auto new_task = std::make_shared<flowsql::scheduler::StreamTask>("runtime_new", &runtime);
+        new_task->SetFailedOnce(EIO, "new failed");
+
+        flowsql::scheduler::SchedulerPluginTestAccessor::AddStreamTaskRuntime(
+            &retention_plugin, "runtime_old", old_task);
+        flowsql::scheduler::SchedulerPluginTestAccessor::AddStreamTaskRuntime(
+            &retention_plugin, "runtime_new", new_task);
+        flowsql::scheduler::SchedulerPluginTestAccessor::MarkRuntimeTerminal(
+            &retention_plugin, "runtime_old", "single");
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        flowsql::scheduler::SchedulerPluginTestAccessor::MarkRuntimeTerminal(
+            &retention_plugin, "runtime_new", "single");
+        flowsql::scheduler::SchedulerPluginTestAccessor::TouchRuntimeAccess(
+            &retention_plugin, "runtime_old");
+        flowsql::scheduler::SchedulerPluginTestAccessor::TouchRuntimeAccess(
+            &retention_plugin, "runtime_new");
+
+        flowsql::scheduler::SchedulerPluginTestAccessor::SweepRuntimeRetainedObjects(&retention_plugin);
+        ASSERT_TRUE(!flowsql::scheduler::SchedulerPluginTestAccessor::HasStreamTaskRuntime(
+            &retention_plugin, "runtime_old"));
+        ASSERT_TRUE(flowsql::scheduler::SchedulerPluginTestAccessor::HasStreamTaskRuntime(
+            &retention_plugin, "runtime_new"));
+    }
+
+    // Scheduler runtime retention: group GC should cleanup related runtime indexes.
+    {
+        flowsql::scheduler::SchedulerPlugin retention_plugin;
+        ASSERT_EQ(retention_plugin.Option("stream_runtime_retention_s=0;stream_runtime_max_count=100"), 0);
+
+        std::vector<flowsql::scheduler::GroupNodePlan> nodes;
+        flowsql::scheduler::GroupNodePlan n1;
+        n1.id = "n1";
+        n1.sql = "SELECT 1";
+        nodes.push_back(n1);
+        auto group = std::make_shared<flowsql::scheduler::StreamTaskGroup>(
+            "runtime_group_old",
+            "runtime_group_old",
+            nodes,
+            0,
+            [](const std::string&, const std::string&, std::string* runtime_task_id, std::string*) {
+                if (runtime_task_id) *runtime_task_id = "node_rt";
+                return 0;
+            },
+            [](const std::string&, flowsql::scheduler::TaskSnapshot* out) {
+                if (!out) return EINVAL;
+                out->status = flowsql::scheduler::StreamTaskStatus::kStopped;
+                return 0;
+            },
+            [](const std::string&) {});
+        group->MarkExternalFailed(EIO, "group failed", "STREAM_GROUP_EXTERNAL_FAILED");
+
+        flowsql::scheduler::SchedulerPluginTestAccessor::AddStreamGroupRuntime(
+            &retention_plugin, "runtime_group_old", group);
+        flowsql::scheduler::SchedulerPluginTestAccessor::AddGroupNodeOwner(
+            &retention_plugin, "runtime_group_node_old", "runtime_group_old");
+        flowsql::scheduler::SchedulerPluginTestAccessor::AddGroupNodeSources(
+            &retention_plugin, "runtime_group_old");
+        flowsql::scheduler::SchedulerPluginTestAccessor::AddGroupShareSnapshot(
+            &retention_plugin, "runtime_group_old");
+        flowsql::scheduler::SchedulerPluginTestAccessor::MarkRuntimeTerminal(
+            &retention_plugin, "runtime_group_old", "group", 1);
+
+        flowsql::scheduler::SchedulerPluginTestAccessor::SweepRuntimeRetainedObjects(
+            &retention_plugin, 1000);
+        ASSERT_TRUE(!flowsql::scheduler::SchedulerPluginTestAccessor::HasStreamGroupRuntime(
+            &retention_plugin, "runtime_group_old"));
+        ASSERT_TRUE(!flowsql::scheduler::SchedulerPluginTestAccessor::HasGroupNodeOwner(
+            &retention_plugin, "runtime_group_node_old"));
+        ASSERT_TRUE(!flowsql::scheduler::SchedulerPluginTestAccessor::HasGroupNodeSources(
+            &retention_plugin, "runtime_group_old"));
+        ASSERT_TRUE(!flowsql::scheduler::SchedulerPluginTestAccessor::HasGroupShareSnapshot(
+            &retention_plugin, "runtime_group_old"));
     }
 
     std::puts("=== Scheduler mutation guard tests passed ===");

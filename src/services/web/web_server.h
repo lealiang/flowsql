@@ -62,6 +62,7 @@ class WebServer {
     int32_t HandleGetTasks(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleBatchExecuteTask(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleSqlClassifyTask(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleSqlAnalyzeTask(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetTaskResult(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleDeleteTask(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleCancelTask(const std::string& uri, const std::string& req, std::string& rsp);

@@ -112,6 +112,7 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     int ExecuteOneTask(const std::string& task_id, std::string* execute_rsp = nullptr);
     int32_t HandleBatchExecute(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleSqlClassify(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleSqlAnalyze(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleList(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleDetail(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleDelete(const std::string& uri, const std::string& req, std::string& rsp);
@@ -121,6 +122,9 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     int32_t HandleStreamStop(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamStatus(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamList(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t ClassifySqlTaskKindViaScheduler(const std::string& sql,
+                                            std::string* task_kind_out,
+                                            std::string* err_rsp);
 
     IQuerier* querier_ = nullptr;
     mutable std::mutex db_mu_;

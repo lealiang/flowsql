@@ -156,6 +156,11 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     void EndStreamChannelMutation(const std::string& key);
     void ReleaseStreamTaskLeases(const std::string& runtime_task_id);
     void SweepFinishedTaskLeases();
+    void MarkRuntimeTerminal(const std::string& runtime_task_id,
+                             const std::string& runtime_kind,
+                             int64_t terminal_ms = 0);
+    void TouchRuntimeAccess(const std::string& runtime_task_id, int64_t now_ms = 0);
+    void SweepRuntimeRetainedObjects(int64_t now_ms = 0);
 
     IQuerier* querier_ = nullptr;
 
@@ -167,6 +172,8 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     int port_ = 18803;
     size_t max_resolved_sources_ = 64;
     int max_stream_group_timeout_s_ = 86400;
+    int stream_runtime_retention_s_ = 600;
+    size_t stream_runtime_max_count_ = 2000;
 
     // 用于生成唯一临时通道名
     std::atomic<uint64_t> tmp_channel_seq_{0};
@@ -211,6 +218,11 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle {
     std::unordered_map<std::string, StreamSourceLeaseState> stream_source_leases_;
     std::unordered_set<std::string> stream_channel_mutating_;
     std::unordered_map<std::string, StreamTaskLeaseInfo> stream_task_leases_;
+
+    mutable std::mutex stream_runtime_retention_mu_;
+    std::unordered_map<std::string, int64_t> stream_runtime_terminal_ms_;
+    std::unordered_map<std::string, int64_t> stream_runtime_last_access_ms_;
+    std::unordered_map<std::string, std::string> stream_runtime_kind_;
 };
 
 }  // namespace scheduler

@@ -170,113 +170,43 @@ const dialogResult = ref(null)
 const resultLoadingId = ref('')
 const currentTaskId = ref('')
 let pollTimer = null
-let classifyTimer = null
-let classifySeq = 0
+let analyzeTimer = null
+let analyzeSeq = 0
+const sqlAnalyze = ref({
+  statement_count: 0,
+  statements: [],
+  statement_kinds: [],
+  task_kind: 'unknown'
+})
 const POLL_INTERVAL_MS = 2000
 const STREAM_DEMO_SQL = `SELECT * FROM tcp_session_mock.tcp_src
 USING builtin.tcp_service_merge_stream
 INTO dataframe.serviceaccess`
-const splitSqlStatements = (sql) => {
-  const statements = []
-  let current = ''
-  let inSingle = false
-  let inDouble = false
-  let inBacktick = false
-  let inLineComment = false
-  let inBlockComment = false
-  for (let i = 0; i < sql.length; i++) {
-    const ch = sql[i]
-    const next = i + 1 < sql.length ? sql[i + 1] : ''
 
-    if (inLineComment) {
-      current += ch
-      if (ch === '\n') inLineComment = false
-      continue
-    }
-    if (inBlockComment) {
-      current += ch
-      if (ch === '*' && next === '/') {
-        current += next
-        i++
-        inBlockComment = false
-      }
-      continue
-    }
-
-    if (inSingle) {
-      current += ch
-      if (ch === '\'' && next === '\'') {
-        current += next
-        i++
-        continue
-      }
-      if (ch === '\'') inSingle = false
-      continue
-    }
-    if (inDouble) {
-      current += ch
-      if (ch === '"' && next === '"') {
-        current += next
-        i++
-        continue
-      }
-      if (ch === '"') inDouble = false
-      continue
-    }
-    if (inBacktick) {
-      current += ch
-      if (ch === '`' && next === '`') {
-        current += next
-        i++
-        continue
-      }
-      if (ch === '`') inBacktick = false
-      continue
-    }
-
-    if (!inSingle && !inDouble && !inBacktick) {
-      if (ch === '-' && next === '-') {
-        current += ch + next
-        i++
-        inLineComment = true
-        continue
-      }
-      if (ch === '/' && next === '*') {
-        current += ch + next
-        i++
-        inBlockComment = true
-        continue
-      }
-    }
-
-    if (ch === '\'') {
-      current += ch
-      inSingle = true
-      continue
-    }
-    if (ch === '"') {
-      current += ch
-      inDouble = true
-      continue
-    }
-    if (ch === '`') {
-      current += ch
-      inBacktick = true
-      continue
-    }
-
-    if (ch === ';') {
-      const stmt = current.trim()
-      if (stmt) statements.push(stmt)
-      current = ''
-      continue
-    }
-
-    current += ch
+const resetSqlAnalyze = () => {
+  sqlAnalyze.value = {
+    statement_count: 0,
+    statements: [],
+    statement_kinds: [],
+    task_kind: 'unknown'
   }
-  const tail = current.trim()
-  if (tail) statements.push(tail)
-  return statements
+}
+
+const normalizeAnalyzePayload = (payload) => {
+  const statements = Array.isArray(payload?.statements) ? payload.statements.filter(it => typeof it === 'string') : []
+  const statementKinds = Array.isArray(payload?.statement_kinds)
+    ? payload.statement_kinds.filter(it => typeof it === 'string')
+    : []
+  const statementCount = Number.isInteger(payload?.statement_count)
+    ? payload.statement_count
+    : statements.length
+  const taskKind = typeof payload?.task_kind === 'string' ? payload.task_kind : 'unknown'
+  return {
+    statement_count: statementCount,
+    statements,
+    statement_kinds: statementKinds,
+    task_kind: taskKind
+  }
 }
 
 const buildStreamGroupPayload = (sqls) => {
@@ -312,7 +242,10 @@ const parseApiError = (error) => {
 }
 
 const isStreamSql = computed(() => sqlTaskKind.value === 'stream')
-const sqlStatements = computed(() => splitSqlStatements(sqlText.value))
+const sqlStatements = computed(() => {
+  const list = sqlAnalyze.value?.statements
+  return Array.isArray(list) ? list : []
+})
 const isMultiSql = computed(() => sqlStatements.value.length > 1)
 const allowSyncMode = computed(() => !isStreamSql.value && !isMultiSql.value)
 
@@ -349,62 +282,52 @@ const applySqlTaskKind = (kind) => {
   sqlTaskKind.value = 'unknown'
 }
 
-const classifyCurrentSql = async ({ silent = false } = {}) => {
+const analyzeCurrentSql = async ({ silent = false } = {}) => {
   const sql = sqlText.value.trim()
-  const seq = ++classifySeq
+  const seq = ++analyzeSeq
   if (!sql) {
+    resetSqlAnalyze()
     applySqlTaskKind('unknown')
-    return 'unknown'
-  }
-  const sqls = splitSqlStatements(sql)
-  if (sqls.length > 1) {
-    if (seq === classifySeq) {
-      applySqlTaskKind('unknown')
-      executeMode.value = 'async'
-    }
-    return 'multi'
+    return normalizeAnalyzePayload(null)
   }
 
   try {
-    const res = await api.classifySql(sql)
-    const taskKind = res?.data?.task_kind
-    if (seq !== classifySeq) return sqlTaskKind.value
-    applySqlTaskKind(taskKind)
-    return sqlTaskKind.value
+    const res = await api.analyzeSql(sql)
+    if (seq !== analyzeSeq) return sqlAnalyze.value
+    const normalized = normalizeAnalyzePayload(res?.data)
+    sqlAnalyze.value = normalized
+    if (normalized.statement_count > 1) {
+      executeMode.value = 'async'
+    }
+    if (normalized.task_kind === 'batch' || normalized.task_kind === 'stream') {
+      applySqlTaskKind(normalized.task_kind)
+    } else {
+      applySqlTaskKind('unknown')
+      if (normalized.statement_count > 1) {
+        executeMode.value = 'async'
+      }
+    }
+    return normalized
   } catch (error) {
-    if (seq === classifySeq) applySqlTaskKind('unknown')
+    if (seq === analyzeSeq) {
+      resetSqlAnalyze()
+      applySqlTaskKind('unknown')
+    }
     if (!silent) {
-      const detail = error.response?.data?.error || error.message || '未知错误'
-      ElMessage.error('SQL 判定失败: ' + detail)
+      const detail = parseApiError(error)
+      ElMessage.error('SQL 分析失败: ' + detail)
     }
     throw error
   }
 }
 
-const classifyMultiSqlTaskKind = async (sqls) => {
-  const kinds = []
-  for (const stmt of sqls) {
-    const res = await api.classifySql(stmt)
-    const kind = res?.data?.task_kind
-    if (kind !== 'batch' && kind !== 'stream') {
-      throw new Error(`无法判定 SQL 任务类型: ${stmt}`)
-    }
-    kinds.push(kind)
+const scheduleSqlAnalyze = () => {
+  if (analyzeTimer) {
+    clearTimeout(analyzeTimer)
+    analyzeTimer = null
   }
-  const allBatch = kinds.every(kind => kind === 'batch')
-  const allStream = kinds.every(kind => kind === 'stream')
-  if (allBatch) return 'batch'
-  if (allStream) return 'stream'
-  return 'mixed'
-}
-
-const scheduleSqlClassify = () => {
-  if (classifyTimer) {
-    clearTimeout(classifyTimer)
-    classifyTimer = null
-  }
-  classifyTimer = setTimeout(() => {
-    classifyCurrentSql({ silent: true }).catch(() => {})
+  analyzeTimer = setTimeout(() => {
+    analyzeCurrentSql({ silent: true }).catch(() => {})
   }, 250)
 }
 
@@ -521,15 +444,18 @@ const executeSQL = async () => {
   currentResult.value = null
 
   try {
-    if (classifyTimer) {
-      clearTimeout(classifyTimer)
-      classifyTimer = null
+    if (analyzeTimer) {
+      clearTimeout(analyzeTimer)
+      analyzeTimer = null
     }
-    const sqls = splitSqlStatements(sql)
+    const analysis = await analyzeCurrentSql()
+    const sqls = Array.isArray(analysis?.statements) ? analysis.statements : []
+    if (sqls.length === 0) {
+      throw new Error('SQL 文本为空或无法解析')
+    }
     if (sqls.length > 1) {
       executeMode.value = 'async'
-      const multiTaskKind = await classifyMultiSqlTaskKind(sqls)
-      if (multiTaskKind === 'stream') {
+      if (analysis.task_kind === 'stream') {
         const payload = buildStreamGroupPayload(sqls)
         const streamRes = await api.executeStreamTask(payload)
         const submit = streamRes.data || {}
@@ -546,7 +472,7 @@ const executeSQL = async () => {
         startPolling()
         return
       }
-      if (multiTaskKind === 'batch') {
+      if (analysis.task_kind === 'batch') {
         const res = await api.executeBatchTask(sql, executeMode.value)
         const submit = res.data || {}
         const taskId = submit.task_id
@@ -563,8 +489,7 @@ const executeSQL = async () => {
       }
       throw new Error('多 SQL 暂不支持 batch 与 stream 混合执行')
     }
-    const taskKind = await classifyCurrentSql()
-    if (taskKind === 'stream') {
+    if (analysis.task_kind === 'stream') {
       const streamRes = await api.executeStreamTask({
         execution_kind: 'single',
         sql_text: sqls[0],
@@ -582,6 +507,9 @@ const executeSQL = async () => {
       await loadTasks()
       startPolling()
       return
+    }
+    if (analysis.task_kind !== 'batch') {
+      throw new Error('无法判定 SQL 类型，请检查语句')
     }
 
     const res = await api.executeBatchTask(sqls[0], executeMode.value)
@@ -773,14 +701,14 @@ onMounted(() => {
 })
 
 watch(sqlText, () => {
-  scheduleSqlClassify()
+  scheduleSqlAnalyze()
 })
 
 onUnmounted(() => {
   stopPolling()
-  if (classifyTimer) {
-    clearTimeout(classifyTimer)
-    classifyTimer = null
+  if (analyzeTimer) {
+    clearTimeout(analyzeTimer)
+    analyzeTimer = null
   }
 })
 </script>

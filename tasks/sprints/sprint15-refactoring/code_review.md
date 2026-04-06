@@ -348,153 +348,235 @@
 
 ### 9.1 P1-1 细化方案：`StreamTaskGroup` 回调改为“两阶段执行”
 
-#### 9.1.1 改造目标
+#### 9.1.1 问题边界
 
-- 将 `submit_fn_ / query_fn_ / stop_fn_ / pre_stop_fn_` 从 `mu_` 临界区中移出。
-- 缩短锁持有时间，避免状态面（`Snapshot/Status`）被慢回调阻塞。
-- 保持当前节点状态语义与 stop/cancel 行为不变。
+- 当前问题不是“状态机语义错误”，而是“锁持有范围过大”。
+- `submit_fn_ / query_fn_ / stop_fn_ / pre_stop_fn_` 在 `mu_` 持锁期间调用，外部回调一旦慢，`Snapshot()`、`RequestStop()`、状态推进都被阻塞。
+- 该问题在链路变长（更多节点、更多 share-set、慢下游）时放大，属于高负载下的稳定性风险。
 
-#### 9.1.2 设计方案
+#### 9.1.2 目标与非目标
 
-- 统一采用“两阶段模型”：
-  - 阶段 A（锁内）：只做状态判定、动作收集、最小状态标记。
-  - 阶段 B（锁外）：执行外部回调（submit/query/stop/pre-stop）。
-  - 阶段 C（锁内）：回写回调结果并推进状态机。
-- 关键点：
-  - `TrySubmitReadyNodes` 增加“提交中”保护标记（例如 `submit_inflight`），避免并发轮次重复提交。
-  - `RefreshNodeStates` 先收集 `runtime_task_id` 列表，锁外查询快照，锁内按 `runtime_task_id` 合并。
-  - `HandleStopSignal` 锁内标记 `stop_sent` 与目标状态，锁外批量执行 `stop_fn_`。
-  - `pre_stop_fn_` 由锁内置位、锁外调用，保证只触发一次。
+- 目标：
+  - 外部回调全部移出 `mu_` 临界区。
+  - 保持节点状态迁移语义不变（含 `cancelled/stopped/failed/skipped`）。
+  - 避免“同一节点重复 submit/重复 stop”。
+- 非目标：
+  - 不在本次改造中重写 `StreamTaskGroup` 状态机。
+  - 不改变对外状态字段和错误码。
 
-#### 9.1.3 代码改造清单（函数级）
+#### 9.1.3 核心数据结构调整
 
-- `src/services/scheduler/stream_task_group.h`
-  - `NodeState` 增加 in-flight 状态位（如 `submit_inflight`）。
-  - 按需补充辅助结构（提交动作/查询动作）。
-- `src/services/scheduler/stream_task_group.cpp`
-  - `TrySubmitReadyNodes`：改为两阶段提交。
-  - `RefreshNodeStates`：改为两阶段查询与合并。
-  - `HandleStopSignal`：改为锁外执行 `stop_fn_` 与 `pre_stop_fn_`。
-  - 仅在锁内修改 `nodes_`、`error_*`、`status_`，外部回调全部锁外。
+- `NodeState` 新增字段：
+  - `submit_inflight`：标记已出队待 submit，防止重复提交。
+  - `query_inflight`：标记已出队待 query，防止重复查询。
+  - `stop_inflight`：标记已出队待 stop，防止重复 stop。
+  - `generation`：节点代号，每次关键状态跃迁自增，用于回调归并时检测“过期结果”。
+- `StreamTaskGroup` 新增一次性标记：
+  - `pre_stop_fired`：保证 `pre_stop_fn_` 只触发一次。
 
-#### 9.1.4 并发约束与死锁规避
+#### 9.1.4 执行时序（三阶段）
 
-- 禁止在持有 `mu_` 时调用任何外部回调。
-- `RunLoop` 中同一节点的状态跃迁必须由锁内单点提交，避免竞态覆盖。
-- stop/cancel 与 fail 的优先级保持不变：`failed` 优先于 `stopping`。
+- 阶段 A（锁内，收集动作）：
+  - 扫描节点，判定可 submit/query/stop 的候选。
+  - 仅记录动作参数并置 `*_inflight=true`，不得调用外部函数。
+  - 对每个动作记录 `node_id + generation`，用于后续归并校验。
+- 阶段 B（锁外，执行回调）：
+  - 批量执行 submit/query/stop/pre-stop。
+  - 收集每个动作结果（成功、失败、错误码、错误文本、runtime 快照）。
+- 阶段 C（锁内，提交结果）：
+  - 按 `node_id + generation` 归并结果，若 generation 不一致说明结果过期，直接丢弃。
+  - 清理 `*_inflight`，推进节点状态，更新组级状态和错误信息。
 
-#### 9.1.5 测试与验收
+#### 9.1.5 函数级改造方案
 
-- 回归现有 group 语义测试（含 stopped/cancelled/skipped 断言）。
-- 新增测试：
-  - 慢 `submit_fn_`/慢 `query_fn_` 场景下，`Snapshot()` 不出现长时间阻塞。
-  - stop 与 query 并发时，节点状态不出现非法回退。
+- `TrySubmitReadyNodes`：
+  - 变更为“收集提交动作 -> 锁外 submit -> 锁内提交结果”。
+  - submit 成功后才设置 `runtime_task_id` 与 `submitted/running`。
+  - submit 失败按现有优先级落 `failed`，并写组级 `error_*`。
+- `RefreshNodeStates`：
+  - 锁内只收集 `runtime_task_id` 与节点 generation。
+  - 锁外调用 `query_fn_`。
+  - 锁内按 generation 合并，防止 stop 后旧 query 覆盖新状态。
+- `HandleStopSignal`：
+  - 锁内决定 stop 目标并设置 `stop_inflight`。
+  - 锁外执行 `pre_stop_fn_`（单次）与 `stop_fn_`（批量）。
+  - 锁内回写 stop 结果；对“未提交节点”沿用现有 `stopped/skipped` 规则。
+
+#### 9.1.6 并发风险与规避
+
+- 风险 1：回调结果晚到覆盖新状态。
+  - 规避：`generation` 校验，过期结果丢弃。
+- 风险 2：stop 与 submit 并发导致重复提交或重复 stop。
+  - 规避：`submit_inflight/stop_inflight` 双标记 + 锁内单点判定。
+- 风险 3：慢 query 长时间占用 CPU 影响循环频率。
+  - 规避：单轮 query 数量上限（可配，例如每轮最多 128 节点）。
+
+#### 9.1.7 测试矩阵与验收
+
+- 并发行为测试：
+  - 慢 `submit_fn_`（>500ms）下，`Snapshot()` 仍能快速返回。
+  - `stop` 与 `query` 并发，节点状态不回退。
+  - `submit` 失败与 `stop` 同轮触发，优先级符合既有语义。
+- 稳定性测试：
+  - 1000+ 次提交/停止循环，无死锁、无重复 stop/submit。
 - 验收标准：
-  - 回调执行期间状态接口可稳定响应。
-  - 无死锁、无状态抖动。
+  - 持锁外调次数=0（通过代码审查可机械验证）。
+  - `Snapshot` P95 延迟显著下降（目标 < 20ms，压测环境可调）。
 
 ---
 
 ### 9.2 P1-2 细化方案：前后端 SQL 分句规则统一
 
-#### 9.2.1 改造目标
+#### 9.2.1 问题边界
 
-- 移除前端自维护 SQL 分句器，统一以后端 `SplitSqlText` 为唯一语义源。
-- 消除“前端可执行、后端拒绝”不一致（尤其空语句、注释、引号边界）。
+- 目前前端自带 `splitSqlStatements`，后端使用 `SplitSqlText`。
+- 两者在空语句、注释、字符串字面量边界上存在漂移，导致 UI 与执行结果不一致。
 
-#### 9.2.2 设计方案
+#### 9.2.2 目标与非目标
 
-- 在 `TaskPlugin` 新增统一分析接口（建议）：
-  - `POST /tasks/sql/analyze`
-  - 入参：`{"sql_text":"..."}`
-  - 出参：`statements`、`statement_count`、`task_kind`（`batch/stream/mixed/unknown`）、`sql_index`（错误时）
-- `sql_text` 分句只走 `SplitSqlText`。
-- 每条语句类型由后端调用 scheduler classify 得到，前端只消费分析结果：
-  - 编辑态提示、执行模式切换、multi-sql 校验全部基于 analyze 返回。
-- 兼容策略（本 Sprint）：
-  - 保留 `/tasks/sql/classify` 供单 SQL 调用；
-  - 前端迁移后不再使用本地 `splitSqlStatements`。
+- 目标：
+  - 后端成为唯一分句语义源。
+  - 前端仅消费后端 analyze 结果，不再维护独立分句实现。
+  - 统一 `sql_index` 口径为 0-based。
+- 非目标：
+  - 不引入新的 SQL 语法能力。
+  - 不替换现有 `SplitSqlText` 算法。
 
-#### 9.2.3 代码改造清单（函数级）
+#### 9.2.3 后端接口契约（新增）
 
-- `src/services/task/task_plugin.h/.cpp`
-  - 新增 `HandleSqlAnalyze`。
-  - `EnumRoutes` 注册 `/tasks/sql/analyze`。
-  - 复用现有 `SplitSqlText` 和 scheduler classify 代理逻辑。
-- `src/frontend/src/api/*`（对应 API 封装文件）
-  - 新增 `analyzeSqlText` 请求封装。
-- `src/frontend/src/views/Tasks.vue`
-  - 删除本地 `splitSqlStatements`。
-  - 用 analyze 结果驱动：
-    - `isMultiSql` 判定
-    - `sqlTaskKind` 判定
-    - sync/async 按钮可用性
-    - 执行前校验与错误展示
+- 新增路由：`POST /tasks/sql/analyze`
+- 请求：
+  - `{"sql_text":"..."}`
+- 成功响应示例：
+```json
+{
+  "statement_count": 2,
+  "statements": [
+    "SELECT * FROM a INTO dataframe.x",
+    "SELECT * FROM b USING builtin.passthrough_stream INTO stream.y"
+  ],
+  "statement_kinds": ["batch", "stream"],
+  "task_kind": "mixed"
+}
+```
+- 失败响应示例：
+```json
+{
+  "error": "invalid request, sql_text split failed: empty statement",
+  "error_code": "SQL_TEXT_INVALID",
+  "sql_index": 1
+}
+```
 
-#### 9.2.4 交互与性能约束
+#### 9.2.4 后端判定流程
 
-- 编辑器分析请求采用防抖（建议 300~500 ms）并丢弃过期响应（保留现有 `seq` 机制）。
-- 执行前再做一次 analyze，确保提交时语义一致。
+- 步骤 1：`SplitSqlText(sql_text, &sqls, &split_err)`。
+- 步骤 2：逐条调用 scheduler classify（复用现有 `/scheduler/sql/classify` 代理）。
+- 步骤 3：汇总 `statement_kinds` 与整体 `task_kind`：
+  - 全 batch => `batch`
+  - 全 stream => `stream`
+  - 混合 => `mixed`
+- 步骤 4：返回标准结构，错误统一带 `error_code + sql_index`。
 
-#### 9.2.5 测试与验收
+#### 9.2.5 前端改造方案
+
+- 删除本地分句器与本地 task kind 推导。
+- 新增 `analyzeSqlText` API 调用，驱动：
+  - SQL 类型提示
+  - 执行按钮可用性
+  - sync/async 模式展示
+  - 错误定位（`sql_index`）
+- 编辑态使用防抖（300~500ms）+ 序列号丢弃旧响应。
+- 点击执行前强制再 analyze 一次，防止“最后一次输入尚未返回分析结果”。
+
+#### 9.2.6 兼容与迁移顺序
+
+- 本 Sprint 不做双轨兼容：
+  - 前端切换后，全部依赖 analyze。
+  - `/tasks/sql/classify` 保留为单 SQL 轻量接口，不承担多 SQL 分句。
+- 批处理和流式入口都以 analyze 结果做预检，避免“错误路由提交”。
+
+#### 9.2.7 测试矩阵与验收
 
 - 后端测试：
-  - `sql_text` 空字符串、空语句、未闭合注释/引号返回一致错误与 `sql_index`。
-  - 多语句 `batch/stream/mixed` 判定正确。
+  - 空 SQL、空语句、注释边界、引号边界、混合语句判定。
+  - `sql_index` 0-based 一致性。
 - 前端测试：
-  - 删除本地分句逻辑后，multi-sql 执行路径与按钮状态正常。
-  - 异常提示与后端错误码一致。
+  - 多 SQL 编辑态提示稳定。
+  - 执行前 analyze 失败时阻止提交且定位准确。
 - 验收标准：
-  - 分句与类型判定前后端完全一致。
-  - 不再出现分句语义漂移导致的误导性 UI。
+  - 前后端对同一 `sql_text` 的分句结果完全一致。
+  - 不再出现“前端可执行、后端拒绝”的分句偏差类问题。
 
 ---
 
 ### 9.3 P1-3 细化方案：Scheduler 运行态对象回收策略
 
-#### 9.3.1 改造目标
+#### 9.3.1 问题边界
 
-- 防止 `stream_tasks_ / stream_task_groups_` 无限增长。
-- 在保留近期诊断能力的同时，限制内存占用与列表遍历成本。
+- `stream_tasks_`、`stream_task_groups_` 当前以“仅追加”为主，终态后缺少稳定淘汰机制。
+- 长期运行会造成内存增长和 list/status 遍历退化。
 
-#### 9.3.2 设计方案
+#### 9.3.2 目标与非目标
 
-- 引入“终态保留策略”：
-  - 时间维度：`stream_runtime_retention_s`（例如默认 600 s）
-  - 数量维度：`stream_runtime_max_count`（例如默认 2000）
-- 仅回收终态对象（`stopped/cancelled/failed`），运行中对象禁止回收。
-- 回收触发点：
-  - `/scheduler/stream/list`、`/scheduler/stream/status`、`/scheduler/stream/stop` 入口处执行 sweep。
-- 回收内容：
-  - `stream_tasks_` 终态项
-  - `stream_task_groups_` 终态项
-  - 同步清理关联索引：`stream_group_node_owners_`、`stream_group_node_sources_`、`stream_group_share_set_snapshots_` 等
-  - 先释放 lease，再删除运行态对象
+- 目标：
+  - 建立“时间+数量”双阈值回收策略。
+  - 仅回收终态对象，运行中对象绝不回收。
+  - 回收时同步清理关联索引，防止悬挂引用。
+- 非目标：
+  - 不改变 TaskPlugin 元数据持久化策略。
+  - 不引入外部持久化存档（本 Sprint 仅内存回收）。
 
-#### 9.3.3 数据结构与接口调整
+#### 9.3.3 数据结构与参数
 
-- `SchedulerPlugin` 新增终态时间索引（示意）：
-  - `runtime_terminal_ms_`（`runtime_task_id -> terminal_ts`）
-- 新增 helper（示意）：
-  - `MarkRuntimeTerminal(task_id, ts_ms)`
-  - `SweepRuntimeRetainedObjects(now_ms)`
-- `Option` 增加 retention 参数解析。
+- 新增参数（`Option` 可配置）：
+  - `stream_runtime_retention_s`（默认 600）
+  - `stream_runtime_max_count`（默认 2000）
+- 新增索引：
+  - `runtime_terminal_ms_`：`runtime_task_id -> terminal_ms`
+  - `runtime_last_access_ms_`：`runtime_task_id -> last_access_ms`（用于 LRU 式数量淘汰）
 
-#### 9.3.4 行为约束
+#### 9.3.4 回收触发与流程
 
-- 对于已回收的 runtime task，scheduler 返回 `NOT_FOUND` 是允许行为。
-- TaskPlugin 在 task 已终态时，status 接口可回退到元数据结果，不依赖 scheduler 常驻对象。
-- group 的诊断窗口由 retention 参数控制，而非无限期保留。
+- 触发点：
+  - `/scheduler/stream/list`
+  - `/scheduler/stream/status`
+  - `/scheduler/stream/stop`
+- 流程：
+  - 步骤 1：锁内扫描候选（终态且超时，或超过 max_count 的最旧项）。
+  - 步骤 2：锁外执行重资源清理（如 group share set 资源收尾）。
+  - 步骤 3：锁内删除对象与索引，释放 lease。
+- 约束：
+  - 每轮 sweep 上限（例如 128），防止单次请求触发长暂停。
 
-#### 9.3.5 测试与验收
+#### 9.3.5 锁与一致性约束
 
-- 新增测试：
-  - 大量短生命周期 stream 任务后，`stream_tasks_`/`stream_task_groups_` 大小可回落。
-  - retention 时间到期后对象被回收，关联索引同步清理。
-  - 回收后 TaskPlugin 终态查询仍可返回稳定结果。
+- 回收流程禁止长时间持有 `stream_tasks_mu_ / stream_task_groups_mu_`。
+- 关联索引清理必须与主对象删除在同一“提交阶段”完成，避免孤儿索引。
+- 对于已回收对象，scheduler 返回 `NOT_FOUND` 视为正常；TaskPlugin 终态查询回退 DB 元数据。
+
+#### 9.3.6 关键函数改造清单
+
+- `SchedulerPlugin` 新增：
+  - `MarkRuntimeTerminal(...)`
+  - `TouchRuntimeAccess(...)`
+  - `SweepRuntimeRetainedObjects(...)`
+- 在 runtime 终态收敛点调用 `MarkRuntimeTerminal`。
+- 在 list/status/stop 入口调用 `Touch + Sweep`。
+
+#### 9.3.7 测试矩阵与验收
+
+- 功能测试：
+  - 终态任务超时后被回收。
+  - 超过 max_count 时优先淘汰最旧终态对象。
+- 一致性测试：
+  - 回收后关联 map 无残留键。
+  - 回收后 TaskPlugin 查询已终态任务仍返回可解释结果。
+- 性能测试：
+  - 10k 终态对象规模下，list/status 延迟无线性恶化。
 - 验收标准：
-  - 长时间运行内存增长趋势可控。
-  - list/status 时延不随历史终态任务线性劣化。
+  - 内存占用随运行时长增长可控。
+  - 回收流程无死锁、无资源泄漏告警。
 
 ---
 

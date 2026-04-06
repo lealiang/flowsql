@@ -1026,6 +1026,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
                                  (start_err.empty() ? std::to_string(start_rc) : start_err));
         return error::INTERNAL_ERROR;
     }
+    TouchRuntimeAccess(runtime_task_id);
 
     for (auto& ss_runtime : share_set_runtimes) {
         const int64_t deadline_ms = CurrentTimeMsLocal() + static_cast<int64_t>(share_set_ready_timeout_s) * 1000;

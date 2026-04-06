@@ -326,6 +326,11 @@ int WebServer::Init(const std::string& db_path) {
         res.status = (rc == 0) ? 200 : 400;
         res.set_content(rsp, "application/json");
     });
+    server_.Post("/api/tasks/sql/analyze", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp; int32_t rc = HandleSqlAnalyzeTask("", req.body, rsp);
+        res.status = (rc == 0) ? 200 : 400;
+        res.set_content(rsp, "application/json");
+    });
     server_.Post("/api/tasks/list", [this](const httplib::Request& req, httplib::Response& res) {
         std::string rsp; HandleGetTasks("", req.body, rsp);
         res.set_content(rsp, "application/json");
@@ -581,6 +586,10 @@ void WebServer::EnumApiRoutes(std::function<void(const RouteItem&)> cb) {
     cb({"POST", "/api/tasks/sql/classify",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleSqlClassifyTask(u, req, rsp);
+        }});
+    cb({"POST", "/api/tasks/sql/analyze",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleSqlAnalyzeTask(u, req, rsp);
         }});
     cb({"POST", "/api/tasks/list",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
@@ -886,6 +895,10 @@ int32_t WebServer::HandleBatchExecuteTask(const std::string&, const std::string&
 
 int32_t WebServer::HandleSqlClassifyTask(const std::string&, const std::string& req, std::string& rsp) {
     return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/sql/classify", req, &rsp);
+}
+
+int32_t WebServer::HandleSqlAnalyzeTask(const std::string&, const std::string& req, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/sql/analyze", req, &rsp);
 }
 
 // POST /api/tasks/result — Body: {"task_id":123}
