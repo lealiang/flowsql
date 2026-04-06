@@ -1040,6 +1040,7 @@
 - In Scope：Story 14.11 ~ 14.13（统一加载、具名 Stream Sink 产品化、同源并发消费）
 - Out of Scope：跨任务共享 source 动态订阅、广播回放持久化、多主机分布式编排
 - 已拆分至 Epic 15：原 Story 14.5 / 14.6（路径 B 数据面能力）
+- 后续候选：Story 14.14（Hybrid DAG，batch + stream 混合编排）
 
 **已在 Sprint 13 落地**:
 - Story 14.7（路径 B 接口占位）已完成
@@ -1169,6 +1170,17 @@
 - `timeout_s` 与 `share_set_ready_timeout_s` 语义明确，超时路径可收敛并可观测
 - `execute` 与 `modify/remove` 并发下无 TOCTOU 误判（版本校验 + 引用登记原子）
 - 补齐 DAG 并发正确性与稳定性测试（环路校验、串并组合、Stop/Cancel、慢分支、异常分支）
+
+---
+
+### Story 14.14: Hybrid DAG（batch + stream 混合编排）
+**状态**: 📋 待规划（后续 Sprint）
+**验收标准**:
+- 支持单任务内混合编排：`batch -> stream`、`stream -> batch`、以及多段组合拓扑
+- 统一提交契约与状态观测：任务依赖、超时、错误码、节点状态可在单任务维度查询
+- 首阶段约束：`source_share_sets` 仅允许 stream 节点；`stream -> batch` 仅允许 `on_finished`
+- 首阶段约束：`batch -> stream` 仅支持一次性装填并在写入完成后 `CloseStream()`
+- 明确 mixed DAG 的可执行边界：不满足约束的拓扑需在提交阶段被拒绝并返回结构化错误
 
 ---
 

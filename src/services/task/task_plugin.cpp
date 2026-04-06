@@ -1218,24 +1218,32 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
         return error::BAD_REQUEST;
     }
 
+    if (d.HasMember("sql") || d.HasMember("sqls")) {
+        rsp = JsonErrorWithCode(
+            "batch execution accepts only sql_text/mode/timeout_s",
+            "BATCH_SQL_TEXT_INVALID");
+        return error::BAD_REQUEST;
+    }
+
+    if (!d.HasMember("sql_text") || !d["sql_text"].IsString()) {
+        rsp = JsonErrorWithCode(
+            "invalid request, expected {\"sql_text\":\"...\"}",
+            "BATCH_SQL_TEXT_INVALID");
+        return error::BAD_REQUEST;
+    }
+    const std::string sql_text = d["sql_text"].GetString();
+
     std::vector<std::string> sqls;
-    if (d.HasMember("sqls")) {
-        if (!d["sqls"].IsArray() || d["sqls"].Empty()) {
-            rsp = JsonError("invalid request, sqls must be non-empty string array");
-            return error::BAD_REQUEST;
+    SqlTextSplitError split_err;
+    if (SplitSqlText(sql_text, &sqls, &split_err) != 0) {
+        std::string err = "invalid request, sql_text split failed";
+        if (!split_err.message.empty()) {
+            err += ": " + split_err.message;
         }
-        const auto& arr = d["sqls"];
-        for (rapidjson::SizeType i = 0; i < arr.Size(); ++i) {
-            if (!arr[i].IsString() || std::string(arr[i].GetString()).empty()) {
-                rsp = JsonError("invalid request, sqls must contain non-empty strings");
-                return error::BAD_REQUEST;
-            }
-            sqls.emplace_back(arr[i].GetString());
-        }
-    } else if (d.HasMember("sql") && d["sql"].IsString() && std::string(d["sql"].GetString()).size() > 0) {
-        sqls.emplace_back(d["sql"].GetString());
-    } else {
-        rsp = JsonError("invalid request, expected {\"sql\":\"...\"} or {\"sqls\":[...]}");
+        rsp = JsonErrorWithCodeAndSqlIndex(
+            err,
+            "BATCH_SQL_TEXT_INVALID",
+            split_err.statement_index);
         return error::BAD_REQUEST;
     }
 
@@ -1275,7 +1283,8 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
         return error::OK;
     };
 
-    for (const auto& sql : sqls) {
+    for (size_t i = 0; i < sqls.size(); ++i) {
+        const auto& sql = sqls[i];
         std::string task_kind;
         std::string classify_err_rsp;
         const int32_t classify_rc = classify_sql(sql, &task_kind, &classify_err_rsp);
@@ -1284,9 +1293,10 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
             return classify_rc;
         }
         if (task_kind == "stream") {
-            rsp = JsonErrorWithCode(
+            rsp = JsonErrorWithCodeAndSqlIndex(
                 "stream SQL must use /tasks/stream/execute",
-                "STREAM_SQL_USE_STREAM_API");
+                "STREAM_SQL_USE_STREAM_API",
+                i);
             return error::BAD_REQUEST;
         }
     }

@@ -222,7 +222,7 @@ int main() {
         ASSERT_TRUE(routes.count("POST:/tasks/cancel") == 1);
 
         std::string rsp;
-        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1"})", rsp), error::OK);
+        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1"})", rsp), error::OK);
         rapidjson::Document d;
         d.Parse(rsp.c_str());
         ASSERT_TRUE(!d.HasParseError());
@@ -239,7 +239,7 @@ int main() {
         ASSERT_TRUE(list["items"][0].HasMember("task_id") && list["items"][0]["task_id"].IsString());
         ASSERT_EQ(std::string(list["items"][0]["task_id"].GetString()), task_id);
 
-        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
+        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);
         rapidjson::Document sync_ret;
         sync_ret.Parse(rsp.c_str());
         ASSERT_TRUE(!sync_ret.HasParseError() && sync_ret.IsObject());
@@ -303,7 +303,7 @@ int main() {
         std::unordered_map<std::string, fnRouterHandler> local_routes;
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1"})", rsp), error::OK);
         ASSERT_TRUE(std::filesystem::exists(db_path));
         ASSERT_EQ(p.Stop(), 0);
     }
@@ -337,7 +337,7 @@ int main() {
         ASSERT_TRUE(local_routes.count("POST:/tasks/delete") == 1);
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 42","mode":"async"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 42","mode":"async"})", rsp), error::OK);
         rapidjson::Document submit;
         submit.Parse(rsp.c_str());
         ASSERT_TRUE(!submit.HasParseError() && submit.IsObject());
@@ -405,7 +405,7 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 99","mode":"async"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 99","mode":"async"})", rsp), error::OK);
         rapidjson::Document submit;
         submit.Parse(rsp.c_str());
         ASSERT_TRUE(!submit.HasParseError() && submit.IsObject());
@@ -474,7 +474,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"mode":"async","sqls":["SELECT * FROM sqlite.local.src INTO dataframe.tmp","SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final"]})",
+                      R"({"mode":"async","sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final;"})",
                       rsp),
                   error::OK);
         rapidjson::Document submit;
@@ -550,7 +550,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"mode":"async","sqls":["SELECT * FROM sqlite.local.src INTO dataframe.tmp","SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final"]})",
+                      R"({"mode":"async","sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final;"})",
                       rsp),
                   error::OK);
         rapidjson::Document submit;
@@ -630,7 +630,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"mode":"async","sqls":["SELECT * FROM s1 INTO dataframe.tmp","SELECT * FROM dataframe.tmp,dataframe.tmp USING builtin.concat INTO dataframe.final"]})",
+                      R"({"mode":"async","sql_text":"SELECT * FROM s1 INTO dataframe.tmp;SELECT * FROM dataframe.tmp,dataframe.tmp USING builtin.concat INTO dataframe.final;"})",
                       rsp),
                   error::OK);
         rapidjson::Document submit;
@@ -710,7 +710,7 @@ int main() {
             rapidjson::StringBuffer req_buf;
             rapidjson::Writer<rapidjson::StringBuffer> w(req_buf);
             w.StartObject();
-            w.Key("sql");
+            w.Key("sql_text");
             w.String(sql.c_str());
             w.Key("mode");
             w.String("async");
@@ -778,7 +778,7 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"async"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"async"})", rsp), error::OK);
         rapidjson::Document submit;
         submit.Parse(rsp.c_str());
         ASSERT_TRUE(!submit.HasParseError() && submit.IsObject());
@@ -827,7 +827,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"mode":"async","sqls":["SELECT * FROM sqlite.local.src INTO dataframe.tmp","SELECT * FROM dataframe.tmp INTO dataframe.out"]})",
+                      R"({"mode":"async","sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT * FROM dataframe.tmp INTO dataframe.out;"})",
                       rsp),
                   error::OK);
         rapidjson::Document submit;
@@ -908,7 +908,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"sql":"SELECT 1","mode":"async","timeout_s":1})",
+                      R"({"sql_text":"SELECT 1","mode":"async","timeout_s":1})",
                       rsp),
                   error::OK);
         rapidjson::Document submit;
@@ -1169,7 +1169,7 @@ int main() {
 
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"sql":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","mode":"async"})",
+                      R"({"sql_text":"SELECT * FROM tcp_session_mock.tcp_src USING builtin.tcp_service_merge_stream INTO dataframe.svc","mode":"async"})",
                       rsp),
                   error::BAD_REQUEST);
         rapidjson::Document batch_err;
@@ -1193,10 +1193,24 @@ int main() {
 
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"sql":"SELECT * FROM sqlite.local.src INTO dataframe.tmp","mode":"sync"})",
+                      R"({"sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp","mode":"sync"})",
                       rsp),
                   error::OK);
         ASSERT_EQ(batch_execute_calls.load(), 1);
+
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
+                      R"({"sql":"SELECT * FROM sqlite.local.src INTO dataframe.tmp","mode":"sync"})",
+                      rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("sql_text") != std::string::npos);
+
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
+                      "/tasks/batch/execute",
+                      R"({"sqls":["SELECT * FROM sqlite.local.src INTO dataframe.tmp"],"mode":"sync"})",
+                      rsp),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(rsp.find("sql_text") != std::string::npos);
 
         ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
                       "/tasks/stream/execute",
@@ -1576,7 +1590,7 @@ int main() {
 
         std::string rsp;
         for (int i = 0; i < 4; ++i) {
-            ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
+            ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);
         }
         ASSERT_EQ(CountTasks(retention_count_db), 2);
         ASSERT_EQ(p.Stop(), 0);
@@ -1599,7 +1613,7 @@ int main() {
         p.EnumRoutes([&](const RouteItem& item) { local_routes[item.method + ":" + item.uri] = item.handler; });
 
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);
         rapidjson::Document first_submit;
         first_submit.Parse(rsp.c_str());
         ASSERT_TRUE(!first_submit.HasParseError() && first_submit.IsObject());
@@ -1607,7 +1621,7 @@ int main() {
         ASSERT_TRUE(UpdateTaskCreatedAt(retention_days_db, old_task_id, "2000-01-01 00:00:00"));
 
         // 再创建一个终态任务，触发 retention 清理
-        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql":"SELECT 1","mode":"sync"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);
         ASSERT_TRUE(!TaskExists(retention_days_db, old_task_id));
         ASSERT_EQ(CountTasks(retention_days_db), 1);
         ASSERT_EQ(p.Stop(), 0);

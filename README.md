@@ -182,8 +182,8 @@ SELECT * FROM dataframe.input USING sample.column_stats INTO dataframe.stats
 
 | 任务类型 | SQL 数量 | 当前支持 | 提交入口 | 关键约束 | 未来规划 |
 |---|---|---|---|---|---|
-| Batch | 单 SQL | ✅ 支持 | `POST /api/tasks/batch/execute`（内部：`/tasks/batch/execute`） | 可 `mode=sync/async`；若 SQL 被判定为 stream，将拒绝并提示使用 stream API | 持续支持 |
-| Batch | 多 SQL | ✅ 支持（顺序执行） | `POST /api/tasks/batch/execute`（`sqls[]`） | 仅支持 `sql`/`sqls[]` 入参；不支持 `sql_text` 分号切分；不允许混入 stream SQL | `Hybrid DAG`（batch+stream 混编）为后续候选 |
+| Batch | 单 SQL | ✅ 支持 | `POST /api/tasks/batch/execute`（内部：`/tasks/batch/execute`） | 可 `mode=sync/async`；使用 `sql_text` 入参；若 SQL 被判定为 stream，将拒绝并提示使用 stream API | 持续支持 |
+| Batch | 多 SQL | ✅ 支持（顺序执行） | `POST /api/tasks/batch/execute`（`sql_text`） | 多 SQL 必须用分号 `;` 切分；不允许混入 stream SQL | `Hybrid DAG`（batch+stream 混编）为后续候选 |
 | Stream | 单 SQL | ✅ 支持 | `POST /api/tasks/stream/execute`（内部：`/tasks/stream/execute`） | 仅异步；`execution_kind=single`；必须是 stream SQL；必须包含 `USING` 流式算子 | 持续支持 |
 | Stream | 多 SQL | ✅ 支持（Group DAG） | `POST /api/tasks/stream/execute`（`execution_kind=group` + `group_mode=dag` + `sql_text`） | 仅异步；多 SQL 必须用分号 `;` 切分；至少 2 条；仅支持 stream task kind（不支持 batch/stream 混合） | `Hybrid DAG`（batch+stream 混编）为后续候选 |
 

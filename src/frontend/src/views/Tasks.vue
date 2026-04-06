@@ -9,7 +9,7 @@
           <span>SQL 编辑器</span>
           <div class="header-actions">
             <el-button @click="fillStreamDemoSql">流式示例 SQL</el-button>
-            <el-tag v-if="isMultiSql" type="warning">多 SQL（Group，仅异步）</el-tag>
+            <el-tag v-if="isMultiSql" type="warning">多 SQL（仅异步）</el-tag>
             <el-tag v-else-if="sqlTaskKind === 'stream'" type="warning">流式 SQL（仅异步）</el-tag>
             <el-tag v-else-if="sqlTaskKind === 'batch'" type="info">批任务 SQL</el-tag>
             <el-radio-group v-model="executeMode" size="small">
@@ -28,7 +28,7 @@
         v-model="sqlText"
         type="textarea"
         :rows="8"
-        placeholder="输入 SQL。多 SQL（Group）请使用分号 ; 分隔，换行不切分。"
+        placeholder="多SQL采用分号(;)分隔"
         class="sql-textarea"
       />
 
@@ -381,6 +381,23 @@ const classifyCurrentSql = async ({ silent = false } = {}) => {
   }
 }
 
+const classifyMultiSqlTaskKind = async (sqls) => {
+  const kinds = []
+  for (const stmt of sqls) {
+    const res = await api.classifySql(stmt)
+    const kind = res?.data?.task_kind
+    if (kind !== 'batch' && kind !== 'stream') {
+      throw new Error(`无法判定 SQL 任务类型: ${stmt}`)
+    }
+    kinds.push(kind)
+  }
+  const allBatch = kinds.every(kind => kind === 'batch')
+  const allStream = kinds.every(kind => kind === 'stream')
+  if (allBatch) return 'batch'
+  if (allStream) return 'stream'
+  return 'mixed'
+}
+
 const scheduleSqlClassify = () => {
   if (classifyTimer) {
     clearTimeout(classifyTimer)
@@ -511,21 +528,40 @@ const executeSQL = async () => {
     const sqls = splitSqlStatements(sql)
     if (sqls.length > 1) {
       executeMode.value = 'async'
-      const payload = buildStreamGroupPayload(sqls)
-      const streamRes = await api.executeStreamTask(payload)
-      const submit = streamRes.data || {}
-      const taskId = submit.task_id
-      currentTaskId.value = taskId
-      const nodeCount = submit.node_count || sqls.length
-      ElMessage.success(`流式组任务已提交 (ID: ${taskId})`)
-      currentResult.value = {
-        columns: [],
-        rows: [],
-        message: `流式组任务 ${taskId} 已提交，节点数 ${nodeCount}`
+      const multiTaskKind = await classifyMultiSqlTaskKind(sqls)
+      if (multiTaskKind === 'stream') {
+        const payload = buildStreamGroupPayload(sqls)
+        const streamRes = await api.executeStreamTask(payload)
+        const submit = streamRes.data || {}
+        const taskId = submit.task_id
+        currentTaskId.value = taskId
+        const nodeCount = submit.node_count || sqls.length
+        ElMessage.success(`流式组任务已提交 (ID: ${taskId})`)
+        currentResult.value = {
+          columns: [],
+          rows: [],
+          message: `流式组任务 ${taskId} 已提交，节点数 ${nodeCount}`
+        }
+        await loadTasks()
+        startPolling()
+        return
       }
-      await loadTasks()
-      startPolling()
-      return
+      if (multiTaskKind === 'batch') {
+        const res = await api.executeBatchTask(sql, executeMode.value)
+        const submit = res.data || {}
+        const taskId = submit.task_id
+        currentTaskId.value = taskId
+        ElMessage.success(`批任务已提交 (ID: ${taskId})`)
+        currentResult.value = {
+          columns: [],
+          rows: [],
+          message: `批任务 ${taskId} 已提交，正在异步执行`
+        }
+        await loadTasks()
+        startPolling()
+        return
+      }
+      throw new Error('多 SQL 暂不支持 batch 与 stream 混合执行')
     }
     const taskKind = await classifyCurrentSql()
     if (taskKind === 'stream') {

@@ -71,7 +71,7 @@ export default {
       total
     }
   }),
-  executeBatchTask: (sql, mode = 'async') => api.post('/api/tasks/batch/execute', { sql, mode }),
+  executeBatchTask: (sqlText, mode = 'async') => api.post('/api/tasks/batch/execute', { sql_text: sqlText, mode }),
   classifySql: (sql) => api.post('/api/tasks/sql/classify', { sql }),
   getTaskResult: (id) => api.post('/api/tasks/result', { task_id: id }),
   deleteTask: (id) => api.post('/api/tasks/delete', { task_id: id }),
