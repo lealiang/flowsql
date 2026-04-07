@@ -2273,6 +2273,22 @@ int main() {
                   error::BAD_REQUEST);
         ASSERT_TRUE(rsp.find("STREAM_GROUP_SQL_TEXT_INVALID") != std::string::npos);
 
+        // Single execute plan-stage validation error should still return typed error contract.
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute",
+                              R"({
+                                  "execution_kind":"single",
+                                  "sql_text":"SELECT * FROM ring.in INTO stream.out"
+                              })",
+                              rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document single_plan_err_doc;
+        single_plan_err_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!single_plan_err_doc.HasParseError() && single_plan_err_doc.IsObject());
+        ASSERT_TRUE(single_plan_err_doc.HasMember("error_code") && single_plan_err_doc["error_code"].IsString());
+        ASSERT_TRUE(single_plan_err_doc.HasMember("error_stage") && single_plan_err_doc["error_stage"].IsString());
+        ASSERT_EQ(std::string(single_plan_err_doc["error_code"].GetString()), "SQL_TEXT_INVALID");
+        ASSERT_EQ(std::string(single_plan_err_doc["error_stage"].GetString()), "parse");
+
         // sql_text split error should expose 0-based sql_index.
         ASSERT_EQ(stream_exec("/scheduler/stream/execute",
                               R"({

@@ -193,16 +193,16 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
     if (!doc.HasMember("group_mode") || !doc["group_mode"].IsString()) {
         rsp = BuildExecutionErrorJson(
             "group_mode must be provided for group execution",
-            "STREAM_GROUP_MODE_INVALID",
-            "request");
+            ErrorCodeId::kStreamGroupModeInvalid,
+            ErrorStageId::kRequest);
         return error::BAD_REQUEST;
     }
     const std::string group_mode = ToLowerAsciiLocal(doc["group_mode"].GetString());
     if (group_mode != "dag") {
         rsp = BuildExecutionErrorJson(
             "only group_mode=dag is supported",
-            "STREAM_GROUP_MODE_INVALID",
-            "request");
+            ErrorCodeId::kStreamGroupModeInvalid,
+            ErrorStageId::kRequest);
         return error::BAD_REQUEST;
     }
 
@@ -213,15 +213,15 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         doc.HasMember("sqls")) {
         rsp = BuildExecutionErrorJson(
             "group execution accepts only sql_text/group_mode/timeout fields",
-            "STREAM_GROUP_SQL_TEXT_INVALID",
-            "request");
+            ErrorCodeId::kStreamGroupSqlTextInvalid,
+            ErrorStageId::kRequest);
         return error::BAD_REQUEST;
     }
     if (!doc.HasMember("sql_text") || !doc["sql_text"].IsString()) {
         rsp = BuildExecutionErrorJson(
             "group execution requires sql_text",
-            "STREAM_GROUP_SQL_TEXT_INVALID",
-            "request");
+            ErrorCodeId::kStreamGroupSqlTextInvalid,
+            ErrorStageId::kRequest);
         return error::BAD_REQUEST;
     }
 
@@ -230,24 +230,24 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (!doc["timeout_s"].IsInt()) {
             rsp = BuildExecutionErrorJson(
                 "timeout_s must be integer",
-                "STREAM_GROUP_SQL_TEXT_INVALID",
-                "request");
+                ErrorCodeId::kStreamGroupSqlTextInvalid,
+                ErrorStageId::kRequest);
             return error::BAD_REQUEST;
         }
         timeout_s = doc["timeout_s"].GetInt();
         if (timeout_s < 0) {
             rsp = BuildExecutionErrorJson(
                 "timeout_s must be >= 0",
-                "STREAM_GROUP_SQL_TEXT_INVALID",
-                "request");
+                ErrorCodeId::kStreamGroupSqlTextInvalid,
+                ErrorStageId::kRequest);
             return error::BAD_REQUEST;
         }
         if (timeout_s > max_stream_group_timeout_s_) {
             rsp = BuildExecutionErrorJson(
                 "timeout_s exceeds max_stream_group_timeout_s: " +
                     std::to_string(max_stream_group_timeout_s_),
-                "STREAM_GROUP_SQL_TEXT_INVALID",
-                "request");
+                ErrorCodeId::kStreamGroupSqlTextInvalid,
+                ErrorStageId::kRequest);
             return error::BAD_REQUEST;
         }
     }
@@ -257,16 +257,16 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (!doc["share_set_ready_timeout_s"].IsInt()) {
             rsp = BuildExecutionErrorJson(
                 "share_set_ready_timeout_s must be integer",
-                "STREAM_GROUP_SQL_TEXT_INVALID",
-                "request");
+                ErrorCodeId::kStreamGroupSqlTextInvalid,
+                ErrorStageId::kRequest);
             return error::BAD_REQUEST;
         }
         share_set_ready_timeout_s = doc["share_set_ready_timeout_s"].GetInt();
         if (share_set_ready_timeout_s <= 0) {
             rsp = BuildExecutionErrorJson(
                 "share_set_ready_timeout_s must be > 0",
-                "STREAM_GROUP_SQL_TEXT_INVALID",
-                "request");
+                ErrorCodeId::kStreamGroupSqlTextInvalid,
+                ErrorStageId::kRequest);
             return error::BAD_REQUEST;
         }
     }
@@ -283,23 +283,23 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         }
         rsp = BuildExecutionErrorWithSqlIndexJson(
             err,
-            "STREAM_GROUP_SQL_TEXT_INVALID",
-            "request",
+            ErrorCodeId::kStreamGroupSqlTextInvalid,
+            ErrorStageId::kRequest,
             split_err.statement_index);
         return error::BAD_REQUEST;
     }
     if (sqls.size() < 2) {
         rsp = BuildExecutionErrorJson(
             "group execution requires at least two SQL statements",
-            "STREAM_GROUP_SQL_TEXT_INVALID",
-            "request");
+            ErrorCodeId::kStreamGroupSqlTextInvalid,
+            ErrorStageId::kRequest);
         return error::BAD_REQUEST;
     }
     if (sqls.size() > kDefaultMaxGroupNodes) {
         rsp = BuildExecutionErrorJson(
             "group nodes exceed max_group_nodes",
-            "STREAM_GROUP_DAG_TOO_LARGE",
-            "dag_validate");
+            ErrorCodeId::kStreamGroupDagTooLarge,
+            ErrorStageId::kDagValidate);
         return error::BAD_REQUEST;
     }
 
@@ -326,8 +326,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (sql_bytes > kDefaultMaxGroupSqlBytes) {
             rsp = BuildExecutionErrorJson(
                 "group sql bytes exceed max_group_sql_bytes",
-                "STREAM_GROUP_DAG_TOO_LARGE",
-                "dag_validate");
+                ErrorCodeId::kStreamGroupDagTooLarge,
+                ErrorStageId::kDagValidate);
             return error::BAD_REQUEST;
         }
 
@@ -336,8 +336,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (!parsed.error.empty()) {
             rsp = BuildExecutionErrorWithSqlIndexJson(
                 "group node SQL parse failed: node=" + plan.id + ", " + parsed.error,
-                "STREAM_GROUP_DAG_INVALID",
-                "dag_validate",
+                ErrorCodeId::kStreamGroupDagInvalid,
+                ErrorStageId::kDagValidate,
                 i);
             return error::BAD_REQUEST;
         }
@@ -347,8 +347,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (parsed.sources.empty()) {
             rsp = BuildExecutionErrorWithSqlIndexJson(
                 "group node source channel not found: node=" + plan.id,
-                "STREAM_GROUP_DAG_INVALID",
-                "dag_validate",
+                ErrorCodeId::kStreamGroupDagInvalid,
+                ErrorStageId::kDagValidate,
                 i);
             return error::BAD_REQUEST;
         }
@@ -360,8 +360,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (!ParseChannelBaseLocal(source_ref, &source_base, &source_base_err)) {
                 rsp = BuildExecutionErrorJson(
                     "group node source selector invalid: node=" + plan.id + ", source=" + source_ref,
-                    "STREAM_GROUP_DAG_INVALID",
-                    "dag_validate");
+                    ErrorCodeId::kStreamGroupDagInvalid,
+                    ErrorStageId::kDagValidate);
                 return error::BAD_REQUEST;
             }
             if (!StartsWithIgnoreCaseLocal(source_base, "stream.")) continue;
@@ -370,16 +370,16 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (it->second.size() > 1) {
                 rsp = BuildExecutionErrorJson(
                     "ambiguous upstream stream source: node=" + plan.id + ", source=" + source_base,
-                    "STREAM_GROUP_DAG_INVALID",
-                    "dag_validate");
+                    ErrorCodeId::kStreamGroupDagInvalid,
+                    ErrorStageId::kDagValidate);
                 return error::BAD_REQUEST;
             }
             const size_t dep_idx = it->second.front();
             if (dep_idx >= plans.size()) {
                 rsp = BuildExecutionErrorJson(
                     "dependency index out of range: node=" + plan.id,
-                    "STREAM_GROUP_DAG_INVALID",
-                    "dag_validate");
+                    ErrorCodeId::kStreamGroupDagInvalid,
+                    ErrorStageId::kDagValidate);
                 return error::BAD_REQUEST;
             }
             dep_ids.insert(plans[dep_idx].id);
@@ -403,8 +403,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (edges > kDefaultMaxGroupEdges) {
             rsp = BuildExecutionErrorJson(
                 "group edges exceed max_group_edges",
-                "STREAM_GROUP_DAG_TOO_LARGE",
-                "dag_validate");
+                ErrorCodeId::kStreamGroupDagTooLarge,
+                ErrorStageId::kDagValidate);
             return error::BAD_REQUEST;
         }
 
@@ -416,15 +416,15 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             rsp = BuildExecutionErrorJson(
                 "group node source resolve failed: node=" + plan.id +
                     (node_err.empty() ? "" : (", " + node_err)),
-                "STREAM_GROUP_DAG_INVALID",
-                "dag_validate");
+                ErrorCodeId::kStreamGroupDagInvalid,
+                ErrorStageId::kDagValidate);
             return source_rc;
         }
         if (!source_resolved.has_stream_source || source_resolved.has_non_stream_source) {
             rsp = BuildExecutionErrorJson(
                 "group node must be stream task kind: node=" + plan.id,
-                "STREAM_GROUP_MIXED_TASK_KIND",
-                "dag_validate");
+                ErrorCodeId::kStreamGroupMixedTaskKind,
+                ErrorStageId::kDagValidate);
             return error::BAD_REQUEST;
         }
 
@@ -440,8 +440,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (!ParseChannelBaseLocal(parsed.dest, &sink_base, &sink_base_err)) {
             rsp = BuildExecutionErrorJson(
                 "group node sink selector invalid: node=" + plan.id + ", sink=" + parsed.dest,
-                "STREAM_GROUP_DAG_INVALID",
-                "dag_validate");
+                ErrorCodeId::kStreamGroupDagInvalid,
+                ErrorStageId::kDagValidate);
             return error::BAD_REQUEST;
         }
 
@@ -452,8 +452,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (!sink_stream) {
                 rsp = BuildExecutionErrorJson(
                     "group node stream sink not found: node=" + plan.id + ", sink=" + sink_base,
-                    "STREAM_GROUP_DAG_INVALID",
-                    "dag_validate");
+                    ErrorCodeId::kStreamGroupDagInvalid,
+                    ErrorStageId::kDagValidate);
                 return error::BAD_REQUEST;
             }
             const std::string sink_key = MakeStreamChannelKeyLocal(sink_stream->Category(), sink_stream->Name());
@@ -483,7 +483,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
                     ", required.put_mode=MULTI, actual.put_mode=" +
                     std::string(caps.concurrency.put_mode == ProducerMode::MULTI ? "MULTI" : "SINGLE") +
                     ", actual.max_producers=" + std::to_string(caps.concurrency.max_producers),
-                "capability_check",
+                ErrorStageId::kCapabilityCheck,
                 kv.first,
                 kv.second,
                 caps.concurrency.put_mode,
@@ -500,8 +500,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (dep == plans[i].id) {
                 rsp = BuildExecutionErrorJson(
                     "self dependency is not allowed: node=" + plans[i].id,
-                    "STREAM_GROUP_DAG_INVALID",
-                    "dag_validate");
+                    ErrorCodeId::kStreamGroupDagInvalid,
+                    ErrorStageId::kDagValidate);
                 return error::BAD_REQUEST;
             }
             if (!dep_dedup.insert(dep).second) continue;
@@ -509,8 +509,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (dep_it == node_index.end()) {
                 rsp = BuildExecutionErrorJson(
                     "dependency node not found: " + dep + ", node=" + plans[i].id,
-                    "STREAM_GROUP_NODE_NOT_FOUND",
-                    "dag_validate");
+                    ErrorCodeId::kStreamGroupNodeNotFound,
+                    ErrorStageId::kDagValidate);
                 return error::BAD_REQUEST;
             }
             graph[dep_it->second].push_back(i);
@@ -534,8 +534,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
     if (visited != plans.size()) {
         rsp = BuildExecutionErrorJson(
             "dag has cycle dependency",
-            "STREAM_GROUP_DAG_CYCLE_DETECTED",
-            "dag_validate");
+            ErrorCodeId::kStreamGroupDagCycleDetected,
+            ErrorStageId::kDagValidate);
         return error::BAD_REQUEST;
     }
 
@@ -549,7 +549,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (canonical.empty()) {
             rsp = BuildSourceMismatchErrorJson(
                 "root node has empty canonical source keys: node=" + plans[i].id,
-                "dag_validate",
+                ErrorStageId::kDagValidate,
                 "",
                 plans[i].id,
                 {},
@@ -577,7 +577,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         if (ss.source_channels.empty()) {
             rsp = BuildSourceMismatchErrorJson(
                 "auto source_share_set has empty source channels: set=" + ss.id,
-                "dag_validate",
+                ErrorStageId::kDagValidate,
                 ss.id,
                 plans[first_idx].id,
                 ss.canonical_source_keys,
@@ -593,7 +593,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (member_keys != ss.canonical_source_keys) {
                 rsp = BuildSourceMismatchErrorJson(
                     "source_share_set canonical source mismatch: set=" + ss.id + ", node=" + member_node_id,
-                    "dag_validate",
+                    ErrorStageId::kDagValidate,
                     ss.id,
                     member_node_id,
                     ss.canonical_source_keys,
@@ -607,8 +607,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
     if (share_set_plans.size() > kDefaultMaxGroupShareSets) {
         rsp = BuildExecutionErrorJson(
             "auto source_share_sets exceed max_group_share_sets",
-            "STREAM_GROUP_DAG_TOO_LARGE",
-            "dag_validate");
+            ErrorCodeId::kStreamGroupDagTooLarge,
+            ErrorStageId::kDagValidate);
         return error::BAD_REQUEST;
     }
 
@@ -651,27 +651,27 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (blocked_by_mutation) {
                 rsp = BuildExecutionErrorJson(
                     "stream channel is being modified: " + conflict_key,
-                    "STREAM_CHANNEL_MUTATING",
-                    "lease");
+                    ErrorCodeId::kStreamChannelMutating,
+                    ErrorStageId::kLease);
                 return error::CONFLICT;
             }
             rsp = BuildExecutionErrorJson(
                 "stream source is in use: " + conflict_key,
-                "STREAM_SOURCE_IN_USE",
-                "lease");
+                ErrorCodeId::kStreamSourceInUse,
+                ErrorStageId::kLease);
             return error::CONFLICT;
         }
         if (lease_rc == EAGAIN) {
             rsp = BuildExecutionErrorJson(
                 "stream channel changed during group prepare: " + version_conflict_key,
-                "STREAM_CHANNEL_VERSION_CHANGED",
-                "lease");
+                ErrorCodeId::kStreamChannelVersionChanged,
+                ErrorStageId::kLease);
             return error::CONFLICT;
         }
         rsp = BuildExecutionErrorJson(
             "stream group lease acquire failed",
-            "STREAM_LEASE_FAILED",
-            "lease");
+            ErrorCodeId::kStreamLeaseFailed,
+            ErrorStageId::kLease);
         return error::INTERNAL_ERROR;
     }
 
@@ -726,8 +726,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (!channel_ref_dedup.insert(channel_ref).second) {
                 rsp = BuildExecutionErrorJson(
                     "duplicate internal stream channel reference: " + channel_ref,
-                    "STREAM_GROUP_BRANCH_BUILD_FAILED",
-                    "branch_build");
+                    ErrorCodeId::kStreamGroupBranchBuildFailed,
+                    ErrorStageId::kBranchBuild);
                 cleanup_local_resources();
                 return error::INTERNAL_ERROR;
             }
@@ -742,8 +742,8 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             if (open_rc != 0) {
                 rsp = BuildExecutionErrorJson(
                     "open internal stream channel failed: " + channel_ref,
-                    "STREAM_GROUP_BRANCH_BUILD_FAILED",
-                    "branch_build");
+                    ErrorCodeId::kStreamGroupBranchBuildFailed,
+                    ErrorStageId::kBranchBuild);
                 cleanup_local_resources();
                 return error::INTERNAL_ERROR;
             }
@@ -931,7 +931,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
                 ETIMEDOUT,
                 "share_set ready timeout: " + ss_runtime.id +
                     ", timeout_s=" + std::to_string(share_set_ready_timeout_s),
-                "STREAM_GROUP_SHARE_SET_READY_TIMEOUT");
+                ToErrorCode(ErrorCodeId::kStreamGroupShareSetReadyTimeout));
             break;
         }
 
@@ -942,7 +942,7 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
                 hub_rc,
                 "share_set start failed: " + ss_runtime.id +
                     (hub_err.empty() ? "" : (", " + hub_err)),
-                "STREAM_GROUP_SHARE_SET_START_FAILED");
+                ToErrorCode(ErrorCodeId::kStreamGroupShareSetStartFailed));
             break;
         }
     }

@@ -14,6 +14,7 @@
 #include <framework/core/channel_adapter.h>
 #include <framework/core/dataframe.h>
 #include <framework/core/dataframe_channel.h>
+#include <framework/core/error_contract.h>
 #include <framework/core/json_error_builder.h>
 #include <framework/core/memory_channel.h>
 #include <framework/builtin/dataframe/passthrough_operator.h>
@@ -813,6 +814,37 @@ void test_json_error_builder() {
         assert(std::string(d["error_code"].GetString()) == "OP_EXEC_FAIL");
         assert(std::string(d["error_stage"].GetString()) == "execute");
         assert(d["sql_index"].IsUint64() && d["sql_index"].GetUint64() == 3);
+    }
+
+    {
+        assert(std::string(ToErrorCode(ErrorCodeId::kOpExecFail)) == "OP_EXEC_FAIL");
+        assert(std::string(ToErrorStage(ErrorStageId::kLease)) == "lease");
+
+        rapidjson::Document d;
+        const std::string json = BuildExecutionErrorWithSqlIndexJson(
+            "typed exec failed",
+            ErrorCodeId::kStreamChannelMutating,
+            ErrorStageId::kModify,
+            1);
+        d.Parse(json.c_str());
+        assert(!d.HasParseError() && d.IsObject());
+        assert(std::string(d["error"].GetString()) == "typed exec failed");
+        assert(std::string(d["error_code"].GetString()) == "STREAM_CHANNEL_MUTATING");
+        assert(std::string(d["error_stage"].GetString()) == "modify");
+        assert(d["sql_index"].IsUint64() && d["sql_index"].GetUint64() == 1);
+    }
+
+    {
+        rapidjson::Document d;
+        const std::string json = BuildErrorWithCodeAndSqlIndexJson(
+            "typed parse failed",
+            ErrorCodeId::kSqlTextInvalid,
+            2);
+        d.Parse(json.c_str());
+        assert(!d.HasParseError() && d.IsObject());
+        assert(std::string(d["error"].GetString()) == "typed parse failed");
+        assert(std::string(d["error_code"].GetString()) == "SQL_TEXT_INVALID");
+        assert(d["sql_index"].IsUint64() && d["sql_index"].GetUint64() == 2);
     }
 
     {

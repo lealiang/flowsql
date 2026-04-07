@@ -2,29 +2,30 @@
 #define _FLOWSQL_SERVICES_TASK_TASK_PLUGIN_H_
 
 #include <common/iplugin.h>
+#include <framework/core/scheduler_control_client.h>
 #include <framework/interfaces/irouter_handle.h>
-#include <framework/interfaces/ischeduler_control_service.h>
 #include <framework/interfaces/itask_store.h>
-
-#include <sqlite3.h>
 
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
-#include <vector>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 namespace flowsql {
 namespace task {
 
+class TaskStoreSqlite;
+
 class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public IRouterHandle, public ITaskStore {
  public:
-    TaskPlugin() = default;
-    ~TaskPlugin() override = default;
+    TaskPlugin();
+    ~TaskPlugin() override;
 
     int Option(const char* arg) override;
     int Load(IQuerier* querier) override;
@@ -53,12 +54,9 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
 
  private:
     int EnsureDb();
-    int EnsureSchema();
     int CleanupOrphans();
     int WriteTaskEvent(const std::string& task_id, const std::string& from_status,
                        const std::string& to_status, const std::string& message);
-    int WriteTaskEventNoLock(const std::string& task_id, const std::string& from_status,
-                             const std::string& to_status, const std::string& message);
     int WriteDiagnostic(const std::string& task_id,
                         int sql_index,
                         const std::string& sql_text,
@@ -67,7 +65,6 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
                         int64_t sink_rows,
                         const std::string& operator_chain);
     int RunRetentionCleanup();
-    int RunRetentionCleanupNoLock();
     int CreateTaskInternal(const std::string& request_sql,
                            const std::string& sqls_json,
                            int sql_count,
@@ -77,19 +74,12 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
                            const std::string& task_kind = "batch",
                            const std::string& runtime_task_id = "");
     void CleanupIntermediateChannels(const std::set<std::string>& channels);
-    std::string BuildDbPath() const;
     static const char* StatusName(TaskStatus s);
     static TaskStatus ParseStatus(const std::string& s);
     static const char* RuntimeStatusName(TaskStatus s);
     static TaskStatus MapStreamRuntimeStatus(const std::string& runtime_status);
     static bool IsTerminal(TaskStatus s);
     static std::string MakeNowTaskId(uint64_t seq);
-    ISchedulerControlService* GetSchedulerControlService(std::string* err_rsp);
-    int32_t SchedulerClassifySql(const std::string& req, std::string* rsp);
-    int32_t SchedulerExecuteBatch(const std::string& req, std::string* rsp);
-    int32_t SchedulerExecuteStream(const std::string& req, std::string* rsp);
-    int32_t SchedulerStopStream(const std::string& req, std::string* rsp);
-    int32_t SchedulerQueryStreamStatus(const std::string& req, std::string* rsp);
     int UpdateRuntimeTaskId(const std::string& task_id, const std::string& runtime_task_id);
     int UpdateTaskKindAndRuntimeId(const std::string& task_id,
                                    const std::string& task_kind,
@@ -103,16 +93,6 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     std::string DequeueTask();
     void WorkerLoop();
     void TimeoutLoop();
-    int GetTaskNoLock(const std::string& task_id, TaskRecord* out);
-    int DeleteTaskNoLock(const std::string& task_id);
-    int UpdateStatusNoLock(const std::string& task_id,
-                           TaskStatus new_status,
-                           const std::string& error_code,
-                           const std::string& error_message,
-                           const std::string& error_stage,
-                           int64_t result_row_count,
-                           int64_t result_col_count,
-                           const std::string& result_target);
     int ExecuteOneTask(const std::string& task_id, std::string* execute_rsp = nullptr);
     int32_t HandleBatchExecute(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleSqlClassify(const std::string& uri, const std::string& req, std::string& rsp);
@@ -131,8 +111,8 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
                                             std::string* err_rsp);
 
     IQuerier* querier_ = nullptr;
-    mutable std::mutex db_mu_;
-    sqlite3* db_ = nullptr;
+    SchedulerControlClient scheduler_client_;
+    std::unique_ptr<TaskStoreSqlite> store_;
     std::string db_dir_ = "./taskdb";
     std::string db_path_;
     int worker_threads_ = 4;

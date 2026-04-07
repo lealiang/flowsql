@@ -22,6 +22,7 @@
 #include "stream_runtime.h"
 #include "broadcast_hub.h"
 #include "stream_task_group.h"
+#include "stream_execution_plan.h"
 
 namespace flowsql {
 
@@ -112,6 +113,15 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
                               std::string& rsp,
                               const std::string& lease_owner_id = "",
                               bool skip_lease_acquire = false);
+    int32_t BuildStreamExecutionPlan(const SqlStatement& stmt,
+                                     const std::string& lease_owner_id,
+                                     bool skip_lease_acquire,
+                                     StreamExecutionPlan* plan,
+                                     std::string* err_rsp);
+    int32_t ValidateStreamExecutionPlan(StreamExecutionPlan* plan, std::string* err_rsp);
+    int32_t AcquireStreamExecutionLease(StreamExecutionPlan* plan,
+                                        LeaseToken* lease_token,
+                                        std::string* err_rsp);
     int32_t HandleStreamExecuteSingle(const rapidjson::Document& doc, std::string& rsp);
     int32_t HandleStreamExecuteGroup(const rapidjson::Document& doc, std::string& rsp);
     int32_t ClassifySqlTaskKind(const std::string& sql_text, std::string* task_kind, std::string* err_rsp);

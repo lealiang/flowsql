@@ -6,7 +6,6 @@
 #include <framework/core/sql_text_splitter.h>
 #include <framework/core/sql_parser.h>
 #include <framework/interfaces/ichannel_registry.h>
-#include <framework/interfaces/ischeduler_control_service.h>
 
 #include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
@@ -14,68 +13,20 @@
 
 #include <chrono>
 #include <cstdio>
-#include <filesystem>
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <set>
 
+#include "task_store_sqlite.h"
 #include "task_sql_utils.h"
-
-namespace fs = std::filesystem;
 
 namespace flowsql {
 namespace task {
 
-namespace {
-
-static const char* kSchemaSql =
-    "CREATE TABLE IF NOT EXISTS tasks ("
-    "task_id TEXT PRIMARY KEY,"
-    "request_sql TEXT NOT NULL,"
-    "sqls_json TEXT NOT NULL DEFAULT '',"
-    "sql_count INTEGER NOT NULL DEFAULT 1,"
-    "current_sql_index INTEGER NOT NULL DEFAULT 0,"
-    "timeout_s INTEGER NOT NULL DEFAULT 0,"
-    "cancel_requested INTEGER NOT NULL DEFAULT 0,"
-    "task_kind TEXT NOT NULL DEFAULT 'batch',"
-    "runtime_task_id TEXT NOT NULL DEFAULT '',"
-    "status TEXT NOT NULL,"
-    "error_code TEXT NOT NULL DEFAULT '',"
-    "error_message TEXT NOT NULL DEFAULT '',"
-    "error_stage TEXT NOT NULL DEFAULT '',"
-    "result_row_count INTEGER NOT NULL DEFAULT 0,"
-    "result_col_count INTEGER NOT NULL DEFAULT 0,"
-    "result_target TEXT NOT NULL DEFAULT '',"
-    "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-    "started_at DATETIME,"
-    "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-    "finished_at DATETIME"
-    ");"
-    "CREATE TABLE IF NOT EXISTS task_events ("
-    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "task_id TEXT NOT NULL,"
-    "from_status TEXT,"
-    "to_status TEXT NOT NULL,"
-    "event_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-    "message TEXT"
-    ");"
-    "CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id);"
-    "CREATE TABLE IF NOT EXISTS task_diagnostics ("
-    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "task_id TEXT NOT NULL,"
-    "sql_index INTEGER NOT NULL,"
-    "sql_text TEXT NOT NULL,"
-    "duration_ms INTEGER NOT NULL DEFAULT 0,"
-    "source_rows INTEGER NOT NULL DEFAULT 0,"
-    "sink_rows INTEGER NOT NULL DEFAULT 0,"
-    "operator_chain TEXT NOT NULL DEFAULT '',"
-    "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
-    ");"
-    "CREATE INDEX IF NOT EXISTS idx_task_diag_task_id ON task_diagnostics(task_id, sql_index);";
-
-}  // namespace
+TaskPlugin::TaskPlugin() = default;
+TaskPlugin::~TaskPlugin() = default;
 
 int TaskPlugin::Option(const char* arg) {
     if (!arg || !*arg) return 0;
@@ -125,6 +76,7 @@ int TaskPlugin::Option(const char* arg) {
 
 int TaskPlugin::Load(IQuerier* querier) {
     querier_ = querier;
+    scheduler_client_.ResetQuerier(querier);
     return 0;
 }
 
@@ -133,96 +85,20 @@ int TaskPlugin::Unload() {
     return 0;
 }
 
-int TaskPlugin::EnsureSchema() {
-    if (!db_) return -1;
-    if (sqlite3_exec(db_, kSchemaSql, nullptr, nullptr, nullptr) != SQLITE_OK) return -1;
-    // 向后兼容：老库没有 sqls_json/sql_count/current_sql_index 列时自动补齐。
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN sqls_json TEXT NOT NULL DEFAULT '';",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN sql_count INTEGER NOT NULL DEFAULT 1;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN current_sql_index INTEGER NOT NULL DEFAULT 0;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN timeout_s INTEGER NOT NULL DEFAULT 0;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'batch';",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN runtime_task_id TEXT NOT NULL DEFAULT '';",
-                       nullptr, nullptr, nullptr);
-    // 向后兼容：老库没有 result_col_count 列时自动补齐。
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN result_col_count INTEGER NOT NULL DEFAULT 0;",
-                       nullptr, nullptr, nullptr);
-    // 向后兼容：老库没有 started_at 列时自动补齐。
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN started_at DATETIME;",
-                       nullptr, nullptr, nullptr);
-    return 0;
-}
-
-std::string TaskPlugin::BuildDbPath() const {
-    if (!db_path_.empty()) return db_path_;
-    fs::path p(db_dir_);
-    p /= "task_store.db";
-    return p.string();
-}
-
 int TaskPlugin::EnsureDb() {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    if (db_) return 0;
-    std::error_code ec;
-    const std::string db_path = BuildDbPath();
-    fs::path parent = fs::path(db_path).parent_path();
-    if (!parent.empty()) {
-        fs::create_directories(parent, ec);
-        if (ec) return -1;
-    } else if (db_path_.empty()) {
-        fs::create_directories(db_dir_, ec);
-        if (ec) return -1;
+    if (!store_) {
+        store_ = std::make_unique<TaskStoreSqlite>();
     }
-    const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
-    if (sqlite3_open_v2(db_path.c_str(), &db_, flags, nullptr) != SQLITE_OK) {
-        if (db_) sqlite3_close(db_);
-        db_ = nullptr;
-        return -1;
-    }
-    (void)sqlite3_exec(db_, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
-    return EnsureSchema();
+    TaskStoreSqlite::OpenOptions options;
+    options.db_dir = db_dir_;
+    options.db_path = db_path_;
+    options.retention_days = retention_days_;
+    options.retention_max_count = retention_max_count_;
+    return store_->Open(options);
 }
 
 int TaskPlugin::CleanupOrphans() {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    if (!db_) return -1;
-    // 查出所有非终态任务
-    sqlite3_stmt* sel = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT task_id, status FROM tasks WHERE status IN ('pending','running');",
-                           -1, &sel, nullptr) != SQLITE_OK) return -1;
-    std::vector<std::pair<std::string, std::string>> orphans;
-    while (sqlite3_step(sel) == SQLITE_ROW) {
-        const unsigned char* id  = sqlite3_column_text(sel, 0);
-        const unsigned char* st  = sqlite3_column_text(sel, 1);
-        if (id && st) orphans.push_back({reinterpret_cast<const char*>(id), reinterpret_cast<const char*>(st)});
-    }
-    sqlite3_finalize(sel);
-    if (orphans.empty()) return 0;
-
-    // 批量置为 failed
-    const char* upd_sql =
-        "UPDATE tasks "
-        "SET status='failed', "
-        "error_code='PROCESS_RESTART', "
-        "error_message='task interrupted by process restart', "
-        "error_stage='bootstrap', "
-        "updated_at=CURRENT_TIMESTAMP, "
-        "finished_at=CURRENT_TIMESTAMP "
-        "WHERE status IN ('pending','running');";
-    if (sqlite3_exec(db_, upd_sql, nullptr, nullptr, nullptr) != SQLITE_OK) return -1;
-
-    // 为每条孤儿任务写入事件记录
-    for (const auto& [id, from_st] : orphans) {
-        WriteTaskEventNoLock(id, from_st, "failed", "PROCESS_RESTART");
-    }
-    return 0;
+    return store_ ? store_->CleanupOrphans() : -1;
 }
 
 int TaskPlugin::Start() {
@@ -230,21 +106,12 @@ int TaskPlugin::Start() {
     if (CleanupOrphans() != 0) return -1;
 
     {
-        std::lock_guard<std::mutex> lock(db_mu_);
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT task_id FROM tasks ORDER BY task_id DESC LIMIT 1;", -1, &stmt, nullptr) ==
-            SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                const unsigned char* txt = sqlite3_column_text(stmt, 0);
-                if (txt) {
-                    std::string last(reinterpret_cast<const char*>(txt));
-                    size_t pos = last.rfind('_');
-                    if (pos != std::string::npos) {
-                        seq_.store(static_cast<uint64_t>(std::strtoull(last.c_str() + pos + 1, nullptr, 10)));
-                    }
-                }
+        std::string last;
+        if (store_ && store_->QueryLastTaskId(&last) == 0 && !last.empty()) {
+            const size_t pos = last.rfind('_');
+            if (pos != std::string::npos) {
+                seq_.store(static_cast<uint64_t>(std::strtoull(last.c_str() + pos + 1, nullptr, 10)));
             }
-            sqlite3_finalize(stmt);
         }
     }
 
@@ -268,13 +135,7 @@ int TaskPlugin::Stop() {
         if (w.joinable()) w.join();
     }
     workers_.clear();
-    {
-        std::lock_guard<std::mutex> lock(db_mu_);
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
-    }
+    if (store_) (void)store_->Close();
     {
         std::lock_guard<std::mutex> lock(mu_);
         queue_.clear();
@@ -345,26 +206,7 @@ bool TaskPlugin::IsTerminal(TaskStatus s) {
 
 int TaskPlugin::WriteTaskEvent(const std::string& task_id, const std::string& from_status,
                                const std::string& to_status, const std::string& message) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    return WriteTaskEventNoLock(task_id, from_status, to_status, message);
-}
-
-int TaskPlugin::WriteTaskEventNoLock(const std::string& task_id, const std::string& from_status,
-                                     const std::string& to_status, const std::string& message) {
-    if (!db_ || task_id.empty() || to_status.empty()) return -1;
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "INSERT INTO task_events(task_id, from_status, to_status, message) VALUES(?1, ?2, ?3, ?4);";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (from_status.empty()) sqlite3_bind_null(stmt, 2);
-    else sqlite3_bind_text(stmt, 2, from_status.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, to_status.c_str(), -1, SQLITE_TRANSIENT);
-    if (message.empty()) sqlite3_bind_null(stmt, 4);
-    else sqlite3_bind_text(stmt, 4, message.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return 0;
+    return store_ ? store_->WriteTaskEvent(task_id, from_status, to_status, message) : -1;
 }
 
 int TaskPlugin::WriteDiagnostic(const std::string& task_id,
@@ -374,23 +216,14 @@ int TaskPlugin::WriteDiagnostic(const std::string& task_id,
                                 int64_t source_rows,
                                 int64_t sink_rows,
                                 const std::string& operator_chain) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    if (!db_ || task_id.empty()) return -1;
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "INSERT INTO task_diagnostics(task_id, sql_index, sql_text, duration_ms, source_rows, sink_rows, operator_chain) "
-        "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 2, sql_index);
-    sqlite3_bind_text(stmt, 3, sql_text.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 4, duration_ms);
-    sqlite3_bind_int64(stmt, 5, source_rows);
-    sqlite3_bind_int64(stmt, 6, sink_rows);
-    sqlite3_bind_text(stmt, 7, operator_chain.c_str(), -1, SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? 0 : -1;
+    return store_ ? store_->WriteDiagnostic(task_id,
+                                            sql_index,
+                                            sql_text,
+                                            duration_ms,
+                                            source_rows,
+                                            sink_rows,
+                                            operator_chain)
+                  : -1;
 }
 
 std::string TaskPlugin::MakeNowTaskId(uint64_t seq) {
@@ -405,54 +238,6 @@ std::string TaskPlugin::MakeNowTaskId(uint64_t seq) {
     char ts[32] = {0};
     std::strftime(ts, sizeof(ts), "%Y%m%d%H%M%S", &tm_now);
     return std::string("tsk_") + ts + "_" + std::to_string(seq);
-}
-
-ISchedulerControlService* TaskPlugin::GetSchedulerControlService(std::string* err_rsp) {
-    if (!querier_) {
-        if (err_rsp) *err_rsp = BuildErrorJson("scheduler control service unavailable");
-        return nullptr;
-    }
-    auto* control = static_cast<ISchedulerControlService*>(querier_->First(IID_SCHEDULER_CONTROL_SERVICE));
-    if (!control) {
-        if (err_rsp) *err_rsp = BuildErrorJson("scheduler control service unavailable");
-        return nullptr;
-    }
-    return control;
-}
-
-int32_t TaskPlugin::SchedulerClassifySql(const std::string& req, std::string* rsp) {
-    if (!rsp) return error::INTERNAL_ERROR;
-    auto* control = GetSchedulerControlService(rsp);
-    if (!control) return error::UNAVAILABLE;
-    return control->ClassifySql(req, rsp);
-}
-
-int32_t TaskPlugin::SchedulerExecuteBatch(const std::string& req, std::string* rsp) {
-    if (!rsp) return error::INTERNAL_ERROR;
-    auto* control = GetSchedulerControlService(rsp);
-    if (!control) return error::UNAVAILABLE;
-    return control->ExecuteBatch(req, rsp);
-}
-
-int32_t TaskPlugin::SchedulerExecuteStream(const std::string& req, std::string* rsp) {
-    if (!rsp) return error::INTERNAL_ERROR;
-    auto* control = GetSchedulerControlService(rsp);
-    if (!control) return error::UNAVAILABLE;
-    return control->ExecuteStream(req, rsp);
-}
-
-int32_t TaskPlugin::SchedulerStopStream(const std::string& req, std::string* rsp) {
-    if (!rsp) return error::INTERNAL_ERROR;
-    auto* control = GetSchedulerControlService(rsp);
-    if (!control) return error::UNAVAILABLE;
-    return control->StopStream(req, rsp);
-}
-
-int32_t TaskPlugin::SchedulerQueryStreamStatus(const std::string& req, std::string* rsp) {
-    if (!rsp) return error::INTERNAL_ERROR;
-    auto* control = GetSchedulerControlService(rsp);
-    if (!control) return error::UNAVAILABLE;
-    return control->QueryStreamStatus(req, rsp);
 }
 
 int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
@@ -473,7 +258,7 @@ int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
     classify_req_w.EndObject();
 
     std::string classify_rsp;
-    const int32_t classify_rc = SchedulerClassifySql(classify_req_buf.GetString(), &classify_rsp);
+    const int32_t classify_rc = scheduler_client_.ClassifySql(classify_req_buf.GetString(), &classify_rsp);
     if (classify_rc != error::OK) {
         if (err_rsp) {
             *err_rsp = classify_rsp.empty() ? BuildErrorJson("scheduler sql classify failed") : classify_rsp;
@@ -498,36 +283,13 @@ int32_t TaskPlugin::ClassifySqlTaskKindViaScheduler(const std::string& sql,
 }
 
 int TaskPlugin::UpdateRuntimeTaskId(const std::string& task_id, const std::string& runtime_task_id) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    if (!db_ || task_id.empty()) return -1;
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "UPDATE tasks SET runtime_task_id=?1, updated_at=CURRENT_TIMESTAMP WHERE task_id=?2;";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, runtime_task_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, task_id.c_str(), -1, SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(stmt);
-    const int changed = sqlite3_changes(db_);
-    sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE && changed > 0) ? 0 : -1;
+    return store_ ? store_->UpdateRuntimeTaskId(task_id, runtime_task_id) : -1;
 }
 
 int TaskPlugin::UpdateTaskKindAndRuntimeId(const std::string& task_id,
                                            const std::string& task_kind,
                                            const std::string& runtime_task_id) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    if (!db_ || task_id.empty()) return -1;
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "UPDATE tasks SET task_kind=?1, runtime_task_id=?2, updated_at=CURRENT_TIMESTAMP WHERE task_id=?3;";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, task_kind.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, runtime_task_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, task_id.c_str(), -1, SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(stmt);
-    const int changed = sqlite3_changes(db_);
-    sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE && changed > 0) ? 0 : -1;
+    return store_ ? store_->UpdateTaskKindAndRuntimeId(task_id, task_kind, runtime_task_id) : -1;
 }
 
 int TaskPlugin::CreateTask(const std::string& request_sql, std::string* task_id) {
@@ -545,25 +307,15 @@ int TaskPlugin::CreateTaskInternal(const std::string& request_sql,
     if (!task_id || request_sql.empty()) return -1;
     if (EnsureDb() != 0) return -1;
     const std::string id = MakeNowTaskId(++seq_);
-    {
-        std::lock_guard<std::mutex> lock(db_mu_);
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql =
-            "INSERT INTO tasks(task_id, request_sql, sqls_json, sql_count, current_sql_index, timeout_s, task_kind, runtime_task_id, status) "
-            "VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 'pending');";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-        sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-        const std::string truncated = TruncateSql(request_sql);
-        sqlite3_bind_text(stmt, 2, truncated.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, sqls_json.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt, 4, sql_count > 0 ? sql_count : 1);
-        sqlite3_bind_int(stmt, 5, timeout_s > 0 ? timeout_s : 0);
-        sqlite3_bind_text(stmt, 6, task_kind.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 7, runtime_task_id.c_str(), -1, SQLITE_TRANSIENT);
-        const int rc = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        if (rc != SQLITE_DONE) return -1;
-    }
+    TaskStoreSqlite::TaskCreateParams params;
+    params.task_id = id;
+    params.request_sql = TruncateSql(request_sql);
+    params.sqls_json = sqls_json;
+    params.sql_count = sql_count;
+    params.timeout_s = timeout_s;
+    params.task_kind = task_kind;
+    params.runtime_task_id = runtime_task_id;
+    if (!store_ || store_->CreateTask(params) != 0) return -1;
     *task_id = id;
     if (enqueue) {
         std::lock_guard<std::mutex> lock(mu_);
@@ -592,111 +344,21 @@ int TaskPlugin::UpdateStatus(const std::string& task_id,
                              int64_t result_row_count,
                              int64_t result_col_count,
                              const std::string& result_target) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    return UpdateStatusNoLock(task_id,
-                              new_status,
-                              error_code,
-                              error_message,
-                              error_stage,
-                              result_row_count,
-                              result_col_count,
-                              result_target);
-}
-
-int TaskPlugin::UpdateStatusNoLock(const std::string& task_id,
-                                   TaskStatus new_status,
-                                   const std::string& error_code,
-                                   const std::string& error_message,
-                                   const std::string& error_stage,
-                                   int64_t result_row_count,
-                                   int64_t result_col_count,
-                                   const std::string& result_target) {
-    if (task_id.empty() || !db_) return -1;
-
-    // 先查当前状态，用于终态保护和事件记录
-    std::string cur_status_str;
-    {
-        sqlite3_stmt* sel = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT status FROM tasks WHERE task_id=?1;", -1, &sel, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(sel, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(sel) == SQLITE_ROW) {
-                const unsigned char* v = sqlite3_column_text(sel, 0);
-                if (v) cur_status_str = reinterpret_cast<const char*>(v);
-            }
-            sqlite3_finalize(sel);
-        }
-    }
-    if (cur_status_str.empty()) return -1;  // 任务不存在
-    if (IsTerminal(ParseStatus(cur_status_str))) return 1;  // 终态保护，返回 1 表示冲突
-
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "UPDATE tasks SET status=?1, error_code=?2, error_message=?3, error_stage=?4, "
-        "result_row_count=?5, result_col_count=?6, result_target=?7, updated_at=CURRENT_TIMESTAMP, "
-        "cancel_requested=CASE WHEN ?9=1 THEN 0 ELSE cancel_requested END, "
-        "started_at=CASE WHEN ?8=1 AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, "
-        "finished_at=CASE WHEN ?9=1 THEN CURRENT_TIMESTAMP ELSE finished_at END "
-        "WHERE task_id=?10 AND status NOT IN ('completed','failed','stopped','cancelled','timeout');";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, StatusName(new_status), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, error_code.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, error_message.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, error_stage.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 5, result_row_count);
-    sqlite3_bind_int64(stmt, 6, result_col_count);
-    sqlite3_bind_text(stmt, 7, result_target.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 8, (new_status == TaskStatus::kRunning) ? 1 : 0);
-    sqlite3_bind_int(stmt, 9, IsTerminal(new_status) ? 1 : 0);
-    sqlite3_bind_text(stmt, 10, task_id.c_str(), -1, SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(stmt);
-    const int changed = sqlite3_changes(db_);
-    sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE || changed <= 0) return -1;
-
-    WriteTaskEventNoLock(task_id, cur_status_str, StatusName(new_status), error_code);
-    return 0;
+    if (!store_) return -1;
+    TaskStoreSqlite::TaskStatusUpdate update;
+    update.task_id = task_id;
+    update.new_status = new_status;
+    update.error_code = error_code;
+    update.error_message = error_message;
+    update.error_stage = error_stage;
+    update.result_row_count = result_row_count;
+    update.result_col_count = result_col_count;
+    update.result_target = result_target;
+    return store_->UpdateStatus(update);
 }
 
 int TaskPlugin::GetTask(const std::string& task_id, TaskRecord* out) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    return GetTaskNoLock(task_id, out);
-}
-
-int TaskPlugin::GetTaskNoLock(const std::string& task_id, TaskRecord* out) {
-    if (task_id.empty() || !out || !db_) return -1;
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "SELECT task_id, request_sql, IFNULL(task_kind,'batch'), IFNULL(runtime_task_id,''), status, "
-        "error_code, error_message, error_stage, result_row_count, result_col_count, result_target, "
-        "created_at, IFNULL(started_at,''), updated_at, IFNULL(finished_at,'') "
-        "FROM tasks WHERE task_id=?1;";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return -1;
-    }
-    auto txt = [stmt](int idx) -> std::string {
-        const unsigned char* v = sqlite3_column_text(stmt, idx);
-        return v ? reinterpret_cast<const char*>(v) : "";
-    };
-    out->task_id = txt(0);
-    out->request_sql = txt(1);
-    out->task_kind = txt(2);
-    out->runtime_task_id = txt(3);
-    out->status = ParseStatus(txt(4));
-    out->error_code = txt(5);
-    out->error_message = txt(6);
-    out->error_stage = txt(7);
-    out->result_row_count = sqlite3_column_int64(stmt, 8);
-    out->result_col_count = sqlite3_column_int64(stmt, 9);
-    out->result_target = txt(10);
-    out->created_at = txt(11);
-    out->started_at = txt(12);
-    out->updated_at = txt(13);
-    out->finished_at = txt(14);
-    sqlite3_finalize(stmt);
-    return 0;
+    return store_ ? store_->GetTask(task_id, out) : -1;
 }
 
 int TaskPlugin::ListTasks(int page,
@@ -704,61 +366,7 @@ int TaskPlugin::ListTasks(int page,
                           const std::string& status_filter,
                           std::vector<TaskRecord>* items,
                           int64_t* total) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    if (!items || !total || !db_) return -1;
-    if (page < 1) page = 1;
-    if (page_size < 1) page_size = 20;
-    if (page_size > 100) page_size = 100;
-    items->clear();
-    *total = 0;
-
-    std::string where;
-    if (!status_filter.empty()) where = " WHERE status=?1";
-
-    sqlite3_stmt* cnt = nullptr;
-    std::string cnt_sql = "SELECT COUNT(1) FROM tasks" + where + ";";
-    if (sqlite3_prepare_v2(db_, cnt_sql.c_str(), -1, &cnt, nullptr) != SQLITE_OK) return -1;
-    if (!status_filter.empty()) sqlite3_bind_text(cnt, 1, status_filter.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(cnt) == SQLITE_ROW) *total = sqlite3_column_int64(cnt, 0);
-    sqlite3_finalize(cnt);
-
-    sqlite3_stmt* stmt = nullptr;
-    std::string sql =
-        "SELECT task_id, request_sql, IFNULL(task_kind,'batch'), IFNULL(runtime_task_id,''), status, "
-        "error_code, error_message, error_stage, result_row_count, result_col_count, result_target, "
-        "created_at, IFNULL(started_at,''), updated_at, IFNULL(finished_at,'') "
-        "FROM tasks" + where + " ORDER BY created_at DESC LIMIT ? OFFSET ?;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    int bind_idx = 1;
-    if (!status_filter.empty()) sqlite3_bind_text(stmt, bind_idx++, status_filter.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, bind_idx++, page_size);
-    sqlite3_bind_int(stmt, bind_idx, (page - 1) * page_size);
-
-    auto txt = [stmt](int idx) -> std::string {
-        const unsigned char* v = sqlite3_column_text(stmt, idx);
-        return v ? reinterpret_cast<const char*>(v) : "";
-    };
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        TaskRecord r;
-        r.task_id = txt(0);
-        r.request_sql = txt(1);
-        r.task_kind = txt(2);
-        r.runtime_task_id = txt(3);
-        r.status = ParseStatus(txt(4));
-        r.error_code = txt(5);
-        r.error_message = txt(6);
-        r.error_stage = txt(7);
-        r.result_row_count = sqlite3_column_int64(stmt, 8);
-        r.result_col_count = sqlite3_column_int64(stmt, 9);
-        r.result_target = txt(10);
-        r.created_at = txt(11);
-        r.started_at = txt(12);
-        r.updated_at = txt(13);
-        r.finished_at = txt(14);
-        items->push_back(std::move(r));
-    }
-    sqlite3_finalize(stmt);
-    return 0;
+    return store_ ? store_->ListTasks(page, page_size, status_filter, items, total) : -1;
 }
 
 int TaskPlugin::ListTasksByKind(const std::string& task_kind,
@@ -767,181 +375,15 @@ int TaskPlugin::ListTasksByKind(const std::string& task_kind,
                                 const std::string& status_filter,
                                 std::vector<TaskRecord>* items,
                                 int64_t* total) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    if (!items || !total || !db_ || task_kind.empty()) return -1;
-    if (page < 1) page = 1;
-    if (page_size < 1) page_size = 20;
-    if (page_size > 100) page_size = 100;
-    items->clear();
-    *total = 0;
-
-    const bool has_status = !status_filter.empty();
-    const std::string where = has_status
-        ? " WHERE task_kind=?1 AND status=?2"
-        : " WHERE task_kind=?1";
-
-    sqlite3_stmt* cnt = nullptr;
-    std::string cnt_sql = "SELECT COUNT(1) FROM tasks" + where + ";";
-    if (sqlite3_prepare_v2(db_, cnt_sql.c_str(), -1, &cnt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(cnt, 1, task_kind.c_str(), -1, SQLITE_TRANSIENT);
-    if (has_status) sqlite3_bind_text(cnt, 2, status_filter.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(cnt) == SQLITE_ROW) *total = sqlite3_column_int64(cnt, 0);
-    sqlite3_finalize(cnt);
-
-    sqlite3_stmt* stmt = nullptr;
-    std::string sql =
-        "SELECT task_id, request_sql, IFNULL(task_kind,'batch'), IFNULL(runtime_task_id,''), status, "
-        "error_code, error_message, error_stage, result_row_count, result_col_count, result_target, "
-        "created_at, IFNULL(started_at,''), updated_at, IFNULL(finished_at,'') "
-        "FROM tasks" + where + " ORDER BY created_at DESC LIMIT ?3 OFFSET ?4;";
-    if (!has_status) {
-        sql =
-            "SELECT task_id, request_sql, IFNULL(task_kind,'batch'), IFNULL(runtime_task_id,''), status, "
-            "error_code, error_message, error_stage, result_row_count, result_col_count, result_target, "
-            "created_at, IFNULL(started_at,''), updated_at, IFNULL(finished_at,'') "
-            "FROM tasks" + where + " ORDER BY created_at DESC LIMIT ?2 OFFSET ?3;";
-    }
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, task_kind.c_str(), -1, SQLITE_TRANSIENT);
-    int bind_idx = 2;
-    if (has_status) {
-        sqlite3_bind_text(stmt, bind_idx++, status_filter.c_str(), -1, SQLITE_TRANSIENT);
-    }
-    sqlite3_bind_int(stmt, bind_idx++, page_size);
-    sqlite3_bind_int(stmt, bind_idx, (page - 1) * page_size);
-
-    auto txt = [stmt](int idx) -> std::string {
-        const unsigned char* v = sqlite3_column_text(stmt, idx);
-        return v ? reinterpret_cast<const char*>(v) : "";
-    };
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        TaskRecord r;
-        r.task_id = txt(0);
-        r.request_sql = txt(1);
-        r.task_kind = txt(2);
-        r.runtime_task_id = txt(3);
-        r.status = ParseStatus(txt(4));
-        r.error_code = txt(5);
-        r.error_message = txt(6);
-        r.error_stage = txt(7);
-        r.result_row_count = sqlite3_column_int64(stmt, 8);
-        r.result_col_count = sqlite3_column_int64(stmt, 9);
-        r.result_target = txt(10);
-        r.created_at = txt(11);
-        r.started_at = txt(12);
-        r.updated_at = txt(13);
-        r.finished_at = txt(14);
-        items->push_back(std::move(r));
-    }
-    sqlite3_finalize(stmt);
-    return 0;
+    return store_ ? store_->ListTasksByKind(task_kind, page, page_size, status_filter, items, total) : -1;
 }
 
 int TaskPlugin::DeleteTask(const std::string& task_id) {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    return DeleteTaskNoLock(task_id);
-}
-
-int TaskPlugin::DeleteTaskNoLock(const std::string& task_id) {
-    TaskRecord r;
-    if (GetTaskNoLock(task_id, &r) != 0) return -1;
-    if (!IsTerminal(r.status)) return 1;
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE TRANSACTION;", nullptr, nullptr, nullptr) != SQLITE_OK) return -1;
-
-    bool ok = true;
-    sqlite3_stmt* stmt = nullptr;
-
-    if (sqlite3_prepare_v2(db_, "DELETE FROM task_events WHERE task_id=?1;", -1, &stmt, nullptr) != SQLITE_OK) {
-        ok = false;
-    } else {
-        sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(stmt) != SQLITE_DONE) ok = false;
-        sqlite3_finalize(stmt);
-        stmt = nullptr;
-    }
-
-    int changed = 0;
-    if (ok) {
-        if (sqlite3_prepare_v2(db_, "DELETE FROM task_diagnostics WHERE task_id=?1;", -1, &stmt, nullptr) != SQLITE_OK) {
-            ok = false;
-        } else {
-            sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(stmt) != SQLITE_DONE) ok = false;
-            sqlite3_finalize(stmt);
-            stmt = nullptr;
-        }
-    }
-
-    if (ok) {
-        if (sqlite3_prepare_v2(db_, "DELETE FROM tasks WHERE task_id=?1;", -1, &stmt, nullptr) != SQLITE_OK) {
-            ok = false;
-        } else {
-            sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-            const int rc = sqlite3_step(stmt);
-            changed = sqlite3_changes(db_);
-            if (rc != SQLITE_DONE || changed <= 0) ok = false;
-            sqlite3_finalize(stmt);
-            stmt = nullptr;
-        }
-    }
-
-    if (!ok) {
-        (void)sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        return -1;
-    }
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        (void)sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        return -1;
-    }
-    return 0;
+    return store_ ? store_->DeleteTask(task_id) : -1;
 }
 
 int TaskPlugin::RunRetentionCleanup() {
-    std::lock_guard<std::mutex> lock(db_mu_);
-    return RunRetentionCleanupNoLock();
-}
-
-int TaskPlugin::RunRetentionCleanupNoLock() {
-    if (!db_) return -1;
-    if (retention_days_ <= 0 && retention_max_count_ <= 0) return 0;
-
-    std::set<std::string> to_delete;
-    auto add_ids = [&to_delete](sqlite3* db, const char* sql, int int_param) {
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return;
-        if (int_param >= 0) sqlite3_bind_int(stmt, 1, int_param);
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const unsigned char* txt = sqlite3_column_text(stmt, 0);
-            if (txt) to_delete.insert(reinterpret_cast<const char*>(txt));
-        }
-        sqlite3_finalize(stmt);
-    };
-
-    if (retention_days_ > 0) {
-        const char* sql_days =
-            "SELECT task_id FROM tasks "
-            "WHERE status IN ('completed','failed','stopped','cancelled','timeout') "
-            "AND created_at < datetime('now', '-' || ?1 || ' days');";
-        add_ids(db_, sql_days, retention_days_);
-    }
-    if (retention_max_count_ > 0) {
-        const char* sql_count =
-            "SELECT task_id FROM tasks "
-            "WHERE status IN ('completed','failed','stopped','cancelled','timeout') "
-            "ORDER BY datetime(created_at) DESC, task_id DESC "
-            "LIMIT -1 OFFSET ?1;";
-        add_ids(db_, sql_count, retention_max_count_);
-    }
-
-    static constexpr size_t kCleanupBatchLimit = 128;
-    size_t cleaned = 0;
-    for (const auto& id : to_delete) {
-        if (cleaned >= kCleanupBatchLimit) break;
-        if (DeleteTaskNoLock(id) == 0) {
-            ++cleaned;
-        }
-    }
-    return 0;
+    return store_ ? store_->RunRetentionCleanup() : -1;
 }
 
 std::string TaskPlugin::DequeueTask() {
@@ -966,25 +408,7 @@ void TaskPlugin::TimeoutLoop() {
     constexpr auto kRetentionInterval = std::chrono::seconds(1);
     while (running_.load()) {
         std::vector<std::string> timed_out_ids;
-        {
-            std::lock_guard<std::mutex> lock(db_mu_);
-            if (db_) {
-                sqlite3_stmt* stmt = nullptr;
-                const char* sql =
-                    "SELECT task_id FROM tasks "
-                    "WHERE status='running' AND timeout_s > 0 AND started_at IS NOT NULL "
-                    "AND (strftime('%s','now') - strftime('%s', started_at)) >= timeout_s;";
-                if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-                    while (sqlite3_step(stmt) == SQLITE_ROW) {
-                        const unsigned char* txt = sqlite3_column_text(stmt, 0);
-                        if (txt) timed_out_ids.emplace_back(reinterpret_cast<const char*>(txt));
-                    }
-                    sqlite3_finalize(stmt);
-                } else if (stmt) {
-                    sqlite3_finalize(stmt);
-                }
-            }
-        }
+        if (store_) (void)store_->ListTimedOutTaskIds(&timed_out_ids);
 
         for (const auto& id : timed_out_ids) {
             (void)UpdateStatus(id, TaskStatus::kTimeout, "TIMEOUT", "task execution timeout", "timeout", 0, 0, "");
@@ -1010,20 +434,7 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
 
     std::string request_sql = rec.request_sql;
     std::string sqls_json;
-    {
-        std::lock_guard<std::mutex> lock(db_mu_);
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql = "SELECT request_sql, IFNULL(sqls_json,'') FROM tasks WHERE task_id=?1;";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-        sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            const unsigned char* req_sql = sqlite3_column_text(stmt, 0);
-            const unsigned char* sqls = sqlite3_column_text(stmt, 1);
-            if (req_sql) request_sql = reinterpret_cast<const char*>(req_sql);
-            if (sqls) sqls_json = reinterpret_cast<const char*>(sqls);
-        }
-        sqlite3_finalize(stmt);
-    }
+    if (store_) (void)store_->QueryTaskSqlPayload(task_id, &request_sql, &sqls_json);
 
     std::vector<std::string> sqls;
     if (!ParseSqlsJson(sqls_json, &sqls) && !request_sql.empty()) {
@@ -1043,14 +454,7 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
     }
 
     auto update_current_index = [this, &task_id](int index) {
-        std::lock_guard<std::mutex> lock(db_mu_);
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql = "UPDATE tasks SET current_sql_index=?1, updated_at=CURRENT_TIMESTAMP WHERE task_id=?2;";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return;
-        sqlite3_bind_int(stmt, 1, index);
-        sqlite3_bind_text(stmt, 2, task_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+        if (store_) (void)store_->UpdateCurrentSqlIndex(task_id, index);
     };
 
     int64_t final_rows = 0;
@@ -1063,21 +467,7 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
         // running 任务的取消/超时在下一条 SQL 执行前生效（不抢占正在执行的 SQL）
         bool terminal_now = false;
         bool cancel_requested = false;
-        {
-            std::lock_guard<std::mutex> lock(db_mu_);
-            sqlite3_stmt* task_stmt = nullptr;
-            const char* task_sql = "SELECT status, cancel_requested FROM tasks WHERE task_id=?1;";
-            if (sqlite3_prepare_v2(db_, task_sql, -1, &task_stmt, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(task_stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-                if (sqlite3_step(task_stmt) == SQLITE_ROW) {
-                    const unsigned char* status_txt = sqlite3_column_text(task_stmt, 0);
-                    const std::string status = status_txt ? reinterpret_cast<const char*>(status_txt) : "";
-                    terminal_now = IsTerminal(ParseStatus(status));
-                    cancel_requested = sqlite3_column_int(task_stmt, 1) == 1;
-                }
-                sqlite3_finalize(task_stmt);
-            }
-        }
+        if (store_) (void)store_->QueryTaskRuntimeFlags(task_id, &terminal_now, &cancel_requested);
         if (terminal_now) {
             CleanupIntermediateChannels(intermediate_channels);
             return 0;
@@ -1102,7 +492,7 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
         req_w.EndObject();
 
         std::string rsp;
-        int32_t rc = SchedulerExecuteBatch(req_buf.GetString(), &rsp);
+        int32_t rc = scheduler_client_.ExecuteBatch(req_buf.GetString(), &rsp);
         if (rc != error::OK) {
             const auto sql_end = std::chrono::steady_clock::now();
             const int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(sql_end - sql_start).count();
@@ -1204,14 +594,14 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
     if (d.HasMember("sql") || d.HasMember("sqls")) {
         rsp = BuildErrorWithCodeJson(
             "batch execution accepts only sql_text/mode/timeout_s",
-            "BATCH_SQL_TEXT_INVALID");
+            ErrorCodeId::kBatchSqlTextInvalid);
         return error::BAD_REQUEST;
     }
 
     if (!d.HasMember("sql_text") || !d["sql_text"].IsString()) {
         rsp = BuildErrorWithCodeJson(
             "invalid request, expected {\"sql_text\":\"...\"}",
-            "BATCH_SQL_TEXT_INVALID");
+            ErrorCodeId::kBatchSqlTextInvalid);
         return error::BAD_REQUEST;
     }
     const std::string sql_text = d["sql_text"].GetString();
@@ -1225,7 +615,7 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
         }
         rsp = BuildErrorWithCodeAndSqlIndexJson(
             err,
-            "BATCH_SQL_TEXT_INVALID",
+            ErrorCodeId::kBatchSqlTextInvalid,
             split_err.statement_index);
         return error::BAD_REQUEST;
     }
@@ -1242,7 +632,7 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
         if (task_kind == "stream") {
             rsp = BuildErrorWithCodeAndSqlIndexJson(
                 "stream SQL must use /tasks/stream/execute",
-                "STREAM_SQL_USE_STREAM_API",
+                ErrorCodeId::kStreamSqlUseStreamApi,
                 i);
             return error::BAD_REQUEST;
         }
@@ -1397,7 +787,7 @@ int32_t TaskPlugin::HandleSqlAnalyze(const std::string&, const std::string& req,
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject() || !d.HasMember("sql_text") || !d["sql_text"].IsString()) {
-        rsp = BuildErrorWithCodeJson("invalid request, expected {\"sql_text\":\"...\"}", "SQL_TEXT_INVALID");
+        rsp = BuildErrorWithCodeJson("invalid request, expected {\"sql_text\":\"...\"}", ErrorCodeId::kSqlTextInvalid);
         return error::BAD_REQUEST;
     }
     const std::string sql_text = d["sql_text"].GetString();
@@ -1409,7 +799,7 @@ int32_t TaskPlugin::HandleSqlAnalyze(const std::string&, const std::string& req,
         if (!split_err.message.empty()) {
             err += ": " + split_err.message;
         }
-        rsp = BuildErrorWithCodeAndSqlIndexJson(err, "SQL_TEXT_INVALID", split_err.statement_index);
+        rsp = BuildErrorWithCodeAndSqlIndexJson(err, ErrorCodeId::kSqlTextInvalid, split_err.statement_index);
         return error::BAD_REQUEST;
     }
 
@@ -1421,7 +811,7 @@ int32_t TaskPlugin::HandleSqlAnalyze(const std::string&, const std::string& req,
         const int32_t classify_rc = ClassifySqlTaskKindViaScheduler(sqls[i], &task_kind, &classify_err_rsp);
         if (classify_rc != error::OK) {
             std::string err_text = "sql classify failed";
-            std::string err_code = "SQL_ANALYZE_CLASSIFY_FAILED";
+            std::string err_code = ToErrorCode(ErrorCodeId::kSqlAnalyzeClassifyFailed);
             if (!classify_err_rsp.empty()) {
                 rapidjson::Document err_doc;
                 err_doc.Parse(classify_err_rsp.c_str());
@@ -1604,16 +994,11 @@ int32_t TaskPlugin::HandleDiagnostics(const std::string&, const std::string& req
         return error::NOT_FOUND;
     }
 
-    std::lock_guard<std::mutex> lock(db_mu_);
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "SELECT sql_index, sql_text, duration_ms, source_rows, sink_rows, operator_chain, created_at "
-        "FROM task_diagnostics WHERE task_id=?1 ORDER BY sql_index ASC;";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    std::vector<TaskStoreSqlite::TaskDiagnostic> diagnostics;
+    if (!store_ || store_->ListDiagnostics(task_id, &diagnostics) != 0) {
         rsp = BuildErrorJson("failed to query diagnostics");
         return error::INTERNAL_ERROR;
     }
-    sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
@@ -1622,29 +1007,24 @@ int32_t TaskPlugin::HandleDiagnostics(const std::string&, const std::string& req
     w.String(task_id.c_str());
     w.Key("items");
     w.StartArray();
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        auto txt = [stmt](int idx) -> std::string {
-            const unsigned char* v = sqlite3_column_text(stmt, idx);
-            return v ? reinterpret_cast<const char*>(v) : "";
-        };
+    for (const auto& item : diagnostics) {
         w.StartObject();
         w.Key("sql_index");
-        w.Int(sqlite3_column_int(stmt, 0));
+        w.Int(item.sql_index);
         w.Key("sql_text");
-        w.String(txt(1).c_str());
+        w.String(item.sql_text.c_str());
         w.Key("duration_ms");
-        w.Int64(sqlite3_column_int64(stmt, 2));
+        w.Int64(item.duration_ms);
         w.Key("source_rows");
-        w.Int64(sqlite3_column_int64(stmt, 3));
+        w.Int64(item.source_rows);
         w.Key("sink_rows");
-        w.Int64(sqlite3_column_int64(stmt, 4));
+        w.Int64(item.sink_rows);
         w.Key("operator_chain");
-        w.String(txt(5).c_str());
+        w.String(item.operator_chain.c_str());
         w.Key("created_at");
-        w.String(txt(6).c_str());
+        w.String(item.created_at.c_str());
         w.EndObject();
     }
-    sqlite3_finalize(stmt);
     w.EndArray();
     w.EndObject();
     rsp = buf.GetString();
@@ -1709,24 +1089,16 @@ int32_t TaskPlugin::HandleCancel(const std::string&, const std::string& req, std
         return error::OK;
     }
 
-    int rc = SQLITE_ERROR;
-    int changed = 0;
-    {
-        std::lock_guard<std::mutex> lock(db_mu_);
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql =
-            "UPDATE tasks SET cancel_requested=1, updated_at=CURRENT_TIMESTAMP "
-            "WHERE task_id=?1 AND status='running';";
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            rsp = BuildErrorJson("failed to prepare cancel statement");
-            return error::INTERNAL_ERROR;
-        }
-        sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt);
-        changed = sqlite3_changes(db_);
-        sqlite3_finalize(stmt);
+    if (!store_) {
+        rsp = BuildErrorJson("task store unavailable");
+        return error::INTERNAL_ERROR;
     }
-    if (rc != SQLITE_DONE || changed <= 0) {
+    const int cancel_rc = store_->RequestCancelRunningTask(task_id);
+    if (cancel_rc < 0) {
+        rsp = BuildErrorJson("failed to request task cancel");
+        return error::INTERNAL_ERROR;
+    }
+    if (cancel_rc > 0) {
         rsp = BuildErrorJson("task is not cancellable at current state");
         return error::CONFLICT;
     }
@@ -1761,14 +1133,14 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     if (doc.HasMember("share_set_ready_timeout_s")) {
         if (!doc["share_set_ready_timeout_s"].IsInt()) {
             rsp = BuildErrorWithCodeJson("invalid request, share_set_ready_timeout_s must be integer",
-                                    "STREAM_GROUP_SQL_TEXT_INVALID");
+                                    ErrorCodeId::kStreamGroupSqlTextInvalid);
             return error::BAD_REQUEST;
         }
         has_share_set_ready_timeout_s = true;
         share_set_ready_timeout_s = doc["share_set_ready_timeout_s"].GetInt();
         if (share_set_ready_timeout_s <= 0) {
             rsp = BuildErrorWithCodeJson("invalid request, share_set_ready_timeout_s must be > 0",
-                                    "STREAM_GROUP_SQL_TEXT_INVALID");
+                                    ErrorCodeId::kStreamGroupSqlTextInvalid);
             return error::BAD_REQUEST;
         }
     }
@@ -1786,7 +1158,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
 
     if (!doc.HasMember("sql_text") || !doc["sql_text"].IsString()) {
         rsp = BuildErrorWithCodeJson("invalid request, expected {\"sql_text\":\"...\"}",
-                                "STREAM_GROUP_SQL_TEXT_INVALID");
+                                ErrorCodeId::kStreamGroupSqlTextInvalid);
         return error::BAD_REQUEST;
     }
     const std::string sql_text = doc["sql_text"].GetString();
@@ -1804,7 +1176,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         }
         rsp = BuildErrorWithCodeAndSqlIndexJson(
             err,
-            "STREAM_GROUP_SQL_TEXT_INVALID",
+            ErrorCodeId::kStreamGroupSqlTextInvalid,
             split_err.statement_index);
         return error::BAD_REQUEST;
     }
@@ -1813,19 +1185,19 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         if (doc.HasMember("group_mode") || has_legacy_dag || has_legacy_sql || has_legacy_sqls) {
             rsp = BuildErrorWithCodeJson(
                 "single execution accepts only sql_text/timeout_s",
-                "STREAM_GROUP_SQL_TEXT_INVALID");
+                ErrorCodeId::kStreamGroupSqlTextInvalid);
             return error::BAD_REQUEST;
         }
         if (has_share_set_ready_timeout_s) {
             rsp = BuildErrorWithCodeJson(
                 "single execution must not contain share_set_ready_timeout_s",
-                "STREAM_GROUP_SQL_TEXT_INVALID");
+                ErrorCodeId::kStreamGroupSqlTextInvalid);
             return error::BAD_REQUEST;
         }
         if (sqls.size() != 1) {
             rsp = BuildErrorWithCodeJson(
                 "single execution requires exactly one SQL statement in sql_text",
-                "STREAM_GROUP_SQL_TEXT_INVALID");
+                ErrorCodeId::kStreamGroupSqlTextInvalid);
             return error::BAD_REQUEST;
         }
 
@@ -1837,7 +1209,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         classify_req_w.EndObject();
 
         std::string classify_rsp;
-        const int32_t classify_rc = SchedulerClassifySql(classify_req_buf.GetString(), &classify_rsp);
+        const int32_t classify_rc = scheduler_client_.ClassifySql(classify_req_buf.GetString(), &classify_rsp);
         if (classify_rc != error::OK) {
             rsp = classify_rsp.empty() ? BuildErrorJson("scheduler sql classify failed") : classify_rsp;
             return classify_rc;
@@ -1852,14 +1224,14 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         if (std::string(classify_doc["task_kind"].GetString()) != "stream") {
             rsp = BuildErrorWithCodeJson(
                 "batch SQL must use /tasks/batch/execute",
-                "BATCH_SQL_USE_BATCH_API");
+                ErrorCodeId::kBatchSqlUseBatchApi);
             return error::BAD_REQUEST;
         }
     } else if (execution_kind == "group") {
         if (has_legacy_sql || has_legacy_sqls || has_legacy_dag) {
             rsp = BuildErrorWithCodeJson(
                 "group execution accepts only sql_text/group_mode/timeout fields",
-                "STREAM_GROUP_SQL_TEXT_INVALID");
+                ErrorCodeId::kStreamGroupSqlTextInvalid);
             return error::BAD_REQUEST;
         }
         if (!doc.HasMember("group_mode") || !doc["group_mode"].IsString()) {
@@ -1868,19 +1240,19 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         }
         if (std::string(doc["group_mode"].GetString()) != "dag") {
             rsp = BuildErrorWithCodeJson("invalid request, group_mode must be dag",
-                                    "STREAM_GROUP_MODE_INVALID");
+                                    ErrorCodeId::kStreamGroupModeInvalid);
             return error::BAD_REQUEST;
         }
         if (sqls.size() < 2) {
             rsp = BuildErrorWithCodeJson(
                 "group execution requires at least two SQL statements in sql_text",
-                "STREAM_GROUP_SQL_TEXT_INVALID");
+                ErrorCodeId::kStreamGroupSqlTextInvalid);
             return error::BAD_REQUEST;
         }
     } else {
         rsp = BuildErrorWithCodeJson(
             "invalid request, execution_kind must be single or group",
-            "STREAM_GROUP_SQL_TEXT_INVALID");
+            ErrorCodeId::kStreamGroupSqlTextInvalid);
         return error::BAD_REQUEST;
     }
 
@@ -1904,7 +1276,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
     scheduler_req_w.EndObject();
 
     std::string scheduler_rsp;
-    const int32_t rc = SchedulerExecuteStream(scheduler_req_buf.GetString(), &scheduler_rsp);
+    const int32_t rc = scheduler_client_.ExecuteStream(scheduler_req_buf.GetString(), &scheduler_rsp);
     if (rc != error::OK) {
         rsp = scheduler_rsp.empty() ? BuildErrorJson("scheduler stream execute failed") : scheduler_rsp;
         return rc;
@@ -1945,7 +1317,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
         stop_w.String(runtime_task_id.c_str());
         stop_w.EndObject();
         std::string ignored;
-        (void)SchedulerStopStream(stop_req_buf.GetString(), &ignored);
+        (void)scheduler_client_.StopStream(stop_req_buf.GetString(), &ignored);
 
         rsp = BuildErrorJson("failed to create stream task");
         return error::INTERNAL_ERROR;
@@ -2013,7 +1385,7 @@ int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req,
     req_w.EndObject();
 
     std::string scheduler_rsp;
-    const int32_t rc = SchedulerStopStream(req_buf.GetString(), &scheduler_rsp);
+    const int32_t rc = scheduler_client_.StopStream(req_buf.GetString(), &scheduler_rsp);
     if (rc != error::OK) {
         rsp = scheduler_rsp.empty() ? BuildErrorJson("scheduler stream stop failed") : scheduler_rsp;
         return rc;
@@ -2136,7 +1508,7 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
         req_w.EndObject();
 
         std::string scheduler_rsp;
-        const int32_t rc = SchedulerQueryStreamStatus(req_buf.GetString(), &scheduler_rsp);
+        const int32_t rc = scheduler_client_.QueryStreamStatus(req_buf.GetString(), &scheduler_rsp);
         if (rc == error::OK) {
             rapidjson::Document runtime_doc;
             runtime_doc.Parse(scheduler_rsp.c_str());

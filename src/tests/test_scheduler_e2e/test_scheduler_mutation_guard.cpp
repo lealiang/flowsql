@@ -194,6 +194,24 @@ struct SchedulerPluginTestAccessor {
     static void SweepRuntimeRetainedObjects(SchedulerPlugin* plugin, int64_t now_ms = 0) {
         plugin->SweepRuntimeRetainedObjects(now_ms);
     }
+
+    static int AcquireStreamExecutionLease(SchedulerPlugin* plugin,
+                                           StreamExecutionPlan* plan,
+                                           LeaseToken* lease_token,
+                                           std::string* err_rsp) {
+        return plugin->AcquireStreamExecutionLease(plan, lease_token, err_rsp);
+    }
+
+    static bool HasTaskLease(SchedulerPlugin* plugin, const std::string& runtime_task_id) {
+        std::lock_guard<std::mutex> lock(plugin->stream_channel_refs_mu_);
+        return plugin->stream_task_leases_.find(runtime_task_id) != plugin->stream_task_leases_.end();
+    }
+
+    static uint32_t ChannelRefCount(SchedulerPlugin* plugin, const std::string& channel_key) {
+        std::lock_guard<std::mutex> lock(plugin->stream_channel_refs_mu_);
+        auto it = plugin->stream_channel_ref_counts_.find(channel_key);
+        return it == plugin->stream_channel_ref_counts_.end() ? 0u : it->second;
+    }
 };
 }  // namespace scheduler
 }  // namespace flowsql
@@ -319,6 +337,55 @@ int main() {
                   &version_conflict_key),
               0);
     flowsql::scheduler::SchedulerPluginTestAccessor::ReleaseStreamTaskLeases(&plugin, "stream_task_version_new");
+
+    // AcquireStreamExecutionLease: when execution aborts before commit, lease must be auto-released.
+    {
+        flowsql::scheduler::StreamExecutionPlan plan;
+        plan.runtime_task_id = "stream_task_raii_no_commit";
+        plan.source_keys = source_keys;
+        plan.sink_keys = sink_keys;
+        plan.skip_lease_acquire = false;
+
+        std::string lease_err;
+        {
+            flowsql::scheduler::LeaseToken lease_token;
+            ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::AcquireStreamExecutionLease(
+                          &plugin, &plan, &lease_token, &lease_err),
+                      0);
+            ASSERT_TRUE(flowsql::scheduler::SchedulerPluginTestAccessor::HasTaskLease(
+                &plugin, "stream_task_raii_no_commit"));
+            ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::ChannelRefCount(&plugin, source_key), 1u);
+            ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::ChannelRefCount(&plugin, sink_key), 1u);
+        }
+        ASSERT_TRUE(!flowsql::scheduler::SchedulerPluginTestAccessor::HasTaskLease(
+            &plugin, "stream_task_raii_no_commit"));
+        ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::ChannelRefCount(&plugin, source_key), 0u);
+        ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::ChannelRefCount(&plugin, sink_key), 0u);
+    }
+
+    // AcquireStreamExecutionLease: commit should transfer ownership to runtime and skip auto-release.
+    {
+        flowsql::scheduler::StreamExecutionPlan plan;
+        plan.runtime_task_id = "stream_task_raii_commit";
+        plan.source_keys = source_keys;
+        plan.sink_keys = sink_keys;
+        plan.skip_lease_acquire = false;
+
+        std::string lease_err;
+        {
+            flowsql::scheduler::LeaseToken lease_token;
+            ASSERT_EQ(flowsql::scheduler::SchedulerPluginTestAccessor::AcquireStreamExecutionLease(
+                          &plugin, &plan, &lease_token, &lease_err),
+                      0);
+            lease_token.Commit();
+        }
+        ASSERT_TRUE(flowsql::scheduler::SchedulerPluginTestAccessor::HasTaskLease(
+            &plugin, "stream_task_raii_commit"));
+        flowsql::scheduler::SchedulerPluginTestAccessor::ReleaseStreamTaskLeases(
+            &plugin, "stream_task_raii_commit");
+        ASSERT_TRUE(!flowsql::scheduler::SchedulerPluginTestAccessor::HasTaskLease(
+            &plugin, "stream_task_raii_commit"));
+    }
 
     // Managed channel owner should remain alive after map erase if caller holds shared owner.
     {

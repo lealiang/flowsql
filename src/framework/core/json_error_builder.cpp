@@ -92,6 +92,10 @@ std::string BuildErrorWithCodeJson(const std::string& error, const std::string& 
     return buf.GetString();
 }
 
+std::string BuildErrorWithCodeJson(const std::string& error, ErrorCodeId error_code_id) {
+    return BuildErrorWithCodeJson(error, ToErrorCode(error_code_id));
+}
+
 std::string BuildErrorWithCodeAndSqlIndexJson(const std::string& error,
                                               const std::string& error_code,
                                               std::size_t sql_index) {
@@ -108,6 +112,12 @@ std::string BuildErrorWithCodeAndSqlIndexJson(const std::string& error,
     return buf.GetString();
 }
 
+std::string BuildErrorWithCodeAndSqlIndexJson(const std::string& error,
+                                              ErrorCodeId error_code_id,
+                                              std::size_t sql_index) {
+    return BuildErrorWithCodeAndSqlIndexJson(error, ToErrorCode(error_code_id), sql_index);
+}
+
 std::string BuildExecutionErrorJson(const std::string& error,
                                     const std::string& error_code,
                                     const std::string& error_stage) {
@@ -122,6 +132,18 @@ std::string BuildExecutionErrorJson(const std::string& error,
     w.String(error_stage.c_str());
     w.EndObject();
     return buf.GetString();
+}
+
+std::string BuildExecutionErrorJson(const std::string& error,
+                                    ErrorCodeId error_code_id,
+                                    const std::string& error_stage) {
+    return BuildExecutionErrorJson(error, ToErrorCode(error_code_id), error_stage);
+}
+
+std::string BuildExecutionErrorJson(const std::string& error,
+                                    ErrorCodeId error_code_id,
+                                    ErrorStageId error_stage_id) {
+    return BuildExecutionErrorJson(error, ToErrorCode(error_code_id), ToErrorStage(error_stage_id));
 }
 
 std::string BuildExecutionErrorWithSqlIndexJson(const std::string& error,
@@ -141,6 +163,21 @@ std::string BuildExecutionErrorWithSqlIndexJson(const std::string& error,
     w.Uint64(static_cast<uint64_t>(sql_index));
     w.EndObject();
     return buf.GetString();
+}
+
+std::string BuildExecutionErrorWithSqlIndexJson(const std::string& error,
+                                                ErrorCodeId error_code_id,
+                                                const std::string& error_stage,
+                                                std::size_t sql_index) {
+    return BuildExecutionErrorWithSqlIndexJson(error, ToErrorCode(error_code_id), error_stage, sql_index);
+}
+
+std::string BuildExecutionErrorWithSqlIndexJson(const std::string& error,
+                                                ErrorCodeId error_code_id,
+                                                ErrorStageId error_stage_id,
+                                                std::size_t sql_index) {
+    return BuildExecutionErrorWithSqlIndexJson(
+        error, ToErrorCode(error_code_id), ToErrorStage(error_stage_id), sql_index);
 }
 
 std::string BuildCapabilityMismatchJson(const std::string& error,
@@ -174,6 +211,13 @@ std::string BuildCapabilityMismatchJson(const std::string& error,
     return buf.GetString();
 }
 
+std::string BuildCapabilityMismatchJson(const std::string& error,
+                                        ErrorCodeId error_code_id,
+                                        const StreamChannelCapabilities* source_caps,
+                                        const StreamChannelCapabilities* sink_caps) {
+    return BuildCapabilityMismatchJson(error, ToErrorCode(error_code_id), source_caps, sink_caps);
+}
+
 std::string BuildSinkCapabilityMismatchJson(const std::string& error,
                                             const std::string& error_stage,
                                             const std::string& sink_key,
@@ -186,7 +230,7 @@ std::string BuildSinkCapabilityMismatchJson(const std::string& error,
     w.Key("error");
     w.String(error.c_str());
     w.Key("error_code");
-    w.String("STREAM_GROUP_SINK_CAPABILITY_MISMATCH");
+    w.String(ToErrorCode(ErrorCodeId::kStreamGroupSinkCapabilityMismatch));
     w.Key("error_stage");
     w.String(error_stage.c_str());
     w.Key("sink_key");
@@ -209,6 +253,20 @@ std::string BuildSinkCapabilityMismatchJson(const std::string& error,
     return buf.GetString();
 }
 
+std::string BuildSinkCapabilityMismatchJson(const std::string& error,
+                                            ErrorStageId error_stage_id,
+                                            const std::string& sink_key,
+                                            uint32_t required_writers,
+                                            ProducerMode actual_put_mode,
+                                            uint32_t actual_max_producers) {
+    return BuildSinkCapabilityMismatchJson(error,
+                                           ToErrorStage(error_stage_id),
+                                           sink_key,
+                                           required_writers,
+                                           actual_put_mode,
+                                           actual_max_producers);
+}
+
 std::string BuildSourceMismatchErrorJson(const std::string& error,
                                          const std::string& error_stage,
                                          const std::string& share_set_id,
@@ -225,7 +283,7 @@ std::string BuildSourceMismatchErrorJson(const std::string& error,
     w.Key("error");
     w.String(error.c_str());
     w.Key("error_code");
-    w.String("STREAM_GROUP_SOURCE_MISMATCH");
+    w.String(ToErrorCode(ErrorCodeId::kStreamGroupSourceMismatch));
     w.Key("error_stage");
     w.String(error_stage.c_str());
     if (!share_set_id.empty()) {
@@ -250,6 +308,20 @@ std::string BuildSourceMismatchErrorJson(const std::string& error,
     w.EndArray();
     w.EndObject();
     return buf.GetString();
+}
+
+std::string BuildSourceMismatchErrorJson(const std::string& error,
+                                         ErrorStageId error_stage_id,
+                                         const std::string& share_set_id,
+                                         const std::string& node_id,
+                                         const std::vector<std::string>& expected_keys,
+                                         const std::vector<std::string>& actual_keys) {
+    return BuildSourceMismatchErrorJson(error,
+                                        ToErrorStage(error_stage_id),
+                                        share_set_id,
+                                        node_id,
+                                        expected_keys,
+                                        actual_keys);
 }
 
 }  // namespace flowsql

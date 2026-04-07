@@ -13,6 +13,7 @@
 
 #include <common/error_code.h>
 #include <common/iquerier.hpp>
+#include <framework/core/scheduler_control_client.h>
 #include <framework/interfaces/ichannel_registry.h>
 #include <framework/interfaces/irouter_handle.h>
 #include <framework/interfaces/ischeduler_control_service.h>
@@ -172,51 +173,6 @@ class MockRouterHandle : public IRouterHandle {
 
  private:
     std::vector<RouteItem> items_;
-};
-
-class RouterBackedSchedulerControlService : public ISchedulerControlService {
- public:
-    explicit RouterBackedSchedulerControlService(IRouterHandle* router) : router_(router) {}
-
-    int32_t ClassifySql(const std::string& req_json, std::string* rsp_json) override {
-        return Dispatch("/scheduler/sql/classify", req_json, rsp_json);
-    }
-
-    int32_t ExecuteBatch(const std::string& req_json, std::string* rsp_json) override {
-        return Dispatch("/scheduler/batch/execute", req_json, rsp_json);
-    }
-
-    int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) override {
-        return Dispatch("/scheduler/stream/execute", req_json, rsp_json);
-    }
-
-    int32_t StopStream(const std::string& req_json, std::string* rsp_json) override {
-        return Dispatch("/scheduler/stream/stop", req_json, rsp_json);
-    }
-
-    int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) override {
-        return Dispatch("/scheduler/stream/status", req_json, rsp_json);
-    }
-
- private:
-    int32_t Dispatch(const char* uri, const std::string& req_json, std::string* rsp_json) {
-        if (!rsp_json) return error::INTERNAL_ERROR;
-        if (!router_) {
-            *rsp_json = R"({"error":"scheduler route not found"})";
-            return error::UNAVAILABLE;
-        }
-        fnRouterHandler handler;
-        router_->EnumRoutes([&](const RouteItem& item) {
-            if (item.method == "POST" && item.uri == uri) handler = item.handler;
-        });
-        if (!handler) {
-            *rsp_json = std::string(R"({"error":"scheduler route not found: )") + uri + "\"}";
-            return error::UNAVAILABLE;
-        }
-        return handler(uri, req_json, *rsp_json);
-    }
-
-    IRouterHandle* router_ = nullptr;
 };
 
 class MockChannelRegistry : public IChannelRegistry {
