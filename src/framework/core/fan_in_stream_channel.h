@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_CORE_FAN_IN_STREAM_CHANNEL_H_
 #define _FLOWSQL_FRAMEWORK_CORE_FAN_IN_STREAM_CHANNEL_H_
 

@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_ICHANNEL_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_ICHANNEL_H_
 
@@ -17,27 +25,57 @@ namespace ChannelType {
     constexpr const char* kBlockStream = "block_stream";
 }  // namespace ChannelType
 
-// IChannel — 数据通道基类（纯接口，不继承 IPlugin）
-// 只定义生命周期、身份和元数据，数据读写方法由子类定义（IDataFrameChannel、IDatabaseChannel 等）
+/**
+ * @brief 数据通道抽象基接口，定义通道身份、元数据与生命周期。
+ *
+ * 具体数据读写能力由子接口扩展（如 IDataFrameChannel、IDatabaseChannel、IStreamChannel）。
+ */
 interface IChannel {
     virtual ~IChannel() = default;
 
-    // 身份标识
+    /**
+     * @brief 返回通道类别（catalog/type 前缀）。
+     * @return 通道类别字符串，如 "dataframe"、"mysql"、"stream"。
+     */
     virtual const char* Category() = 0;
+    /**
+     * @brief 返回通道名称（不含类别前缀）。
+     * @return 通道名称字符串。
+     */
     virtual const char* Name() = 0;
 
-    // 通道类型（"dataframe"、"database" 等）
+    /**
+     * @brief 返回通道大类类型。
+     * @return 类型字符串，典型值见 ChannelType 常量。
+     */
     virtual const char* Type() = 0;
 
-    // 元数据描述（格式由实现决定，如 Arrow Schema JSON）
+    /**
+     * @brief 返回通道元数据描述。
+     * @return 元数据字符串，格式由具体实现定义（例如 Arrow Schema JSON）。
+     */
     virtual const char* Schema() = 0;
 
-    // 生命周期
+    /**
+     * @brief 打开通道资源。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Open() = 0;
+    /**
+     * @brief 关闭通道资源。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Close() = 0;
+    /**
+     * @brief 查询通道是否处于已打开状态。
+     * @return true 表示已打开，false 表示未打开。
+     */
     virtual bool IsOpened() const = 0;
 
-    // 批量刷新
+    /**
+     * @brief 刷新通道内部缓冲。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Flush() = 0;
 };
 

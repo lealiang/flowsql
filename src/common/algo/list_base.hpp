@@ -1,15 +1,9 @@
 /*
- * Copyright (C) 2020-06 - flowSQL
- *
+ * Copyright (C) 2026 LIHUO
  *
  * Licensed under the MIT License. See LICENSE file in the project root
  * for full license information.
  *
- *
- * Author       : LIHUO
- * Date         : 2021-03-10 22:10:44
- * LastEditors  : LIHUO
- * LastEditTime : 2026-02-25 12:00:00
  */
 
 #ifndef _FLOWSQL_COMMON_ALGO_LIST_BASE_HPP_

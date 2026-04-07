@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IOPERATOR_CATALOG_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IOPERATOR_CATALOG_H_
 
@@ -35,11 +43,32 @@ struct UpsertResult {
     std::string error_message;
 };
 
+/**
+ * @brief 算子元数据目录接口，提供状态查询与批量上架能力。
+ */
 interface IOperatorCatalog {
     virtual ~IOperatorCatalog() = default;
 
+    /**
+     * @brief 查询算子当前状态。
+     * @param category 算子分类。
+     * @param name 算子名称。
+     * @return 算子状态枚举值。
+     */
     virtual OperatorStatus QueryStatus(const std::string& category, const std::string& name) = 0;
+    /**
+     * @brief 批量写入或更新算子元数据。
+     * @param operators 待 upsert 的算子元数据数组。
+     * @return 批量处理结果（成功/失败数与错误信息）。
+     */
     virtual UpsertResult UpsertBatch(const std::vector<OperatorMeta>& operators) = 0;
+    /**
+     * @brief 设置算子启用状态。
+     * @param category 算子分类。
+     * @param name 算子名称。
+     * @param active true 表示激活，false 表示停用。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int SetActive(const std::string& category, const std::string& name, bool active) = 0;
 };
 

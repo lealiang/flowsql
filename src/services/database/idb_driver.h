@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_SERVICES_DATABASE_IDB_DRIVER_H_
 #define _FLOWSQL_SERVICES_DATABASE_IDB_DRIVER_H_
 
@@ -9,22 +17,46 @@
 namespace flowsql {
 namespace database {
 
-// IDbDriver — 数据库驱动基础接口（所有驱动必须实现）
-// 只包含连接管理和元数据，不包含数据读写方法
-// 数据读写能力通过能力接口（IBatchReadable/IBatchWritable等）按需组合
+/**
+ * @brief 数据库驱动基础接口。
+ *
+ * 只定义连接管理与元数据查询能力；数据读写由能力接口按需组合。
+ */
 interface IDbDriver {
     virtual ~IDbDriver() = default;
 
-    // 连接管理
+    /**
+     * @brief 建立数据库连接。
+     * @param params 连接参数映射（host/user/password/db 等）。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Connect(const std::unordered_map<std::string, std::string>& params) = 0;
+    /**
+     * @brief 断开数据库连接。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Disconnect() = 0;
+    /**
+     * @brief 查询当前连接状态。
+     * @return true 表示已连接，false 表示未连接。
+     */
     virtual bool IsConnected() = 0;
 
-    // 驱动元数据
+    /**
+     * @brief 获取驱动名称。
+     * @return 驱动名称字符串。
+     */
     virtual const char* DriverName() = 0;
+    /**
+     * @brief 获取最近一次错误信息。
+     * @return 错误字符串指针。
+     */
     virtual const char* LastError() = 0;
 
-    // 健康检查
+    /**
+     * @brief 执行健康检查。
+     * @return true 表示可用，false 表示不可用。
+     */
     virtual bool Ping() = 0;
 };
 

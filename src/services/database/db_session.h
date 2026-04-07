@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_SERVICES_DATABASE_DB_SESSION_H_
 #define _FLOWSQL_SERVICES_DATABASE_DB_SESSION_H_
 
@@ -19,46 +27,91 @@ class Schema;
 namespace flowsql {
 namespace database {
 
-// IResultSet — 查询结果集接口
-// 封装数据库查询结果，提供行迭代和元数据访问
-//
-// 所有权说明：IResultSet 由 ExecuteQuery 的调用方负责释放（delete）。
-// 在 RelationDbSessionBase 中，IResultSet 被传入 IBatchReader，由 IBatchReader 持有并在
-// Release() 时释放。直接调用 ExecuteQuery 的代码需手动 delete 返回的 IResultSet。
+/**
+ * @brief 查询结果集接口，提供行迭代与字段访问能力。
+ *
+ * 所有权约定：ExecuteQuery 返回的 IResultSet 由调用方负责释放。
+ */
 interface IResultSet {
     virtual ~IResultSet() = default;
 
-    // 获取字段数
+    /**
+     * @brief 获取字段数量。
+     * @return 字段数。
+     */
     virtual int FieldCount() = 0;
 
-    // 获取字段名
+    /**
+     * @brief 获取字段名。
+     * @param index 字段索引（从 0 开始）。
+     * @return 字段名称字符串。
+     */
     virtual const char* FieldName(int index) const = 0;
 
-    // 获取字段类型
+    /**
+     * @brief 获取字段类型编码。
+     * @param index 字段索引（从 0 开始）。
+     * @return 字段类型编码（由具体驱动定义）。
+     */
     virtual int FieldType(int index) const = 0;
 
-    // 获取字段长度
+    /**
+     * @brief 获取字段长度。
+     * @param index 字段索引（从 0 开始）。
+     * @return 字段长度。
+     */
     virtual int FieldLength(int index) = 0;
 
-    // 判断是否还有下一行
+    /**
+     * @brief 判断是否还有下一行。
+     * @return true 表示仍有下一行。
+     */
     virtual bool HasNext() = 0;
 
-    // 移动到下一行，返回 true 表示成功
+    /**
+     * @brief 移动到下一行。
+     * @return true 表示成功移动到下一行。
+     */
     virtual bool Next() = 0;
 
-    // 获取当前行的整数值
+    /**
+     * @brief 获取当前行 int 值。
+     * @param index 字段索引。
+     * @param value 输出值指针。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int GetInt(int index, int* value) = 0;
 
-    // 获取当前行的 64 位整数值
+    /**
+     * @brief 获取当前行 int64 值。
+     * @param index 字段索引。
+     * @param value 输出值指针。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int GetInt64(int index, int64_t* value) = 0;
 
-    // 获取当前行的双精度浮点数值
+    /**
+     * @brief 获取当前行 double 值。
+     * @param index 字段索引。
+     * @param value 输出值指针。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int GetDouble(int index, double* value) = 0;
 
-    // 获取当前行的字符串值
+    /**
+     * @brief 获取当前行字符串值。
+     * @param index 字段索引。
+     * @param value 输出字符串地址。
+     * @param len 输出字符串长度。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int GetString(int index, const char** value, size_t* len) = 0;
 
-    // 判断当前行的指定列是否为 NULL
+    /**
+     * @brief 判断当前行字段是否为 NULL。
+     * @param index 字段索引。
+     * @return true 表示为 NULL。
+     */
     virtual bool IsNull(int index) = 0;
 };
 
@@ -69,18 +122,30 @@ class IDbSession : public std::enable_shared_from_this<IDbSession> {
 public:
     virtual ~IDbSession() = default;
 
-    // 获取最近一次操作的错误信息
+    /**
+     * @brief 获取最近一次错误信息。
+     * @return 错误字符串指针。
+     */
     virtual const char* GetLastError() { return last_error_.c_str(); }
 
     // ==================== 行式数据库接口 ====================
 
-    // 执行查询，返回结果集（返回 0 成功，-1 失败）
+    /**
+     * @brief 执行查询 SQL 并返回结果集。
+     * @param sql 查询 SQL。
+     * @param result 输出结果集对象。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int ExecuteQuery(const char* sql, IResultSet** result) {
         last_error_ = "ExecuteQuery not supported";
         return -1;
     }
 
-    // 执行 SQL（INSERT/UPDATE/DELETE 等），返回受影响行数，-1 失败
+    /**
+     * @brief 执行无结果集 SQL（INSERT/UPDATE/DELETE 等）。
+     * @param sql 输入 SQL。
+     * @return 受影响行数或 0 表示成功，<0 表示失败（由实现定义）。
+     */
     virtual int ExecuteSql(const char* sql) {
         last_error_ = "ExecuteSql not supported";
         return -1;
@@ -88,14 +153,24 @@ public:
 
     // ==================== 列式数据库接口 ====================
 
-    // 执行 Arrow 查询，返回 RecordBatch 列表
+    /**
+     * @brief 执行 Arrow 查询。
+     * @param sql 查询 SQL。
+     * @param batches 输出 RecordBatch 数组。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int ExecuteQueryArrow(const char* sql,
                                   std::vector<std::shared_ptr<arrow::RecordBatch>>* batches) {
         last_error_ = "ExecuteQueryArrow not supported";
         return -1;
     }
 
-    // 写入 Arrow RecordBatches
+    /**
+     * @brief 写入 Arrow 批次数组。
+     * @param table 目标表名。
+     * @param batches 输入 RecordBatch 数组。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int WriteArrowBatches(const char* table,
                                   const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches) {
         last_error_ = "WriteArrowBatches not supported";
@@ -105,12 +180,28 @@ public:
     // ==================== 事务控制 ====================
     // 某些列式数据库（如 ClickHouse）不支持事务，默认实现为空操作
 
+    /**
+     * @brief 开启事务。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int BeginTransaction() { return 0; }
+    /**
+     * @brief 提交事务。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int CommitTransaction() { return 0; }
+    /**
+     * @brief 回滚事务。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int RollbackTransaction() { return 0; }
 
     // ==================== 健康检查 ====================
 
+    /**
+     * @brief 健康检查。
+     * @return true 表示连接可用。
+     */
     virtual bool Ping() = 0;
 
 protected:

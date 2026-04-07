@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IROUTER_HANDLE_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IROUTER_HANDLE_H_
 
@@ -9,9 +17,13 @@
 
 namespace flowsql {
 
-// 路由处理函数：纯业务逻辑，不感知 HTTP
-// 参数：uri（完整路径）、req_json（请求体 JSON）、rsp_json（响应体 JSON，输出）
-// 返回：error::OK 成功，其他值见 error_code.h
+/**
+ * @brief 路由处理函数签名（纯业务逻辑，不感知 HTTP 协议细节）。
+ * @param uri 完整路由路径。
+ * @param req_json 请求 JSON 字符串。
+ * @param rsp_json 输出 JSON 字符串。
+ * @return 业务错误码（0 表示成功）。
+ */
 typedef std::function<int32_t(const std::string& uri,
                                const std::string& req_json,
                                std::string& rsp_json)>
@@ -28,10 +40,15 @@ struct RouteItem {
 const Guid IID_ROUTER_HANDLE = {
     0xa1b2c3d4, 0xe5f6, 0x7890, {0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90}};
 
-// 业务插件实现此接口，声明自己提供的路由
-// RouterAgencyPlugin 在 Start() 时通过 Traverse(IID_ROUTER_HANDLE) 收集所有路由
+/**
+ * @brief 插件路由声明接口，RouterAgencyPlugin 在启动阶段统一收集路由表。
+ */
 interface IRouterHandle {
     virtual ~IRouterHandle() = default;
+    /**
+     * @brief 枚举插件暴露的所有路由。
+     * @param callback 枚举回调，参数为单条路由信息。
+     */
     virtual void EnumRoutes(std::function<void(const RouteItem&)> callback) = 0;
 };
 

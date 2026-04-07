@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "task_plugin.h"
 
 #include <common/error_code.h>
@@ -426,6 +434,11 @@ void TaskPlugin::TimeoutLoop() {
 }
 
 int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_rsp) {
+    // 逻辑链：
+    // 1) 读取任务与 SQL 列表，提前收集中间 dataframe sink 以便失败回收；
+    // 2) 按语句顺序执行 batch SQL，并在每步写入诊断与进度索引；
+    // 3) 统一处理 cancel/timeout/执行失败，并映射错误码与阶段；
+    // 4) 结束时写最终状态并清理中间通道。
     TaskRecord rec;
     if (GetTask(task_id, &rec) != 0) return -1;
     if (rec.task_kind != "batch") return 0;
@@ -584,6 +597,10 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
 }
 
 int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& req, std::string& rsp) {
+    // 逻辑链：
+    // 1) 仅接受 sql_text 入口并做多 SQL 拆分；
+    // 2) 对每条 SQL 走 scheduler classify，禁止 stream SQL 混入 batch API；
+    // 3) 创建任务元数据，async 返回 pending；sync 直接串行执行并回填结果。
     rapidjson::Document d;
     d.Parse(req.c_str());
     if (d.HasParseError() || !d.IsObject()) {
@@ -1109,6 +1126,11 @@ int32_t TaskPlugin::HandleCancel(const std::string&, const std::string& req, std
 }
 
 int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& req, std::string& rsp) {
+    // 逻辑链：
+    // 1) 解析 execution_kind/sql_text/timeout 等参数并做约束校验；
+    // 2) single 模式强校验单语句且必须是 stream SQL；group 模式校验 dag 前提；
+    // 3) 组装 scheduler 请求执行 runtime task；
+    // 4) 回写 task store，并把 runtime 元信息透传给前端。
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject()) {
@@ -1356,6 +1378,11 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
 }
 
 int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req, std::string& rsp) {
+    // 逻辑链：
+    // 1) 校验任务归属与 runtime_task_id；
+    // 2) 转发 stop 请求到 scheduler；
+    // 3) 将 runtime status 映射为 task store 状态并更新错误信息；
+    // 4) 回传 task/runtime 双视角状态，便于前端展示。
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
@@ -1464,6 +1491,11 @@ int32_t TaskPlugin::HandleStreamStop(const std::string&, const std::string& req,
 }
 
 int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& req, std::string& rsp) {
+    // 逻辑链：
+    // 1) 读取 task store 快照，作为兜底状态；
+    // 2) 若存在 runtime_task_id，则向 scheduler 拉取最新运行态；
+    // 3) 将 runtime 状态回写 task store（仅在必要状态迁移时）；
+    // 4) 输出融合后的状态、统计、节点与 share_set 视图。
     rapidjson::Document doc;
     doc.Parse(req.c_str());
     if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {

@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "broadcast_hub.h"
 
 #include <arrow/api.h>
@@ -128,6 +136,11 @@ void BroadcastHub::MarkFailed(int code, const std::string& message, int64_t now_
 }
 
 void BroadcastHub::RunLoop() {
+    // 逻辑链：
+    // 1) 确保 source/member channel 已打开；
+    // 2) 循环 poll source 并处理 stop/cancel/eof/error 分支；
+    // 3) 数据事件下执行共享背压判定，再 fan-out 写入各成员通道；
+    // 4) 维护 delivered/drop 统计与状态机终态。
     if (!source_->IsOpened()) {
         const int open_rc = source_->Open();
         if (open_rc != 0) {

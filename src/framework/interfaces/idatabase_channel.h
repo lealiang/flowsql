@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IDATABASE_CHANNEL_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IDATABASE_CHANNEL_H_
 
@@ -27,123 +35,229 @@ struct BatchWriteStats {
     int64_t elapsed_ms = 0;
 };
 
-// IBatchReader — 流式读取器
-// 生命周期：CreateReader() → GetSchema() → Next()... → Close() → Release()
+/**
+ * @brief 行式批量读取器接口。
+ *
+ * 生命周期：CreateReader() -> GetSchema() -> Next()... -> Close() -> Release()。
+ */
 interface IBatchReader {
     virtual ~IBatchReader() = default;
 
-    // 获取结果集 Schema（Arrow Schema IPC 序列化）
+    /**
+     * @brief 获取结果集 schema（Arrow Schema IPC 序列化）。
+     * @param buf 输出 buffer 地址。
+     * @param len 输出 buffer 长度。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int GetSchema(const uint8_t** buf, size_t* len) = 0;
 
-    // 读取下一批数据（Arrow RecordBatch IPC buffer）
-    // 返回：0=有数据, 1=已读完, <0=错误
+    /**
+     * @brief 读取下一批数据（Arrow RecordBatch IPC 序列化）。
+     * @param buf 输出 buffer 地址。
+     * @param len 输出 buffer 长度。
+     * @return 0 表示有数据，1 表示已读完，<0 表示错误。
+     */
     virtual int Next(const uint8_t** buf, size_t* len) = 0;
 
-    // 取消正在进行的读取
+    /**
+     * @brief 取消进行中的读取操作。
+     */
     virtual void Cancel() = 0;
 
-    // 关闭读取器
+    /**
+     * @brief 关闭读取器，释放底层游标资源。
+     */
     virtual void Close() = 0;
 
-    // 错误信息
+    /**
+     * @brief 获取最近一次错误信息。
+     * @return 错误字符串指针。
+     */
     virtual const char* GetLastError() = 0;
 
-    // 释放读取器自身
+    /**
+     * @brief 释放读取器对象自身。
+     */
     virtual void Release() = 0;
 };
 
-// IBatchWriter — 批量写入器
-// 生命周期：CreateWriter() → Write()... → Flush() → Close() → Release()
+/**
+ * @brief 行式批量写入器接口。
+ *
+ * 生命周期：CreateWriter() -> Write()... -> Flush() -> Close() -> Release()。
+ */
 interface IBatchWriter {
     virtual ~IBatchWriter() = default;
 
-    // 写入一批数据（Arrow RecordBatch IPC buffer）
+    /**
+     * @brief 写入一批数据（Arrow RecordBatch IPC 序列化）。
+     * @param buf 输入 buffer 地址。
+     * @param len 输入 buffer 长度。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Write(const uint8_t* buf, size_t len) = 0;
 
-    // 强制刷新缓冲区到数据库
+    /**
+     * @brief 强制刷新缓冲区到数据库。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Flush() = 0;
 
-    // 关闭写入器，返回统计信息（stats 可为 nullptr）
+    /**
+     * @brief 关闭写入器并返回统计信息。
+     * @param stats 输出统计信息，可为 nullptr。
+     */
     virtual void Close(BatchWriteStats* stats) = 0;
 
-    // 错误信息
+    /**
+     * @brief 获取最近一次错误信息。
+     * @return 错误字符串指针。
+     */
     virtual const char* GetLastError() = 0;
 
-    // 释放写入器自身
+    /**
+     * @brief 释放写入器对象自身。
+     */
     virtual void Release() = 0;
 };
 
-// IArrowReader — 列式读取器（Arrow 原生）
-// 生命周期：ExecuteQueryArrow() → 直接获取 RecordBatch 列表
+/**
+ * @brief Arrow 原生读取器接口。
+ */
 interface IArrowReader {
     virtual ~IArrowReader() = default;
 
-    // 执行查询并直接获取 Arrow RecordBatch 列表
+    /**
+     * @brief 执行查询并读取 Arrow RecordBatch 列表。
+     * @param query 查询 SQL。
+     * @param batches 输出批次数组。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int ExecuteQueryArrow(const char* query,
                                   std::vector<std::shared_ptr<arrow::RecordBatch>>* batches) = 0;
 
-    // 获取 Schema
+    /**
+     * @brief 获取结果 schema。
+     * @return Arrow Schema 指针。
+     */
     virtual std::shared_ptr<arrow::Schema> GetSchema() = 0;
 
-    // 错误信息
+    /**
+     * @brief 获取最近一次错误信息。
+     * @return 错误字符串指针。
+     */
     virtual const char* GetLastError() = 0;
 
-    // 释放读取器自身
+    /**
+     * @brief 释放读取器对象自身。
+     */
     virtual void Release() = 0;
 };
 
-// IArrowWriter — 列式写入器（Arrow 原生）
-// 生命周期：CreateWriter() → WriteBatches() → Close() → Release()
+/**
+ * @brief Arrow 原生写入器接口。
+ */
 interface IArrowWriter {
     virtual ~IArrowWriter() = default;
 
-    // 直接写入 Arrow RecordBatch 列表
+    /**
+     * @brief 直接写入 Arrow RecordBatch 列表。
+     * @param table 目标表名。
+     * @param batches 输入批次数组。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int WriteBatches(const char* table,
                             const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches) = 0;
 
-    // 错误信息
+    /**
+     * @brief 获取最近一次错误信息。
+     * @return 错误字符串指针。
+     */
     virtual const char* GetLastError() = 0;
 
-    // 释放写入器自身
+    /**
+     * @brief 释放写入器对象自身。
+     */
     virtual void Release() = 0;
 };
 
-// IDatabaseChannel — 数据库通道
-// 作为工厂创建 Reader/Writer，内部管理连接
+/**
+ * @brief 数据库通道接口，封装连接、读写器创建与 SQL 执行能力。
+ */
 interface IDatabaseChannel : public IChannel {
     // ==================== 行式数据库接口 ====================
 
-    // 创建读取器，执行 query 并流式返回结果
+    /**
+     * @brief 创建行式读取器并执行查询。
+     * @param query 查询 SQL。
+     * @param reader 输出读取器指针。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int CreateReader(const char* query, IBatchReader** reader) = 0;
 
-    // 创建写入器，指定目标表
+    /**
+     * @brief 创建行式写入器。
+     * @param table 目标表名。
+     * @param writer 输出写入器指针。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int CreateWriter(const char* table, IBatchWriter** writer) = 0;
 
     // ==================== 列式数据库接口（Arrow 原生） ====================
 
-    // 创建列式读取器
+    /**
+     * @brief 创建 Arrow 读取器并执行查询。
+     * @param query 查询 SQL。
+     * @param reader 输出 Arrow 读取器指针。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int CreateArrowReader(const char* query, IArrowReader** reader) = 0;
 
-    // 创建列式写入器
+    /**
+     * @brief 创建 Arrow 写入器。
+     * @param table 目标表名。
+     * @param writer 输出 Arrow 写入器指针。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int CreateArrowWriter(const char* table, IArrowWriter** writer) = 0;
 
-    // 直接执行 Arrow 查询（便捷方法）
+    /**
+     * @brief 便捷执行 Arrow 查询。
+     * @param query 查询 SQL。
+     * @param batches 输出批次数组。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int ExecuteQueryArrow(const char* query,
                                   std::vector<std::shared_ptr<arrow::RecordBatch>>* batches) = 0;
 
-    // 直接写入 Arrow RecordBatch 列表（便捷方法）
+    /**
+     * @brief 便捷写入 Arrow 批次数组。
+     * @param table 目标表名。
+     * @param batches 输入批次数组。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int WriteArrowBatches(const char* table,
                                   const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches) = 0;
 
     // ==================== 通用接口 ====================
 
-    // 执行任意 SQL（DDL/DML），不返回结果集
+    /**
+     * @brief 执行无结果集 SQL（DDL/DML）。
+     * @param sql 输入 SQL。
+     * @return 0 或受影响行数表示成功，<0 表示失败（由实现定义）。
+     */
     virtual int ExecuteSql(const char* sql) = 0;
 
-    // 获取最近一次操作的错误信息
+    /**
+     * @brief 获取最近一次错误信息。
+     * @return 错误字符串指针。
+     */
     virtual const char* GetLastError() = 0;
 
-    // 测试连接是否可用
+    /**
+     * @brief 测试连接是否可用。
+     * @return true 表示可用，false 表示不可用。
+     */
     virtual bool IsConnected() = 0;
 };
 

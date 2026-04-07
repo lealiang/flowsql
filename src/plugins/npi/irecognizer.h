@@ -1,16 +1,11 @@
 /*
- * Copyright (C) 2020-06 - flowSQL
- *
+ * Copyright (C) 2026 LIHUO
  *
  * Licensed under the MIT License. See LICENSE file in the project root
  * for full license information.
  *
- *
- * Author       : LIHUO
- * Date         : 2021-12-02 16:42:48
- * LastEditors  : LIHUO
- * LastEditTime : 2026-02-25 12:00:00
  */
+
 #ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_IRECOGNIZER_H_
 #define _FLOWSQL_PLUGINS_PROTOCOL_NPI_IRECOGNIZER_H_
 
@@ -35,13 +30,27 @@ struct RecognizeContext {
     };
 };
 
+/**
+ * @brief 协议识别器接口，根据报文内容识别协议编号。
+ */
 interface IRecognizer {
+    /**
+     * @brief 识别输入报文的协议。
+     * @param pipeno 处理管线编号。
+     * @param packet 报文字节指针。
+     * @param packet_size 报文字节长度。
+     * @param layers 已解析层信息。
+     * @param rctx 识别上下文（输入输出）。
+     * @return 协议编号，UNKNOWN 表示未知。
+     */
     virtual int32_t Identify(int32_t pipeno, const uint8_t* packet, int32_t packet_size, const protocol::Layers* layers,
                              RecognizeContext* rctx) = 0;
     virtual ~IRecognizer() {}
 };
 
-// Just for chain invoke
+/**
+ * @brief 固定返回值识别器，常用于链式识别中的占位或短路分支。
+ */
 class Recognized : public IRecognizer {
  public:
     explicit Recognized() : output_(UNKNOWN) {}

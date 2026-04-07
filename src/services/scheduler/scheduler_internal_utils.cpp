@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "scheduler_internal_utils.h"
 
 #include <common/error_code.h>
@@ -183,6 +191,11 @@ bool IsSinkRoleAllowed(const std::string& role) {
 }
 
 int ParseOptionObject(const std::string& option, rapidjson::Document* out, std::string* err) {
+    // 逻辑链：
+    // 1) 空字符串直接返回空对象；
+    // 2) 如果是 JSON 对象文本则直接 parse；
+    // 3) 否则按 key=value;key=value 语法拆解并推断 bool/int/string 类型；
+    // 4) 输出统一的 JSON object，供 stream option 规范化复用。
     if (!out) return EINVAL;
     out->SetObject();
     auto& alloc = out->GetAllocator();

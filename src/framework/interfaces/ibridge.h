@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IBRIDGE_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IBRIDGE_H_
 
@@ -14,15 +22,27 @@ const Guid IID_BRIDGE = {0xa1b2c3d4, 0xe5f6, 0x7890, {0xab, 0xcd, 0xef, 0x01, 0x
 
 interface IOperator;  // 前向声明
 
-// IBridge — 纯接口，不继承 IPlugin
-// 提供 Python 算子的查询、遍历和刷新能力
+/**
+ * @brief Python 算子桥接接口，提供算子发现与刷新能力。
+ */
 interface IBridge {
     virtual ~IBridge() {}
-    // 按 category + name 查找算子，返回 shared_ptr 保证生命周期安全
+    /**
+     * @brief 按分类和名称查找算子。
+     * @param category 算子分类。
+     * @param name 算子名称。
+     * @return 算子智能指针；未找到返回空指针。
+     */
     virtual std::shared_ptr<IOperator> FindOperator(const std::string& category, const std::string& name) = 0;
-    // 遍历所有已发现的算子，回调返回 -1 时停止遍历
+    /**
+     * @brief 遍历所有已发现算子。
+     * @param fn 遍历回调，参数为算子指针，返回 -1 可提前中断遍历。
+     */
     virtual void TraverseOperators(std::function<int(IOperator*)> fn) = 0;
-    // 重新从 Python Worker 发现算子
+    /**
+     * @brief 从 Python Worker 重新发现算子并刷新缓存。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Refresh() = 0;
 };
 

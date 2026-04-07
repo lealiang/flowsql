@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "sql_parser.h"
 
 #include <algorithm>
@@ -152,6 +160,11 @@ static size_t FindExtensionStart(const std::string& sql) {
 }
 
 SqlStatement SqlParser::Parse(const std::string& sql) {
+    // 逻辑链：
+    // 1) 顺序解析 SELECT/FROM/WHERE 主体；
+    // 2) 识别 USING/THEN 算子链、WITH 参数与 INTO 目标；
+    // 3) 构建 sources/operators/with_params 的统一结构；
+    // 4) 在每个阶段失败即返回带 error 的 SqlStatement。
     SqlStatement stmt;
     pos_ = sql.c_str();
     end_ = pos_ + sql.size();

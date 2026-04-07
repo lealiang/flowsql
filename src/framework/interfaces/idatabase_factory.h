@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IDATABASE_FACTORY_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IDATABASE_FACTORY_H_
 
@@ -14,46 +22,76 @@ namespace flowsql {
 const Guid IID_DATABASE_FACTORY = {0xa9b8c7d6, 0xe5f4, 0x3210,
                                    {0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10}};
 
-// IDatabaseFactory — 数据库通道工厂接口
-// 管理数据库通道的创建、缓存和释放
+/**
+ * @brief 数据库通道工厂接口，负责数据库通道生命周期管理。
+ */
 interface IDatabaseFactory {
     virtual ~IDatabaseFactory() = default;
 
-    // 获取或创建数据库通道实例（懒加载）
-    // type: "sqlite", "mysql", "postgres", "clickhouse"
-    // name: 通道名称（如 "mydb"）
-    // 返回: 通道指针（工厂持有所有权），失败返回 nullptr
+    /**
+     * @brief 获取或创建数据库通道（懒加载）。
+     * @param type 数据库类型，例如 "sqlite"、"mysql"、"postgres"、"clickhouse"。
+     * @param name 通道名称。
+     * @return 通道指针（工厂持有所有权），失败返回 nullptr。
+     */
     virtual IDatabaseChannel* Get(const char* type, const char* name) = 0;
 
-    // [预留] 获取数据库通道（带用户上下文）
+    /**
+     * @brief 带用户上下文获取数据库通道（扩展入口）。
+     * @param type 数据库类型。
+     * @param name 通道名称。
+     * @param user_context 用户上下文字符串。
+     * @return 通道指针（工厂持有所有权），失败返回 nullptr。
+     */
     virtual IDatabaseChannel* GetWithContext(const char* type, const char* name,
                                              const char* user_context) {
         return Get(type, name);
     }
 
-    // 列出所有已配置的数据库连接
-    // config_json：该通道的配置 JSON（密码字段脱敏为 "****"），可为 nullptr
+    /**
+     * @brief 枚举已配置数据库通道。
+     * @param callback 枚举回调：
+     * type 为数据库类型，name 为通道名，config_json 为脱敏后的配置 JSON（可为空）。
+     */
     virtual void List(std::function<void(const char* type, const char* name,
                                          const char* config_json)> callback) = 0;
 
-    // 释放指定通道（关闭连接，从池中移除）
+    /**
+     * @brief 释放指定通道并从缓存中移除。
+     * @param type 数据库类型。
+     * @param name 通道名称。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Release(const char* type, const char* name) = 0;
 
-    // 获取最近一次操作的错误信息（线程安全：thread_local 存储）
+    /**
+     * @brief 获取最近一次错误信息。
+     * @return 错误字符串指针（线程局部存储）。
+     */
     virtual const char* LastError() = 0;
 
     // ==================== 动态管理方法（Epic 6）====================
 
-    // 运行时新增通道（写 YAML，加入 configs_，懒加载连接）
-    // config_str 格式：type=xxx;name=xxx;host=xxx;...
-    // type+name 已存在时返回 -1（请用 UpdateChannel）
+    /**
+     * @brief 运行时新增数据库通道配置。
+     * @param config_str 通道配置字符串（key=value;key=value...）。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int AddChannel(const char* config_str) { return -1; }
 
-    // 运行时删除通道（关闭连接，从 YAML 删除，从 configs_ 移除）
+    /**
+     * @brief 运行时删除数据库通道配置。
+     * @param type 数据库类型。
+     * @param name 通道名称。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int RemoveChannel(const char* type, const char* name) { return -1; }
 
-    // 运行时更新通道配置（原子覆盖写 YAML，不走 Remove+Add）
-    // config_str 格式同 AddChannel，type+name 不存在时返回 -1
+    /**
+     * @brief 运行时更新数据库通道配置。
+     * @param config_str 通道配置字符串（key=value;key=value...）。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int UpdateChannel(const char* config_str) { return -1; }
 };
 

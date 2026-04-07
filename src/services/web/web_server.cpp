@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "web_server.h"
 
 #include <rapidjson/document.h>
@@ -96,6 +104,11 @@ void WebServer::NotifySchedulerRefresh() {
 }
 
 int WebServer::Init(const std::string& db_path) {
+    // 逻辑链：
+    // 1) 初始化本地元数据库与上传目录；
+    // 2) 配置静态资源托管、CORS 与 SPA 回退；
+    // 3) 绑定 /api 路由并将控制面请求转发到 Scheduler/Task 服务；
+    // 4) 统一记录启动成功日志。
     if (db_.Open(db_path) != 0) {
         LOG_ERROR("WebServer::Init: failed to open database: %s", db_path.c_str());
         return -1;
@@ -512,9 +525,11 @@ void WebServer::Stop() {
     server_.stop();
 }
 
-// --- 声明管理 API 路由 ---
-
 void WebServer::EnumApiRoutes(std::function<void(const RouteItem&)> cb) {
+    // 逻辑链：
+    // 1) 声明 Web 插件本地处理的管理面 API；
+    // 2) 对通道、任务、算子接口进行统一路由注册；
+    // 3) 对需后端处理的接口封装 HTTP 代理，保持 Web 层轻量转发职责。
     cb({"GET",  "/api/health",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleHealth(u, req, rsp);

@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_ISTREAM_CHANNEL_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_ISTREAM_CHANNEL_H_
 
@@ -119,44 +127,89 @@ struct StreamChannelCapabilities {
     StreamPartitionCaps partition;
 };
 
-// IStreamChannel — 流式通道接口（路径 A）
+/**
+ * @brief 流式通道接口，定义流数据投递、轮询消费与并发能力声明。
+ */
 interface IStreamChannel : public IChannel {
     virtual ~IStreamChannel() = default;
 
-    // 生产者（通道内部采集线程调用）
-    // 返回 0=成功，EAGAIN=队列满，ECANCELED=通道已取消，<0=其他错误
+    /**
+     * @brief 投递一个输入批次到流通道。
+     * @param batch 输入批次数据。
+     * @param ts_ms 批次时间戳（毫秒）。
+     * @return 0 成功，EAGAIN 队列满，ECANCELED 已取消，<0 其他错误。
+     */
     virtual int Put(std::shared_ptr<arrow::RecordBatch> batch, int64_t ts_ms) = 0;
 
-    // 消费者（worker 调用）
-    // timeout_ms: 0=立即返回，>0=等待指定毫秒
+    /**
+     * @brief 轮询读取下一批数据。
+     * @param timeout_ms 超时毫秒；0 表示立即返回，>0 表示等待。
+     * @return 轮询事件（数据/超时/EOF/错误等）。
+     */
     virtual PollEvent PollNext(int timeout_ms = 100) = 0;
 
-    // 返回静态输出 schema；返回 null 表示动态 schema
+    /**
+     * @brief 获取通道输出 schema。
+     * @return 静态 schema 指针；返回 nullptr 表示动态 schema。
+     */
     virtual std::shared_ptr<arrow::Schema> GetOutputSchema() = 0;
 
-    // WHERE 下推，unsupported_out 非空时表示存在不可下推条件
+    /**
+     * @brief 设置过滤条件下推。
+     * @param condition_json 过滤条件 JSON。
+     * @param unsupported_out 输出不可下推条件列表，可为 nullptr。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int SetFilter(const char* condition_json,
                           std::vector<std::string>* unsupported_out) = 0;
 
-    // 队列状态
+    /**
+     * @brief 判断通道是否已满。
+     * @return true 表示已满。
+     */
     virtual bool IsFull() const = 0;
+    /**
+     * @brief 判断通道是否为空。
+     * @return true 表示为空。
+     */
     virtual bool IsEmpty() const = 0;
+    /**
+     * @brief 获取通道容量。
+     * @return 容量（元素个数）。
+     */
     virtual size_t Capacity() const = 0;
+    /**
+     * @brief 获取当前通道长度。
+     * @return 当前元素个数。
+     */
     virtual size_t Size() const = 0;
 
-    // 是否有限流（例如 pcap 文件）
+    /**
+     * @brief 判断是否为有限流。
+     * @return true 表示有限流（可结束），false 表示无限流。
+     */
     virtual bool IsFinite() const = 0;
 
-    // 有限流内部使用：读完后推 EOF
+    /**
+     * @brief 关闭流并发送 EOF（有限流场景）。
+     */
     virtual void CloseStream() = 0;
 
-    // 外部取消：触发优雅收敛退出
+    /**
+     * @brief 取消流处理并触发优雅退出。
+     */
     virtual void Cancel() = 0;
 
-    // true 表示生产/转发侧已结束
+    /**
+     * @brief 查询生产/转发侧是否结束。
+     * @return true 表示已结束。
+     */
     virtual bool IsFinished() const = 0;
 
-    // 并发与语义能力声明
+    /**
+     * @brief 声明通道并发与语义能力。
+     * @return 能力描述结构体。
+     */
     virtual StreamChannelCapabilities Capabilities() const {
         StreamChannelCapabilities caps;
         caps.channel_type = ChannelType::kStream;
@@ -180,11 +233,30 @@ interface IStreamChannel : public IChannel {
         return caps;
     }
 
-    // Stream hub 扩展能力（默认不支持）
+    /**
+     * @brief 是否支持 Hub 扩展能力。
+     * @return true 表示支持 Hub 扩展。
+     */
     virtual bool IsHubChannel() const { return false; }
+    /**
+     * @brief 返回 Hub 模式提示。
+     * @return 模式字符串（如 split/merge），不支持时返回空串。
+     */
     virtual const char* HubModeHint() const { return ""; }  // split|merge
+    /**
+     * @brief 返回 Hub 分区数。
+     * @return 分区数，不支持时返回 0。
+     */
     virtual size_t HubPartitionCount() const { return 0; }
-    virtual std::shared_ptr<IStreamChannel> HubPartition(size_t) const { return nullptr; }
+    /**
+     * @brief 返回指定 Hub 分区通道。
+     * @param idx 分区索引。
+     * @return 分区通道智能指针，不支持或越界时返回 nullptr。
+     */
+    virtual std::shared_ptr<IStreamChannel> HubPartition(size_t idx) const {
+        (void)idx;
+        return nullptr;
+    }
 };
 
 }  // namespace flowsql

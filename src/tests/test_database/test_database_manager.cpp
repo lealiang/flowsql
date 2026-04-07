@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 // test_database_manager.cpp — DatabasePlugin 持久化与动态管理单元测试
 //
 // 直接链接 flowsql_database，不走 PluginLoader

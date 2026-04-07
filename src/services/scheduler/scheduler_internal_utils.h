@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_SCHEDULER_SCHEDULER_INTERNAL_UTILS_H_
 #define _FLOWSQL_SCHEDULER_SCHEDULER_INTERNAL_UTILS_H_
 

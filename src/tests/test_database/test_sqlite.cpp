@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 // test_sqlite.cpp — SQLite 驱动独立测试套件
 //
 // 设计原则：

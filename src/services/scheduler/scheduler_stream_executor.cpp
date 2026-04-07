@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "scheduler_plugin.h"
 
 #include <rapidjson/document.h>
@@ -1148,6 +1156,11 @@ int32_t SchedulerPlugin::BuildStreamExecutionPlan(const SqlStatement& stmt,
 }
 
 int32_t SchedulerPlugin::ValidateStreamExecutionPlan(StreamExecutionPlan* plan, std::string* err_rsp) {
+    // 逻辑链：
+    // 1) 基于 source 列表构建单源或 fan-in 读模型；
+    // 2) 创建并校验首个 stream 算子实例，读取并行策略与并行度；
+    // 3) 汇总 source/sink capabilities，按策略校验并发能力匹配；
+    // 4) 在校验阶段提前拒绝能力不匹配的执行计划，避免运行期失败。
     if (!plan || !err_rsp) return error::INTERNAL_ERROR;
     err_rsp->clear();
 

@@ -1,14 +1,11 @@
 /*
- * Copyright (C) 2020-06 - flowSQL
+ * Copyright (C) 2026 LIHUO
  *
  * Licensed under the MIT License. See LICENSE file in the project root
  * for full license information.
  *
- * 插件接口定义 — 所有插件只需 include 此文件
- * IPlugin: 插件生命周期接口
- * IRegister: 插件注册接口（由 PluginLoader 实现）
- * BEGIN_PLUGIN_REGIST 宏: 插件注册入口
  */
+
 #ifndef _FLOWSQL_COMMON_IPLUGIN_H_
 #define _FLOWSQL_COMMON_IPLUGIN_H_
 
@@ -18,22 +15,54 @@
 
 namespace flowsql {
 
+/**
+ * @brief 插件注册接口，由加载器在插件注册阶段调用。
+ */
 interface IRegister {
+    /**
+     * @brief 注册插件暴露的接口实例。
+     * @param iid 接口唯一标识。
+     * @param iface 接口实例指针（非拥有语义）。
+     */
     virtual void Regist(const Guid& iid, void* iface) = 0;
 };
 
 // {86dc3d8-e65f-9a83-1a39-66d26e95a9ca}
 const Guid IID_PLUGIN = {0x86dc3d8, 0xe65f, 0x9a83, {0x1a, 0x39, 0x66, 0xd2, 0x6e, 0x95, 0xa9, 0xca}};
 
+/**
+ * @brief 插件生命周期接口，定义插件装载与运行阶段回调。
+ */
 interface IPlugin {
     virtual ~IPlugin(){};
 
+    /**
+     * @brief 解析插件配置参数。
+     * @param arg 插件启动参数字符串，可为空。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Option(const char* /* arg */) { return 0; }
-    virtual int Load(IQuerier* querier) = 0;  // 插件初始化，通过 querier 查询其他插件接口
+    /**
+     * @brief 执行插件加载逻辑并绑定依赖接口。
+     * @param querier 插件查询器，用于获取其他插件暴露的接口。
+     * @return 0 表示成功，非 0 表示失败。
+     */
+    virtual int Load(IQuerier* querier) = 0;
+    /**
+     * @brief 执行插件卸载逻辑并释放资源。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Unload() = 0;
 
-    // 模块启停（默认空实现，轻量插件无需覆写）
+    /**
+     * @brief 启动插件运行逻辑。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Start() { return 0; }
+    /**
+     * @brief 停止插件运行逻辑。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Stop() { return 0; }
 };
 

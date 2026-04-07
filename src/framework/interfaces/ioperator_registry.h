@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IOPERATOR_REGISTRY_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IOPERATOR_REGISTRY_H_
 
@@ -17,20 +25,38 @@ const Guid IID_OPERATOR_REGISTRY = {
 // 算子工厂函数类型：无参构造，调用方负责 delete
 using OperatorFactory = std::function<IOperator*()>;
 
-// IOperatorRegistry — 内置算子类型注册中心
+/**
+ * @brief 内置算子类型注册中心接口。
+ */
 interface IOperatorRegistry {
     virtual ~IOperatorRegistry() = default;
 
-    // 注册算子类型；同名时覆盖
+    /**
+     * @brief 注册算子工厂。
+     * @param name 算子类型全名。
+     * @param factory 算子工厂函数。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Register(const char* name, OperatorFactory factory) = 0;
 
-    // 按名创建算子实例（未注册返回 nullptr）
+    /**
+     * @brief 按名称创建算子实例。
+     * @param name 算子类型全名。
+     * @return 新创建的算子实例（调用方负责释放），未注册返回 nullptr。
+     */
     virtual IOperator* Create(const char* name) = 0;
 
-    // 注销算子工厂（不存在返回 -1）
+    /**
+     * @brief 移除算子工厂。
+     * @param name 算子类型全名。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int RemoveFactory(const char* name) = 0;
 
-    // 枚举所有已注册算子类型
+    /**
+     * @brief 枚举所有已注册算子名称。
+     * @param callback 枚举回调，参数为算子名。
+     */
     virtual void List(std::function<void(const char* name)> callback) = 0;
 };
 

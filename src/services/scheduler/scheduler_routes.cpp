@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "scheduler_plugin.h"
 
 #include <rapidjson/document.h>
@@ -493,7 +501,11 @@ int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&
     return error::OK;
 }
 
-// --- HandleExecute ---
+// 逻辑链：
+// 1) 解析并校验 SQL，请求路由先区分 stream/batch 源类型；
+// 2) batch 路径解析算子链并绑定 source/sink；
+// 3) 执行纯传输或算子链执行，统一抽取错误阶段并返回标准错误结构；
+// 4) INTO dataframe.<name> 场景写回注册中心并组织最终响应。
 int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& req_body, std::string& rsp) {
     auto* ch_registry = querier_ ? static_cast<IChannelRegistry*>(querier_->First(IID_CHANNEL_REGISTRY)) : nullptr;
     rapidjson::Document doc;
@@ -1274,6 +1286,11 @@ int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
 // --- HandlePreviewDataframe ---
 // POST /channels/dataframe/preview — Body: {"category":"...","name":"..."} 或 {"name":"..."}
 int32_t SchedulerPlugin::HandlePreviewDataframe(const std::string&, const std::string& req, std::string& rsp) {
+    // 逻辑链：
+    // 1) 解析分页参数并按 category.name 定位目标 dataframe 通道；
+    // 2) 依次在托管通道、静态注册通道、命名 dataframe 注册中心中查找；
+    // 3) 读取 DataFrame 快照并按页裁剪；
+    // 4) 输出 columns/types/data 的前端预览结构。
     auto* ch_registry = querier_ ? static_cast<IChannelRegistry*>(querier_->First(IID_CHANNEL_REGISTRY)) : nullptr;
     rapidjson::Document doc;
     doc.Parse(req.c_str());

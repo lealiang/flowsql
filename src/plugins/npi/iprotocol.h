@@ -1,15 +1,9 @@
 /*
- * Copyright (C) 2020-06 - flowSQL
- *
+ * Copyright (C) 2026 LIHUO
  *
  * Licensed under the MIT License. See LICENSE file in the project root
  * for full license information.
  *
- *
- * Author       : LIHUO
- * Date         : 2021-01-24 14:29:42
- * LastEditors  : LIHUO
- * LastEditTime : 2026-02-25 12:00:00
  */
 
 #ifndef _FLOWSQL_PLUGINS_PROTOCOL_NPI_IPROTOCOL_H_
@@ -127,28 +121,67 @@ struct Protocol {
     uint16_t subid;  // sub protocol number, like ICMP-ECHO
 };
 
+/**
+ * @brief 协议词典接口，提供协议条目查询与遍历能力。
+ */
 interface IDictionary {
+    /**
+     * @brief 获取条目数量。
+     * @return 协议条目数。
+     */
     virtual int32_t Count() const = 0;
+    /**
+     * @brief 按协议编号查询条目。
+     * @param number 协议编号。
+     * @return 协议条目指针，未找到返回 nullptr。
+     */
     virtual const Entry* Query(int32_t number) const = 0;
+    /**
+     * @brief 遍历所有协议条目。
+     * @param traverser 遍历回调，参数为条目指针，返回非 0 可中断遍历。
+     * @return 遍历状态码。
+     */
     virtual int32_t Traverse(std::function<int32_t(const Entry*)> traverser) const = 0;
 };
 
 }  // namespace protocol
 
+/**
+ * @brief 协议识别主接口，负责并发配置、协议识别与层解析。
+ */
 interface IProtocol {
     virtual ~IProtocol() {}
 
+    /**
+     * @brief 设置协议识别并发度。
+     * @param number 并发 worker 数量。
+     */
     virtual void Concurrency(int32_t number) = 0;
-    /*
-    Return value:
-       0 : unknown protocol
-     > 0 : protocol No.
-    */
+    /**
+     * @brief 识别报文协议编号。
+     * @param pipeno 管线编号。
+     * @param packet 报文字节指针。
+     * @param packet_size 报文字节长度。
+     * @param layers 已解析层信息。
+     * @return 协议标识（id/subid 组合）；id=0 表示未知协议。
+     */
     virtual protocol::Protocol Identify(int32_t pipeno, const uint8_t* packet, int32_t packet_size,
                                         const protocol::Layers* layers) = 0;
 
+    /**
+     * @brief 执行分层解析并填充层信息。
+     * @param pipeno 管线编号。
+     * @param packet 报文字节指针。
+     * @param packet_size 报文字节长度。
+     * @param layers 输入输出层结构。
+     * @return 成功解析的层数，<0 表示失败。
+     */
     virtual int32_t Layer(int32_t pipeno, const uint8_t* packet, int32_t packet_size, protocol::Layers* layers) = 0;
 
+    /**
+     * @brief 获取协议词典接口。
+     * @return 词典接口指针（非拥有语义）。
+     */
     virtual protocol::IDictionary* Dictionary() = 0;
 };
 

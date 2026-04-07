@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IDATAFRAME_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IDATAFRAME_H_
 
@@ -46,35 +54,81 @@ struct Field {
     std::string description;
 };
 
+/**
+ * @brief 列式内存数据结构接口，提供 Schema、行列访问、序列化与 Arrow 互操作能力。
+ */
 interface IDataFrame {
     virtual ~IDataFrame() = default;
 
-    // Schema
+    /**
+     * @brief 获取当前数据框 schema。
+     * @return 字段描述数组。
+     */
     virtual std::vector<Field> GetSchema() const = 0;
+    /**
+     * @brief 设置当前数据框 schema。
+     * @param schema 字段描述数组。
+     */
     virtual void SetSchema(const std::vector<Field>& schema) = 0;
 
-    // 行操作
+    /**
+     * @brief 获取当前行数。
+     * @return 行数。
+     */
     virtual int32_t RowCount() const = 0;
+    /**
+     * @brief 追加一行数据。
+     * @param row 行字段值数组，顺序与 schema 一致。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int AppendRow(const std::vector<FieldValue>& row) = 0;
+    /**
+     * @brief 按行号读取一行数据。
+     * @param index 行索引（从 0 开始）。
+     * @return 行字段值数组；越界时实现可返回空数组。
+     */
     virtual std::vector<FieldValue> GetRow(int32_t index) const = 0;
 
-    // 列操作
+    /**
+     * @brief 按列名读取一列数据。
+     * @param name 列名。
+     * @return 列字段值数组；列不存在时实现可返回空数组。
+     */
     virtual std::vector<FieldValue> GetColumn(const std::string& name) const = 0;
 
-    // Arrow 互操作（零拷贝）
+    /**
+     * @brief 导出为 Arrow RecordBatch。
+     * @return Arrow RecordBatch 智能指针。
+     */
     virtual std::shared_ptr<arrow::RecordBatch> ToArrow() const = 0;
+    /**
+     * @brief 从 Arrow RecordBatch 导入数据。
+     * @param batch Arrow RecordBatch 智能指针。
+     */
     virtual void FromArrow(std::shared_ptr<arrow::RecordBatch> batch) = 0;
 
-    // 序列化
+    /**
+     * @brief 序列化为 JSON 字符串。
+     * @return JSON 字符串。
+     */
     virtual std::string ToJson() const = 0;
+    /**
+     * @brief 从 JSON 字符串反序列化。
+     * @param json 输入 JSON 字符串。
+     * @return true 表示成功，false 表示失败。
+     */
     virtual bool FromJson(const std::string& json) = 0;
 
-    // 清空
+    /**
+     * @brief 清空所有数据与状态。
+     */
     virtual void Clear() = 0;
 
-    // 按条件过滤行（返回新的过滤后 DataFrame）
-    // condition 格式: "column=value", "column>value", "column<value" 等
-    // 返回: 0=成功, <0=错误（列不存在等）
+    /**
+     * @brief 按条件过滤当前数据框。
+     * @param condition 过滤条件表达式，例如 "column=value"、"column>value"。
+     * @return 0 表示成功，非 0 表示失败（如列不存在、表达式错误）。
+     */
     virtual int Filter(const char* condition) = 0;
 };
 

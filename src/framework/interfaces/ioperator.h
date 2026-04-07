@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IOPERATOR_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IOPERATOR_H_
 
@@ -21,29 +29,64 @@ enum class OperatorPosition : int32_t {
     DATA = 1
 };
 
-// IOperator — 算子纯接口，不继承 IPlugin
+/**
+ * @brief 通用算子接口，定义元数据、配置与执行入口。
+ */
 interface IOperator {
     virtual ~IOperator() = default;
 
-    // 元数据
+    /**
+     * @brief 获取算子分类。
+     * @return 分类字符串。
+     */
     virtual std::string Category() = 0;
+    /**
+     * @brief 获取算子名称。
+     * @return 名称字符串。
+     */
     virtual std::string Name() = 0;
+    /**
+     * @brief 获取算子描述信息。
+     * @return 描述字符串。
+     */
     virtual std::string Description() = 0;
+    /**
+     * @brief 获取算子所在位置（数据面或存储面）。
+     * @return 算子位置枚举值。
+     */
     virtual OperatorPosition Position() = 0;
 
-    // 核心处理：算子自行从 in 通道读取、向 out 通道写入
+    /**
+     * @brief 执行单输入算子逻辑。
+     * @param in 输入通道指针（非拥有语义）。
+     * @param out 输出通道指针（非拥有语义）。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Work(IChannel* in, IChannel* out) = 0;
 
-    // 多输入处理：默认退化到单输入 inputs[0]。
+    /**
+     * @brief 执行多输入算子逻辑。
+     * @param inputs 输入通道数组视图。
+     * @param out 输出通道指针（非拥有语义）。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Work(Span<IChannel*> inputs, IChannel* out) {
         if (inputs.empty()) return -1;
         return Work(inputs[0], out);
     }
 
-    // 配置
+    /**
+     * @brief 设置算子配置项。
+     * @param key 配置键。
+     * @param value 配置值。
+     * @return 0 表示成功，非 0 表示失败。
+     */
     virtual int Configure(const char* key, const char* value) = 0;
 
-    // 最近一次执行错误信息（默认空）
+    /**
+     * @brief 获取最近一次执行错误信息。
+     * @return 错误字符串；无错误时可返回空串。
+     */
     virtual std::string LastError() { return ""; }
 };
 

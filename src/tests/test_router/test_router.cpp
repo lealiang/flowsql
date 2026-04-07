@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 // test_router.cpp — RouterAgencyPlugin + RouteTable + Gateway 路由测试
 // 覆盖：路由收集、冲突检测、前缀提取、Trie 匹配、过期清理、错误码映射
 

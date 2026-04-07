@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "scheduler_plugin.h"
 
 #include <rapidjson/stringbuffer.h>
@@ -189,6 +197,12 @@ std::string MakeStreamChannelKeyLocal(const std::string& type, const std::string
 }
 
 }  // namespace
+
+// 逻辑链：
+// 1) 校验 group 请求格式，仅允许 sql_text + dag 模式参数；
+// 2) 将多 SQL 拆分为节点，逐条解析并完成 source/sink 元数据归一化；
+// 3) 构建节点依赖边与 share set，执行 DAG 合法性与并发能力校验；
+// 4) 申请 lease 并创建 group runtime，启动节点并汇总响应。
 int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc, std::string& rsp) {
     if (!doc.HasMember("group_mode") || !doc["group_mode"].IsString()) {
         rsp = BuildExecutionErrorJson(

@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "scheduler_plugin.h"
 
 #include <algorithm>
@@ -92,6 +100,11 @@ void SchedulerPlugin::TouchRuntimeAccess(const std::string& runtime_task_id, int
 }
 
 void SchedulerPlugin::SweepRuntimeRetainedObjects(int64_t now_ms) {
+    // 逻辑链：
+    // 1) 快照所有 terminal runtime 的终止时间、最近访问时间与类型；
+    // 2) 按保留时长 + 最大保留数量计算淘汰集合；
+    // 3) 按 single/group 分支释放 runtime 资源并清理关联索引；
+    // 4) 最后统一回收 retention map 中的元数据键。
     struct RuntimeEntry {
         std::string runtime_task_id;
         std::string runtime_kind;

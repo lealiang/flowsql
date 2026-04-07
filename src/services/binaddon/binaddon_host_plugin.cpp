@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "binaddon_host_plugin.h"
 
 #include <common/error_code.h>
@@ -489,6 +497,11 @@ int BinAddonHostPlugin::ListCppPlugins(std::string& rsp) {
 }
 
 int BinAddonHostPlugin::UploadCppPlugin(const std::string& filename, const std::string& tmp_path, std::string& rsp) {
+    // 逻辑链：
+    // 1) 校验上传文件名与临时文件有效性，搬运到上传目录；
+    // 2) 计算插件 SHA256 并以 hash 作为 plugin_id；
+    // 3) 在 sqlite 元数据库去重并写入 uploaded 元数据；
+    // 4) 返回上传结果与插件基础信息。
     if (!IsSafeUploadFilename(filename)) {
         rsp = R"({"error":"invalid filename"})";
         return error::BAD_REQUEST;
@@ -605,6 +618,11 @@ int BinAddonHostPlugin::UploadCppPlugin(const std::string& filename, const std::
 }
 
 int BinAddonHostPlugin::ActivateCppPlugin(const std::string& plugin_id, std::string& rsp) {
+    // 逻辑链：
+    // 1) 读取插件元数据并执行 dlopen + 符号完整性校验；
+    // 2) 校验 ABI 与导出算子元数据，构造注册列表；
+    // 3) 原子注册算子到 catalog/registry，失败时回滚并更新插件状态；
+    // 4) 成功后持有 loaded 插件句柄并返回 activated 响应。
     if (plugin_id.size() != 64) {
         rsp = R"({"error":"invalid plugin_id"})";
         return error::BAD_REQUEST;

@@ -1,12 +1,11 @@
 /*
- * Copyright (C) 2020-06 - flowSQL
+ * Copyright (C) 2026 LIHUO
  *
  * Licensed under the MIT License. See LICENSE file in the project root
  * for full license information.
  *
- * PluginLoader — 插件加载器实现
- * 只有主程序需要 include 此文件，插件只需 include iplugin.h
  */
+
 #ifndef _FLOWSQL_COMMON_LOADER_HPP_
 #define _FLOWSQL_COMMON_LOADER_HPP_
 

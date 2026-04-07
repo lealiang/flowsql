@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 // FlowSQL 通用入口
 // Guardian 模式: flowsql --config deploy-multi.yaml  （fork 守护，拉起所有服务）
 // Gateway 模式:  flowsql --role gateway --port 18800 --plugins libflowsql_gateway.so:...

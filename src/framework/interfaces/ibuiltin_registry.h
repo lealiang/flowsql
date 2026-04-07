@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #ifndef _FLOWSQL_FRAMEWORK_INTERFACES_IBUILTIN_REGISTRY_H_
 #define _FLOWSQL_FRAMEWORK_INTERFACES_IBUILTIN_REGISTRY_H_
 
@@ -56,16 +64,39 @@ struct BuiltinOperatorDescriptor {
     OperatorFactory factory;
 };
 
+/**
+ * @brief 内置能力注册中心接口，统一管理内置 stream 通道类型与内置算子描述。
+ */
 interface IBuiltinRegistry {
     virtual ~IBuiltinRegistry() = default;
 
+    /**
+     * @brief 按类型名查询 stream 通道类型定义。
+     * @param type 通道类型名（如 ring、stream_hub）。
+     * @param out 输出类型描述。
+     * @return 0 表示成功，非 0 表示未找到或失败。
+     */
     virtual int FindStreamChannelType(const std::string& type,
                                       StreamChannelTypeDescriptor* out) = 0;
+    /**
+     * @brief 枚举所有 stream 通道类型定义。
+     * @param callback 枚举回调，参数为单个类型描述。
+     */
     virtual void ListStreamChannelTypes(
         std::function<void(const StreamChannelTypeDescriptor&)> callback) = 0;
 
+    /**
+     * @brief 枚举所有内置算子定义。
+     * @param callback 枚举回调，参数为单个算子描述。
+     */
     virtual void ListBuiltinOperators(
         std::function<void(const BuiltinOperatorDescriptor&)> callback) = 0;
+    /**
+     * @brief 创建内置算子实例。
+     * @param category 算子分类。
+     * @param name 算子名称。
+     * @return 新建算子实例（调用方负责释放），失败返回 nullptr。
+     */
     virtual IOperator* CreateBuiltinOperator(const std::string& category,
                                              const std::string& name) = 0;
 };

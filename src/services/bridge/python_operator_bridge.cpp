@@ -1,3 +1,11 @@
+/*
+ * Copyright (C) 2026 LIHUO
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root
+ * for full license information.
+ *
+ */
+
 #include "python_operator_bridge.h"
 
 #include <cstdio>
@@ -54,6 +62,11 @@ PythonOperatorBridge::PythonOperatorBridge(const OperatorMeta& meta, const std::
 }
 
 int PythonOperatorBridge::Work(IChannel* in, IChannel* out) {
+    // 逻辑链：
+    // 1) 校验输入输出通道类型并读取输入 DataFrame；
+    // 2) 将输入序列化为 Arrow IPC 文件并发起 Python Worker 调用；
+    // 3) 解析响应并反序列化输出批次；
+    // 4) 写回输出通道并在任一失败点记录 last_error_。
     last_error_.clear();
 
     // 1. dynamic_cast 到 IDataFrameChannel

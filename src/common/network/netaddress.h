@@ -1,16 +1,9 @@
 /*
- * Copyright (C) 2020-06 - flowSQL
- * 
- * 
+ * Copyright (C) 2026 LIHUO
+ *
  * Licensed under the MIT License. See LICENSE file in the project root
  * for full license information.
- * the Free Software Foundation; either version 3 of the License, or 
- * 
- * 
- * Author       : LIHUO
- * Date         : 2021-11-10 12:47:28
- * LastEditors  : LIHUO
- * LastEditTime : 2026-02-25 12:00:00
+ *
  */
 
 #ifndef _FLOWSQL_COMMON_NETWORK_NETADDRESS_H_
