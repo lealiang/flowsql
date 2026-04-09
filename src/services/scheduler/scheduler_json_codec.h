@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "broadcast_hub.h"
+#include "shared_source_hub.h"
 #include "stream_task.h"
 #include "stream_task_group.h"
 
@@ -29,10 +29,11 @@ const char* StreamTaskStatusName(StreamTaskStatus status);
 bool IsTerminalStreamTaskStatus(StreamTaskStatus status);
 
 void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
-                           const TaskSnapshot& s);
+                           const TaskSnapshot& s,
+                           const SharedHubSnapshot* shared_hub);
 void WriteGroupSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
                             const StreamGroupSnapshot& s,
-                            const std::vector<BroadcastHubSnapshot>* share_sets,
+                            const std::vector<SharedHubSnapshot>* share_sets,
                             const std::unordered_map<std::string, GroupNodeResolvedSourceMeta>* node_sources);
 
 }  // namespace scheduler

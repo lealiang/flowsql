@@ -638,11 +638,34 @@ const viewResult = async (rowOrTaskId) => {
               message: `Group 状态：${payload.status || 'unknown'}，group_mode=${payload.group_mode || 'dag'}，share_sets=${shareSetCount}，resolved_sources=${resolvedCount}`
             }
       } else {
-        const message = `流任务状态：${payload.status || 'unknown'}，processed_rows=${payload.processed_rows ?? 0}，output_rows=${payload.output_rows ?? 0}`
-        dialogResult.value = {
-          columns: [],
-          rows: [],
-          message
+        const sharedHubId = typeof payload.shared_hub_id === 'string' ? payload.shared_hub_id : ''
+        const sharedSourceKeys = Array.isArray(payload.shared_source_keys)
+          ? payload.shared_source_keys.filter(it => typeof it === 'string')
+          : []
+        const subscriberStats = Array.isArray(payload.subscriber_stats) ? payload.subscriber_stats : []
+        if (subscriberStats.length > 0) {
+          const rows = subscriberStats.map((s) => ({
+            shared_hub_id: sharedHubId || '-',
+            shared_source_keys: sharedSourceKeys.join(',') || '-',
+            subscriber_id: s?.subscriber_id || '',
+            runtime_task_id: s?.runtime_task_id || '',
+            active: Boolean(s?.active),
+            ready: Boolean(s?.ready),
+            delivered_batches: Number(s?.delivered_batches ?? 0),
+            dropped_batches: Number(s?.dropped_batches ?? 0),
+            lag: Number(s?.lag ?? 0)
+          }))
+          dialogResult.value = {
+            columns: ['shared_hub_id', 'shared_source_keys', 'subscriber_id', 'runtime_task_id', 'active', 'ready', 'delivered_batches', 'dropped_batches', 'lag'],
+            rows
+          }
+        } else {
+          const message = `流任务状态：${payload.status || 'unknown'}，processed_rows=${payload.processed_rows ?? 0}，output_rows=${payload.output_rows ?? 0}，hub=${sharedHubId || '-'}`
+          dialogResult.value = {
+            columns: [],
+            rows: [],
+            message
+          }
         }
       }
     } else {

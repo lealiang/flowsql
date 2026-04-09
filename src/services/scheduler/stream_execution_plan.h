@@ -38,6 +38,8 @@ struct StreamExecutionPlan {
     std::vector<std::string> source_keys;
     std::vector<std::string> resolved_sources;
     std::string source_expand_rule = "explicit";
+    std::string shared_hub_key;
+    std::string where_signature;
 
     std::shared_ptr<IChannel> sink_channel;
     std::string sink_type;

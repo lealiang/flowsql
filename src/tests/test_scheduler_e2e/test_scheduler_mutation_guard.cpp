@@ -155,7 +155,7 @@ struct SchedulerPluginTestAccessor {
     static void AddGroupShareSnapshot(SchedulerPlugin* plugin,
                                       const std::string& group_runtime_task_id) {
         std::lock_guard<std::mutex> lock(plugin->stream_group_share_set_snapshots_mu_);
-        BroadcastHubSnapshot snap;
+        SharedHubSnapshot snap;
         snap.id = "ss1";
         snap.source_ref = "stream.a";
         plugin->stream_group_share_set_snapshots_[group_runtime_task_id] = {std::move(snap)};

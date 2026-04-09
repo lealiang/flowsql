@@ -28,7 +28,7 @@
 #include <rapidjson/document.h>
 
 #include "stream_runtime.h"
-#include "broadcast_hub.h"
+#include "shared_source_hub.h"
 #include "stream_task_group.h"
 #include "stream_execution_plan.h"
 
@@ -130,12 +130,16 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     int32_t AcquireStreamExecutionLease(StreamExecutionPlan* plan,
                                         LeaseToken* lease_token,
                                         std::string* err_rsp);
+    int32_t AcquireSharedSourceSubscription(StreamExecutionPlan* plan,
+                                            std::shared_ptr<IStreamChannel>* source_override,
+                                            std::string* err_rsp);
     int32_t HandleStreamExecuteSingle(const rapidjson::Document& doc, std::string& rsp);
     int32_t HandleStreamExecuteGroup(const rapidjson::Document& doc, std::string& rsp);
     int32_t ClassifySqlTaskKind(const std::string& sql_text, std::string* task_kind, std::string* err_rsp);
     int QueryStreamTaskSnapshotByRuntimeId(const std::string& runtime_task_id, TaskSnapshot* snapshot_out);
+    int QueryRuntimeSharedHubSnapshot(const std::string& runtime_task_id, SharedHubSnapshot* snapshot_out);
     void RequestStopStreamTaskByRuntimeId(const std::string& runtime_task_id);
-    std::vector<BroadcastHubSnapshot> QueryGroupShareSetSnapshots(const std::string& group_runtime_task_id);
+    std::vector<SharedHubSnapshot> QueryGroupShareSetSnapshots(const std::string& group_runtime_task_id);
     std::unordered_map<std::string, GroupNodeResolvedSourceMeta> QueryGroupNodeResolvedSources(
         const std::string& group_runtime_task_id);
     void CleanupGroupRuntimeResources(const std::string& group_runtime_task_id,
@@ -181,6 +185,8 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     int TryBeginStreamChannelMutation(const std::string& key, std::string* reason_out);
     void EndStreamChannelMutation(const std::string& key);
     void ReleaseStreamTaskLeases(const std::string& runtime_task_id);
+    void ReleaseRuntimeSubscriptions(const std::string& runtime_task_id);
+    void PruneSharedHubs(bool force_stop = false);
     void SweepFinishedTaskLeases();
     void MarkRuntimeTerminal(const std::string& runtime_task_id,
                              const std::string& runtime_kind,
@@ -200,6 +206,10 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     int max_stream_group_timeout_s_ = 86400;
     int stream_runtime_retention_s_ = 600;
     size_t stream_runtime_max_count_ = 2000;
+    size_t max_shared_hubs_ = 4096;
+    size_t max_subscribers_per_hub_ = 128;
+    size_t shared_subscriber_queue_size_ = 2048;
+    int shared_hub_poll_timeout_ms_ = 50;
 
     // 用于生成唯一临时通道名
     std::atomic<uint64_t> tmp_channel_seq_{0};
@@ -222,12 +232,12 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
         std::string source_ref;
         std::vector<std::string> members;
         std::vector<std::string> internal_channel_refs;
-        std::shared_ptr<BroadcastHub> hub;
+        std::shared_ptr<SharedSourceHub> hub;
     };
     mutable std::mutex stream_group_share_sets_mu_;
     std::unordered_map<std::string, std::vector<StreamGroupShareSetRuntime>> stream_group_share_sets_;
     mutable std::mutex stream_group_share_set_snapshots_mu_;
-    std::unordered_map<std::string, std::vector<BroadcastHubSnapshot>> stream_group_share_set_snapshots_;
+    std::unordered_map<std::string, std::vector<SharedHubSnapshot>> stream_group_share_set_snapshots_;
 
     struct StreamTaskLeaseInfo {
         std::vector<std::string> all_keys;
@@ -244,6 +254,15 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     std::unordered_map<std::string, StreamSourceLeaseState> stream_source_leases_;
     std::unordered_set<std::string> stream_channel_mutating_;
     std::unordered_map<std::string, StreamTaskLeaseInfo> stream_task_leases_;
+
+    struct RuntimeSharedSubscription {
+        std::string hub_key;
+        SharedSubscriberHandle handle;
+    };
+    mutable std::mutex shared_hubs_mu_;
+    std::unordered_map<std::string, std::shared_ptr<SharedSourceHub>> shared_hubs_;
+    mutable std::mutex runtime_subscriptions_mu_;
+    std::unordered_map<std::string, std::vector<RuntimeSharedSubscription>> runtime_subscriptions_;
 
     mutable std::mutex stream_runtime_retention_mu_;
     std::unordered_map<std::string, int64_t> stream_runtime_terminal_ms_;

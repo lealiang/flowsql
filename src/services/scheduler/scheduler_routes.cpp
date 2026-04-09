@@ -351,7 +351,7 @@ int32_t SchedulerPlugin::HandleStreamStop(const std::string&, const std::string&
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    WriteTaskSnapshotJson(&w, task->Snapshot());
+    WriteTaskSnapshotJson(&w, task->Snapshot(), nullptr);
     rsp = buf.GetString();
     SweepRuntimeRetainedObjects();
     return error::OK;
@@ -423,7 +423,12 @@ int32_t SchedulerPlugin::HandleStreamStatus(const std::string&, const std::strin
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
-    WriteTaskSnapshotJson(&w, snapshot);
+    SharedHubSnapshot shared_hub_snapshot;
+    SharedHubSnapshot* shared_hub_ptr = nullptr;
+    if (QueryRuntimeSharedHubSnapshot(task_id, &shared_hub_snapshot) == 0) {
+        shared_hub_ptr = &shared_hub_snapshot;
+    }
+    WriteTaskSnapshotJson(&w, snapshot, shared_hub_ptr);
     rsp = buf.GetString();
     SweepRuntimeRetainedObjects();
     return error::OK;
@@ -484,7 +489,12 @@ int32_t SchedulerPlugin::HandleStreamList(const std::string&, const std::string&
     w.Key("tasks");
     w.StartArray();
     for (const auto& s : snapshots) {
-        WriteTaskSnapshotJson(&w, s);
+        SharedHubSnapshot shared_hub_snapshot;
+        SharedHubSnapshot* shared_hub_ptr = nullptr;
+        if (QueryRuntimeSharedHubSnapshot(s.task_id, &shared_hub_snapshot) == 0) {
+            shared_hub_ptr = &shared_hub_snapshot;
+        }
+        WriteTaskSnapshotJson(&w, s, shared_hub_ptr);
     }
     for (const auto& s : group_snapshots) {
         const auto node_sources = QueryGroupNodeResolvedSources(s.task_id);

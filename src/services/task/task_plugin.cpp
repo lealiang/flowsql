@@ -1522,6 +1522,14 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
     std::string runtime_error_message = rec.error_message;
     int64_t processed_rows = 0;
     int64_t output_rows = rec.result_row_count;
+    std::string shared_hub_id;
+    uint64_t subscriber_count = 0;
+    rapidjson::Document shared_source_keys_doc;
+    shared_source_keys_doc.SetArray();
+    bool has_shared_source_keys = false;
+    rapidjson::Document subscriber_stats_doc;
+    subscriber_stats_doc.SetArray();
+    bool has_subscriber_stats = false;
     rapidjson::Document op_stats_doc;
     bool has_op_stats = false;
     rapidjson::Document nodes_doc;
@@ -1568,6 +1576,24 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
                 }
                 if (runtime_doc.HasMember("output_rows") && runtime_doc["output_rows"].IsUint64()) {
                     output_rows = static_cast<int64_t>(runtime_doc["output_rows"].GetUint64());
+                }
+                if (runtime_doc.HasMember("shared_hub_id") && runtime_doc["shared_hub_id"].IsString()) {
+                    shared_hub_id = runtime_doc["shared_hub_id"].GetString();
+                }
+                if (runtime_doc.HasMember("shared_source_keys") && runtime_doc["shared_source_keys"].IsArray()) {
+                    shared_source_keys_doc.CopyFrom(runtime_doc["shared_source_keys"],
+                                                    shared_source_keys_doc.GetAllocator());
+                    has_shared_source_keys = true;
+                }
+                if (runtime_doc.HasMember("subscriber_count") && runtime_doc["subscriber_count"].IsUint64()) {
+                    subscriber_count = runtime_doc["subscriber_count"].GetUint64();
+                } else if (runtime_doc.HasMember("subscriber_count") && runtime_doc["subscriber_count"].IsUint()) {
+                    subscriber_count = runtime_doc["subscriber_count"].GetUint();
+                }
+                if (runtime_doc.HasMember("subscriber_stats") && runtime_doc["subscriber_stats"].IsArray()) {
+                    subscriber_stats_doc.CopyFrom(runtime_doc["subscriber_stats"],
+                                                  subscriber_stats_doc.GetAllocator());
+                    has_subscriber_stats = true;
                 }
                 if (runtime_doc.HasMember("op_stats")) {
                     op_stats_doc.CopyFrom(runtime_doc["op_stats"], op_stats_doc.GetAllocator());
@@ -1649,6 +1675,24 @@ int32_t TaskPlugin::HandleStreamStatus(const std::string&, const std::string& re
     w.Int64(processed_rows);
     w.Key("output_rows");
     w.Int64(output_rows);
+    w.Key("shared_hub_id");
+    w.String(shared_hub_id.c_str());
+    w.Key("shared_source_keys");
+    if (has_shared_source_keys) {
+        shared_source_keys_doc.Accept(w);
+    } else {
+        w.StartArray();
+        w.EndArray();
+    }
+    w.Key("subscriber_count");
+    w.Uint64(subscriber_count);
+    w.Key("subscriber_stats");
+    if (has_subscriber_stats) {
+        subscriber_stats_doc.Accept(w);
+    } else {
+        w.StartArray();
+        w.EndArray();
+    }
     w.Key("op_stats");
     if (has_op_stats) {
         op_stats_doc.Accept(w);
@@ -1709,6 +1753,49 @@ int32_t TaskPlugin::HandleStreamList(const std::string&, const std::string& req,
     w.Key("tasks");
     w.StartArray();
     for (const auto& item : items) {
+        std::string shared_hub_id;
+        uint64_t subscriber_count = 0;
+        rapidjson::Document shared_source_keys_doc;
+        shared_source_keys_doc.SetArray();
+        bool has_shared_source_keys = false;
+        rapidjson::Document subscriber_stats_doc;
+        subscriber_stats_doc.SetArray();
+        bool has_subscriber_stats = false;
+        if (!item.runtime_task_id.empty()) {
+            rapidjson::StringBuffer req_buf;
+            rapidjson::Writer<rapidjson::StringBuffer> req_w(req_buf);
+            req_w.StartObject();
+            req_w.Key("task_id");
+            req_w.String(item.runtime_task_id.c_str());
+            req_w.EndObject();
+
+            std::string scheduler_rsp;
+            if (scheduler_client_.QueryStreamStatus(req_buf.GetString(), &scheduler_rsp) == error::OK) {
+                rapidjson::Document runtime_doc;
+                runtime_doc.Parse(scheduler_rsp.c_str());
+                if (!runtime_doc.HasParseError() && runtime_doc.IsObject()) {
+                    if (runtime_doc.HasMember("shared_hub_id") && runtime_doc["shared_hub_id"].IsString()) {
+                        shared_hub_id = runtime_doc["shared_hub_id"].GetString();
+                    }
+                    if (runtime_doc.HasMember("shared_source_keys") && runtime_doc["shared_source_keys"].IsArray()) {
+                        shared_source_keys_doc.CopyFrom(runtime_doc["shared_source_keys"],
+                                                        shared_source_keys_doc.GetAllocator());
+                        has_shared_source_keys = true;
+                    }
+                    if (runtime_doc.HasMember("subscriber_count") && runtime_doc["subscriber_count"].IsUint64()) {
+                        subscriber_count = runtime_doc["subscriber_count"].GetUint64();
+                    } else if (runtime_doc.HasMember("subscriber_count") &&
+                               runtime_doc["subscriber_count"].IsUint()) {
+                        subscriber_count = runtime_doc["subscriber_count"].GetUint();
+                    }
+                    if (runtime_doc.HasMember("subscriber_stats") && runtime_doc["subscriber_stats"].IsArray()) {
+                        subscriber_stats_doc.CopyFrom(runtime_doc["subscriber_stats"],
+                                                      subscriber_stats_doc.GetAllocator());
+                        has_subscriber_stats = true;
+                    }
+                }
+            }
+        }
         w.StartObject();
         w.Key("task_id");
         w.String(item.task_id.c_str());
@@ -1722,6 +1809,24 @@ int32_t TaskPlugin::HandleStreamList(const std::string&, const std::string& req,
         w.String(item.error_code.c_str());
         w.Key("error_message");
         w.String(item.error_message.c_str());
+        w.Key("shared_hub_id");
+        w.String(shared_hub_id.c_str());
+        w.Key("shared_source_keys");
+        if (has_shared_source_keys) {
+            shared_source_keys_doc.Accept(w);
+        } else {
+            w.StartArray();
+            w.EndArray();
+        }
+        w.Key("subscriber_count");
+        w.Uint64(subscriber_count);
+        w.Key("subscriber_stats");
+        if (has_subscriber_stats) {
+            subscriber_stats_doc.Accept(w);
+        } else {
+            w.StartArray();
+            w.EndArray();
+        }
         w.Key("created_at");
         w.String(item.created_at.c_str());
         w.Key("updated_at");

@@ -92,6 +92,18 @@ int SchedulerPlugin::Option(const char* arg) {
         } else if (key == "stream_runtime_max_count") {
             const size_t parsed = static_cast<size_t>(std::stoull(val));
             stream_runtime_max_count_ = std::max<size_t>(1, parsed);
+        } else if (key == "max_shared_hubs") {
+            const size_t parsed = static_cast<size_t>(std::stoull(val));
+            max_shared_hubs_ = std::max<size_t>(1, parsed);
+        } else if (key == "max_subscribers_per_hub") {
+            const size_t parsed = static_cast<size_t>(std::stoull(val));
+            max_subscribers_per_hub_ = std::max<size_t>(1, parsed);
+        } else if (key == "shared_subscriber_queue_size") {
+            const size_t parsed = static_cast<size_t>(std::stoull(val));
+            shared_subscriber_queue_size_ = std::max<size_t>(64, parsed);
+        } else if (key == "shared_hub_poll_timeout_ms") {
+            const int parsed = std::stoi(val);
+            shared_hub_poll_timeout_ms_ = std::max(1, parsed);
         }
 
         pos = (end < opts.size()) ? end + 1 : opts.size();
@@ -221,6 +233,18 @@ int SchedulerPlugin::Stop() {
     for (const auto& task : tasks) {
         task->Join();
     }
+    std::vector<std::string> runtime_ids;
+    {
+        std::lock_guard<std::mutex> lock(runtime_subscriptions_mu_);
+        runtime_ids.reserve(runtime_subscriptions_.size());
+        for (const auto& kv : runtime_subscriptions_) {
+            runtime_ids.push_back(kv.first);
+        }
+    }
+    for (const auto& runtime_id : runtime_ids) {
+        ReleaseRuntimeSubscriptions(runtime_id);
+    }
+    PruneSharedHubs(true);
     stream_runtime_.Stop();
 
     {
@@ -253,6 +277,14 @@ int SchedulerPlugin::Stop() {
         stream_source_leases_.clear();
         stream_channel_ref_counts_.clear();
         stream_channel_mutating_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(runtime_subscriptions_mu_);
+        runtime_subscriptions_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(shared_hubs_mu_);
+        shared_hubs_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(stream_runtime_retention_mu_);

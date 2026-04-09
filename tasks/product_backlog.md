@@ -1040,7 +1040,7 @@
 - In Scope：Story 14.11 ~ 14.13（统一加载、具名 Stream Sink 产品化、同源并发消费）
 - Out of Scope：跨任务共享 source 动态订阅、广播回放持久化、多主机分布式编排
 - 已拆分至 Epic 15：原 Story 14.5 / 14.6（路径 B 数据面能力）
-- 后续候选：Story 14.14（Hybrid DAG，batch + stream 混合编排）
+- 后续候选：Story 14.14（Hybrid DAG，batch + stream 混合编排）、Story 14.15（跨任务共享 source / late join）、Story 14.16（历史数据批处理补算）
 
 **已在 Sprint 13 落地**:
 - Story 14.7（路径 B 接口占位）已完成
@@ -1181,6 +1181,32 @@
 - 首阶段约束：`source_share_sets` 仅允许 stream 节点；`stream -> batch` 仅允许 `on_finished`
 - 首阶段约束：`batch -> stream` 仅支持一次性装填并在写入完成后 `CloseStream()`
 - 明确 mixed DAG 的可执行边界：不满足约束的拓扑需在提交阶段被拒绝并返回结构化错误
+
+---
+
+### Story 14.15: 跨任务共享 source（late join）
+**状态**: ✅ 已完成（Sprint 16）
+**验收标准**:
+- 支持多个 stream 任务并行消费同一 source，不再要求 source 独占租约
+- 支持 `late join`：新任务在既有任务运行中加入后，从加入时刻开始消费（不补历史）
+- 消费隔离：单任务 `stop/cancel/fail` 不影响其他共享消费者正常运行
+- 背压策略可配置且可观测：慢消费者不阻塞全局，关键指标（丢弃/滞后/吞吐）可查询
+- 管理面与状态接口返回共享消费拓扑信息（共享组、消费者数、每消费者状态）
+- 实施结果：
+  - 已完成：SharedSourceHub 核心运行时、跨任务同源并发、late join、stop 隔离、Group share set 迁移、BroadcastHub 下线
+  - 已完成：`subscriber_stats.lag` 指标、TaskPlugin `/tasks/stream/status|list` 透传、前端任务详情共享订阅信息展示、README 能力矩阵同步
+  - 已完成：新增慢消费者背压可观测回归用例（跨任务共享 source 场景）
+
+---
+
+### Story 14.16: 历史数据批处理补算（替代流内回放）
+**状态**: 📋 待规划（后续 Sprint）
+**验收标准**:
+- 明确不在流式数据面实现“广播回放/持久化重放”；历史补算统一走 batch 任务链路
+- 支持基于时间窗口/条件的历史数据重算与回写（面向已落地存储）
+- 提供实时流与历史补算的边界约束（时间水位或 offset 边界），避免重复统计
+- 定义补算结果幂等策略（去重键/覆盖策略），保障反复补算结果一致
+- 提供标准化执行模板与运维指引（提交参数、失败重试、结果校验）
 
 ---
 

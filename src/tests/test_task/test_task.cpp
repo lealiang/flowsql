@@ -1055,6 +1055,7 @@ int main() {
         std::atomic<int> stream_execute_calls{0};
         std::atomic<int> stream_status_calls{0};
         std::atomic<int> stream_stop_calls{0};
+        std::atomic<bool> stream_stopped{false};
 
         MockRouterHandle scheduler({
             MakeSqlClassifyRoute(),
@@ -1071,28 +1072,107 @@ int main() {
                  return error::OK;
              }},
             {"POST", "/scheduler/stream/status",
-             [&stream_status_calls](const std::string&, const std::string& req, std::string& rsp) {
+             [&stream_status_calls, &stream_stopped](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
                  d.Parse(req.c_str());
                  ASSERT_TRUE(!d.HasParseError() && d.IsObject());
                  ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
                  ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_task_1001");
-                 const int n = stream_status_calls.fetch_add(1);
-                 if (n == 0) {
-                     rsp = R"({"task_id":"stream_task_1001","status":"running","processed_rows":12,"output_rows":8,"op_stats":{"shards":2}})";
+                 stream_status_calls.fetch_add(1);
+                 if (stream_stopped.load()) {
+                     rsp = R"({
+                         "task_id":"stream_task_1001",
+                         "status":"stopped",
+                         "processed_rows":12,
+                         "output_rows":8,
+                         "shared_hub_id":"hub_stream_1001",
+                         "shared_source_keys":["ring.tcp_src"],
+                         "subscriber_count":2,
+                         "subscriber_stats":[
+                             {
+                                 "subscriber_id":"sub1",
+                                 "runtime_task_id":"stream_task_1001",
+                                 "logical_node_id":"",
+                                 "active":true,
+                                 "ready":true,
+                                 "delivered_batches":12,
+                                 "delivered_rows":12,
+                                 "dropped_batches":3,
+                                 "dropped_rows":3,
+                                 "last_delivered_seq":12,
+                                 "last_dropped_seq":15,
+                                 "lag":0
+                             },
+                             {
+                                 "subscriber_id":"sub2",
+                                 "runtime_task_id":"stream_task_1002",
+                                 "logical_node_id":"",
+                                 "active":true,
+                                 "ready":true,
+                                 "delivered_batches":12,
+                                 "delivered_rows":12,
+                                 "dropped_batches":1,
+                                 "dropped_rows":1,
+                                 "last_delivered_seq":12,
+                                 "last_dropped_seq":13,
+                                 "lag":0
+                             }
+                         ],
+                         "op_stats":{"shards":2}
+                     })";
                  } else {
-                     rsp = R"({"task_id":"stream_task_1001","status":"stopped","processed_rows":12,"output_rows":8,"op_stats":{"shards":2}})";
+                     rsp = R"({
+                         "task_id":"stream_task_1001",
+                         "status":"running",
+                         "processed_rows":12,
+                         "output_rows":8,
+                         "shared_hub_id":"hub_stream_1001",
+                         "shared_source_keys":["ring.tcp_src"],
+                         "subscriber_count":2,
+                         "subscriber_stats":[
+                             {
+                                 "subscriber_id":"sub1",
+                                 "runtime_task_id":"stream_task_1001",
+                                 "logical_node_id":"",
+                                 "active":true,
+                                 "ready":true,
+                                 "delivered_batches":12,
+                                 "delivered_rows":12,
+                                 "dropped_batches":3,
+                                 "dropped_rows":3,
+                                 "last_delivered_seq":12,
+                                 "last_dropped_seq":15,
+                                 "lag":4
+                             },
+                             {
+                                 "subscriber_id":"sub2",
+                                 "runtime_task_id":"stream_task_1002",
+                                 "logical_node_id":"",
+                                 "active":true,
+                                 "ready":true,
+                                 "delivered_batches":12,
+                                 "delivered_rows":12,
+                                 "dropped_batches":1,
+                                 "dropped_rows":1,
+                                 "last_delivered_seq":12,
+                                 "last_dropped_seq":13,
+                                 "lag":2
+                             }
+                         ],
+                         "op_stats":{"shards":2}
+                     })";
                  }
                  return error::OK;
              }},
             {"POST", "/scheduler/stream/stop",
-             [&stream_stop_calls](const std::string&, const std::string& req, std::string& rsp) {
+             [&stream_stop_calls, &stream_stopped](const std::string&, const std::string& req, std::string& rsp) {
                  rapidjson::Document d;
                  d.Parse(req.c_str());
                  ASSERT_TRUE(!d.HasParseError() && d.IsObject());
                  ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
                  ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_task_1001");
                  stream_stop_calls.fetch_add(1);
+                 stream_stopped.store(true);
                  rsp = R"({"task_id":"stream_task_1001","status":"stopped"})";
                  return error::OK;
              }},
@@ -1145,6 +1225,18 @@ int main() {
         ASSERT_EQ(list_ret["tasks"].Size(), rapidjson::SizeType(1));
         ASSERT_TRUE(list_ret["tasks"][0].HasMember("runtime_task_id"));
         ASSERT_EQ(std::string(list_ret["tasks"][0]["runtime_task_id"].GetString()), "stream_task_1001");
+        ASSERT_TRUE(list_ret["tasks"][0].HasMember("shared_hub_id"));
+        ASSERT_EQ(std::string(list_ret["tasks"][0]["shared_hub_id"].GetString()), "hub_stream_1001");
+        ASSERT_TRUE(list_ret["tasks"][0].HasMember("shared_source_keys"));
+        ASSERT_TRUE(list_ret["tasks"][0]["shared_source_keys"].IsArray());
+        ASSERT_EQ(list_ret["tasks"][0]["shared_source_keys"].Size(), rapidjson::SizeType(1));
+        ASSERT_TRUE(list_ret["tasks"][0].HasMember("subscriber_count"));
+        ASSERT_EQ(list_ret["tasks"][0]["subscriber_count"].GetUint(), 2u);
+        ASSERT_TRUE(list_ret["tasks"][0].HasMember("subscriber_stats"));
+        ASSERT_TRUE(list_ret["tasks"][0]["subscriber_stats"].IsArray());
+        ASSERT_EQ(list_ret["tasks"][0]["subscriber_stats"].Size(), rapidjson::SizeType(2));
+        ASSERT_TRUE(list_ret["tasks"][0]["subscriber_stats"][0].HasMember("lag"));
+        ASSERT_TRUE(list_ret["tasks"][0]["subscriber_stats"][0]["lag"].IsUint64());
 
         ASSERT_EQ(local_routes["POST:/tasks/stream/status"](
                       "/tasks/stream/status", MakeTaskIdReq(local_stream_task_id), rsp),
@@ -1156,6 +1248,19 @@ int main() {
         ASSERT_EQ(std::string(status_ret_1["runtime_status"].GetString()), "running");
         ASSERT_EQ(status_ret_1["processed_rows"].GetInt64(), 12);
         ASSERT_EQ(status_ret_1["output_rows"].GetInt64(), 8);
+        ASSERT_TRUE(status_ret_1.HasMember("shared_hub_id"));
+        ASSERT_EQ(std::string(status_ret_1["shared_hub_id"].GetString()), "hub_stream_1001");
+        ASSERT_TRUE(status_ret_1.HasMember("shared_source_keys"));
+        ASSERT_TRUE(status_ret_1["shared_source_keys"].IsArray());
+        ASSERT_EQ(status_ret_1["shared_source_keys"].Size(), rapidjson::SizeType(1));
+        ASSERT_TRUE(status_ret_1.HasMember("subscriber_count"));
+        ASSERT_EQ(status_ret_1["subscriber_count"].GetUint(), 2u);
+        ASSERT_TRUE(status_ret_1.HasMember("subscriber_stats"));
+        ASSERT_TRUE(status_ret_1["subscriber_stats"].IsArray());
+        ASSERT_EQ(status_ret_1["subscriber_stats"].Size(), rapidjson::SizeType(2));
+        ASSERT_TRUE(status_ret_1["subscriber_stats"][0].HasMember("lag"));
+        ASSERT_TRUE(status_ret_1["subscriber_stats"][0]["lag"].IsUint64());
+        ASSERT_EQ(status_ret_1["subscriber_stats"][0]["lag"].GetUint64(), 4u);
 
         ASSERT_EQ(local_routes["POST:/tasks/stream/stop"](
                       "/tasks/stream/stop", MakeTaskIdReq(local_stream_task_id), rsp),

@@ -76,6 +76,20 @@ const char* ToErrorCode(ErrorCodeId id) {
             return "STREAM_SOURCE_CAPABILITY_MISMATCH";
         case ErrorCodeId::kStreamSinkCapabilityMismatch:
             return "STREAM_SINK_CAPABILITY_MISMATCH";
+        case ErrorCodeId::kSharedSourceHubCreateFailed:
+            return "SHARED_SOURCE_HUB_CREATE_FAILED";
+        case ErrorCodeId::kSharedSourceSubscribeFailed:
+            return "SHARED_SOURCE_SUBSCRIBE_FAILED";
+        case ErrorCodeId::kSharedSourceModeMismatch:
+            return "SHARED_SOURCE_MODE_MISMATCH";
+        case ErrorCodeId::kSharedSourceWhereMismatch:
+            return "SHARED_SOURCE_WHERE_MISMATCH";
+        case ErrorCodeId::kSharedSourceFilterUnsupported:
+            return "SHARED_SOURCE_FILTER_UNSUPPORTED";
+        case ErrorCodeId::kSharedSourceReadyTimeout:
+            return "SHARED_SOURCE_READY_TIMEOUT";
+        case ErrorCodeId::kSharedSourceInternalError:
+            return "SHARED_SOURCE_INTERNAL_ERROR";
         case ErrorCodeId::kUnknown:
         default:
             return "UNKNOWN";

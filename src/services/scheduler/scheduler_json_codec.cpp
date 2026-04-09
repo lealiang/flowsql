@@ -33,7 +33,8 @@ bool IsTerminalStreamTaskStatus(StreamTaskStatus status) {
 }
 
 void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
-                           const TaskSnapshot& s) {
+                           const TaskSnapshot& s,
+                           const SharedHubSnapshot* shared_hub) {
     if (!w) return;
     w->StartObject();
     w->Key("task_id");
@@ -93,6 +94,51 @@ void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
     w->EndArray();
     w->Key("source_expand_rule");
     w->String(s.source_expand_rule.c_str());
+    w->Key("shared_hub_id");
+    w->String(shared_hub ? shared_hub->id.c_str() : "");
+    w->Key("shared_source_keys");
+    w->StartArray();
+    if (shared_hub) {
+        for (const auto& key : shared_hub->source_keys) {
+            w->String(key.c_str());
+        }
+    }
+    w->EndArray();
+    w->Key("subscriber_count");
+    w->Uint(shared_hub ? static_cast<unsigned>(shared_hub->subscribers.size()) : 0);
+    w->Key("subscriber_stats");
+    w->StartArray();
+    if (shared_hub) {
+        for (const auto& sub : shared_hub->subscribers) {
+            w->StartObject();
+            w->Key("subscriber_id");
+            w->String(sub.subscriber_id.c_str());
+            w->Key("runtime_task_id");
+            w->String(sub.runtime_task_id.c_str());
+            w->Key("logical_node_id");
+            w->String(sub.logical_node_id.c_str());
+            w->Key("active");
+            w->Bool(sub.active);
+            w->Key("ready");
+            w->Bool(sub.ready);
+            w->Key("delivered_batches");
+            w->Uint64(sub.delivered_batches);
+            w->Key("delivered_rows");
+            w->Uint64(sub.delivered_rows);
+            w->Key("dropped_batches");
+            w->Uint64(sub.dropped_batches);
+            w->Key("dropped_rows");
+            w->Uint64(sub.dropped_rows);
+            w->Key("last_delivered_seq");
+            w->Uint64(sub.last_delivered_seq);
+            w->Key("last_dropped_seq");
+            w->Uint64(sub.last_dropped_seq);
+            w->Key("lag");
+            w->Uint64(sub.lag);
+            w->EndObject();
+        }
+    }
+    w->EndArray();
 
     rapidjson::Document stats_doc;
     if (!s.op_stats_json.empty()) {
@@ -113,7 +159,7 @@ void WriteTaskSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
 
 void WriteGroupSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
                             const StreamGroupSnapshot& s,
-                            const std::vector<BroadcastHubSnapshot>* share_sets,
+                            const std::vector<SharedHubSnapshot>* share_sets,
                             const std::unordered_map<std::string, GroupNodeResolvedSourceMeta>* node_sources) {
     if (!w) return;
     uint64_t processed_rows = 0;
@@ -250,7 +296,7 @@ void WriteGroupSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
             w->Key("source_ref");
             w->String(ss.source_ref.c_str());
             w->Key("status");
-            w->String(BroadcastHubStatusName(ss.status));
+            w->String(SharedHubStatusName(ss.status));
             w->Key("members");
             w->StartArray();
             for (const auto& member : ss.members) {

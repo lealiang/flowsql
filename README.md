@@ -155,27 +155,30 @@ IPlugin（生命周期）
 
 | 层 | 格式 | 示例 |
 |---|---|---|
-| 前端对外（WebPlugin 8081） | `/api/{资源}[/{动作}]` | `/api/channels`, `/api/tasks/result` |
+| 前端对外（WebPlugin 8081） | `/api/{资源}[/{动作}]` | `/api/channels/list`, `/api/tasks/result` |
 | 内部服务间（RouterAgencyPlugin） | `/{资源}[/{子类型}]/{动作}` | `/channels/database/add`, `/tasks/batch/execute`, `/tasks/stream/execute` |
 | Gateway 管理（内部专用） | `/gateway/{动作}` | `/gateway/register`, `/gateway/routes` |
 
-动作词汇：`query` / `add` / `remove` / `modify` / `execute` / `refresh` / `reload`
+常见动作词汇（非穷举）：`list` / `query` / `detail` / `add` / `remove` / `modify` / `preview` / `execute` / `status` / `stop` / `cancel` / `refresh` / `reload`
 
 ## SQL 语法示例
 
 ```sql
--- 数据采集
-SELECT * FROM netcard USING npm INTO ts.db1
+-- 批处理算子示例（需先准备 dataframe.input 通道）
+SELECT * FROM dataframe.input USING builtin.passthrough INTO dataframe.output
 
--- 探索性分析（Python 算子）
-SELECT * FROM example.memory USING explore.chisquare WITH target='label'
+-- 流式单 SQL 示例（内置流式算子）
+SELECT * FROM tcp_session_mock.tcp_src
+USING builtin.tcp_service_merge_stream
+INTO dataframe.serviceaccess
 
--- 统计分析
-SELECT bps FROM ts.npm.tcp_session USING statistic.hist
-WHERE time = '[2024/07/14 00:00:00 - 2024/07/14 23:59:59]'
-
--- C++ 插件算子（示例）
-SELECT * FROM dataframe.input USING sample.column_stats INTO dataframe.stats
+-- 流式多 SQL（Group DAG）示例
+SELECT * FROM ring.src
+USING builtin.passthrough_stream
+INTO stream.mid;
+SELECT * FROM stream.mid
+USING builtin.passthrough_stream
+INTO dataframe.out;
 ```
 
 ## SQL 任务能力矩阵（当前）
@@ -186,10 +189,13 @@ SELECT * FROM dataframe.input USING sample.column_stats INTO dataframe.stats
 | Batch | 多 SQL | ✅ 支持（顺序执行） | `POST /api/tasks/batch/execute`（`sql_text`） | 多 SQL 必须用分号 `;` 切分；不允许混入 stream SQL | `Hybrid DAG`（batch+stream 混编）为后续候选 |
 | Stream | 单 SQL | ✅ 支持 | `POST /api/tasks/stream/execute`（内部：`/tasks/stream/execute`） | 仅异步；`execution_kind=single`；必须是 stream SQL；必须包含 `USING` 流式算子 | 持续支持 |
 | Stream | 多 SQL | ✅ 支持（Group DAG） | `POST /api/tasks/stream/execute`（`execution_kind=group` + `group_mode=dag` + `sql_text`） | 仅异步；多 SQL 必须用分号 `;` 切分；至少 2 条；仅支持 stream task kind（不支持 batch/stream 混合） | `Hybrid DAG`（batch+stream 混编）为后续候选 |
+| Stream | 同源跨任务并发消费 | ✅ 支持（late join） | `POST /api/tasks/stream/execute`（多任务并行提交） | 新任务从加入时刻开始消费，不补历史；同源共享要求 `WHERE` 签名一致 | 持续支持 |
 
 说明：
 - Stream 当前仅支持异步执行。
 - Stream 多 SQL 的 `group` 当前仅支持 `group_mode=dag`。
+- Stream 支持同一 source 的跨任务并发消费（late join）；任务间 stop/cancel/fail 相互隔离。
+- `POST /api/tasks/stream/status` 与 `POST /api/tasks/stream/list` 已提供共享消费观测字段：`shared_hub_id`、`shared_source_keys`、`subscriber_count`、`subscriber_stats`（含 `lag`）。
 - `Hybrid DAG`（batch+stream 混合编排）当前未实现，已列为后续候选能力。
 
 ## 流式任务执行契约（Sprint 14）
@@ -248,6 +254,7 @@ SELECT * FROM dataframe.input USING sample.column_stats INTO dataframe.stats
 | `STREAM_GROUP_SHARE_SET_READY_TIMEOUT` | share set ready 屏障超时 | 同源广播组未在限定时间内全部就绪 |
 | `STREAM_GROUP_SOURCE_MISMATCH` | 同源校验不一致 | `source_share_set` 成员解析源集合不一致（返回 `missing_keys/extra_keys`） |
 | `STREAM_GROUP_SINK_CAPABILITY_MISMATCH` | sink 并发写能力不足 | 多节点写同一 stream sink，但通道能力不满足 |
+| `SHARED_SOURCE_WHERE_MISMATCH` | 共享 source 的 `WHERE` 签名不一致 | 同一 source 上新任务的 `WHERE` 与已运行共享 hub 不一致 |
 
 ## 算子扩展能力
 
@@ -304,6 +311,7 @@ flowSQL/
 │   ├── deploy-multi.yaml   # 多进程部署配置（生产）
 │   └── flowsql.yml         # 数据库通道持久化配置
 ├── src/
+│   ├── app/                # 主程序入口
 │   ├── common/             # 公共头文件（define.h、loader.hpp、error_code.h）
 │   ├── framework/          # 框架核心（IPlugin、Pipeline、IRouterHandle 等）
 │   ├── services/
@@ -313,11 +321,12 @@ flowSQL/
 │   │   ├── scheduler/      # SchedulerPlugin（SQL 执行 + 通道管理）
 │   │   ├── task/           # TaskPlugin（任务管理与执行入口）
 │   │   ├── database/       # DatabasePlugin（MySQL/SQLite/PostgreSQL/ClickHouse）
+│   │   ├── stream/         # StreamPlugin（流通道实例管理与持久化）
+│   │   ├── builtin/        # BuiltinPlugin（内置通道/算子注册）
 │   │   ├── catalog/        # CatalogPlugin（通道目录 + 算子目录 + /operators/*）
 │   │   ├── binaddon/       # BinAddonHostPlugin（C++ 算子插件管理）
 │   │   └── bridge/         # BridgePlugin（C++ ↔ Python 桥接）
 │   ├── plugins/
-│   │   ├── example/        # 示例插件（MemoryChannel）
 │   │   └── npi/            # NPI 协议识别
 │   ├── python/             # Python Worker（FastAPI）
 │   ├── frontend/           # Vue.js 前端

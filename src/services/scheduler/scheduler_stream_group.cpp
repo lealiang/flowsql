@@ -730,9 +730,20 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
         runtime.id = ss.id;
         runtime.source_ref = ss.source_ref;
         runtime.members = ss.members;
+        SharedHubOptions hub_opts;
+        hub_opts.queue_size = shared_subscriber_queue_size_;
+        hub_opts.poll_timeout_ms = shared_hub_poll_timeout_ms_;
+        hub_opts.overflow_policy = OverflowPolicy::kDrop;
+        hub_opts.ring_mode = RingMode::SPSC;
+        hub_opts.coordinated_drop = true;
+        runtime.hub = std::make_shared<SharedSourceHub>(
+            ss.id,
+            SharedHubMode::kFixed,
+            ss.source_ref,
+            ss.canonical_source_keys,
+            shared_source,
+            hub_opts);
 
-        std::vector<std::shared_ptr<IStreamChannel>> member_channels;
-        member_channels.reserve(ss.members.size());
         for (size_t mi = 0; mi < ss.members.size(); ++mi) {
             const std::string internal_name = MakeSafeName(
                 runtime_task_id + "_" + ss.id + "_" + ss.members[mi] + "_in");
@@ -764,21 +775,31 @@ int32_t SchedulerPlugin::HandleStreamExecuteGroup(const rapidjson::Document& doc
             RegisterChannel(channel_ref, std::static_pointer_cast<IChannel>(internal));
             created_channel_refs.push_back(channel_ref);
             runtime.internal_channel_refs.push_back(channel_ref);
-            member_channels.push_back(internal);
             node_source_overrides[ss.members[mi]] = channel_ref;
-        }
 
-        runtime.hub = std::make_shared<BroadcastHub>(
-            ss.id,
-            ss.source_ref,
-            ss.members,
-            shared_source,
-            member_channels);
+            std::string sub_err;
+            const int add_rc = runtime.hub->AddSubscriber(
+                runtime_task_id + ":" + ss.members[mi],
+                ss.members[mi],
+                true,
+                nullptr,
+                &sub_err,
+                internal);
+            if (add_rc != 0) {
+                rsp = BuildExecutionErrorJson(
+                    "add share_set subscriber failed: " + ss.members[mi] +
+                        (sub_err.empty() ? "" : (", " + sub_err)),
+                    ErrorCodeId::kStreamGroupBranchBuildFailed,
+                    ErrorStageId::kBranchBuild);
+                cleanup_local_resources();
+                return error::INTERNAL_ERROR;
+            }
+        }
         share_set_runtimes.push_back(std::move(runtime));
     }
 
     auto stop_group_hubs = [this, runtime_task_id]() {
-        std::vector<std::shared_ptr<BroadcastHub>> hubs;
+        std::vector<std::shared_ptr<SharedSourceHub>> hubs;
         {
             std::lock_guard<std::mutex> lock(stream_group_share_sets_mu_);
             auto it = stream_group_share_sets_.find(runtime_task_id);

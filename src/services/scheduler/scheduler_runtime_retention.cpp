@@ -28,6 +28,7 @@ int64_t CurrentTimeMsLocal() {
 
 void SchedulerPlugin::ReleaseStreamTaskLeases(const std::string& runtime_task_id) {
     if (runtime_task_id.empty()) return;
+    ReleaseRuntimeSubscriptions(runtime_task_id);
     std::lock_guard<std::mutex> lock(stream_channel_refs_mu_);
     auto it = stream_task_leases_.find(runtime_task_id);
     if (it == stream_task_leases_.end()) return;
@@ -53,6 +54,54 @@ void SchedulerPlugin::ReleaseStreamTaskLeases(const std::string& runtime_task_id
         }
     }
     stream_task_leases_.erase(it);
+}
+
+void SchedulerPlugin::ReleaseRuntimeSubscriptions(const std::string& runtime_task_id) {
+    if (runtime_task_id.empty()) return;
+    std::vector<RuntimeSharedSubscription> subs;
+    {
+        std::lock_guard<std::mutex> lock(runtime_subscriptions_mu_);
+        auto it = runtime_subscriptions_.find(runtime_task_id);
+        if (it != runtime_subscriptions_.end()) {
+            subs = std::move(it->second);
+            runtime_subscriptions_.erase(it);
+        }
+    }
+    for (auto& sub : subs) {
+        sub.handle.Release();
+    }
+    if (!subs.empty()) {
+        PruneSharedHubs(false);
+    }
+}
+
+void SchedulerPlugin::PruneSharedHubs(bool force_stop) {
+    std::vector<std::pair<std::string, std::shared_ptr<SharedSourceHub>>> candidates;
+    {
+        std::lock_guard<std::mutex> lock(shared_hubs_mu_);
+        candidates.reserve(shared_hubs_.size());
+        for (const auto& kv : shared_hubs_) {
+            if (!kv.second) continue;
+            if (force_stop || kv.second->SubscriberCount() == 0) {
+                candidates.push_back(kv);
+            }
+        }
+    }
+    for (const auto& entry : candidates) {
+        if (!entry.second) continue;
+        entry.second->RequestStop(force_stop);
+        entry.second->Join();
+    }
+    if (candidates.empty()) return;
+    std::lock_guard<std::mutex> lock(shared_hubs_mu_);
+    for (const auto& entry : candidates) {
+        auto it = shared_hubs_.find(entry.first);
+        if (it == shared_hubs_.end()) continue;
+        if (it->second != entry.second) continue;
+        if (force_stop || (it->second->SubscriberCount() == 0 && it->second->IsTerminal())) {
+            shared_hubs_.erase(it);
+        }
+    }
 }
 
 void SchedulerPlugin::SweepFinishedTaskLeases() {
@@ -259,6 +308,35 @@ int SchedulerPlugin::QueryStreamTaskSnapshotByRuntimeId(const std::string& runti
     return 0;
 }
 
+int SchedulerPlugin::QueryRuntimeSharedHubSnapshot(const std::string& runtime_task_id,
+                                                   SharedHubSnapshot* snapshot_out) {
+    if (!snapshot_out || runtime_task_id.empty()) return EINVAL;
+    snapshot_out->id.clear();
+
+    std::string hub_key;
+    {
+        std::lock_guard<std::mutex> lock(runtime_subscriptions_mu_);
+        auto it = runtime_subscriptions_.find(runtime_task_id);
+        if (it == runtime_subscriptions_.end() || it->second.empty()) {
+            return ENOENT;
+        }
+        hub_key = it->second.front().hub_key;
+    }
+    if (hub_key.empty()) return ENOENT;
+
+    std::shared_ptr<SharedSourceHub> hub;
+    {
+        std::lock_guard<std::mutex> lock(shared_hubs_mu_);
+        auto it = shared_hubs_.find(hub_key);
+        if (it == shared_hubs_.end() || !it->second) {
+            return ENOENT;
+        }
+        hub = it->second;
+    }
+    *snapshot_out = hub->Snapshot();
+    return 0;
+}
+
 void SchedulerPlugin::RequestStopStreamTaskByRuntimeId(const std::string& runtime_task_id) {
     if (runtime_task_id.empty()) return;
     std::shared_ptr<StreamTask> task;
@@ -271,9 +349,9 @@ void SchedulerPlugin::RequestStopStreamTaskByRuntimeId(const std::string& runtim
     task->RequestStop();
 }
 
-std::vector<BroadcastHubSnapshot> SchedulerPlugin::QueryGroupShareSetSnapshots(
+std::vector<SharedHubSnapshot> SchedulerPlugin::QueryGroupShareSetSnapshots(
     const std::string& group_runtime_task_id) {
-    std::vector<BroadcastHubSnapshot> out;
+    std::vector<SharedHubSnapshot> out;
     {
         std::lock_guard<std::mutex> lock(stream_group_share_set_snapshots_mu_);
         auto it = stream_group_share_set_snapshots_.find(group_runtime_task_id);
@@ -292,7 +370,7 @@ std::vector<BroadcastHubSnapshot> SchedulerPlugin::QueryGroupShareSetSnapshots(
     }
     out.reserve(runtimes.size());
     for (const auto& runtime : runtimes) {
-        BroadcastHubSnapshot snap;
+        SharedHubSnapshot snap;
         if (runtime.hub) {
             snap = runtime.hub->Snapshot();
         }
@@ -333,7 +411,7 @@ void SchedulerPlugin::CleanupGroupRuntimeResources(const std::string& group_runt
         }
     }
 
-    std::vector<BroadcastHubSnapshot> final_snapshots;
+    std::vector<SharedHubSnapshot> final_snapshots;
     final_snapshots.reserve(share_sets.size());
     for (auto& ss : share_sets) {
         if (ss.hub) {
@@ -342,7 +420,7 @@ void SchedulerPlugin::CleanupGroupRuntimeResources(const std::string& group_runt
             ss.hub->Join();
             final_snapshots.back() = ss.hub->Snapshot();
         } else {
-            BroadcastHubSnapshot snap;
+            SharedHubSnapshot snap;
             snap.id = ss.id;
             snap.source_ref = ss.source_ref;
             snap.members = ss.members;

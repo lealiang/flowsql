@@ -148,6 +148,40 @@ static size_t NextPowerOfTwo(size_t value) {
     return v + 1;
 }
 
+static std::string TrimAsciiSpace(const std::string& input) {
+    size_t first = 0;
+    while (first < input.size() &&
+           (input[first] == ' ' || input[first] == '\t' ||
+            input[first] == '\r' || input[first] == '\n')) {
+        ++first;
+    }
+    if (first >= input.size()) return "";
+    size_t last = input.size();
+    while (last > first &&
+           (input[last - 1] == ' ' || input[last - 1] == '\t' ||
+            input[last - 1] == '\r' || input[last - 1] == '\n')) {
+        --last;
+    }
+    return input.substr(first, last - first);
+}
+
+static std::string CanonicalSharedHubKey(const std::vector<std::string>& source_keys) {
+    std::vector<std::string> keys;
+    keys.reserve(source_keys.size());
+    for (const auto& key : source_keys) {
+        if (!key.empty()) keys.push_back(key);
+    }
+    if (keys.empty()) return "";
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    std::string out;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i != 0) out.push_back('\x1f');
+        out += keys[i];
+    }
+    return out;
+}
+
 class SharedSourceState final : public std::enable_shared_from_this<SharedSourceState> {
  public:
     explicit SharedSourceState(std::shared_ptr<IStreamChannel> source)
@@ -1132,6 +1166,11 @@ int32_t SchedulerPlugin::BuildStreamExecutionPlan(const SqlStatement& stmt,
     plan->source_keys = source_resolved.source_keys;
     plan->resolved_sources = source_resolved.resolved_sources;
     plan->source_expand_rule = source_resolved.source_expand_rule;
+    plan->shared_hub_key = CanonicalSharedHubKey(plan->source_keys);
+    plan->where_signature = TrimAsciiSpace(stmt.where_clause);
+    if (plan->lease_owner_id.empty() && !plan->shared_hub_key.empty()) {
+        plan->lease_owner_id = plan->shared_hub_key;
+    }
 
     plan->sink_channel = sink_binding.sink_channel;
     plan->sink_type = sink_binding.sink_type;
@@ -1339,6 +1378,145 @@ int32_t SchedulerPlugin::AcquireStreamExecutionLease(StreamExecutionPlan* plan,
     return error::OK;
 }
 
+int32_t SchedulerPlugin::AcquireSharedSourceSubscription(StreamExecutionPlan* plan,
+                                                         std::shared_ptr<IStreamChannel>* source_override,
+                                                         std::string* err_rsp) {
+    if (!plan || !source_override || !err_rsp) return error::INTERNAL_ERROR;
+    source_override->reset();
+    err_rsp->clear();
+
+    if (plan->skip_lease_acquire) {
+        return error::OK;
+    }
+    if (plan->shared_hub_key.empty()) {
+        return error::OK;
+    }
+    if (!plan->source) {
+        *err_rsp = BuildExecutionErrorJson(
+            "shared source attach failed: source is null",
+            ErrorCodeId::kSharedSourceHubCreateFailed,
+            ErrorStageId::kSourceResolve);
+        return error::INTERNAL_ERROR;
+    }
+
+    std::shared_ptr<SharedSourceHub> hub;
+    bool created = false;
+    {
+        std::lock_guard<std::mutex> lock(shared_hubs_mu_);
+        auto it = shared_hubs_.find(plan->shared_hub_key);
+        if (it != shared_hubs_.end()) {
+            hub = it->second;
+        } else {
+            if (shared_hubs_.size() >= max_shared_hubs_) {
+                *err_rsp = BuildExecutionErrorJson(
+                    "shared source hub count exceeded max_shared_hubs",
+                    ErrorCodeId::kSharedSourceHubCreateFailed,
+                    ErrorStageId::kSourceResolve);
+                return error::CONFLICT;
+            }
+            SharedHubOptions opts;
+            opts.queue_size = shared_subscriber_queue_size_;
+            opts.poll_timeout_ms = shared_hub_poll_timeout_ms_;
+            opts.overflow_policy = OverflowPolicy::kDrop;
+            opts.ring_mode = RingMode::SPSC;
+            opts.coordinated_drop = false;
+            std::string source_ref;
+            for (size_t i = 0; i < plan->resolved_sources.size(); ++i) {
+                if (i != 0) source_ref.push_back(',');
+                source_ref += plan->resolved_sources[i];
+            }
+            hub = std::make_shared<SharedSourceHub>(
+                plan->shared_hub_key,
+                SharedHubMode::kDynamic,
+                source_ref,
+                plan->source_keys,
+                plan->source,
+                opts);
+            shared_hubs_[plan->shared_hub_key] = hub;
+            created = true;
+        }
+    }
+
+    std::string bind_err;
+    const int bind_rc = hub->BindWhereSignature(plan->where_signature, &bind_err);
+    if (bind_rc != 0) {
+        if (created) {
+            std::lock_guard<std::mutex> lock(shared_hubs_mu_);
+            auto it = shared_hubs_.find(plan->shared_hub_key);
+            if (it != shared_hubs_.end() && it->second == hub) {
+                shared_hubs_.erase(it);
+            }
+        }
+        const ErrorCodeId code = bind_rc == EINVAL
+            ? ErrorCodeId::kSharedSourceWhereMismatch
+            : ErrorCodeId::kSharedSourceFilterUnsupported;
+        *err_rsp = BuildExecutionErrorJson(
+            bind_err.empty() ? "shared source WHERE binding failed" : bind_err,
+            code,
+            ErrorStageId::kSourceResolve);
+        return bind_rc == EINVAL ? error::CONFLICT : error::BAD_REQUEST;
+    }
+
+    if (hub->SubscriberCount() >= max_subscribers_per_hub_) {
+        *err_rsp = BuildExecutionErrorJson(
+            "shared source subscribers exceeded max_subscribers_per_hub",
+            ErrorCodeId::kSharedSourceSubscribeFailed,
+            ErrorStageId::kSourceResolve);
+        return error::CONFLICT;
+    }
+
+    SharedSubscriberHandle handle;
+    std::string sub_err;
+    const int sub_rc = hub->AddSubscriber(
+        plan->runtime_task_id,
+        "",
+        true,
+        &handle,
+        &sub_err);
+    if (sub_rc != 0 || !handle.Valid()) {
+        if (created) {
+            hub->RequestStop();
+            hub->Join();
+            std::lock_guard<std::mutex> lock(shared_hubs_mu_);
+            auto it = shared_hubs_.find(plan->shared_hub_key);
+            if (it != shared_hubs_.end() && it->second == hub) {
+                shared_hubs_.erase(it);
+            }
+        }
+        *err_rsp = BuildExecutionErrorJson(
+            sub_err.empty() ? "shared source subscribe failed" : sub_err,
+            ErrorCodeId::kSharedSourceSubscribeFailed,
+            ErrorStageId::kSourceResolve);
+        return MapStreamManagerErrorToStatus(sub_rc == 0 ? EIO : sub_rc);
+    }
+    if (!handle.Input()) {
+        handle.Release();
+        *err_rsp = BuildExecutionErrorJson(
+            "shared source subscribe returned null input",
+            ErrorCodeId::kSharedSourceSubscribeFailed,
+            ErrorStageId::kSourceResolve);
+        return error::INTERNAL_ERROR;
+    }
+    std::shared_ptr<IStreamChannel> attached_input = handle.Input();
+
+    RuntimeSharedSubscription sub;
+    sub.hub_key = plan->shared_hub_key;
+    sub.handle = std::move(handle);
+    {
+        std::lock_guard<std::mutex> lock(runtime_subscriptions_mu_);
+        runtime_subscriptions_[plan->runtime_task_id].push_back(std::move(sub));
+    }
+    *source_override = attached_input;
+    if (!*source_override) {
+        *err_rsp = BuildExecutionErrorJson(
+            "shared source runtime input is null",
+            ErrorCodeId::kSharedSourceInternalError,
+            ErrorStageId::kSourceResolve);
+        return error::INTERNAL_ERROR;
+    }
+    return error::OK;
+}
+
 int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
                                            std::string& rsp,
                                            const std::string& lease_owner_id,
@@ -1386,7 +1564,31 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
         return error::INTERNAL_ERROR;
     }
 
-    if (!plan.stmt.where_clause.empty()) {
+    bool cleanup_shared_subscription = false;
+    auto shared_subscription_guard = std::unique_ptr<void, std::function<void(void*)>>(
+        reinterpret_cast<void*>(1),
+        [this, runtime_task_id = plan.runtime_task_id, &cleanup_shared_subscription](void*) {
+            if (cleanup_shared_subscription) {
+                ReleaseRuntimeSubscriptions(runtime_task_id);
+            }
+        });
+
+    std::shared_ptr<IStreamChannel> source_override;
+    rc = AcquireSharedSourceSubscription(&plan, &source_override, &err_rsp);
+    if (rc != error::OK) {
+        rsp = EnsureExecutionErrorJson(err_rsp,
+                                       "acquire shared source subscription failed",
+                                       ErrorCodeId::kSharedSourceSubscribeFailed,
+                                       ErrorStageId::kSourceResolve);
+        return rc;
+    }
+    const bool using_shared_source = (source_override != nullptr);
+    if (using_shared_source) {
+        source = source_override;
+        cleanup_shared_subscription = true;
+    }
+
+    if (!plan.stmt.where_clause.empty() && !using_shared_source) {
         std::vector<std::string> unsupported;
         const int filter_rc = source->SetFilter(plan.stmt.where_clause.c_str(), &unsupported);
         if (filter_rc != 0) {
@@ -1537,6 +1739,8 @@ int32_t SchedulerPlugin::ExecuteStreamTask(const SqlStatement& stmt,
     if (!plan.skip_lease_acquire) {
         lease_token.Commit();
     }
+    cleanup_shared_subscription = false;
+    shared_subscription_guard.reset();
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);

@@ -13,7 +13,7 @@ add_executable(test_scheduler_mutation_guard
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_json_codec.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_stream_group.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/stream_execution_plan.cpp
-    ${CMAKE_SOURCE_DIR}/services/scheduler/broadcast_hub.cpp
+    ${CMAKE_SOURCE_DIR}/services/scheduler/shared_source_hub.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/stream_runtime.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/stream_task.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/stream_task_group.cpp

@@ -45,6 +45,13 @@ enum class ErrorCodeId {
     kStreamFaninCapabilityMismatch,
     kStreamSourceCapabilityMismatch,
     kStreamSinkCapabilityMismatch,
+    kSharedSourceHubCreateFailed,
+    kSharedSourceSubscribeFailed,
+    kSharedSourceModeMismatch,
+    kSharedSourceWhereMismatch,
+    kSharedSourceFilterUnsupported,
+    kSharedSourceReadyTimeout,
+    kSharedSourceInternalError,
 };
 
 enum class ErrorStageId {
