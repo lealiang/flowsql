@@ -49,6 +49,7 @@ tasks/
 ├── sprints/
 │   └── sprintN/
 │       ├── planning.md         # 迭代规划
+│       ├── design.md           # 迭代设计
 │       ├── review.md           # 迭代评审
 │       └── retrospective.md    # 迭代回顾
 └── lessons.md                  # 经验教训汇总

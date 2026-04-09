@@ -1,10 +1,10 @@
 # FlowSQL
 
-基于 SQL 语法的网络流量分析共创平台
+基于 SQL 的实时数据处理与分析共创平台
 
 ## 项目简介
 
-FlowSQL 是一个全栈式网络流量分析平台，通过扩展的 SQL 语法提供从数据采集、流量分析到数据探索的完整能力。用户无需深入了解底层技术（如 DPDK、Hyperscan），只需使用熟悉的 SQL 语句即可构建自己的流量分析系统。
+FlowSQL 是一个全栈式实时数据处理与分析平台，通过扩展的 SQL 语法提供从数据采集、流式处理到结果探索的完整能力。用户无需深入了解底层执行细节，只需使用熟悉的 SQL 语句即可构建面向实时与离线场景的数据任务。
 
 平台采用 Gateway + RouterAgency 插件架构：所有 C++ 服务共享同一个框架程序（加载不同 .so），业务插件通过 IRouterHandle 声明路由，RouterAgencyPlugin 统一收集并向 Gateway 注册，Python Worker 作为独立 FastAPI 进程运行。控制面统一走 HTTP + URI 路由，数据面通过共享内存 / Arrow IPC 实现零拷贝传输。
 
@@ -15,6 +15,7 @@ FlowSQL 是一个全栈式网络流量分析平台，通过扩展的 SQL 语法�
 - **Gateway 转发**：Trie 最长前缀匹配，KeepAlive 自动续期，服务故障自动重启
 - **C++ ↔ Python 桥接**：共享内存 + Arrow IPC 零拷贝数据传输，HTTP 仅传控制指令
 - **SQL 驱动**：扩展 SQL 语法统一数据采集、分析、探索操作
+- **流批双模式统一**：Batch 与 Stream 均采用 SQL 驱动、统一任务管理与统一插件体系
 - **三类算子统一管理**：内置算子（builtin）+ Python 算子 + C++ 插件算子统一走 `/api/operators/*`
 - **Web 管理**：Vue.js 前端 + REST API，支持通道/算子/任务管理
 
@@ -196,6 +197,7 @@ INTO dataframe.out;
 - Stream 多 SQL 的 `group` 当前仅支持 `group_mode=dag`。
 - Stream 支持同一 source 的跨任务并发消费（late join）；任务间 stop/cancel/fail 相互隔离。
 - `POST /api/tasks/stream/status` 与 `POST /api/tasks/stream/list` 已提供共享消费观测字段：`shared_hub_id`、`shared_source_keys`、`subscriber_count`、`subscriber_stats`（含 `lag`）。
+- 流批一体当前边界：单任务内暂不支持 batch + stream 混合 DAG 编排（Hybrid DAG）。
 - `Hybrid DAG`（batch+stream 混合编排）当前未实现，已列为后续候选能力。
 
 ## 流式任务执行契约（Sprint 14）
