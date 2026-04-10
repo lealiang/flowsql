@@ -200,7 +200,7 @@ INTO dataframe.out;
 - 流批一体当前边界：单任务内暂不支持 batch + stream 混合 DAG 编排（Hybrid DAG）。
 - `Hybrid DAG`（batch+stream 混合编排）当前未实现，已列为后续候选能力。
 
-## 流式任务执行契约（Sprint 14）
+## 流式任务执行契约
 
 ### API 入口
 

@@ -1,6 +1,6 @@
 project(flowsql_scheduler)
 
-file(GLOB DIR_SRCS *.cpp)
+file(GLOB DIR_SRCS CONFIGURE_DEPENDS *.cpp)
 
 add_library(${PROJECT_NAME} SHARED
     ${DIR_SRCS}

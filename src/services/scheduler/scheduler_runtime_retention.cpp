@@ -162,6 +162,7 @@ void SchedulerPlugin::SweepRuntimeRetainedObjects(int64_t now_ms) {
     };
 
     const int64_t now = now_ms > 0 ? now_ms : CurrentTimeMsLocal();
+    batch_runtime_.SweepFinished(now, stream_runtime_retention_s_, stream_runtime_max_count_);
     std::vector<RuntimeEntry> terminal_entries;
     {
         std::lock_guard<std::mutex> lock(stream_runtime_retention_mu_);
@@ -400,6 +401,32 @@ std::unordered_map<std::string, GroupNodeResolvedSourceMeta> SchedulerPlugin::Qu
 void SchedulerPlugin::CleanupGroupRuntimeResources(const std::string& group_runtime_task_id,
                                                    const StreamGroupSnapshot* group_snapshot) {
     if (group_runtime_task_id.empty()) return;
+
+    std::vector<std::string> batch_node_runtime_ids;
+    {
+        std::lock_guard<std::mutex> lock(stream_group_batch_nodes_mu_);
+        auto it = stream_group_batch_node_runtime_ids_.find(group_runtime_task_id);
+        if (it != stream_group_batch_node_runtime_ids_.end()) {
+            batch_node_runtime_ids = std::move(it->second);
+            stream_group_batch_node_runtime_ids_.erase(it);
+        }
+    }
+    if (group_snapshot) {
+        for (const auto& node : group_snapshot->nodes) {
+            if (node.kind != GroupNodeKind::kBatch || node.runtime_task_id.empty()) continue;
+            batch_node_runtime_ids.push_back(node.runtime_task_id);
+        }
+    }
+    if (!batch_node_runtime_ids.empty()) {
+        std::sort(batch_node_runtime_ids.begin(), batch_node_runtime_ids.end());
+        batch_node_runtime_ids.erase(
+            std::unique(batch_node_runtime_ids.begin(), batch_node_runtime_ids.end()),
+            batch_node_runtime_ids.end());
+        for (const auto& node_runtime_id : batch_node_runtime_ids) {
+            std::string stop_err;
+            batch_runtime_.RequestStop(node_runtime_id, &stop_err);
+        }
+    }
 
     std::vector<StreamGroupShareSetRuntime> share_sets;
     {

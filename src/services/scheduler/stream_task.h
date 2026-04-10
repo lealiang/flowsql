@@ -86,6 +86,7 @@ struct TaskSnapshot {
     int64_t finished_ms = 0;
 
     int error_code = 0;
+    std::string error_code_text;
     std::string error_message;
     std::string op_stats_json;
     std::vector<std::string> resolved_sources;

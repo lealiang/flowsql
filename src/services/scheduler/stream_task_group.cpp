@@ -8,6 +8,8 @@
 
 #include "stream_task_group.h"
 
+#include <framework/core/error_contract.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -52,6 +54,15 @@ const char* GroupNodeStatusName(GroupNodeStatus status) {
         case GroupNodeStatus::kFailed: return "failed";
         case GroupNodeStatus::kSkipped: return "skipped";
         default: return "unknown";
+    }
+}
+
+const char* GroupNodeKindName(GroupNodeKind kind) {
+    switch (kind) {
+        case GroupNodeKind::kBatch: return "batch";
+        case GroupNodeKind::kStream:
+        default:
+            return "stream";
     }
 }
 
@@ -177,9 +188,12 @@ StreamGroupSnapshot StreamTaskGroup::Snapshot() const {
         GroupNodeSnapshot n;
         n.node_id = node.plan.id;
         n.runtime_task_id = node.runtime_task_id;
+        n.sql_index = node.plan.sql_index;
+        n.kind = node.plan.kind;
         n.status = node.status;
         n.start_condition = node.plan.start_condition;
         n.depends_on = node.plan.depends_on;
+        n.phase = node.phase;
         n.error_code = node.error_code;
         n.error_no = node.error_no;
         n.error_message = node.error_message;
@@ -287,17 +301,19 @@ bool StreamTaskGroup::TrySubmitReadyNodes(int64_t now_ms) {
         if (result.rc != 0 || result.runtime_task_id.empty()) {
             node.status = GroupNodeStatus::kFailed;
             node.error_no = result.rc != 0 ? result.rc : EIO;
-            node.error_code = "STREAM_GROUP_NODE_SUBMIT_FAILED";
+            node.error_code = ToErrorCode(ErrorCodeId::kStreamGroupNodeExecutionFailed);
             node.error_message = result.err_msg.empty() ? "submit group node failed" : result.err_msg;
+            node.phase = "submit";
             MarkGroupFailed(node.error_no,
                             "group node submit failed: " + node.plan.id,
                             now_ms,
-                            "STREAM_GROUP_NODE_SUBMIT_FAILED");
+                            node.error_code);
             continue;
         }
         node.runtime_task_id = result.runtime_task_id;
         node.submitted = true;
         node.status = GroupNodeStatus::kRunning;
+        node.phase = "execute";
         submitted_any = true;
     }
     return submitted_any;
@@ -363,10 +379,16 @@ void StreamTaskGroup::RefreshNodeStates() {
         }
         node.status = mapped;
         node.error_no = node.task_snapshot.error_code;
+        if (!node.task_snapshot.error_code_text.empty()) {
+            node.error_code = node.task_snapshot.error_code_text;
+        }
         if (node.status == GroupNodeStatus::kFailed && node.error_code.empty()) {
-            node.error_code = "STREAM_NODE_RUNTIME_FAILED";
+            node.error_code = ToErrorCode(ErrorCodeId::kStreamGroupNodeExecutionFailed);
         }
         node.error_message = node.task_snapshot.error_message;
+        if (node.status == GroupNodeStatus::kFailed && node.phase.empty()) {
+            node.phase = "execute";
+        }
     }
 }
 

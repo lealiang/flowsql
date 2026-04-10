@@ -252,6 +252,10 @@ void WriteGroupSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
         w->String(node.node_id.c_str());
         w->Key("runtime_task_id");
         w->String(node.runtime_task_id.c_str());
+        w->Key("node_kind");
+        w->String(GroupNodeKindName(node.kind));
+        w->Key("sql_index");
+        w->Uint64(static_cast<uint64_t>(node.sql_index));
         w->Key("status");
         w->String(GroupNodeStatusName(node.status));
         w->Key("depends_on");
@@ -274,6 +278,10 @@ void WriteGroupSnapshotJson(rapidjson::Writer<rapidjson::StringBuffer>* w,
         w->String(node.error_code.c_str());
         w->Key("error_no");
         w->Int(node.error_no);
+        w->Key("phase");
+        w->String(node.phase.c_str());
+        w->Key("error_message");
+        w->String(node.error_message.c_str());
         w->Key("last_error");
         w->String(node.error_message.c_str());
         w->Key("started_ms");

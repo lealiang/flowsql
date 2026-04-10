@@ -39,6 +39,27 @@ int32_t SchedulerControlClient::ExecuteBatch(const std::string& req_json, std::s
     return control->ExecuteBatch(req_json, rsp_json);
 }
 
+int32_t SchedulerControlClient::SubmitBatch(const std::string& req_json, std::string* rsp_json) const {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    auto* control = Acquire(rsp_json);
+    if (!control) return error::UNAVAILABLE;
+    return control->SubmitBatch(req_json, rsp_json);
+}
+
+int32_t SchedulerControlClient::QueryBatchStatus(const std::string& req_json, std::string* rsp_json) const {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    auto* control = Acquire(rsp_json);
+    if (!control) return error::UNAVAILABLE;
+    return control->QueryBatchStatus(req_json, rsp_json);
+}
+
+int32_t SchedulerControlClient::StopBatch(const std::string& req_json, std::string* rsp_json) const {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    auto* control = Acquire(rsp_json);
+    if (!control) return error::UNAVAILABLE;
+    return control->StopBatch(req_json, rsp_json);
+}
+
 int32_t SchedulerControlClient::ExecuteStream(const std::string& req_json, std::string* rsp_json) const {
     if (!rsp_json) return error::INTERNAL_ERROR;
     auto* control = Acquire(rsp_json);
@@ -88,6 +109,19 @@ int32_t RouterBackedSchedulerControlService::ClassifySql(const std::string& req_
 
 int32_t RouterBackedSchedulerControlService::ExecuteBatch(const std::string& req_json, std::string* rsp_json) {
     return Dispatch("/scheduler/batch/execute", req_json, rsp_json);
+}
+
+int32_t RouterBackedSchedulerControlService::SubmitBatch(const std::string& req_json, std::string* rsp_json) {
+    return Dispatch("/scheduler/batch/submit", req_json, rsp_json);
+}
+
+int32_t RouterBackedSchedulerControlService::QueryBatchStatus(const std::string& req_json,
+                                                              std::string* rsp_json) {
+    return Dispatch("/scheduler/batch/status", req_json, rsp_json);
+}
+
+int32_t RouterBackedSchedulerControlService::StopBatch(const std::string& req_json, std::string* rsp_json) {
+    return Dispatch("/scheduler/batch/stop", req_json, rsp_json);
 }
 
 int32_t RouterBackedSchedulerControlService::ExecuteStream(const std::string& req_json, std::string* rsp_json) {

@@ -80,6 +80,7 @@ int SchedulerPlugin::Option(const char* arg) {
         if (key == "host") host_ = val;
         else if (key == "port") port_ = std::stoi(val);
         else if (key == "stream_workers") stream_worker_count_ = static_cast<size_t>(std::stoull(val));
+        else if (key == "batch_workers") batch_worker_count_ = static_cast<size_t>(std::stoull(val));
         else if (key == "max_resolved_sources") {
             const size_t parsed = static_cast<size_t>(std::stoull(val));
             max_resolved_sources_ = std::max<size_t>(1, parsed);
@@ -177,6 +178,24 @@ int SchedulerPlugin::Start() {
         LOG_ERROR("SchedulerPlugin::Start: IOperatorCatalog not found");
     }
 
+    size_t batch_workers = batch_worker_count_;
+    if (batch_workers == 0) {
+        batch_workers = static_cast<size_t>(std::thread::hardware_concurrency());
+    }
+    if (batch_workers == 0) batch_workers = 1;
+    batch_runtime_.Start(
+        batch_workers,
+        [this](const std::string& sql, std::string* rsp) -> int32_t {
+            if (!rsp) return error::INTERNAL_ERROR;
+            rapidjson::StringBuffer req_buf;
+            rapidjson::Writer<rapidjson::StringBuffer> req_w(req_buf);
+            req_w.StartObject();
+            req_w.Key("sql");
+            req_w.String(sql.c_str());
+            req_w.EndObject();
+            return HandleExecute("/scheduler/batch/execute", req_buf.GetString(), *rsp);
+        });
+
     size_t workers = stream_worker_count_;
     if (workers == 0) {
         workers = static_cast<size_t>(std::thread::hardware_concurrency());
@@ -184,7 +203,7 @@ int SchedulerPlugin::Start() {
     if (workers == 0) workers = 1;
     stream_runtime_.Start(workers);
 
-    LOG_INFO("SchedulerPlugin::Start: ready, stream_workers=%zu", workers);
+    LOG_INFO("SchedulerPlugin::Start: ready, stream_workers=%zu, batch_workers=%zu", workers, batch_workers);
     return 0;
 }
 
@@ -246,6 +265,7 @@ int SchedulerPlugin::Stop() {
     }
     PruneSharedHubs(true);
     stream_runtime_.Stop();
+    batch_runtime_.Stop();
 
     {
         std::lock_guard<std::mutex> lock(stream_task_groups_mu_);
@@ -258,6 +278,10 @@ int SchedulerPlugin::Stop() {
     {
         std::lock_guard<std::mutex> lock(stream_group_node_sources_mu_);
         stream_group_node_sources_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(stream_group_batch_nodes_mu_);
+        stream_group_batch_node_runtime_ids_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(stream_group_share_sets_mu_);
@@ -307,6 +331,21 @@ int32_t SchedulerPlugin::ClassifySql(const std::string& req_json, std::string* r
 int32_t SchedulerPlugin::ExecuteBatch(const std::string& req_json, std::string* rsp_json) {
     if (!rsp_json) return error::INTERNAL_ERROR;
     return HandleExecute("/scheduler/batch/execute", req_json, *rsp_json);
+}
+
+int32_t SchedulerPlugin::SubmitBatch(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleBatchSubmit("/scheduler/batch/submit", req_json, *rsp_json);
+}
+
+int32_t SchedulerPlugin::QueryBatchStatus(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleBatchStatus("/scheduler/batch/status", req_json, *rsp_json);
+}
+
+int32_t SchedulerPlugin::StopBatch(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleBatchStop("/scheduler/batch/stop", req_json, *rsp_json);
 }
 
 int32_t SchedulerPlugin::ExecuteStream(const std::string& req_json, std::string* rsp_json) {

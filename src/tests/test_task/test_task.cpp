@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -174,13 +175,417 @@ static std::unordered_map<std::string, fnRouterHandler> CollectRoutes(IRouterHan
 
 class MockRouterHandle : public IRouterHandle {
  public:
-    explicit MockRouterHandle(std::vector<RouteItem> items) : items_(std::move(items)) {}
+    explicit MockRouterHandle(std::vector<RouteItem> items) : items_(std::move(items)) {
+        InstallBatchCompatRuntimeRoutes();
+    }
     void EnumRoutes(std::function<void(const RouteItem&)> cb) override {
         for (auto& item : items_) cb(item);
     }
 
  private:
+    struct BatchCompatTask {
+        std::string runtime_task_id;
+        std::vector<std::string> sqls;
+        int timeout_s = 0;
+        std::string status = "pending";
+        std::string error_code;
+        std::string error_message;
+        std::string error_stage;
+        int current_sql_index = 0;
+        int sql_count = 0;
+        int64_t result_row_count = 0;
+        int64_t result_col_count = 0;
+        std::string result_target;
+        int64_t created_ms = 0;
+        int64_t started_ms = 0;
+        int64_t last_active_ms = 0;
+        int64_t finished_ms = 0;
+        bool stop_requested = false;
+    };
+
+    struct BatchCompatRuntimeState {
+        std::mutex mu;
+        std::unordered_map<std::string, BatchCompatTask> tasks;
+        fnRouterHandler execute_handler;
+        std::atomic<uint64_t> seq{0};
+    };
+
+    static int64_t NowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    static void ParseExecuteResult(const std::string& rsp,
+                                   int64_t* rows,
+                                   int64_t* cols,
+                                   std::string* result_target) {
+        if (rows) *rows = 0;
+        if (cols) *cols = 0;
+        if (result_target) result_target->clear();
+        rapidjson::Document d;
+        d.Parse(rsp.c_str());
+        if (d.HasParseError() || !d.IsObject()) return;
+        if (rows) {
+            if (d.HasMember("result_row_count") && d["result_row_count"].IsInt64()) {
+                *rows = d["result_row_count"].GetInt64();
+            } else if (d.HasMember("rows") && d["rows"].IsInt64()) {
+                *rows = d["rows"].GetInt64();
+            }
+        }
+        if (cols) {
+            if (d.HasMember("result_col_count") && d["result_col_count"].IsInt64()) {
+                *cols = d["result_col_count"].GetInt64();
+            } else if (d.HasMember("cols") && d["cols"].IsInt64()) {
+                *cols = d["cols"].GetInt64();
+            }
+        }
+        if (result_target && d.HasMember("result_target") && d["result_target"].IsString()) {
+            *result_target = d["result_target"].GetString();
+        }
+    }
+
+    static void ParseExecuteError(const std::string& rsp,
+                                  std::string* error_code,
+                                  std::string* error_message,
+                                  std::string* error_stage) {
+        if (error_code) error_code->clear();
+        if (error_message) error_message->clear();
+        if (error_stage) error_stage->clear();
+        rapidjson::Document d;
+        d.Parse(rsp.c_str());
+        if (d.HasParseError() || !d.IsObject()) return;
+        if (error_code && d.HasMember("error_code") && d["error_code"].IsString()) {
+            *error_code = d["error_code"].GetString();
+        }
+        if (error_message && d.HasMember("error") && d["error"].IsString()) {
+            *error_message = d["error"].GetString();
+        }
+        if (error_stage && d.HasMember("error_stage") && d["error_stage"].IsString()) {
+            *error_stage = d["error_stage"].GetString();
+        }
+    }
+
+    static std::string BuildBatchStatusJson(const BatchCompatTask& t) {
+        rapidjson::StringBuffer out;
+        rapidjson::Writer<rapidjson::StringBuffer> w(out);
+        w.StartObject();
+        w.Key("runtime_task_id");
+        w.String(t.runtime_task_id.c_str());
+        w.Key("runtime_kind");
+        w.String("batch");
+        w.Key("status");
+        w.String(t.status.c_str());
+        w.Key("error_code");
+        w.String(t.error_code.c_str());
+        w.Key("error_message");
+        w.String(t.error_message.c_str());
+        w.Key("error_stage");
+        w.String(t.error_stage.c_str());
+        w.Key("current_sql_index");
+        w.Int(t.current_sql_index);
+        w.Key("sql_count");
+        w.Int(t.sql_count);
+        w.Key("timeout_s");
+        w.Int(t.timeout_s);
+        w.Key("result_row_count");
+        w.Int64(t.result_row_count);
+        w.Key("result_col_count");
+        w.Int64(t.result_col_count);
+        w.Key("result_target");
+        w.String(t.result_target.c_str());
+        w.Key("created_ms");
+        w.Int64(t.created_ms);
+        w.Key("started_ms");
+        w.Int64(t.started_ms);
+        w.Key("last_active_ms");
+        w.Int64(t.last_active_ms);
+        w.Key("finished_ms");
+        w.Int64(t.finished_ms);
+        w.EndObject();
+        return out.GetString();
+    }
+
+    static void RunBatchCompatTask(const std::shared_ptr<BatchCompatRuntimeState>& state,
+                                   const std::string& runtime_task_id) {
+        std::vector<std::string> sqls;
+        int timeout_s = 0;
+        int64_t started_ms = 0;
+        {
+            std::lock_guard<std::mutex> lock(state->mu);
+            auto it = state->tasks.find(runtime_task_id);
+            if (it == state->tasks.end()) return;
+            it->second.status = "running";
+            it->second.started_ms = NowMs();
+            it->second.last_active_ms = it->second.started_ms;
+            sqls = it->second.sqls;
+            timeout_s = it->second.timeout_s;
+            started_ms = it->second.started_ms;
+        }
+
+        for (size_t i = 0; i < sqls.size(); ++i) {
+            {
+                std::lock_guard<std::mutex> lock(state->mu);
+                auto it = state->tasks.find(runtime_task_id);
+                if (it == state->tasks.end()) return;
+                if (it->second.stop_requested) {
+                    it->second.status = "cancelled";
+                    it->second.finished_ms = NowMs();
+                    it->second.last_active_ms = it->second.finished_ms;
+                    return;
+                }
+                if (timeout_s > 0 && NowMs() - started_ms >= static_cast<int64_t>(timeout_s) * 1000) {
+                    it->second.status = "timeout";
+                    it->second.error_code = "TIMEOUT";
+                    it->second.error_message = "batch runtime task timeout";
+                    it->second.error_stage = "timeout";
+                    it->second.finished_ms = NowMs();
+                    it->second.last_active_ms = it->second.finished_ms;
+                    return;
+                }
+                it->second.current_sql_index = static_cast<int>(i);
+                it->second.last_active_ms = NowMs();
+            }
+
+            rapidjson::StringBuffer req_buf;
+            rapidjson::Writer<rapidjson::StringBuffer> req_w(req_buf);
+            req_w.StartObject();
+            req_w.Key("sql");
+            req_w.String(sqls[i].c_str());
+            req_w.EndObject();
+
+            std::string exec_rsp;
+            const int32_t rc = state->execute_handler("/scheduler/batch/execute", req_buf.GetString(), exec_rsp);
+            if (rc != error::OK) {
+                std::string err_code;
+                std::string err_message;
+                std::string err_stage;
+                ParseExecuteError(exec_rsp, &err_code, &err_message, &err_stage);
+                if (err_code.empty()) err_code = "EXECUTION_FAILED";
+                if (err_message.empty()) err_message = "batch SQL execute failed";
+                if (err_stage.empty()) err_stage = "execute";
+                std::lock_guard<std::mutex> lock(state->mu);
+                auto it = state->tasks.find(runtime_task_id);
+                if (it == state->tasks.end()) return;
+                it->second.status = "failed";
+                it->second.error_code = err_code;
+                it->second.error_message = err_message;
+                it->second.error_stage = err_stage;
+                it->second.finished_ms = NowMs();
+                it->second.last_active_ms = it->second.finished_ms;
+                return;
+            }
+
+            int64_t rows = 0;
+            int64_t cols = 0;
+            std::string target;
+            ParseExecuteResult(exec_rsp, &rows, &cols, &target);
+            {
+                std::lock_guard<std::mutex> lock(state->mu);
+                auto it = state->tasks.find(runtime_task_id);
+                if (it == state->tasks.end()) return;
+                it->second.result_row_count = rows;
+                it->second.result_col_count = cols;
+                it->second.result_target = target;
+                it->second.last_active_ms = NowMs();
+                if (timeout_s > 0 && NowMs() - started_ms >= static_cast<int64_t>(timeout_s) * 1000) {
+                    it->second.status = "timeout";
+                    it->second.error_code = "TIMEOUT";
+                    it->second.error_message = "batch runtime task timeout";
+                    it->second.error_stage = "timeout";
+                    it->second.finished_ms = NowMs();
+                    it->second.last_active_ms = it->second.finished_ms;
+                    return;
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(state->mu);
+        auto it = state->tasks.find(runtime_task_id);
+        if (it == state->tasks.end()) return;
+        it->second.current_sql_index = it->second.sql_count;
+        if (it->second.stop_requested) {
+            it->second.status = "cancelled";
+        } else {
+            it->second.status = "completed";
+        }
+        it->second.finished_ms = NowMs();
+        it->second.last_active_ms = it->second.finished_ms;
+    }
+
+    void InstallBatchCompatRuntimeRoutes() {
+        fnRouterHandler execute_handler;
+        bool has_submit = false;
+        bool has_status = false;
+        bool has_stop = false;
+        for (const auto& item : items_) {
+            if (item.method != "POST") continue;
+            if (item.uri == "/scheduler/batch/execute") execute_handler = item.handler;
+            if (item.uri == "/scheduler/batch/submit") has_submit = true;
+            if (item.uri == "/scheduler/batch/status") has_status = true;
+            if (item.uri == "/scheduler/batch/stop") has_stop = true;
+        }
+        if (!execute_handler) return;
+        if (has_submit && has_status && has_stop) return;
+
+        batch_runtime_state_ = std::make_shared<BatchCompatRuntimeState>();
+        batch_runtime_state_->execute_handler = execute_handler;
+        auto state = batch_runtime_state_;
+
+        if (!has_submit) {
+            items_.push_back({"POST", "/scheduler/batch/submit",
+                              [state](const std::string&, const std::string& req, std::string& rsp) {
+                                  rapidjson::Document d;
+                                  d.Parse(req.c_str());
+                                  if (d.HasParseError() || !d.IsObject()) {
+                                      rsp = R"({"error":"invalid request body"})";
+                                      return error::BAD_REQUEST;
+                                  }
+
+                                  std::string runtime_task_id;
+                                  if (d.HasMember("runtime_task_id") && d["runtime_task_id"].IsString()) {
+                                      runtime_task_id = d["runtime_task_id"].GetString();
+                                  }
+                                  if (runtime_task_id.empty()) {
+                                      const uint64_t seq = state->seq.fetch_add(1) + 1;
+                                      runtime_task_id = "batch_rt_" + std::to_string(seq);
+                                  }
+
+                                  int timeout_s = 0;
+                                  if (d.HasMember("timeout_s") && d["timeout_s"].IsInt()) {
+                                      timeout_s = d["timeout_s"].GetInt();
+                                  }
+
+                                  std::vector<std::string> sqls;
+                                  if (!d.HasMember("sqls") || !d["sqls"].IsArray() || d["sqls"].Empty()) {
+                                      rsp = R"({"error":"sqls must be non-empty string array"})";
+                                      return error::BAD_REQUEST;
+                                  }
+                                  for (const auto& v : d["sqls"].GetArray()) {
+                                      if (!v.IsString()) {
+                                          rsp = R"({"error":"sqls must be non-empty string array"})";
+                                          return error::BAD_REQUEST;
+                                      }
+                                      sqls.emplace_back(v.GetString());
+                                  }
+
+                                  {
+                                      std::lock_guard<std::mutex> lock(state->mu);
+                                      if (state->tasks.find(runtime_task_id) != state->tasks.end()) {
+                                          rsp = R"({"error":"runtime_task_id already exists"})";
+                                          return error::CONFLICT;
+                                      }
+                                      BatchCompatTask task;
+                                      task.runtime_task_id = runtime_task_id;
+                                      task.sqls = std::move(sqls);
+                                      task.timeout_s = timeout_s;
+                                      task.sql_count = static_cast<int>(task.sqls.size());
+                                      task.current_sql_index = 0;
+                                      task.created_ms = NowMs();
+                                      task.last_active_ms = task.created_ms;
+                                      state->tasks[runtime_task_id] = std::move(task);
+                                  }
+
+                                  std::thread([state, runtime_task_id]() {
+                                      RunBatchCompatTask(state, runtime_task_id);
+                                  }).detach();
+
+                                  rapidjson::StringBuffer out;
+                                  rapidjson::Writer<rapidjson::StringBuffer> w(out);
+                                  w.StartObject();
+                                  w.Key("status");
+                                  w.String("submitted");
+                                  w.Key("runtime_task_id");
+                                  w.String(runtime_task_id.c_str());
+                                  w.Key("runtime_kind");
+                                  w.String("batch");
+                                  w.EndObject();
+                                  rsp = out.GetString();
+                                  return error::OK;
+                              }});
+        }
+
+        if (!has_status) {
+            items_.push_back({"POST", "/scheduler/batch/status",
+                              [state](const std::string&, const std::string& req, std::string& rsp) {
+                                  rapidjson::Document d;
+                                  d.Parse(req.c_str());
+                                  if (d.HasParseError() || !d.IsObject()) {
+                                      rsp = R"({"error":"invalid request body"})";
+                                      return error::BAD_REQUEST;
+                                  }
+                                  std::string runtime_task_id;
+                                  if (d.HasMember("runtime_task_id") && d["runtime_task_id"].IsString()) {
+                                      runtime_task_id = d["runtime_task_id"].GetString();
+                                  } else if (d.HasMember("task_id") && d["task_id"].IsString()) {
+                                      runtime_task_id = d["task_id"].GetString();
+                                  }
+                                  if (runtime_task_id.empty()) {
+                                      rsp = R"({"error":"runtime_task_id is required"})";
+                                      return error::BAD_REQUEST;
+                                  }
+
+                                  BatchCompatTask snapshot;
+                                  {
+                                      std::lock_guard<std::mutex> lock(state->mu);
+                                      auto it = state->tasks.find(runtime_task_id);
+                                      if (it == state->tasks.end()) {
+                                          rsp = R"({"error":"batch runtime task not found"})";
+                                          return error::NOT_FOUND;
+                                      }
+                                      snapshot = it->second;
+                                  }
+                                  rsp = BuildBatchStatusJson(snapshot);
+                                  return error::OK;
+                              }});
+        }
+
+        if (!has_stop) {
+            items_.push_back({"POST", "/scheduler/batch/stop",
+                              [state](const std::string&, const std::string& req, std::string& rsp) {
+                                  rapidjson::Document d;
+                                  d.Parse(req.c_str());
+                                  if (d.HasParseError() || !d.IsObject()) {
+                                      rsp = R"({"error":"invalid request body"})";
+                                      return error::BAD_REQUEST;
+                                  }
+                                  std::string runtime_task_id;
+                                  if (d.HasMember("runtime_task_id") && d["runtime_task_id"].IsString()) {
+                                      runtime_task_id = d["runtime_task_id"].GetString();
+                                  } else if (d.HasMember("task_id") && d["task_id"].IsString()) {
+                                      runtime_task_id = d["task_id"].GetString();
+                                  }
+                                  if (runtime_task_id.empty()) {
+                                      rsp = R"({"error":"runtime_task_id is required"})";
+                                      return error::BAD_REQUEST;
+                                  }
+
+                                  BatchCompatTask snapshot;
+                                  {
+                                      std::lock_guard<std::mutex> lock(state->mu);
+                                      auto it = state->tasks.find(runtime_task_id);
+                                      if (it == state->tasks.end()) {
+                                          rsp = R"({"error":"batch runtime task not found"})";
+                                          return error::NOT_FOUND;
+                                      }
+                                      it->second.stop_requested = true;
+                                      if (it->second.status == "pending") {
+                                          it->second.status = "cancelled";
+                                          it->second.finished_ms = NowMs();
+                                          it->second.last_active_ms = it->second.finished_ms;
+                                      } else if (it->second.status == "running") {
+                                          it->second.status = "stopping";
+                                          it->second.last_active_ms = NowMs();
+                                      }
+                                      snapshot = it->second;
+                                  }
+                                  rsp = BuildBatchStatusJson(snapshot);
+                                  return error::OK;
+                              }});
+        }
+    }
+
     std::vector<RouteItem> items_;
+    std::shared_ptr<BatchCompatRuntimeState> batch_runtime_state_;
 };
 
 class MockChannelRegistry : public IChannelRegistry {
@@ -326,7 +731,15 @@ int main() {
     }
 
     {
-        MockRouterHandle scheduler({MakeSqlClassifyRoute()});
+        MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
+            {"POST", "/scheduler/batch/execute",
+             [](const std::string&, const std::string&, std::string& rsp) {
+                 std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                 rsp = R"({"status":"completed","result_row_count":1,"result_col_count":1,"result_target":"dataframe.pending","data":[]})";
+                 return error::OK;
+             }},
+        });
         MockQuerier querier;
         querier.AddHandle(&scheduler);
 
@@ -346,7 +759,7 @@ int main() {
         ASSERT_TRUE(routes.count("POST:/tasks/cancel") == 1);
 
         std::string rsp;
-        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1"})", rsp), error::OK);
+        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"async"})", rsp), error::OK);
         rapidjson::Document d;
         d.Parse(rsp.c_str());
         ASSERT_TRUE(!d.HasParseError());
@@ -362,16 +775,6 @@ int main() {
         ASSERT_EQ(list["items"].Size(), rapidjson::SizeType(1));
         ASSERT_TRUE(list["items"][0].HasMember("task_id") && list["items"][0]["task_id"].IsString());
         ASSERT_EQ(std::string(list["items"][0]["task_id"].GetString()), task_id);
-
-        ASSERT_EQ(routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);
-        rapidjson::Document sync_ret;
-        sync_ret.Parse(rsp.c_str());
-        ASSERT_TRUE(!sync_ret.HasParseError() && sync_ret.IsObject());
-        ASSERT_TRUE(sync_ret.HasMember("task_id") && sync_ret["task_id"].IsString());
-        ASSERT_TRUE(sync_ret.HasMember("status") && sync_ret["status"].IsString());
-        ASSERT_EQ(std::string(sync_ret["status"].GetString()), "failed");
-        ASSERT_TRUE(sync_ret.HasMember("error_code") && sync_ret["error_code"].IsString());
-        ASSERT_EQ(std::string(sync_ret["error_code"].GetString()), "SCHEDULER_UNAVAILABLE");
 
         ASSERT_EQ(routes["POST:/tasks/delete"]("/tasks/delete",
                                                MakeTaskIdReq(task_id),
@@ -425,7 +828,7 @@ int main() {
 
         auto local_routes = CollectRoutes(&p);
         std::string rsp;
-        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1"})", rsp), error::OK);
+        ASSERT_EQ(local_routes["POST:/tasks/batch/execute"]("/tasks/batch/execute", R"({"sql_text":"SELECT 1","mode":"sync"})", rsp), error::OK);
         ASSERT_TRUE(std::filesystem::exists(db_path));
         ASSERT_EQ(p.Stop(), 0);
     }
@@ -593,7 +996,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"mode":"async","sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final;"})",
+                      R"({"mode":"sync","sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final;"})",
                       rsp),
                   error::OK);
         rapidjson::Document submit;
@@ -668,7 +1071,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"mode":"async","sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final;"})",
+                      R"({"mode":"sync","sql_text":"SELECT * FROM sqlite.local.src INTO dataframe.tmp;SELECT * FROM dataframe.tmp USING builtin.passthrough INTO dataframe.final;"})",
                       rsp),
                   error::OK);
         rapidjson::Document submit;
@@ -747,7 +1150,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/batch/execute"](
                       "/tasks/batch/execute",
-                      R"({"mode":"async","sql_text":"SELECT * FROM s1 INTO dataframe.tmp;SELECT * FROM dataframe.tmp,dataframe.tmp USING builtin.concat INTO dataframe.final;"})",
+                      R"({"mode":"sync","sql_text":"SELECT * FROM s1 INTO dataframe.tmp;SELECT * FROM dataframe.tmp,dataframe.tmp USING builtin.concat INTO dataframe.final;"})",
                       rsp),
                   error::OK);
         rapidjson::Document submit;
@@ -880,7 +1283,15 @@ int main() {
 
     {
         const std::string cancel_pending_dir = MakeTempDir("cancel_pending");
-        MockRouterHandle scheduler({MakeSqlClassifyRoute()});
+        MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
+            {"POST", "/scheduler/batch/execute",
+             [](const std::string&, const std::string&, std::string& rsp) {
+                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                 rsp = R"({"status":"completed","result_row_count":1,"result_col_count":1,"result_target":"dataframe.pending","data":[]})";
+                 return error::OK;
+             }},
+        });
         MockQuerier querier;
         querier.AddHandle(&scheduler);
 
@@ -900,14 +1311,22 @@ int main() {
         const std::string task_id = submit["task_id"].GetString();
 
         ASSERT_EQ(local_routes["POST:/tasks/cancel"]("/tasks/cancel", MakeTaskIdReq(task_id), rsp), error::OK);
-        ASSERT_TRUE(rsp.find("cancelled") != std::string::npos);
+        ASSERT_TRUE(rsp.find("cancelled") != std::string::npos || rsp.find("cancelling") != std::string::npos);
 
-        ASSERT_EQ(local_routes["POST:/tasks/detail"]("/tasks/detail", MakeTaskIdReq(task_id), rsp), error::OK);
-        rapidjson::Document detail;
-        detail.Parse(rsp.c_str());
-        ASSERT_TRUE(!detail.HasParseError() && detail.IsObject());
-        ASSERT_EQ(std::string(detail["status"].GetString()), "cancelled");
-        ASSERT_EQ(std::string(detail["error_code"].GetString()), "CANCELLED");
+        bool cancelled = false;
+        for (int i = 0; i < 120; ++i) {
+            ASSERT_EQ(local_routes["POST:/tasks/detail"]("/tasks/detail", MakeTaskIdReq(task_id), rsp), error::OK);
+            rapidjson::Document detail;
+            detail.Parse(rsp.c_str());
+            ASSERT_TRUE(!detail.HasParseError() && detail.IsObject());
+            if (std::string(detail["status"].GetString()) == "cancelled") {
+                ASSERT_EQ(std::string(detail["error_code"].GetString()), "CANCELLED");
+                cancelled = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        ASSERT_TRUE(cancelled);
 
         ASSERT_EQ(local_routes["POST:/tasks/delete"]("/tasks/delete", MakeTaskIdReq(task_id), rsp), error::OK);
         ASSERT_EQ(p.Stop(), 0);

@@ -10,6 +10,7 @@
 #define _FLOWSQL_FRAMEWORK_INTERFACES_ISCHEDULER_CONTROL_SERVICE_H_
 
 #include <common/guid.h>
+#include <common/error_code.h>
 #include <common/typedef.h>
 
 #include <string>
@@ -40,6 +41,36 @@ interface ISchedulerControlService {
      * @return 0 表示成功，非 0 表示失败。
      */
     virtual int32_t ExecuteBatch(const std::string& req_json, std::string* rsp_json) = 0;
+    /**
+     * @brief 提交异步 batch 任务到 Scheduler runtime。
+     * @param req_json 输入 JSON，请求体。
+     * @param rsp_json 输出 JSON，提交结果。
+     * @return 0 表示成功，非 0 表示失败。
+     */
+    virtual int32_t SubmitBatch(const std::string& req_json, std::string* rsp_json) {
+        if (rsp_json) rsp_json->assign("{\"error\":\"batch submit not supported\"}");
+        return error::UNAVAILABLE;
+    }
+    /**
+     * @brief 查询异步 batch 任务运行状态。
+     * @param req_json 输入 JSON，请求体。
+     * @param rsp_json 输出 JSON，状态结果。
+     * @return 0 表示成功，非 0 表示失败。
+     */
+    virtual int32_t QueryBatchStatus(const std::string& req_json, std::string* rsp_json) {
+        if (rsp_json) rsp_json->assign("{\"error\":\"batch status not supported\"}");
+        return error::UNAVAILABLE;
+    }
+    /**
+     * @brief 请求停止异步 batch 任务。
+     * @param req_json 输入 JSON，请求体。
+     * @param rsp_json 输出 JSON，停止结果。
+     * @return 0 表示成功，非 0 表示失败。
+     */
+    virtual int32_t StopBatch(const std::string& req_json, std::string* rsp_json) {
+        if (rsp_json) rsp_json->assign("{\"error\":\"batch stop not supported\"}");
+        return error::UNAVAILABLE;
+    }
     /**
      * @brief 执行 stream 任务。
      * @param req_json 输入 JSON，请求体。

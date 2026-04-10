@@ -15,14 +15,10 @@
 #include <framework/interfaces/itask_store.h>
 
 #include <atomic>
-#include <condition_variable>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <set>
-#include <unordered_map>
 #include <vector>
 
 namespace flowsql {
@@ -78,7 +74,6 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
                            int sql_count,
                            int timeout_s,
                            std::string* task_id,
-                           bool enqueue,
                            const std::string& task_kind = "batch",
                            const std::string& runtime_task_id = "");
     void CleanupIntermediateChannels(const std::set<std::string>& channels);
@@ -86,6 +81,7 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     static TaskStatus ParseStatus(const std::string& s);
     static const char* RuntimeStatusName(TaskStatus s);
     static TaskStatus MapStreamRuntimeStatus(const std::string& runtime_status);
+    static TaskStatus MapBatchRuntimeStatus(const std::string& runtime_status);
     static bool IsTerminal(TaskStatus s);
     static std::string MakeNowTaskId(uint64_t seq);
     int UpdateRuntimeTaskId(const std::string& task_id, const std::string& runtime_task_id);
@@ -98,8 +94,6 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
                         const std::string& status_filter,
                         std::vector<TaskRecord>* items,
                         int64_t* total);
-    std::string DequeueTask();
-    void WorkerLoop();
     void TimeoutLoop();
     int ExecuteOneTask(const std::string& task_id, std::string* execute_rsp = nullptr);
     int32_t HandleBatchExecute(const std::string& uri, const std::string& req, std::string& rsp);
@@ -117,22 +111,17 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     int32_t ClassifySqlTaskKindViaScheduler(const std::string& sql,
                                             std::string* task_kind_out,
                                             std::string* err_rsp);
+    int SyncBatchRuntimeTask(TaskRecord* rec);
 
     IQuerier* querier_ = nullptr;
     SchedulerControlClient scheduler_client_;
     std::unique_ptr<TaskStoreSqlite> store_;
     std::string db_dir_ = "./taskdb";
     std::string db_path_;
-    int worker_threads_ = 4;
     int retention_days_ = 0;
     int retention_max_count_ = 0;
-    bool disable_worker_ = false;
     std::atomic<bool> running_{false};
-    std::vector<std::thread> workers_;
     std::thread timeout_thread_;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    std::deque<std::string> queue_;
     std::atomic<uint64_t> seq_{0};
 };
 

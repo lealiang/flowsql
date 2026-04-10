@@ -11,6 +11,7 @@
             <el-button @click="fillStreamDemoSql">流式示例 SQL</el-button>
             <el-tag v-if="isMultiSql" type="warning">多 SQL（仅异步）</el-tag>
             <el-tag v-else-if="sqlTaskKind === 'stream'" type="warning">流式 SQL（仅异步）</el-tag>
+            <el-tag v-else-if="sqlTaskKind === 'mixed'" type="warning">混合 SQL（仅异步）</el-tag>
             <el-tag v-else-if="sqlTaskKind === 'batch'" type="info">批任务 SQL</el-tag>
             <el-radio-group v-model="executeMode" size="small">
               <el-radio-button v-if="allowSyncMode" label="sync">同步</el-radio-button>
@@ -223,16 +224,19 @@ const parseApiError = (error) => {
   const payload = error?.response?.data || {}
   const code = payload.error_code || ''
   const raw = payload.error || error?.message || '未知错误'
-  const codeTips = {
-    STREAM_GROUP_SQL_TEXT_INVALID: 'SQL 文本格式错误：多 SQL 请使用分号分隔，且 single/group 入参需符合契约',
-    STREAM_GROUP_TIMEOUT: '流式组任务执行超时',
-    STREAM_GROUP_SHARE_SET_READY_TIMEOUT: '同源分支就绪超时，请检查上游数据与节点启动状态',
-    STREAM_GROUP_DAG_INVALID: 'DAG 构建失败，请检查 SQL 之间的依赖关系',
-    STREAM_GROUP_DAG_CYCLE_DETECTED: 'DAG 存在环路依赖，请调整 SQL 拓扑',
-    STREAM_GROUP_SINK_CAPABILITY_MISMATCH: '共享 sink 并发写能力不足，请检查 sink 通道并发模式',
-    STREAM_CHANNEL_VERSION_CHANGED: '通道配置在执行前被并发修改，请重试',
-    STREAM_CHANNEL_MUTATING: '通道正在被修改，请稍后重试',
-    STREAM_SOURCE_IN_USE: 'source 通道正在被其他任务占用'
+    const codeTips = {
+      STREAM_GROUP_SQL_TEXT_INVALID: 'SQL 文本格式错误：多 SQL 请使用分号分隔，且 single/group 入参需符合契约',
+      STREAM_GROUP_TIMEOUT: '流式组任务执行超时',
+      STREAM_GROUP_SHARE_SET_READY_TIMEOUT: '同源分支就绪超时，请检查上游数据与节点启动状态',
+      STREAM_GROUP_DAG_INVALID: 'DAG 构建失败，请检查 SQL 之间的依赖关系',
+      STREAM_GROUP_DAG_CYCLE_DETECTED: 'DAG 存在环路依赖，请调整 SQL 拓扑',
+      STREAM_GROUP_NODE_KIND_INVALID: '节点类型判定失败，请检查 SQL 的 source/sink 类型',
+      STREAM_GROUP_NODE_EXECUTION_FAILED: '节点执行失败，请查看节点 phase 与错误详情',
+      STREAM_GROUP_NON_STREAM_SINK_MULTI_WRITER: '非 stream sink 当前仅支持单写入者，请调整 DAG 写入拓扑',
+      STREAM_GROUP_SINK_CAPABILITY_MISMATCH: '共享 sink 并发写能力不足，请检查 sink 通道并发模式',
+      STREAM_CHANNEL_VERSION_CHANGED: '通道配置在执行前被并发修改，请重试',
+      STREAM_CHANNEL_MUTATING: '通道正在被修改，请稍后重试',
+      STREAM_SOURCE_IN_USE: 'source 通道正在被其他任务占用'
   }
   if (!code) return raw
   const tip = codeTips[code]
@@ -455,18 +459,19 @@ const executeSQL = async () => {
     }
     if (sqls.length > 1) {
       executeMode.value = 'async'
-      if (analysis.task_kind === 'stream') {
+      if (analysis.task_kind === 'stream' || analysis.task_kind === 'mixed') {
         const payload = buildStreamGroupPayload(sqls)
         const streamRes = await api.executeStreamTask(payload)
         const submit = streamRes.data || {}
         const taskId = submit.task_id
         currentTaskId.value = taskId
         const nodeCount = submit.node_count || sqls.length
-        ElMessage.success(`流式组任务已提交 (ID: ${taskId})`)
+        const groupKindLabel = analysis.task_kind === 'mixed' ? '混合组任务' : '流式组任务'
+        ElMessage.success(`${groupKindLabel}已提交 (ID: ${taskId})`)
         currentResult.value = {
           columns: [],
           rows: [],
-          message: `流式组任务 ${taskId} 已提交，节点数 ${nodeCount}`
+          message: `${groupKindLabel} ${taskId} 已提交，节点数 ${nodeCount}`
         }
         await loadTasks()
         startPolling()
@@ -612,24 +617,39 @@ const viewResult = async (rowOrTaskId) => {
     if (isStreamTask) {
       const res = await api.getStreamTaskStatus(taskId)
       const payload = res?.data || {}
-      const runtimeKind = payload.runtime_kind || 'single'
-      if (runtimeKind === 'group') {
-        const nodes = Array.isArray(payload.nodes) ? payload.nodes : []
-        const rows = nodes.map((n) => ({
-          node_id: n.id || n.node_id || '',
-          status: n.status || '',
-          start_condition: n.start_condition || '',
-          depends_on: Array.isArray(n.depends_on) ? n.depends_on.join(',') : '',
-          processed_rows: n.processed_rows ?? 0,
-          output_rows: n.output_rows ?? 0,
-          error_code: n.error_code || '',
-          error_message: n.last_error || n.error_message || ''
-        }))
-        const shareSetCount = Array.isArray(payload.share_sets) ? payload.share_sets.length : 0
-        const resolvedCount = Array.isArray(payload.resolved_sources) ? payload.resolved_sources.length : 0
-        dialogResult.value = rows.length > 0
-          ? {
-              columns: ['node_id', 'status', 'start_condition', 'depends_on', 'processed_rows', 'output_rows', 'error_code', 'error_message'],
+        const runtimeKind = payload.runtime_kind || 'single'
+        if (runtimeKind === 'group') {
+          const nodes = Array.isArray(payload.nodes) ? payload.nodes : []
+          const rows = nodes.map((n) => ({
+            node_id: n.id || n.node_id || '',
+            node_kind: n.node_kind || '',
+            sql_index: Number.isInteger(n.sql_index) ? n.sql_index : '',
+            status: n.status || '',
+            phase: n.phase || '',
+            start_condition: n.start_condition || '',
+            depends_on: Array.isArray(n.depends_on) ? n.depends_on.join(',') : '',
+            processed_rows: n.processed_rows ?? 0,
+            output_rows: n.output_rows ?? 0,
+            error_code: n.error_code || '',
+            error_message: (() => {
+              if (typeof n.error_message === 'string' && n.error_message) return n.error_message
+              if (typeof n.last_error === 'string' && n.last_error) return n.last_error
+              if (n.last_error && typeof n.last_error === 'object') {
+                if (typeof n.last_error.error_message === 'string' && n.last_error.error_message) {
+                  return n.last_error.error_message
+                }
+                if (typeof n.last_error.message === 'string' && n.last_error.message) {
+                  return n.last_error.message
+                }
+              }
+              return ''
+            })()
+          }))
+          const shareSetCount = Array.isArray(payload.share_sets) ? payload.share_sets.length : 0
+          const resolvedCount = Array.isArray(payload.resolved_sources) ? payload.resolved_sources.length : 0
+          dialogResult.value = rows.length > 0
+            ? {
+              columns: ['node_id', 'node_kind', 'sql_index', 'status', 'phase', 'start_condition', 'depends_on', 'processed_rows', 'output_rows', 'error_code', 'error_message'],
               rows
             }
           : {

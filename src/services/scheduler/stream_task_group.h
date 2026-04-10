@@ -41,6 +41,11 @@ enum class GroupNodeStatus {
     kSkipped,
 };
 
+enum class GroupNodeKind {
+    kStream,
+    kBatch,
+};
+
 enum class StreamGroupStatus {
     kCreated,
     kPreparing,
@@ -53,6 +58,8 @@ enum class StreamGroupStatus {
 
 struct GroupNodePlan {
     std::string id;
+    size_t sql_index = 0;
+    GroupNodeKind kind = GroupNodeKind::kStream;
     std::string sql;
     std::vector<std::string> depends_on;
     GroupStartCondition start_condition = GroupStartCondition::kOnRunning;
@@ -61,9 +68,12 @@ struct GroupNodePlan {
 struct GroupNodeSnapshot {
     std::string node_id;
     std::string runtime_task_id;
+    size_t sql_index = 0;
+    GroupNodeKind kind = GroupNodeKind::kStream;
     GroupNodeStatus status = GroupNodeStatus::kPending;
     GroupStartCondition start_condition = GroupStartCondition::kOnRunning;
     std::vector<std::string> depends_on;
+    std::string phase;
 
     std::string error_code;
     int error_no = 0;
@@ -99,6 +109,7 @@ struct StreamGroupSnapshot {
 
 const char* GroupStartConditionName(GroupStartCondition cond);
 const char* GroupNodeStatusName(GroupNodeStatus status);
+const char* GroupNodeKindName(GroupNodeKind kind);
 const char* StreamGroupStatusName(StreamGroupStatus status);
 bool IsTerminalStreamGroupStatus(StreamGroupStatus status);
 
@@ -141,6 +152,7 @@ class StreamTaskGroup final {
         bool query_inflight = false;
         bool stop_inflight = false;
         uint64_t generation = 0;
+        std::string phase;
         std::string error_code;
         int error_no = 0;
         std::string error_message;

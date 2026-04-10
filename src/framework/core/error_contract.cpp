@@ -34,10 +34,16 @@ const char* ToErrorCode(ErrorCodeId id) {
             return "STREAM_GROUP_DAG_INVALID";
         case ErrorCodeId::kStreamGroupMixedTaskKind:
             return "STREAM_GROUP_MIXED_TASK_KIND";
+        case ErrorCodeId::kStreamGroupNodeKindInvalid:
+            return "STREAM_GROUP_NODE_KIND_INVALID";
         case ErrorCodeId::kStreamGroupNodeNotFound:
             return "STREAM_GROUP_NODE_NOT_FOUND";
         case ErrorCodeId::kStreamGroupDagCycleDetected:
             return "STREAM_GROUP_DAG_CYCLE_DETECTED";
+        case ErrorCodeId::kStreamGroupNodeExecutionFailed:
+            return "STREAM_GROUP_NODE_EXECUTION_FAILED";
+        case ErrorCodeId::kStreamGroupNonStreamSinkMultiWriter:
+            return "STREAM_GROUP_NON_STREAM_SINK_MULTI_WRITER";
         case ErrorCodeId::kStreamGroupBranchBuildFailed:
             return "STREAM_GROUP_BRANCH_BUILD_FAILED";
         case ErrorCodeId::kStreamGroupShareSetReadyTimeout:

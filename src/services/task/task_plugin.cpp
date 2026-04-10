@@ -49,16 +49,6 @@ int TaskPlugin::Option(const char* arg) {
         std::string val = opts.substr(eq + 1, end - eq - 1);
         if (key == "db_dir" && !val.empty()) db_dir_ = val;
         if (key == "db_path" && !val.empty()) db_path_ = val;
-        if (key == "disable_worker" && (val == "1" || val == "true")) disable_worker_ = true;
-        if (key == "worker_threads" && !val.empty()) {
-            char* endp = nullptr;
-            long n = std::strtol(val.c_str(), &endp, 10);
-            if (endp != val.c_str() && endp && *endp == '\0') {
-                if (n < 1) n = 1;
-                if (n > 64) n = 64;
-                worker_threads_ = static_cast<int>(n);
-            }
-        }
         if (key == "retention_days" && !val.empty()) {
             char* endp = nullptr;
             long n = std::strtol(val.c_str(), &endp, 10);
@@ -125,29 +115,13 @@ int TaskPlugin::Start() {
 
     running_.store(true);
     timeout_thread_ = std::thread([this]() { TimeoutLoop(); });
-    if (!disable_worker_) {
-        workers_.clear();
-        workers_.reserve(static_cast<size_t>(worker_threads_));
-        for (int i = 0; i < worker_threads_; ++i) {
-            workers_.emplace_back([this]() { WorkerLoop(); });
-        }
-    }
     return 0;
 }
 
 int TaskPlugin::Stop() {
     running_.store(false);
-    cv_.notify_all();
     if (timeout_thread_.joinable()) timeout_thread_.join();
-    for (auto& w : workers_) {
-        if (w.joinable()) w.join();
-    }
-    workers_.clear();
     if (store_) (void)store_->Close();
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        queue_.clear();
-    }
     return 0;
 }
 
@@ -200,6 +174,24 @@ TaskStatus TaskPlugin::MapStreamRuntimeStatus(const std::string& runtime_status)
     }
     if (runtime_status == "stopped") return TaskStatus::kStopped;
     if (runtime_status == "cancelled") return TaskStatus::kCancelled;
+    if (runtime_status == "failed") return TaskStatus::kFailed;
+    return TaskStatus::kPending;
+}
+
+TaskStatus TaskPlugin::MapBatchRuntimeStatus(const std::string& runtime_status) {
+    if (runtime_status == "submitted" ||
+        runtime_status == "pending" ||
+        runtime_status == "created") {
+        return TaskStatus::kPending;
+    }
+    if (runtime_status == "running" ||
+        runtime_status == "stopping") {
+        return TaskStatus::kRunning;
+    }
+    if (runtime_status == "stopped") return TaskStatus::kStopped;
+    if (runtime_status == "cancelled") return TaskStatus::kCancelled;
+    if (runtime_status == "completed") return TaskStatus::kCompleted;
+    if (runtime_status == "timeout") return TaskStatus::kTimeout;
     if (runtime_status == "failed") return TaskStatus::kFailed;
     return TaskStatus::kPending;
 }
@@ -301,7 +293,7 @@ int TaskPlugin::UpdateTaskKindAndRuntimeId(const std::string& task_id,
 }
 
 int TaskPlugin::CreateTask(const std::string& request_sql, std::string* task_id) {
-    return CreateTaskInternal(request_sql, "", 1, 0, task_id, true);
+    return CreateTaskInternal(request_sql, "", 1, 0, task_id);
 }
 
 int TaskPlugin::CreateTaskInternal(const std::string& request_sql,
@@ -309,7 +301,6 @@ int TaskPlugin::CreateTaskInternal(const std::string& request_sql,
                                    int sql_count,
                                    int timeout_s,
                                    std::string* task_id,
-                                   bool enqueue,
                                    const std::string& task_kind,
                                    const std::string& runtime_task_id) {
     if (!task_id || request_sql.empty()) return -1;
@@ -325,11 +316,6 @@ int TaskPlugin::CreateTaskInternal(const std::string& request_sql,
     params.runtime_task_id = runtime_task_id;
     if (!store_ || store_->CreateTask(params) != 0) return -1;
     *task_id = id;
-    if (enqueue) {
-        std::lock_guard<std::mutex> lock(mu_);
-        queue_.push_back(id);
-        cv_.notify_one();
-    }
     return 0;
 }
 
@@ -394,23 +380,6 @@ int TaskPlugin::RunRetentionCleanup() {
     return store_ ? store_->RunRetentionCleanup() : -1;
 }
 
-std::string TaskPlugin::DequeueTask() {
-    std::unique_lock<std::mutex> lock(mu_);
-    cv_.wait(lock, [this]() { return !running_.load() || !queue_.empty(); });
-    if (!running_.load() || queue_.empty()) return "";
-    std::string id = queue_.front();
-    queue_.pop_front();
-    return id;
-}
-
-void TaskPlugin::WorkerLoop() {
-    while (running_.load()) {
-        std::string id = DequeueTask();
-        if (id.empty()) continue;
-        (void)ExecuteOneTask(id);
-    }
-}
-
 void TaskPlugin::TimeoutLoop() {
     auto last_retention_run = std::chrono::steady_clock::now();
     constexpr auto kRetentionInterval = std::chrono::seconds(1);
@@ -419,6 +388,12 @@ void TaskPlugin::TimeoutLoop() {
         if (store_) (void)store_->ListTimedOutTaskIds(&timed_out_ids);
 
         for (const auto& id : timed_out_ids) {
+            TaskRecord rec;
+            if (GetTask(id, &rec) != 0) continue;
+            if (rec.task_kind == "batch" && !rec.runtime_task_id.empty()) {
+                // batch async 任务超时由 Scheduler runtime 统一负责。
+                continue;
+            }
             (void)UpdateStatus(id, TaskStatus::kTimeout, "TIMEOUT", "task execution timeout", "timeout", 0, 0, "");
         }
 
@@ -596,6 +571,103 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
     return urc;
 }
 
+int TaskPlugin::SyncBatchRuntimeTask(TaskRecord* rec) {
+    if (!rec) return EINVAL;
+    if (rec->task_kind != "batch") return 0;
+    if (rec->runtime_task_id.empty()) return 0;
+
+    rapidjson::StringBuffer req_buf;
+    rapidjson::Writer<rapidjson::StringBuffer> req_w(req_buf);
+    req_w.StartObject();
+    req_w.Key("runtime_task_id");
+    req_w.String(rec->runtime_task_id.c_str());
+    req_w.EndObject();
+
+    std::string scheduler_rsp;
+    const int32_t rc = scheduler_client_.QueryBatchStatus(req_buf.GetString(), &scheduler_rsp);
+    if (rc != error::OK) return rc;
+
+    rapidjson::Document runtime_doc;
+    runtime_doc.Parse(scheduler_rsp.c_str());
+    if (runtime_doc.HasParseError() || !runtime_doc.IsObject() ||
+        !runtime_doc.HasMember("status") || !runtime_doc["status"].IsString()) {
+        return error::INTERNAL_ERROR;
+    }
+
+    const std::string runtime_status = runtime_doc["status"].GetString();
+    const TaskStatus mapped = MapBatchRuntimeStatus(runtime_status);
+    std::string runtime_error_code;
+    std::string runtime_error_message;
+    std::string runtime_error_stage;
+    int64_t result_rows = rec->result_row_count;
+    int64_t result_cols = rec->result_col_count;
+    std::string result_target = rec->result_target;
+
+    if (runtime_doc.HasMember("error_code") && runtime_doc["error_code"].IsString()) {
+        runtime_error_code = runtime_doc["error_code"].GetString();
+    }
+    if (runtime_doc.HasMember("error_message") && runtime_doc["error_message"].IsString()) {
+        runtime_error_message = runtime_doc["error_message"].GetString();
+    }
+    if (runtime_doc.HasMember("error_stage") && runtime_doc["error_stage"].IsString()) {
+        runtime_error_stage = runtime_doc["error_stage"].GetString();
+    }
+    if (runtime_doc.HasMember("result_row_count") && runtime_doc["result_row_count"].IsInt64()) {
+        result_rows = runtime_doc["result_row_count"].GetInt64();
+    }
+    if (runtime_doc.HasMember("result_col_count") && runtime_doc["result_col_count"].IsInt64()) {
+        result_cols = runtime_doc["result_col_count"].GetInt64();
+    }
+    if (runtime_doc.HasMember("result_target") && runtime_doc["result_target"].IsString()) {
+        result_target = runtime_doc["result_target"].GetString();
+    }
+
+    bool should_update = false;
+    if (mapped != rec->status) {
+        should_update = true;
+    }
+    if ((mapped == TaskStatus::kCompleted || mapped == TaskStatus::kFailed || mapped == TaskStatus::kTimeout) &&
+        (result_rows != rec->result_row_count ||
+         result_cols != rec->result_col_count ||
+         result_target != rec->result_target)) {
+        should_update = true;
+    }
+    if ((mapped == TaskStatus::kFailed || mapped == TaskStatus::kTimeout) &&
+        (runtime_error_code != rec->error_code ||
+         runtime_error_message != rec->error_message ||
+         runtime_error_stage != rec->error_stage)) {
+        should_update = true;
+    }
+    if (mapped == TaskStatus::kCancelled && rec->error_code != "CANCELLED") {
+        should_update = true;
+    }
+
+    if (should_update) {
+        std::string err_code;
+        std::string err_msg;
+        std::string err_stage;
+        if (mapped == TaskStatus::kFailed || mapped == TaskStatus::kTimeout) {
+            err_code = runtime_error_code;
+            err_msg = runtime_error_message;
+            err_stage = runtime_error_stage;
+        } else if (mapped == TaskStatus::kCancelled) {
+            err_code = "CANCELLED";
+            err_msg = "cancelled by user";
+            err_stage = "cancel";
+        }
+        (void)UpdateStatus(rec->task_id,
+                           mapped,
+                           err_code,
+                           err_msg,
+                           err_stage,
+                           result_rows,
+                           result_cols,
+                           result_target);
+    }
+    (void)GetTask(rec->task_id, rec);
+    return 0;
+}
+
 int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& req, std::string& rsp) {
     // 逻辑链：
     // 1) 仅接受 sql_text 入口并做多 SQL 拆分；
@@ -688,19 +760,63 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
     const std::string sqls_json = BuildSqlsJson(sqls);
 
     std::string task_id;
-    if (CreateTaskInternal(request_summary, sqls_json, static_cast<int>(sqls.size()), timeout_s, &task_id, !sync) != 0) {
+    if (CreateTaskInternal(request_summary, sqls_json, static_cast<int>(sqls.size()), timeout_s, &task_id) != 0) {
         rsp = BuildErrorJson("failed to create task");
         return error::INTERNAL_ERROR;
     }
 
     if (!sync) {
+        rapidjson::StringBuffer submit_req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> submit_req_w(submit_req_buf);
+        submit_req_w.StartObject();
+        submit_req_w.Key("runtime_task_id");
+        submit_req_w.String(task_id.c_str());
+        submit_req_w.Key("timeout_s");
+        submit_req_w.Int(timeout_s);
+        submit_req_w.Key("sqls");
+        submit_req_w.StartArray();
+        for (const auto& sql : sqls) {
+            submit_req_w.String(sql.c_str());
+        }
+        submit_req_w.EndArray();
+        submit_req_w.EndObject();
+
+        std::string submit_rsp;
+        const int32_t submit_rc = scheduler_client_.SubmitBatch(submit_req_buf.GetString(), &submit_rsp);
+        if (submit_rc != error::OK) {
+            (void)UpdateStatus(task_id,
+                               TaskStatus::kFailed,
+                               "SCHEDULER_UNAVAILABLE",
+                               "scheduler batch submit failed",
+                               "dispatch",
+                               0,
+                               0,
+                               "");
+            rsp = submit_rsp.empty() ? BuildErrorJson("scheduler batch submit failed") : submit_rsp;
+            return submit_rc;
+        }
+
+        rapidjson::Document submit_doc;
+        submit_doc.Parse(submit_rsp.c_str());
+        std::string runtime_task_id = task_id;
+        if (!submit_doc.HasParseError() && submit_doc.IsObject() &&
+            submit_doc.HasMember("runtime_task_id") && submit_doc["runtime_task_id"].IsString()) {
+            runtime_task_id = submit_doc["runtime_task_id"].GetString();
+        }
+        if (runtime_task_id.empty()) runtime_task_id = task_id;
+        (void)UpdateRuntimeTaskId(task_id, runtime_task_id);
+
         rapidjson::StringBuffer buf;
         rapidjson::Writer<rapidjson::StringBuffer> w(buf);
         w.StartObject();
         w.Key("task_id");
         w.String(task_id.c_str());
+        w.Key("runtime_task_id");
+        w.String(runtime_task_id.c_str());
         w.Key("status");
         w.String("pending");
+        w.Key("runtime_kind");
+        w.String("batch");
         w.EndObject();
         rsp = buf.GetString();
         return error::OK;
@@ -902,6 +1018,11 @@ int32_t TaskPlugin::HandleList(const std::string&, const std::string& req, std::
         rsp = BuildErrorJson("failed to list tasks");
         return error::INTERNAL_ERROR;
     }
+    for (auto& item : items) {
+        if (item.task_kind != "batch") continue;
+        if (IsTerminal(item.status)) continue;
+        (void)SyncBatchRuntimeTask(&item);
+    }
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
     w.StartObject();
@@ -958,6 +1079,9 @@ int32_t TaskPlugin::HandleDetail(const std::string&, const std::string& req, std
     if (GetTask(d["task_id"].GetString(), &rec) != 0) {
         rsp = BuildErrorJson("task not found");
         return error::NOT_FOUND;
+    }
+    if (rec.task_kind == "batch" && !IsTerminal(rec.status)) {
+        (void)SyncBatchRuntimeTask(&rec);
     }
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> w(buf);
@@ -1090,6 +1214,104 @@ int32_t TaskPlugin::HandleCancel(const std::string&, const std::string& req, std
         rsp = BuildErrorJson("stream task should use /tasks/stream/stop");
         return error::CONFLICT;
     }
+    if (rec.task_kind == "batch" && !IsTerminal(rec.status) && !rec.runtime_task_id.empty()) {
+        rapidjson::StringBuffer stop_req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> stop_req_w(stop_req_buf);
+        stop_req_w.StartObject();
+        stop_req_w.Key("runtime_task_id");
+        stop_req_w.String(rec.runtime_task_id.c_str());
+        stop_req_w.EndObject();
+
+        std::string stop_rsp;
+        const int32_t stop_rc = scheduler_client_.StopBatch(stop_req_buf.GetString(), &stop_rsp);
+        if (stop_rc != error::OK) {
+            rsp = stop_rsp.empty() ? BuildErrorJson("scheduler batch stop failed") : stop_rsp;
+            return stop_rc;
+        }
+
+        rapidjson::Document stop_doc;
+        stop_doc.Parse(stop_rsp.c_str());
+        std::string runtime_status = "stopping";
+        std::string runtime_error_code;
+        std::string runtime_error_message;
+        std::string runtime_error_stage;
+        int64_t result_rows = rec.result_row_count;
+        int64_t result_cols = rec.result_col_count;
+        std::string result_target = rec.result_target;
+        if (!stop_doc.HasParseError() && stop_doc.IsObject()) {
+            if (stop_doc.HasMember("status") && stop_doc["status"].IsString()) {
+                runtime_status = stop_doc["status"].GetString();
+            }
+            if (stop_doc.HasMember("error_code") && stop_doc["error_code"].IsString()) {
+                runtime_error_code = stop_doc["error_code"].GetString();
+            }
+            if (stop_doc.HasMember("error_message") && stop_doc["error_message"].IsString()) {
+                runtime_error_message = stop_doc["error_message"].GetString();
+            }
+            if (stop_doc.HasMember("error_stage") && stop_doc["error_stage"].IsString()) {
+                runtime_error_stage = stop_doc["error_stage"].GetString();
+            }
+            if (stop_doc.HasMember("result_row_count") && stop_doc["result_row_count"].IsInt64()) {
+                result_rows = stop_doc["result_row_count"].GetInt64();
+            }
+            if (stop_doc.HasMember("result_col_count") && stop_doc["result_col_count"].IsInt64()) {
+                result_cols = stop_doc["result_col_count"].GetInt64();
+            }
+            if (stop_doc.HasMember("result_target") && stop_doc["result_target"].IsString()) {
+                result_target = stop_doc["result_target"].GetString();
+            }
+        }
+
+        const TaskStatus mapped = MapBatchRuntimeStatus(runtime_status);
+        if (mapped == TaskStatus::kStopped ||
+            mapped == TaskStatus::kCancelled ||
+            mapped == TaskStatus::kFailed ||
+            mapped == TaskStatus::kTimeout ||
+            mapped == TaskStatus::kCompleted) {
+            std::string err_code;
+            std::string err_message;
+            std::string err_stage;
+            if (mapped == TaskStatus::kCancelled) {
+                err_code = "CANCELLED";
+                err_message = "cancelled by user";
+                err_stage = "cancel";
+            } else if (mapped == TaskStatus::kFailed || mapped == TaskStatus::kTimeout) {
+                err_code = runtime_error_code;
+                err_message = runtime_error_message;
+                err_stage = runtime_error_stage;
+            }
+            (void)UpdateStatus(task_id,
+                               mapped,
+                               err_code,
+                               err_message,
+                               err_stage,
+                               result_rows,
+                               result_cols,
+                               result_target);
+        } else {
+            (void)WriteTaskEvent(task_id, StatusName(rec.status), StatusName(rec.status), "CANCEL_REQUESTED");
+        }
+
+        rapidjson::StringBuffer out;
+        rapidjson::Writer<rapidjson::StringBuffer> w(out);
+        w.StartObject();
+        w.Key("task_id");
+        w.String(task_id.c_str());
+        w.Key("runtime_task_id");
+        w.String(rec.runtime_task_id.c_str());
+        w.Key("status");
+        if (mapped == TaskStatus::kRunning || mapped == TaskStatus::kPending) {
+            w.String("cancelling");
+        } else {
+            w.String(StatusName(mapped));
+        }
+        w.Key("runtime_status");
+        w.String(runtime_status.c_str());
+        w.EndObject();
+        rsp = out.GetString();
+        return error::OK;
+    }
+
     if (IsTerminal(rec.status)) {
         rsp = BuildErrorJson("terminal task cannot be cancelled");
         return error::CONFLICT;
@@ -1328,7 +1550,6 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
                            static_cast<int>(sqls.size()),
                            timeout_s,
                            &task_id,
-                           false,
                            "stream",
                            runtime_task_id) != 0) {
         // 元数据写入失败时尝试停止 runtime task，避免悬挂任务。

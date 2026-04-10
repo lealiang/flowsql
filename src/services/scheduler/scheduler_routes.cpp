@@ -95,6 +95,18 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleExecute(u, req, rsp);
         }});
+    cb({"POST", "/scheduler/batch/submit",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleBatchSubmit(u, req, rsp);
+        }});
+    cb({"POST", "/scheduler/batch/status",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleBatchStatus(u, req, rsp);
+        }});
+    cb({"POST", "/scheduler/batch/stop",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleBatchStop(u, req, rsp);
+        }});
     cb({"POST", "/scheduler/sql/classify",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleSqlClassify(u, req, rsp);
@@ -177,6 +189,203 @@ int32_t SchedulerPlugin::HandleSqlClassify(const std::string&, const std::string
     w.EndObject();
     rsp = buf.GetString();
     return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleBatchSubmit(const std::string&, const std::string& req_body, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req_body.c_str());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        rsp = BuildErrorJson("invalid request body");
+        return error::BAD_REQUEST;
+    }
+
+    std::string runtime_task_id;
+    if (doc.HasMember("runtime_task_id")) {
+        if (!doc["runtime_task_id"].IsString()) {
+            rsp = BuildErrorJson("runtime_task_id must be string");
+            return error::BAD_REQUEST;
+        }
+        runtime_task_id = doc["runtime_task_id"].GetString();
+    }
+    if (runtime_task_id.empty()) {
+        runtime_task_id = "b_" + NextStreamTaskId();
+    }
+
+    int timeout_s = 0;
+    if (doc.HasMember("timeout_s")) {
+        if (!doc["timeout_s"].IsInt()) {
+            rsp = BuildErrorJson("timeout_s must be integer");
+            return error::BAD_REQUEST;
+        }
+        timeout_s = doc["timeout_s"].GetInt();
+        if (timeout_s < 0) {
+            rsp = BuildErrorJson("timeout_s must be >= 0");
+            return error::BAD_REQUEST;
+        }
+    }
+
+    std::vector<std::string> sqls;
+    if (doc.HasMember("sqls")) {
+        if (!doc["sqls"].IsArray() || doc["sqls"].Empty()) {
+            rsp = BuildErrorJson("sqls must be non-empty string array");
+            return error::BAD_REQUEST;
+        }
+        for (const auto& it : doc["sqls"].GetArray()) {
+            if (!it.IsString()) {
+                rsp = BuildErrorJson("sqls must be non-empty string array");
+                return error::BAD_REQUEST;
+            }
+            std::string sql = it.GetString();
+            if (sql.empty()) {
+                rsp = BuildErrorJson("sqls must not contain empty SQL");
+                return error::BAD_REQUEST;
+            }
+            sqls.push_back(sql);
+        }
+    } else if (doc.HasMember("sql_text") && doc["sql_text"].IsString()) {
+        SqlTextSplitError split_err;
+        if (SplitSqlText(doc["sql_text"].GetString(), &sqls, &split_err) != 0) {
+            std::string err = "invalid sql_text";
+            if (!split_err.message.empty()) err += ": " + split_err.message;
+            rsp = BuildErrorJson(err);
+            return error::BAD_REQUEST;
+        }
+    } else {
+        rsp = BuildErrorJson("request must contain sqls or sql_text");
+        return error::BAD_REQUEST;
+    }
+
+    for (size_t i = 0; i < sqls.size(); ++i) {
+        std::string task_kind;
+        std::string classify_err_rsp;
+        const int32_t classify_rc = ClassifySqlTaskKind(sqls[i], &task_kind, &classify_err_rsp);
+        if (classify_rc != error::OK) {
+            rsp = classify_err_rsp.empty() ? BuildErrorJson("sql classify failed") : classify_err_rsp;
+            return classify_rc;
+        }
+        if (task_kind != "batch") {
+            rsp = BuildErrorJson("batch submit only accepts batch SQL");
+            return error::BAD_REQUEST;
+        }
+    }
+
+    std::string submit_err;
+    const int submit_rc = batch_runtime_.Submit(runtime_task_id, std::move(sqls), timeout_s, &submit_err);
+    if (submit_rc != 0) {
+        if (submit_rc == EEXIST) {
+            rsp = BuildErrorJson("runtime_task_id already exists: " + runtime_task_id);
+            return error::CONFLICT;
+        }
+        rsp = BuildErrorJson("batch submit failed: " + submit_err);
+        return error::INTERNAL_ERROR;
+    }
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("status");
+    w.String("submitted");
+    w.Key("runtime_task_id");
+    w.String(runtime_task_id.c_str());
+    w.Key("runtime_kind");
+    w.String("batch");
+    w.EndObject();
+    rsp = buf.GetString();
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleBatchStatus(const std::string&, const std::string& req_body, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req_body.c_str());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        rsp = BuildErrorJson("invalid request body");
+        return error::BAD_REQUEST;
+    }
+    std::string runtime_task_id;
+    if (doc.HasMember("runtime_task_id") && doc["runtime_task_id"].IsString()) {
+        runtime_task_id = doc["runtime_task_id"].GetString();
+    } else if (doc.HasMember("task_id") && doc["task_id"].IsString()) {
+        runtime_task_id = doc["task_id"].GetString();
+    }
+    if (runtime_task_id.empty()) {
+        rsp = BuildErrorJson("runtime_task_id is required");
+        return error::BAD_REQUEST;
+    }
+
+    BatchRuntimeSnapshot snapshot;
+    const int query_rc = batch_runtime_.Query(runtime_task_id, &snapshot);
+    if (query_rc != 0) {
+        rsp = BuildErrorJson("batch runtime task not found: " + runtime_task_id);
+        return error::NOT_FOUND;
+    }
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    batch_runtime_.SweepFinished(now_ms, stream_runtime_retention_s_, stream_runtime_max_count_);
+
+    rapidjson::StringBuffer buf;
+    rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+    w.StartObject();
+    w.Key("runtime_task_id");
+    w.String(snapshot.runtime_task_id.c_str());
+    w.Key("runtime_kind");
+    w.String("batch");
+    w.Key("status");
+    w.String(BatchRuntimeStatusName(snapshot.status));
+    w.Key("error_code");
+    w.String(snapshot.error_code.c_str());
+    w.Key("error_message");
+    w.String(snapshot.error_message.c_str());
+    w.Key("error_stage");
+    w.String(snapshot.error_stage.c_str());
+    w.Key("current_sql_index");
+    w.Int(snapshot.current_sql_index);
+    w.Key("sql_count");
+    w.Int(snapshot.sql_count);
+    w.Key("timeout_s");
+    w.Int(snapshot.timeout_s);
+    w.Key("result_row_count");
+    w.Int64(snapshot.result_row_count);
+    w.Key("result_col_count");
+    w.Int64(snapshot.result_col_count);
+    w.Key("result_target");
+    w.String(snapshot.result_target.c_str());
+    w.Key("created_ms");
+    w.Int64(snapshot.created_ms);
+    w.Key("started_ms");
+    w.Int64(snapshot.started_ms);
+    w.Key("last_active_ms");
+    w.Int64(snapshot.last_active_ms);
+    w.Key("finished_ms");
+    w.Int64(snapshot.finished_ms);
+    w.EndObject();
+    rsp = buf.GetString();
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleBatchStop(const std::string&, const std::string& req_body, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req_body.c_str());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        rsp = BuildErrorJson("invalid request body");
+        return error::BAD_REQUEST;
+    }
+    std::string runtime_task_id;
+    if (doc.HasMember("runtime_task_id") && doc["runtime_task_id"].IsString()) {
+        runtime_task_id = doc["runtime_task_id"].GetString();
+    } else if (doc.HasMember("task_id") && doc["task_id"].IsString()) {
+        runtime_task_id = doc["task_id"].GetString();
+    }
+    if (runtime_task_id.empty()) {
+        rsp = BuildErrorJson("runtime_task_id is required");
+        return error::BAD_REQUEST;
+    }
+
+    std::string stop_err;
+    const int stop_rc = batch_runtime_.RequestStop(runtime_task_id, &stop_err);
+    if (stop_rc != 0) {
+        rsp = BuildErrorJson("batch stop failed: " + stop_err);
+        return stop_rc == ENOENT ? error::NOT_FOUND : error::BAD_REQUEST;
+    }
+    return HandleBatchStatus("", std::string("{\"runtime_task_id\":\"") + runtime_task_id + "\"}", rsp);
 }
 
 int32_t SchedulerPlugin::HandleStreamExecuteSingle(const rapidjson::Document& doc, std::string& rsp) {

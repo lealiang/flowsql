@@ -27,6 +27,9 @@ class SchedulerControlClient {
 
     int32_t ClassifySql(const std::string& req_json, std::string* rsp_json) const;
     int32_t ExecuteBatch(const std::string& req_json, std::string* rsp_json) const;
+    int32_t SubmitBatch(const std::string& req_json, std::string* rsp_json) const;
+    int32_t QueryBatchStatus(const std::string& req_json, std::string* rsp_json) const;
+    int32_t StopBatch(const std::string& req_json, std::string* rsp_json) const;
     int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) const;
     int32_t StopStream(const std::string& req_json, std::string* rsp_json) const;
     int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) const;
@@ -46,6 +49,9 @@ class RouterBackedSchedulerControlService : public ISchedulerControlService {
 
     int32_t ClassifySql(const std::string& req_json, std::string* rsp_json) override;
     int32_t ExecuteBatch(const std::string& req_json, std::string* rsp_json) override;
+    int32_t SubmitBatch(const std::string& req_json, std::string* rsp_json) override;
+    int32_t QueryBatchStatus(const std::string& req_json, std::string* rsp_json) override;
+    int32_t StopBatch(const std::string& req_json, std::string* rsp_json) override;
     int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) override;
     int32_t StopStream(const std::string& req_json, std::string* rsp_json) override;
     int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) override;
