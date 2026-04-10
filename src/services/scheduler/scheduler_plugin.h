@@ -10,6 +10,7 @@
 #define _FLOWSQL_SCHEDULER_SCHEDULER_PLUGIN_H_
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -28,9 +29,11 @@
 #include <rapidjson/document.h>
 
 #include "stream_runtime.h"
+#include "scheduler_batch_runtime.h"
 #include "shared_source_hub.h"
 #include "stream_task_group.h"
 #include "stream_execution_plan.h"
+#include "scheduler_stream_group_internal.h"
 
 namespace flowsql {
 
@@ -65,6 +68,9 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     // ISchedulerControlService
     int32_t ClassifySql(const std::string& req_json, std::string* rsp_json) override;
     int32_t ExecuteBatch(const std::string& req_json, std::string* rsp_json) override;
+    int32_t SubmitBatch(const std::string& req_json, std::string* rsp_json) override;
+    int32_t QueryBatchStatus(const std::string& req_json, std::string* rsp_json) override;
+    int32_t StopBatch(const std::string& req_json, std::string* rsp_json) override;
     int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) override;
     int32_t StopStream(const std::string& req_json, std::string* rsp_json) override;
     int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) override;
@@ -74,6 +80,9 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
 
     // 路由处理（fnRouterHandler 签名）
     int32_t HandleExecute(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleBatchSubmit(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleBatchStatus(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleBatchStop(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleSqlClassify(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamExecute(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamStop(const std::string& uri, const std::string& req, std::string& rsp);
@@ -135,6 +144,46 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
                                             std::string* err_rsp);
     int32_t HandleStreamExecuteSingle(const rapidjson::Document& doc, std::string& rsp);
     int32_t HandleStreamExecuteGroup(const rapidjson::Document& doc, std::string& rsp);
+    int32_t ParseStreamGroupExecuteRequest(const rapidjson::Document& doc,
+                                           StreamGroupExecuteRequest* out,
+                                           std::string* err_rsp);
+    int32_t BuildStreamGroupPlan(const StreamGroupExecuteRequest& req,
+                                 StreamGroupBuildArtifacts* out,
+                                 std::string* err_rsp);
+    int32_t ValidateStreamGroupPlan(const StreamGroupBuildArtifacts& build,
+                                    std::string* err_rsp);
+    int32_t AcquireStreamGroupLeases(const std::string& runtime_task_id,
+                                     const StreamGroupBuildArtifacts& build,
+                                     std::string* err_rsp);
+    int32_t PrepareStreamGroupRuntimeResources(const std::string& runtime_task_id,
+                                               const StreamGroupBuildArtifacts& build,
+                                               StreamGroupRuntimeArtifacts* out,
+                                               std::function<void()>* cleanup_local_resources,
+                                               std::string* err_rsp);
+    std::shared_ptr<StreamTaskGroup> BuildStreamGroupObject(
+        const std::string& runtime_task_id,
+        const StreamGroupExecuteRequest& req,
+        const StreamGroupBuildArtifacts& build,
+        const StreamGroupRuntimeArtifacts& runtime_build,
+        std::shared_ptr<StreamGroupCallbackContext>* callback_ctx_out);
+    int32_t RegisterAndStartStreamGroup(const std::string& runtime_task_id,
+                                        const StreamGroupBuildArtifacts& build,
+                                        const StreamGroupRuntimeArtifacts& runtime_build,
+                                        const std::shared_ptr<StreamTaskGroup>& group,
+                                        int share_set_ready_timeout_s,
+                                        std::function<void()> cleanup_local_resources,
+                                        std::string* err_rsp);
+    int SubmitStreamGroupNodeRuntime(StreamGroupCallbackContext* ctx,
+                                     const std::string& node_id,
+                                     const std::string& sql,
+                                     std::string* node_runtime_task_id,
+                                     std::string* error_msg);
+    int QueryStreamGroupNodeRuntime(StreamGroupCallbackContext* ctx,
+                                    const std::string& node_runtime_task_id,
+                                    TaskSnapshot* snapshot_out);
+    void StopStreamGroupNodeRuntime(StreamGroupCallbackContext* ctx,
+                                    const std::string& node_runtime_task_id);
+    void StopStreamGroupShareSetHubs(const std::string& group_runtime_task_id);
     int32_t ClassifySqlTaskKind(const std::string& sql_text, std::string* task_kind, std::string* err_rsp);
     int QueryStreamTaskSnapshotByRuntimeId(const std::string& runtime_task_id, TaskSnapshot* snapshot_out);
     int QueryRuntimeSharedHubSnapshot(const std::string& runtime_task_id, SharedHubSnapshot* snapshot_out);
@@ -216,6 +265,8 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
 
     // 流式任务调度
     size_t stream_worker_count_ = 0;
+    size_t batch_worker_count_ = 0;
+    SchedulerBatchRuntime batch_runtime_;
     StreamRuntime stream_runtime_;
     std::atomic<uint64_t> stream_task_seq_{0};
     mutable std::mutex stream_tasks_mu_;
@@ -227,6 +278,8 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     mutable std::mutex stream_group_node_sources_mu_;
     std::unordered_map<std::string, std::unordered_map<std::string, GroupNodeResolvedSourceMeta>>
         stream_group_node_sources_;
+    mutable std::mutex stream_group_batch_nodes_mu_;
+    std::unordered_map<std::string, std::vector<std::string>> stream_group_batch_node_runtime_ids_;
     struct StreamGroupShareSetRuntime {
         std::string id;
         std::string source_ref;
