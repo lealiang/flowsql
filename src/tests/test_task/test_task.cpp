@@ -1957,7 +1957,7 @@ int main() {
         std::string rsp;
         ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
                       "/tasks/stream/execute",
-                      R"({"execution_kind":"group","group_mode":"dag","sql_text":"select * from dataframe.VNAT into ring.spsc_stream;select * from ring.spsc_stream USING builtin.passthrough_stream into dataframe.VNAT_COPY;"})",
+                      R"({"execution_kind":"group","group_mode":"dag","sql_text":"select * from dataframe.VNAT using builtin.dataframe_dispatch_stream into stream_hub.testHub2;select * from stream_hub.testHub2[*] USING builtin.passthrough_stream into dataframe.testall;"})",
                       rsp),
                   error::OK);
         rapidjson::Document exec_doc;
@@ -1980,12 +1980,42 @@ int main() {
         ASSERT_TRUE(!graph_doc.HasMember("version"));
         ASSERT_TRUE(!graph_doc.HasMember("generated_at_ms"));
         ASSERT_TRUE(graph_doc.HasMember("edges") && graph_doc["edges"].IsArray());
-        ASSERT_EQ(graph_doc["edges"].Size(), rapidjson::SizeType(4));
+        ASSERT_EQ(graph_doc["edges"].Size(), rapidjson::SizeType(5));
+        bool has_on_finish = false;
         for (const auto& edge : graph_doc["edges"].GetArray()) {
             ASSERT_TRUE(edge.IsObject());
             ASSERT_TRUE(edge.HasMember("edge_kind") && edge["edge_kind"].IsString());
-            ASSERT_EQ(std::string(edge["edge_kind"].GetString()), "data");
+            ASSERT_TRUE(edge.HasMember("trigger") && edge["trigger"].IsString());
+            const std::string edge_kind = edge["edge_kind"].GetString();
+            const std::string trigger = edge["trigger"].GetString();
+            if (edge_kind == "control" && trigger == "on_finish") {
+                has_on_finish = true;
+                ASSERT_TRUE(edge.HasMember("from") && edge["from"].IsString());
+                ASSERT_TRUE(edge.HasMember("to") && edge["to"].IsString());
+                ASSERT_EQ(std::string(edge["from"].GetString()), "operator:sql0");
+                ASSERT_EQ(std::string(edge["to"].GetString()), "operator:sql1");
+            }
         }
+        ASSERT_TRUE(has_on_finish);
+
+        ASSERT_TRUE(graph_doc.HasMember("nodes") && graph_doc["nodes"].IsArray());
+        bool has_hub_base = false;
+        bool has_hub_wildcard = false;
+        for (const auto& node : graph_doc["nodes"].GetArray()) {
+            if (!node.IsObject()) continue;
+            if (!node.HasMember("name") || !node["name"].IsString()) continue;
+            const std::string name = node["name"].GetString();
+            if (name == "stream_hub.testHub2") {
+                has_hub_base = true;
+                ASSERT_TRUE(node.HasMember("sql_index") && node["sql_index"].IsInt());
+                ASSERT_EQ(node["sql_index"].GetInt(), 0);
+            }
+            if (name == "stream_hub.testHub2[*]") {
+                has_hub_wildcard = true;
+            }
+        }
+        ASSERT_TRUE(has_hub_base);
+        ASSERT_TRUE(!has_hub_wildcard);
 
         ASSERT_EQ(graph_query_calls.load(), 1);
         ASSERT_EQ(p.Stop(), 0);

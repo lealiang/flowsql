@@ -23,6 +23,7 @@
 5. 多 SQL 串接自动连线（同名通道节点去重）
 6. 自动化测试与前端构建回归
 7. 原始 SQL 独立持久化（按 task_id 关联）与任务历史“任务类型”列展示
+8. Stream 有状态通道重置能力（后端路由 + Web 入口 + 前端操作）
 
 ### 非本迭代范围（Out of Scope）
 
@@ -65,6 +66,7 @@
 - [ ] 任务历史 `sql_text` 显示原始 SQL，不再显示 `[group] N SQL nodes`。
 - [ ] 任务历史新增“任务类型”列（`batch/stream`）。
 - [ ] payload 缺失时接口返回结构化错误（不退化）。
+- [x] 通道管理页支持 Stream 通道“重置”操作（重置运行态，不改配置）。
 
 ---
 
@@ -85,8 +87,9 @@
 | T11 | 已完成 | 任务查询链路改造为 payload 强依赖（移除退化） | `task_plugin.cpp`、`task_store_sqlite.*` | 0.6 | T10 | 列表/详情/runtime graph 统一读 payload |
 | T12 | 已完成 | 前端任务历史新增“任务类型”列并校准展示 | `Tasks.vue` | 0.2 | T3 | 任务类型列稳定展示 |
 | T13 | 已完成 | SQL 持久化专项测试（group 原文展示、payload 异常） | `test_task.cpp` | 0.6 | T10/T11 | 无退化、错误码可验证 |
+| T14 | 已完成 | Stream 通道重置能力（`/channels/stream/reset` + `/api/channels/stream/reset` + Web 按钮） | `scheduler_routes.cpp`、`web_server.cpp`、`Channels.vue`、`test_scheduler_e2e.cpp` | 0.5 | T1 | 可显式重置有状态通道，`in_use/source_in_use` 冲突受控 |
 
-**合计**：11.2 PD
+**合计**：11.7 PD
 
 ---
 

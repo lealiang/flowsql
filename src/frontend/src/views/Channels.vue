@@ -116,9 +116,16 @@
                 <el-tag v-if="scope.row.in_use" style="margin-left:8px" type="warning" size="small">in_use</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="220">
+            <el-table-column label="操作" width="300">
               <template #default="scope">
                 <el-button type="primary" size="small" text @click="openEditStreamDialog(scope.row)">编辑</el-button>
+                <el-button
+                  type="warning"
+                  size="small"
+                  text
+                  :disabled="scope.row.in_use"
+                  @click="resetStream(scope.row)"
+                >重置</el-button>
                 <el-button type="danger" size="small" text @click="removeStream(scope.row)">删除</el-button>
               </template>
             </el-table-column>
@@ -781,6 +788,23 @@ const removeStream = async (row) => {
     await loadStreamChannels()
   } catch (e) {
     if (e !== 'cancel') ElMessage.error('删除失败: ' + (e.response?.data?.error || e.message))
+  }
+}
+
+const resetStream = async (row) => {
+  try {
+    await ElMessageBox.confirm(
+      `确认重置 Stream 通道 ${row.type}.${row.name}？重置会清空运行态并重新初始化该通道。`,
+      '重置确认',
+      { type: 'warning' }
+    )
+    await api.resetStreamChannel(row.type, row.name)
+    ElMessage.success('重置成功')
+    await loadStreamChannels()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') {
+      ElMessage.error('重置失败: ' + (e.response?.data?.error || e.message))
+    }
   }
 }
 

@@ -9,6 +9,7 @@
 #include "builtin_registry.h"
 
 #include <framework/builtin/dataframe/concat_operator.h>
+#include <framework/builtin/dataframe/dataframe_dispatch_stream_operator.h>
 #include <framework/builtin/dataframe/hstack_operator.h>
 #include <framework/builtin/dataframe/passthrough_operator.h>
 #include <framework/builtin/stream/count_window_stream_operator.h>
@@ -477,6 +478,9 @@ void RegisterDefaultBuiltinOperators() {
     const std::vector<BuiltinOperatorDescriptor> defaults = {
         {"builtin", "passthrough", {"passthrough", "builtin.passthrough"},
          []() -> IOperator* { return new PassthroughOperator(); }},
+        {"builtin", "dataframe_dispatch_stream",
+         {"dataframe_dispatch_stream", "builtin.dataframe_dispatch_stream"},
+         []() -> IOperator* { return new DataframeDispatchStreamOperator(); }},
         {"builtin", "concat", {"concat", "builtin.concat"},
          []() -> IOperator* { return new ConcatOperator(); }},
         {"builtin", "hstack", {"hstack", "builtin.hstack"},

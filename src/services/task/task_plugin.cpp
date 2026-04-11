@@ -71,6 +71,36 @@ std::string BuildRuntimeGraphOperatorName(const SqlStatement& stmt) {
     return "transfer";
 }
 
+std::string NormalizeRuntimeGraphChannelName(const std::string& raw_name) {
+    const std::string name = raw_name.empty() ? "unknown.channel" : raw_name;
+    if (name.rfind("stream_hub.", 0) != 0) {
+        return name;
+    }
+
+    const size_t left = name.find('[');
+    if (left == std::string::npos || left == 0 || name.back() != ']') {
+        return name;
+    }
+    if (left + 1 >= name.size() - 1) {
+        return name;
+    }
+
+    bool valid_selector = true;
+    for (size_t i = left + 1; i + 1 < name.size(); ++i) {
+        const char ch = name[i];
+        if (ch == '*') continue;
+        if (!std::isdigit(static_cast<unsigned char>(ch))) {
+            valid_selector = false;
+            break;
+        }
+    }
+    if (!valid_selector) {
+        return name;
+    }
+
+    return name.substr(0, left);
+}
+
 std::string BuildLocalRuntimeGraph(const TaskRecord& rec,
                                    const std::vector<std::string>& sqls,
                                    uint64_t cursor,
@@ -109,7 +139,11 @@ std::string BuildLocalRuntimeGraph(const TaskRecord& rec,
                 view.sources.push_back(stmt.source);
             }
             if (view.sources.empty()) view.sources = {"unknown.source"};
+            for (auto& src : view.sources) {
+                src = NormalizeRuntimeGraphChannelName(src);
+            }
             view.sink = stmt.dest.empty() ? "unknown.sink" : stmt.dest;
+            view.sink = NormalizeRuntimeGraphChannelName(view.sink);
             view.op_name = BuildRuntimeGraphOperatorName(stmt);
         }
         sql_views.push_back(std::move(view));
@@ -117,7 +151,7 @@ std::string BuildLocalRuntimeGraph(const TaskRecord& rec,
     if (sql_views.empty()) {
         SqlView view;
         view.sources = {"unknown.source"};
-        view.sink = rec.result_target.empty() ? "unknown.sink" : rec.result_target;
+        view.sink = NormalizeRuntimeGraphChannelName(rec.result_target.empty() ? "unknown.sink" : rec.result_target);
         view.op_name = rec.task_kind == "batch" ? "batch_worker" : "operator";
         sql_views.push_back(std::move(view));
     }
@@ -127,17 +161,29 @@ std::string BuildLocalRuntimeGraph(const TaskRecord& rec,
     const std::string runtime_task_id = rec.runtime_task_id.empty() ? rec.task_id : rec.runtime_task_id;
 
     std::unordered_map<std::string, size_t> channel_indices;
+    std::unordered_map<std::string, int> channel_sql_index;
     std::vector<std::string> channel_names;
     channel_names.reserve(sql_views.size() * 2);
-    auto ensure_channel = [&](const std::string& name) {
-        const std::string key = name.empty() ? "unknown.channel" : name;
-        if (channel_indices.find(key) != channel_indices.end()) return;
-        channel_indices[key] = channel_names.size();
-        channel_names.push_back(key);
+    auto ensure_channel = [&](const std::string& name, int sql_index) {
+        const std::string key = NormalizeRuntimeGraphChannelName(name);
+        auto it = channel_indices.find(key);
+        if (it == channel_indices.end()) {
+            channel_indices[key] = channel_names.size();
+            channel_names.push_back(key);
+            channel_sql_index[key] = sql_index;
+            return;
+        }
+        auto idx_it = channel_sql_index.find(key);
+        if (idx_it == channel_sql_index.end()) {
+            channel_sql_index[key] = sql_index;
+            return;
+        }
+        idx_it->second = std::min(idx_it->second, sql_index);
     };
-    for (const auto& view : sql_views) {
-        for (const auto& src : view.sources) ensure_channel(src);
-        ensure_channel(view.sink);
+    for (size_t i = 0; i < sql_views.size(); ++i) {
+        const auto& view = sql_views[i];
+        for (const auto& src : view.sources) ensure_channel(src, static_cast<int>(i));
+        ensure_channel(view.sink, static_cast<int>(i));
     }
 
     std::vector<Edge> edges;
@@ -168,6 +214,17 @@ std::string BuildLocalRuntimeGraph(const TaskRecord& rec,
         sink_edge.rows = (i == sql_views.size() - 1) ? static_cast<uint64_t>(std::max<int64_t>(rec.result_row_count, 0)) : 0;
         edges.push_back(std::move(sink_edge));
     }
+    for (size_t i = 1; i < sql_views.size(); ++i) {
+        Edge control_edge;
+        control_edge.id = "edge:control:on_finish:" + std::to_string(edge_seq++);
+        control_edge.from = "operator:sql" + std::to_string(i - 1);
+        control_edge.to = "operator:sql" + std::to_string(i);
+        control_edge.edge_kind = "control";
+        control_edge.trigger = "on_finish";
+        control_edge.status = data_edge_status;
+        control_edge.rows = 0;
+        edges.push_back(std::move(control_edge));
+    }
 
     rapidjson::StringBuffer out;
     rapidjson::Writer<rapidjson::StringBuffer> w(out);
@@ -188,6 +245,11 @@ std::string BuildLocalRuntimeGraph(const TaskRecord& rec,
     w.Key("nodes");
     w.StartArray();
     for (const auto& channel : channel_names) {
+        int channel_index = 0;
+        auto idx_it = channel_sql_index.find(channel);
+        if (idx_it != channel_sql_index.end()) {
+            channel_index = idx_it->second;
+        }
         w.StartObject();
         w.Key("id");
         w.String(("channel:" + channel).c_str());
@@ -196,7 +258,7 @@ std::string BuildLocalRuntimeGraph(const TaskRecord& rec,
         w.Key("name");
         w.String(channel.c_str());
         w.Key("sql_index");
-        w.Int(0);
+        w.Int(channel_index);
         w.Key("status");
         w.String(overall_status.c_str());
         w.Key("phase");

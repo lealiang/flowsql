@@ -230,6 +230,12 @@ SQL 任务类型由 Source 通道类型决定（以 `FROM` 解析结果为准）
 | `POST /api/channels/dataframe/preview` | 预览 DataFrame 通道 |
 | `POST /api/channels/dataframe/rename` | 重命名 DataFrame 通道 |
 | `POST /api/channels/dataframe/delete` | 删除 DataFrame 通道 |
+| `POST /api/channels/stream/query` | 查询 Stream 通道 |
+| `POST /api/channels/stream/definitions/query` | 查询 Stream 通道类型定义 |
+| `POST /api/channels/stream/add` | 新增 Stream 通道 |
+| `POST /api/channels/stream/modify` | 修改 Stream 通道配置 |
+| `POST /api/channels/stream/reset` | 重置 Stream 通道运行态（同配置重建） |
+| `POST /api/channels/stream/remove` | 删除 Stream 通道 |
 
 ### Scheduler 端点（RouterAgencyPlugin，内部）
 
@@ -262,6 +268,12 @@ SQL 任务类型由 Source 通道类型决定（以 `FROM` 解析结果为准）
 | `POST /channels/database/tables` | 列出数据表（DatabasePlugin） |
 | `POST /channels/database/describe` | 查询表结构（DatabasePlugin） |
 | `POST /channels/database/preview` | 预览表数据（DatabasePlugin） |
+| `POST /channels/stream/query` | 查询 Stream 通道（SchedulerPlugin） |
+| `POST /channels/stream/definitions/query` | 查询 Stream 通道类型定义（SchedulerPlugin） |
+| `POST /channels/stream/add` | 新增 Stream 通道（SchedulerPlugin） |
+| `POST /channels/stream/modify` | 修改 Stream 通道配置（SchedulerPlugin） |
+| `POST /channels/stream/reset` | 重置 Stream 通道运行态（SchedulerPlugin） |
+| `POST /channels/stream/remove` | 删除 Stream 通道（SchedulerPlugin） |
 
 **operators — 算子**
 

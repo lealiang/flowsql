@@ -7,10 +7,13 @@
  */
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -412,6 +415,34 @@ static void SeedSourceTable(IDatabaseChannel* db, const char* table) {
     ASSERT_EQ(stats.rows_written, 3);
 }
 
+static bool DrainStreamInt64Columns(IStreamChannel* ch,
+                                    std::vector<int64_t>* col0,
+                                    std::vector<int64_t>* col1 = nullptr) {
+    if (!ch || !col0) return false;
+    col0->clear();
+    if (col1) col1->clear();
+    bool saw_eof = false;
+    for (int i = 0; i < 400; ++i) {
+        PollEvent ev = ch->PollNext(10);
+        if (ev.kind == PollEventKind::kData && ev.batch.data) {
+            auto c0 = std::dynamic_pointer_cast<arrow::Int64Array>(ev.batch.data->column(0));
+            if (!c0) continue;
+            std::shared_ptr<arrow::Int64Array> c1;
+            if (col1) c1 = std::dynamic_pointer_cast<arrow::Int64Array>(ev.batch.data->column(1));
+            for (int64_t r = 0; r < ev.batch.data->num_rows(); ++r) {
+                col0->push_back(c0->Value(r));
+                if (col1 && c1) col1->push_back(c1->Value(r));
+            }
+            continue;
+        }
+        if (ev.kind == PollEventKind::kEof) {
+            saw_eof = true;
+            break;
+        }
+    }
+    return saw_eof;
+}
+
 static int64_t QueryCount(IDatabaseChannel* db, const std::string& query) {
     IBatchReader* reader = nullptr;
     if (db->CreateReader(query.c_str(), &reader) != 0 || !reader) return -1;
@@ -510,6 +541,7 @@ int main() {
     auto stream_status = FindRouteHandler(loader, "POST", "/scheduler/stream/status");
     auto stream_list = FindRouteHandler(loader, "POST", "/scheduler/stream/list");
     auto stream_add = FindRouteHandler(loader, "POST", "/channels/stream/add");
+    auto stream_reset = FindRouteHandler(loader, "POST", "/channels/stream/reset");
     auto stream_definitions_query = FindRouteHandler(loader, "POST", "/channels/stream/definitions/query");
     auto sql_classify = FindRouteHandler(loader, "POST", "/scheduler/sql/classify");
     auto activate = FindRouteHandler(loader, "POST", "/operators/activate");
@@ -521,6 +553,7 @@ int main() {
     ASSERT_TRUE(stream_status != nullptr);
     ASSERT_TRUE(stream_list != nullptr);
     ASSERT_TRUE(stream_add != nullptr);
+    ASSERT_TRUE(stream_reset != nullptr);
     ASSERT_TRUE(stream_definitions_query != nullptr);
     ASSERT_TRUE(sql_classify != nullptr);
     ASSERT_TRUE(activate != nullptr);
@@ -1035,6 +1068,171 @@ int main() {
     }
     std::puts("[PASS] T38A");
 
+    // T38B: dataframe_dispatch_stream 默认无参数 => range(auto) 平均分段
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.dataframe_dispatch_stream"})", rsp), error::OK);
+        const std::string seed_name = "dispatch_seed_" + suffix;
+        auto rebuild_dispatch_seed = [&](const std::string& df_name) {
+            auto seed = std::make_shared<DataFrameChannel>("dataframe", df_name);
+            ASSERT_EQ(seed->Open(), 0);
+            DataFrame data;
+            data.SetSchema({
+                {"id", DataType::INT64, 0, ""},
+                {"service_id", DataType::INT64, 0, ""},
+            });
+            for (int64_t i = 1; i <= 4; ++i) {
+                ASSERT_EQ(data.AppendRow({i, 10 + (i - 1) / 2}), 0);
+            }
+            ASSERT_EQ(seed->Write(&data), 0);
+            if (registry->Get(df_name.c_str())) {
+                ASSERT_EQ(registry->Unregister(df_name.c_str()), 0);
+            }
+            ASSERT_EQ(registry->Register(df_name.c_str(), std::static_pointer_cast<IChannel>(seed)), 0);
+        };
+        rebuild_dispatch_seed(seed_name);
+
+        const std::string hub_name = "dispatch_hub_auto_" + suffix;
+        rapidjson::StringBuffer add_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> add_w(add_buf);
+        add_w.StartObject();
+        add_w.Key("type");
+        add_w.String("stream_hub");
+        add_w.Key("name");
+        add_w.String(hub_name.c_str());
+        add_w.Key("role");
+        add_w.String("both");
+        add_w.Key("options");
+        add_w.StartObject();
+        add_w.Key("mode");
+        add_w.String("split");
+        add_w.Key("partition_count");
+        add_w.Int(4);
+        add_w.Key("partition_ring_mode");
+        add_w.String("spsc");
+        add_w.Key("partition_ring_size");
+        add_w.Int(256);
+        add_w.EndObject();
+        add_w.EndObject();
+        ASSERT_EQ(stream_add("/channels/stream/add", add_buf.GetString(), rsp), error::OK);
+
+        ASSERT_EQ(exec("/scheduler/batch/execute",
+                       MakeReq("SELECT * FROM dataframe." + seed_name +
+                               " USING builtin.dataframe_dispatch_stream INTO stream_hub." + hub_name),
+                       rsp),
+                  error::OK);
+
+        auto* hub = stream_factory->Get("stream_hub", hub_name.c_str());
+        ASSERT_TRUE(hub != nullptr);
+        ASSERT_TRUE(hub->IsHubChannel());
+        ASSERT_EQ(hub->HubPartitionCount(), size_t(4));
+
+        for (size_t i = 0; i < 4; ++i) {
+            auto p = hub->HubPartition(i);
+            ASSERT_TRUE(p != nullptr);
+            std::vector<int64_t> ids;
+            ASSERT_TRUE(DrainStreamInt64Columns(p.get(), &ids));
+            ASSERT_EQ(ids.size(), size_t(1));
+            ASSERT_EQ(ids[0], static_cast<int64_t>(i + 1));
+        }
+    }
+    std::puts("[PASS] T38B");
+
+    // T38C: dataframe_dispatch_stream WITH field_name=... => hash
+    {
+        std::string rsp;
+        const std::string seed_name = "dispatch_seed_" + suffix;
+        auto seed = std::make_shared<DataFrameChannel>("dataframe", seed_name);
+        ASSERT_EQ(seed->Open(), 0);
+        DataFrame data;
+        data.SetSchema({
+            {"id", DataType::INT64, 0, ""},
+            {"service_id", DataType::INT64, 0, ""},
+        });
+        for (int64_t i = 1; i <= 4; ++i) {
+            ASSERT_EQ(data.AppendRow({i, 10 + (i - 1) / 2}), 0);
+        }
+        ASSERT_EQ(seed->Write(&data), 0);
+        if (registry->Get(seed_name.c_str())) {
+            ASSERT_EQ(registry->Unregister(seed_name.c_str()), 0);
+        }
+        ASSERT_EQ(registry->Register(seed_name.c_str(), std::static_pointer_cast<IChannel>(seed)), 0);
+
+        const std::string hub_name = "dispatch_hub_hash_" + suffix;
+        rapidjson::StringBuffer add_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> add_w(add_buf);
+        add_w.StartObject();
+        add_w.Key("type");
+        add_w.String("stream_hub");
+        add_w.Key("name");
+        add_w.String(hub_name.c_str());
+        add_w.Key("role");
+        add_w.String("both");
+        add_w.Key("options");
+        add_w.StartObject();
+        add_w.Key("mode");
+        add_w.String("split");
+        add_w.Key("partition_count");
+        add_w.Int(4);
+        add_w.Key("partition_ring_mode");
+        add_w.String("spsc");
+        add_w.Key("partition_ring_size");
+        add_w.Int(256);
+        add_w.EndObject();
+        add_w.EndObject();
+        ASSERT_EQ(stream_add("/channels/stream/add", add_buf.GetString(), rsp), error::OK);
+
+        ASSERT_EQ(exec("/scheduler/batch/execute",
+                       MakeReq("SELECT * FROM dataframe." + seed_name +
+                               " USING builtin.dataframe_dispatch_stream WITH field_name=service_id INTO stream_hub." +
+                               hub_name),
+                       rsp),
+                  error::OK);
+
+        auto* hub = stream_factory->Get("stream_hub", hub_name.c_str());
+        ASSERT_TRUE(hub != nullptr);
+        ASSERT_TRUE(hub->IsHubChannel());
+        ASSERT_EQ(hub->HubPartitionCount(), size_t(4));
+
+        std::map<int64_t, std::set<size_t>> service_partitions;
+        std::map<int64_t, int> service_counts;
+        int total_rows = 0;
+        for (size_t i = 0; i < 4; ++i) {
+            auto p = hub->HubPartition(i);
+            ASSERT_TRUE(p != nullptr);
+            std::vector<int64_t> ids;
+            std::vector<int64_t> service_ids;
+            ASSERT_TRUE(DrainStreamInt64Columns(p.get(), &ids, &service_ids));
+            ASSERT_EQ(ids.size(), service_ids.size());
+            total_rows += static_cast<int>(ids.size());
+            for (size_t k = 0; k < service_ids.size(); ++k) {
+                service_partitions[service_ids[k]].insert(i);
+                service_counts[service_ids[k]] += 1;
+            }
+        }
+        ASSERT_EQ(total_rows, 4);
+        ASSERT_EQ(service_counts.size(), size_t(2));
+        for (const auto& kv : service_counts) {
+            ASSERT_EQ(kv.second, 2);
+            ASSERT_TRUE(service_partitions[kv.first].size() == 1);
+        }
+    }
+    std::puts("[PASS] T38C");
+
+    // T38D: 参数规则校验（仅 range_rows 且无 strategy -> 报错）
+    {
+        std::string rsp;
+        const std::string seed_name = "dispatch_seed_" + suffix;
+        ASSERT_EQ(exec("/scheduler/batch/execute",
+                       MakeReq("SELECT * FROM dataframe." + seed_name +
+                               " USING builtin.dataframe_dispatch_stream WITH range_rows=100 INTO stream_hub.dispatch_hub_auto_" +
+                               suffix),
+                       rsp),
+                  error::INTERNAL_ERROR);
+        ASSERT_TRUE(rsp.find("DATAFRAME_DISPATCH_STRATEGY_REQUIRED") != std::string::npos);
+    }
+    std::puts("[PASS] T38D");
+
     // T39: 流式 execute/status/list + 数据流转
     {
         std::string rsp;
@@ -1517,6 +1715,113 @@ int main() {
     }
     std::puts("[PASS] T46");
 
+    // T46b: Stream 通道重置（同配置重建，清理 cancel 状态）
+    {
+        std::string rsp;
+        const std::string reset_name = "reset_ring_" + suffix;
+        rapidjson::StringBuffer add_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> add_w(add_buf);
+        add_w.StartObject();
+        add_w.Key("type");
+        add_w.String("ring");
+        add_w.Key("name");
+        add_w.String(reset_name.c_str());
+        add_w.Key("role");
+        add_w.String("both");
+        add_w.Key("options");
+        add_w.StartObject();
+        add_w.Key("ring_mode");
+        add_w.String("spsc");
+        add_w.Key("ring_size");
+        add_w.Int(256);
+        add_w.Key("overflow");
+        add_w.String("drop");
+        add_w.Key("finite");
+        add_w.Bool(false);
+        add_w.EndObject();
+        add_w.EndObject();
+
+        ASSERT_EQ(stream_add("/channels/stream/add", add_buf.GetString(), rsp), error::OK);
+        auto* reset_ch = dynamic_cast<IStreamChannel*>(stream_factory->Get("ring", reset_name.c_str()));
+        ASSERT_TRUE(reset_ch != nullptr);
+        reset_ch->Cancel();
+        ASSERT_EQ(reset_ch->Put(MakeStreamBatch(7001), 0), ECANCELED);
+
+        rapidjson::StringBuffer reset_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> reset_w(reset_buf);
+        reset_w.StartObject();
+        reset_w.Key("type");
+        reset_w.String("ring");
+        reset_w.Key("name");
+        reset_w.String(reset_name.c_str());
+        reset_w.EndObject();
+        ASSERT_EQ(stream_reset("/channels/stream/reset", reset_buf.GetString(), rsp), error::OK);
+
+        auto* reset_ch_after = dynamic_cast<IStreamChannel*>(stream_factory->Get("ring", reset_name.c_str()));
+        ASSERT_TRUE(reset_ch_after != nullptr);
+        ASSERT_EQ(reset_ch_after->Put(MakeStreamBatch(7002), 0), 0);
+    }
+    std::puts("[PASS] T46b");
+
+    // T46c: Stream 通道重置冲突与不存在校验
+    {
+        std::string rsp;
+        ASSERT_EQ(activate("/operators/activate", R"({"name":"builtin.passthrough_stream"})", rsp), error::OK);
+
+        const std::string busy_name = "reset_busy_" + suffix;
+        rapidjson::StringBuffer add_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> add_w(add_buf);
+        add_w.StartObject();
+        add_w.Key("type");
+        add_w.String("ring");
+        add_w.Key("name");
+        add_w.String(busy_name.c_str());
+        add_w.Key("role");
+        add_w.String("both");
+        add_w.Key("options");
+        add_w.StartObject();
+        add_w.Key("ring_mode");
+        add_w.String("spsc");
+        add_w.Key("ring_size");
+        add_w.Int(256);
+        add_w.Key("overflow");
+        add_w.String("drop");
+        add_w.Key("finite");
+        add_w.Bool(false);
+        add_w.EndObject();
+        add_w.EndObject();
+        ASSERT_EQ(stream_add("/channels/stream/add", add_buf.GetString(), rsp), error::OK);
+
+        rapidjson::StringBuffer exec_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> exec_w(exec_buf);
+        exec_w.StartObject();
+        exec_w.Key("sql_text");
+        exec_w.String(("SELECT * FROM ring." + busy_name +
+                       " USING builtin.passthrough_stream INTO dataframe.reset_busy_out").c_str());
+        exec_w.EndObject();
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute", exec_buf.GetString(), rsp), error::OK);
+        const std::string busy_task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!busy_task_id.empty());
+
+        rapidjson::StringBuffer reset_busy_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> reset_busy_w(reset_busy_buf);
+        reset_busy_w.StartObject();
+        reset_busy_w.Key("type");
+        reset_busy_w.String("ring");
+        reset_busy_w.Key("name");
+        reset_busy_w.String(busy_name.c_str());
+        reset_busy_w.EndObject();
+        ASSERT_EQ(stream_reset("/channels/stream/reset", reset_busy_buf.GetString(), rsp), error::CONFLICT);
+
+        ASSERT_EQ(stream_stop("/scheduler/stream/stop", MakeTaskReq(busy_task_id), rsp), error::OK);
+
+        ASSERT_EQ(stream_reset("/channels/stream/reset",
+                               R"({"type":"ring","name":"reset_not_exists"})",
+                               rsp),
+                  error::NOT_FOUND);
+    }
+    std::puts("[PASS] T46c");
+
     // T47: Web 代理流式通道查询接口（严格语义：上游不可达时返回 UNAVAILABLE）
     {
         const std::filesystem::path web_db_path = std::filesystem::temp_directory_path() /
@@ -1532,15 +1837,20 @@ int main() {
 
         fnRouterHandler web_stream_query = nullptr;
         fnRouterHandler web_stream_definitions_query = nullptr;
+        fnRouterHandler web_stream_reset = nullptr;
         web_stream_query = FindRouteHandler(loader, "POST", "/api/channels/stream/query");
         web_stream_definitions_query = FindRouteHandler(loader, "POST", "/api/channels/stream/definitions/query");
+        web_stream_reset = FindRouteHandler(loader, "POST", "/api/channels/stream/reset");
         ASSERT_TRUE(web_stream_query != nullptr);
         ASSERT_TRUE(web_stream_definitions_query != nullptr);
+        ASSERT_TRUE(web_stream_reset != nullptr);
 
         std::string rsp;
         ASSERT_EQ(web_stream_query("/api/channels/stream/query", "{}", rsp), error::UNAVAILABLE);
         ASSERT_TRUE(rsp.find("service unreachable") != std::string::npos);
         ASSERT_EQ(web_stream_definitions_query("/api/channels/stream/definitions/query", "{}", rsp), error::UNAVAILABLE);
+        ASSERT_TRUE(rsp.find("service unreachable") != std::string::npos);
+        ASSERT_EQ(web_stream_reset("/api/channels/stream/reset", R"({"type":"ring","name":"x"})", rsp), error::UNAVAILABLE);
         ASSERT_TRUE(rsp.find("service unreachable") != std::string::npos);
         std::filesystem::remove(web_db_path);
     }
@@ -2622,6 +2932,106 @@ int main() {
     }
     std::puts("[PASS] T54");
 
+    // T54.2: Hybrid Group DAG（batch -> stream_hub(split) -> stream selector）可省略 USING
+    {
+        std::string rsp;
+
+        const std::string seed_df_name = "hub_seed_df_" + suffix;
+        const std::string hub_name = "hub_split_" + suffix;
+        const std::string out0_name = "hub_out0_" + suffix;
+        const std::string out1_name = "hub_out1_" + suffix;
+        const std::string out2_name = "hub_out2_" + suffix;
+        const std::string out3_name = "hub_out3_" + suffix;
+
+        auto make_add_hub_req = [](const std::string& name) {
+            rapidjson::StringBuffer buf;
+            rapidjson::Writer<rapidjson::StringBuffer> w(buf);
+            w.StartObject();
+            w.Key("type");
+            w.String("stream_hub");
+            w.Key("name");
+            w.String(name.c_str());
+            w.Key("role");
+            w.String("both");
+            w.Key("options");
+            w.StartObject();
+            w.Key("mode");
+            w.String("split");
+            w.Key("partition_count");
+            w.Int(4);
+            w.Key("partition_ring_mode");
+            w.String("spsc");
+            w.Key("partition_ring_size");
+            w.Int(256);
+            w.EndObject();
+            w.EndObject();
+            return std::string(buf.GetString());
+        };
+
+        ASSERT_EQ(stream_add("/channels/stream/add", make_add_hub_req(hub_name), rsp), error::OK);
+        ASSERT_EQ(exec("/scheduler/batch/execute",
+                       MakeReq("SELECT * FROM sqlite.local.src INTO dataframe." + seed_df_name),
+                       rsp),
+                  error::OK);
+
+        const std::string sql1 =
+            "SELECT * FROM dataframe." + seed_df_name + " INTO stream_hub." + hub_name;
+        const std::string sql2 =
+            "SELECT * FROM stream_hub." + hub_name + "[0] INTO dataframe." + out0_name;
+        const std::string sql3 =
+            "SELECT * FROM stream_hub." + hub_name + "[1] INTO dataframe." + out1_name;
+        const std::string sql4 =
+            "SELECT * FROM stream_hub." + hub_name + "[2] INTO dataframe." + out2_name;
+        const std::string sql5 =
+            "SELECT * FROM stream_hub." + hub_name + "[3] INTO dataframe." + out3_name;
+        const std::string group_sql_text =
+            sql1 + ";\n" + sql2 + ";\n" + sql3 + ";\n" + sql4 + ";\n" + sql5 + ";";
+
+        rapidjson::StringBuffer req_buf;
+        rapidjson::Writer<rapidjson::StringBuffer> w(req_buf);
+        w.StartObject();
+        w.Key("execution_kind");
+        w.String("group");
+        w.Key("group_mode");
+        w.String("dag");
+        w.Key("sql_text");
+        w.String(group_sql_text.c_str());
+        w.EndObject();
+
+        ASSERT_EQ(stream_exec("/scheduler/stream/execute", req_buf.GetString(), rsp), error::OK);
+        const std::string group_task_id = ParseTaskId(rsp);
+        ASSERT_TRUE(!group_task_id.empty());
+
+        bool done = false;
+        for (int i = 0; i < 1200; ++i) {
+            std::string status_rsp;
+            ASSERT_EQ(stream_status("/scheduler/stream/status", MakeTaskReq(group_task_id), status_rsp), error::OK);
+            const std::string st = ParseStatus(status_rsp);
+            if (st == "stopped" || st == "failed" || st == "cancelled") {
+                ASSERT_EQ(st, "stopped");
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(done);
+
+        int total_rows = 0;
+        int non_empty_count = 0;
+        const std::string out_names[] = {out0_name, out1_name, out2_name, out3_name};
+        for (const auto& out_name : out_names) {
+            auto out_ch = std::dynamic_pointer_cast<IDataFrameChannel>(registry->Get(out_name.c_str()));
+            ASSERT_TRUE(out_ch != nullptr);
+            DataFrame out;
+            ASSERT_EQ(out_ch->Read(&out), 0);
+            total_rows += static_cast<int>(out.RowCount());
+            if (out.RowCount() > 0) ++non_empty_count;
+        }
+        ASSERT_EQ(total_rows, 3);
+        ASSERT_TRUE(non_empty_count >= 1);
+    }
+    std::puts("[PASS] T54.2");
+
     // T54.1: 非 root 同源分支自动构建 share_set（stream.mid -> n2/n3）
     {
         std::string rsp;
@@ -3211,6 +3621,7 @@ int main() {
     stream_status = fnRouterHandler();
     stream_list = fnRouterHandler();
     stream_add = fnRouterHandler();
+    stream_reset = fnRouterHandler();
     stream_definitions_query = fnRouterHandler();
     sql_classify = fnRouterHandler();
     activate = fnRouterHandler();

@@ -4,6 +4,7 @@ project(flowsql_common)
 # 不含 PluginRegistry（已删除）、Pipeline/ChannelAdapter（移入 scheduler.so）
 add_library(${PROJECT_NAME} SHARED
     builtin/dataframe/concat_operator.cpp
+    builtin/dataframe/dataframe_dispatch_stream_operator.cpp
     builtin/dataframe/hstack_operator.cpp
     builtin/dataframe/passthrough_operator.cpp
     builtin/stream/count_window_stream_operator.cpp

@@ -59,6 +59,7 @@ class WebServer {
     int32_t HandleQueryStreamChannels(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleAddStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleModifyStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleResetStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleRemoveStreamChannel(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetOperators(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleUploadOperator(const std::string& uri, const std::string& req, std::string& rsp);

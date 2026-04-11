@@ -120,6 +120,7 @@ export default {
   getStreamDefinitions: () => api.post('/api/channels/stream/definitions/query', {}),
   addStreamChannel: (payload) => api.post('/api/channels/stream/add', payload),
   modifyStreamChannel: (payload) => api.post('/api/channels/stream/modify', payload),
+  resetStreamChannel: (type, name) => api.post('/api/channels/stream/reset', { type, name }),
   removeStreamChannel: (type, name) => api.post('/api/channels/stream/remove', { type, name }),
   importCsv: (file) => {
     const form = new FormData()

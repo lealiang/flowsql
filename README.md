@@ -273,6 +273,17 @@ INTO dataframe.VNAT_COPY;
 
 说明：`stop/status` 使用 `task_id` 查询，不接受 `runtime_task_id`。
 
+### Stream 通道管理
+
+- `POST /api/channels/stream/query`
+- `POST /api/channels/stream/definitions/query`
+- `POST /api/channels/stream/add`
+- `POST /api/channels/stream/modify`
+- `POST /api/channels/stream/reset`
+- `POST /api/channels/stream/remove`
+
+说明：`reset` 仅重置运行态（同配置重建通道），不改动通道配置。
+
 ### 常见错误码
 
 | 错误码 | 含义 | 常见原因 |

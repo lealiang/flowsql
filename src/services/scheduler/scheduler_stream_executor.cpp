@@ -1089,6 +1089,13 @@ int32_t SchedulerPlugin::BuildStreamExecutionPlan(const SqlStatement& stmt,
     if (parsed_ops.empty() && !stmt.op_category.empty() && !stmt.op_name.empty()) {
         parsed_ops.push_back({stmt.op_category, stmt.op_name});
     }
+    // 仅 group 节点（skip_lease_acquire=true）允许省略 USING：
+    // 隐式注入 builtin.passthrough_stream 作为默认算子。
+    // single stream 入口保持原有约束：必须显式 USING stream operator。
+    const bool implicit_passthrough = parsed_ops.empty() && skip_lease_acquire;
+    if (implicit_passthrough) {
+        parsed_ops.push_back({"builtin", "passthrough_stream"});
+    }
     if (parsed_ops.empty()) {
         *err_rsp = BuildErrorJson("stream task requires USING stream operator");
         return error::BAD_REQUEST;
@@ -1099,19 +1106,21 @@ int32_t SchedulerPlugin::BuildStreamExecutionPlan(const SqlStatement& stmt,
     }
     const OperatorRef& op_ref = parsed_ops[0];
 
-    auto* catalog = static_cast<IOperatorCatalog*>(querier_->First(IID_OPERATOR_CATALOG));
-    if (!catalog) {
-        *err_rsp = BuildErrorJson("operator catalog unavailable");
-        return error::UNAVAILABLE;
-    }
-    const OperatorStatus status = catalog->QueryStatus(op_ref.category, op_ref.name);
-    if (status == OperatorStatus::kNotFound) {
-        *err_rsp = BuildErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
-        return error::NOT_FOUND;
-    }
-    if (status == OperatorStatus::kDeactivated) {
-        *err_rsp = BuildErrorJson("operator is deactivated: " + op_ref.category + "." + op_ref.name);
-        return error::CONFLICT;
+    if (!implicit_passthrough) {
+        auto* catalog = static_cast<IOperatorCatalog*>(querier_->First(IID_OPERATOR_CATALOG));
+        if (!catalog) {
+            *err_rsp = BuildErrorJson("operator catalog unavailable");
+            return error::UNAVAILABLE;
+        }
+        const OperatorStatus status = catalog->QueryStatus(op_ref.category, op_ref.name);
+        if (status == OperatorStatus::kNotFound) {
+            *err_rsp = BuildErrorJson("operator not found: " + op_ref.category + "." + op_ref.name);
+            return error::NOT_FOUND;
+        }
+        if (status == OperatorStatus::kDeactivated) {
+            *err_rsp = BuildErrorJson("operator is deactivated: " + op_ref.category + "." + op_ref.name);
+            return error::CONFLICT;
+        }
     }
 
     SourceResolveResult source_resolved;

@@ -234,6 +234,15 @@ int WebServer::Init(const std::string& db_path) {
                      (rc == error::UNAVAILABLE ? 503 : 400)));
         res.set_content(rsp, "application/json");
     });
+    server_.Post("/api/channels/stream/reset", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp;
+        int32_t rc = HandleResetStreamChannel("", req.body, rsp);
+        res.status = (rc == error::OK) ? 200 :
+                     (rc == error::CONFLICT ? 409 :
+                     (rc == error::NOT_FOUND ? 404 :
+                     (rc == error::UNAVAILABLE ? 503 : 400)));
+        res.set_content(rsp, "application/json");
+    });
     server_.Post("/api/channels/stream/remove", [this](const httplib::Request& req, httplib::Response& res) {
         std::string rsp;
         int32_t rc = HandleRemoveStreamChannel("", req.body, rsp);
@@ -575,6 +584,10 @@ void WebServer::EnumApiRoutes(std::function<void(const RouteItem&)> cb) {
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleModifyStreamChannel(u, req, rsp);
         }});
+    cb({"POST", "/api/channels/stream/reset",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleResetStreamChannel(u, req, rsp);
+        }});
     cb({"POST", "/api/channels/stream/remove",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleRemoveStreamChannel(u, req, rsp);
@@ -819,6 +832,10 @@ int32_t WebServer::HandleAddStreamChannel(const std::string&, const std::string&
 
 int32_t WebServer::HandleModifyStreamChannel(const std::string&, const std::string& req, std::string& rsp) {
     return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/modify", req, &rsp);
+}
+
+int32_t WebServer::HandleResetStreamChannel(const std::string&, const std::string& req, std::string& rsp) {
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/channels/stream/reset", req, &rsp);
 }
 
 int32_t WebServer::HandleRemoveStreamChannel(const std::string&, const std::string& req, std::string& rsp) {

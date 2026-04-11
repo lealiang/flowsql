@@ -148,6 +148,10 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleModifyStreamChannel(u, req, rsp);
         }});
+    cb({"POST", "/channels/stream/reset",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleResetStreamChannel(u, req, rsp);
+        }});
     cb({"POST", "/channels/stream/remove",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleRemoveStreamChannel(u, req, rsp);
@@ -1451,6 +1455,77 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
         rsp = BuildErrorJson("modify stream channel failed: " + type + "." + name);
         return MapStreamManagerErrorToStatus(rc);
     }
+    mutation_guard.reset();
+    rsp = R"({"ok":true})";
+    return error::OK;
+}
+
+int32_t SchedulerPlugin::HandleResetStreamChannel(const std::string&,
+                                                  const std::string& req,
+                                                  std::string& rsp) {
+    auto* stream_manager = querier_ ? static_cast<IStreamManager*>(querier_->First(IID_STREAM_MANAGER)) : nullptr;
+    if (!stream_manager) {
+        rsp = BuildErrorJson("stream manager unavailable");
+        return error::UNAVAILABLE;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(req.c_str());
+    if (doc.HasParseError() || !doc.IsObject() ||
+        !doc.HasMember("type") || !doc["type"].IsString() ||
+        !doc.HasMember("name") || !doc["name"].IsString()) {
+        rsp = BuildErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\"}");
+        return error::BAD_REQUEST;
+    }
+
+    const std::string type = doc["type"].GetString();
+    const std::string name = doc["name"].GetString();
+    const std::string type_l = ToLowerAscii(type);
+
+    SweepFinishedTaskLeases();
+    const std::string key = MakeStreamChannelKey(type, name);
+    std::string mutation_reason;
+    const int mutation_rc = TryBeginStreamChannelMutation(key, &mutation_reason);
+    if (mutation_rc != 0) {
+        if (mutation_reason == "source_in_use") {
+            rsp = BuildExecutionErrorJson("stream source is in use", ErrorCodeId::kStreamSourceInUse, ErrorStageId::kModify);
+            return error::CONFLICT;
+        }
+        if (mutation_reason == "mutating") {
+            rsp = BuildExecutionErrorJson("stream channel is mutating", ErrorCodeId::kStreamChannelMutating, ErrorStageId::kModify);
+            return error::CONFLICT;
+        }
+        rsp = BuildExecutionErrorJson("stream channel is in use", ErrorCodeId::kStreamChannelInUse, ErrorStageId::kModify);
+        return error::CONFLICT;
+    }
+    auto mutation_guard = std::unique_ptr<void, std::function<void(void*)>>(
+        reinterpret_cast<void*>(1),
+        [this, key](void*) { EndStreamChannelMutation(key); });
+
+    bool found = false;
+    std::string current_option;
+    stream_manager->QueryChannels(
+        [&](const std::string& item_type,
+            const std::string& item_name,
+            const std::string& option,
+            const std::string&) {
+            if (found) return;
+            if (ToLowerAscii(item_type) == type_l && item_name == name) {
+                found = true;
+                current_option = option;
+            }
+        });
+    if (!found) {
+        rsp = BuildErrorJson("stream channel not found: " + type + "." + name);
+        return error::NOT_FOUND;
+    }
+
+    const int rc = stream_manager->ModifyChannel(type_l, name, current_option);
+    if (rc != 0) {
+        rsp = BuildErrorJson("reset stream channel failed: " + type + "." + name);
+        return MapStreamManagerErrorToStatus(rc);
+    }
+
     mutation_guard.reset();
     rsp = R"({"ok":true})";
     return error::OK;

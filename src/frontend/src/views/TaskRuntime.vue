@@ -148,6 +148,7 @@ const PAD_X = 20
 const PAD_Y = 16
 const H_GAP = 60
 const V_GAP = 16
+const CONTROL_TOP_GAP = 46
 
 const route = useRoute()
 const router = useRouter()
@@ -254,9 +255,214 @@ const normalizedEdges = computed(() => {
   return list.sort((a, b) => String(a?.id || '').localeCompare(String(b?.id || '')))
 })
 
+const isControlEdge = (edge) => {
+  const kind = String(edge?.edge_kind || '').toLowerCase()
+  if (kind === 'control') return true
+  const trigger = String(edge?.trigger || '').toLowerCase()
+  return trigger === 'on_finish' || trigger === 'on_start'
+}
+
+const isDefaultTransferOperator = (node) => {
+  const kind = String(node?.kind || '').toLowerCase()
+  const name = String(node?.name || '').trim().toLowerCase()
+  return kind === 'operator' && name === 'transfer'
+}
+
+const parseHubChild = (channelName) => {
+  const m = String(channelName || '').match(/^(stream_hub\.[^\[]+)\[(\d+|\*)\]$/)
+  if (!m) return null
+  return {
+    hubName: m[1],
+    selector: `[${m[2]}]`
+  }
+}
+
+const statusRank = (status) => {
+  const s = String(status || '').toLowerCase()
+  if (s === 'failed' || s === 'timeout') return 5
+  if (s === 'cancelled') return 4
+  if (s === 'completed' || s === 'stopped' || s === 'done') return 3
+  if (s === 'running' || s === 'stopping' || s === 'active' || s === 'preparing' || s === 'created') return 2
+  if (s === 'pending' || s === 'idle') return 1
+  return 0
+}
+
+const buildSemanticGraph = (rawNodes, rawEdges) => {
+  const nodeMap = new Map()
+  rawNodes.forEach((n) => nodeMap.set(String(n.id), { ...n }))
+
+  const edges = rawEdges
+    .map((e) => ({
+      ...e,
+      from: String(e?.from || ''),
+      to: String(e?.to || '')
+    }))
+    .filter((e) => nodeMap.has(e.from) && nodeMap.has(e.to))
+
+  const dataEdges = edges.filter((e) => !isControlEdge(e))
+  const controlEdges = edges.filter((e) => isControlEdge(e))
+
+  const dataIn = new Map()
+  const dataOut = new Map()
+  dataEdges.forEach((e) => {
+    if (!dataIn.has(e.to)) dataIn.set(e.to, [])
+    if (!dataOut.has(e.from)) dataOut.set(e.from, [])
+    dataIn.get(e.to).push(e)
+    dataOut.get(e.from).push(e)
+  })
+
+  const controlTouched = new Set()
+  controlEdges.forEach((e) => {
+    controlTouched.add(e.from)
+    controlTouched.add(e.to)
+  })
+
+  const collapsedOps = new Map()
+  nodeMap.forEach((node, nodeId) => {
+    if (!isDefaultTransferOperator(node)) return
+    if (controlTouched.has(nodeId)) return
+    const incoming = dataIn.get(nodeId) || []
+    const outgoing = dataOut.get(nodeId) || []
+    if (incoming.length !== 1 || outgoing.length !== 1) return
+    const inEdge = incoming[0]
+    const outEdge = outgoing[0]
+    if (inEdge.from === outEdge.to) return
+    collapsedOps.set(nodeId, { inEdge, outEdge })
+  })
+
+  const keptDataEdges = []
+  dataEdges.forEach((e) => {
+    if (collapsedOps.has(e.from) || collapsedOps.has(e.to)) return
+    keptDataEdges.push({ ...e })
+  })
+  collapsedOps.forEach((pair, opId) => {
+    keptDataEdges.push({
+      id: `edge:collapsed:${opId}`,
+      from: pair.inEdge.from,
+      to: pair.outEdge.to,
+      edge_kind: 'data',
+      trigger: 'on_data',
+      status: pair.outEdge.status || pair.inEdge.status || '',
+      rows: Number(pair.outEdge.rows || pair.inEdge.rows || 0),
+      fire_count: Number(pair.outEdge.fire_count || 0),
+      last_fire_at_ms: Number(pair.outEdge.last_fire_at_ms || 0)
+    })
+  })
+
+  const semanticNodes = []
+  nodeMap.forEach((node, nodeId) => {
+    if (collapsedOps.has(nodeId)) return
+    semanticNodes.push({ ...node })
+  })
+
+  const semanticNodeMap = new Map()
+  semanticNodes.forEach((n) => semanticNodeMap.set(String(n.id), n))
+
+  const childToHub = new Map()
+  const hubMetricsById = new Map()
+  semanticNodes.forEach((n) => {
+    if (String(n.kind || '').toLowerCase() !== 'channel') return
+    const parsed = parseHubChild(n.name)
+    if (!parsed) return
+    const childId = String(n.id)
+    const hubId = `channel:${parsed.hubName}`
+    childToHub.set(childId, { hubId, hubName: parsed.hubName, selector: parsed.selector })
+
+    if (!semanticNodeMap.has(hubId)) {
+      const syntheticHub = {
+        ...n,
+        id: hubId,
+        name: parsed.hubName
+      }
+      semanticNodes.push(syntheticHub)
+      semanticNodeMap.set(hubId, syntheticHub)
+    }
+    if (!hubMetricsById.has(hubId)) {
+      hubMetricsById.set(hubId, {
+        status: semanticNodeMap.get(hubId).status || 'pending',
+        processed_rows: Number(semanticNodeMap.get(hubId).processed_rows || 0),
+        output_rows: Number(semanticNodeMap.get(hubId).output_rows || 0)
+      })
+    }
+    const aggr = hubMetricsById.get(hubId)
+    if (statusRank(n.status) > statusRank(aggr.status)) aggr.status = n.status
+    aggr.processed_rows = Math.max(aggr.processed_rows, Number(n.processed_rows || 0))
+    aggr.output_rows = Math.max(aggr.output_rows, Number(n.output_rows || 0))
+  })
+
+  hubMetricsById.forEach((aggr, hubId) => {
+    const hub = semanticNodeMap.get(hubId)
+    if (!hub) return
+    hub.status = aggr.status
+    hub.processed_rows = aggr.processed_rows
+    hub.output_rows = aggr.output_rows
+  })
+
+  const visibleNodes = semanticNodes.filter((n) => !childToHub.has(String(n.id)))
+  const visibleNodeMap = new Map()
+  visibleNodes.forEach((n) => visibleNodeMap.set(String(n.id), n))
+
+  const transformedEdges = []
+  for (const e of keptDataEdges) {
+    let from = String(e.from)
+    let to = String(e.to)
+    let branchLabel = ''
+
+    const fromHub = childToHub.get(from)
+    if (fromHub) {
+      from = fromHub.hubId
+      branchLabel = fromHub.selector
+    }
+
+    const toHub = childToHub.get(to)
+    if (toHub) {
+      to = toHub.hubId
+      if (!branchLabel) branchLabel = toHub.selector
+    }
+
+    if (!visibleNodeMap.has(from) || !visibleNodeMap.has(to)) continue
+    transformedEdges.push({
+      ...e,
+      from,
+      to,
+      branch_label: branchLabel
+    })
+  }
+
+  for (const e of controlEdges) {
+    const from = String(e.from)
+    const to = String(e.to)
+    if (!visibleNodeMap.has(from) || !visibleNodeMap.has(to)) continue
+    transformedEdges.push({
+      ...e,
+      from,
+      to
+    })
+  }
+
+  const dedup = new Map()
+  transformedEdges.forEach((e) => {
+    const key = [String(e.edge_kind || ''), String(e.trigger || ''), e.from, e.to, String(e.branch_label || '')].join('|')
+    if (!dedup.has(key)) {
+      dedup.set(key, { ...e })
+      return
+    }
+    const prev = dedup.get(key)
+    if (statusRank(e.status) > statusRank(prev.status)) prev.status = e.status
+    prev.rows = Math.max(Number(prev.rows || 0), Number(e.rows || 0))
+    prev.fire_count = Math.max(Number(prev.fire_count || 0), Number(e.fire_count || 0))
+    prev.last_fire_at_ms = Math.max(Number(prev.last_fire_at_ms || 0), Number(e.last_fire_at_ms || 0))
+  })
+
+  const finalEdges = [...dedup.values()].sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')))
+  const finalNodes = visibleNodes.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')))
+  return { nodes: finalNodes, edges: finalEdges }
+}
+
 const canvas = computed(() => {
-  const nodes = normalizedNodes.value
-  const edges = normalizedEdges.value
+  const semantic = buildSemanticGraph(normalizedNodes.value, normalizedEdges.value)
+  const nodes = semantic.nodes
+  const edges = semantic.edges
   if (nodes.length === 0) {
     return { width: 800, height: 420, nodes: [], edges: [] }
   }
@@ -278,8 +484,12 @@ const canvas = computed(() => {
     const to = String(e?.to || '')
     if (!nodeMap.has(from) || !nodeMap.has(to)) return
     validEdges.push({ ...e, from, to })
-    adj.get(from).push(to)
-    indegree.set(to, (indegree.get(to) || 0) + 1)
+  })
+
+  const layoutEdges = validEdges.filter((e) => !isControlEdge(e))
+  layoutEdges.forEach((e) => {
+    adj.get(e.from).push(e.to)
+    indegree.set(e.to, (indegree.get(e.to) || 0) + 1)
   })
 
   const level = new Map()
@@ -289,12 +499,10 @@ const canvas = computed(() => {
     .sort((a, b) => a.localeCompare(b))
 
   const indegreeWork = new Map(indegree)
-  const visited = new Set()
   queue.forEach((id) => level.set(id, 0))
 
   while (queue.length > 0) {
     const cur = queue.shift()
-    visited.add(cur)
     const curLevel = level.get(cur) || 0
     const nexts = adj.get(cur) || []
     for (const to of nexts) {
@@ -330,15 +538,17 @@ const canvas = computed(() => {
   cols.forEach((c) => {
     maxRows = Math.max(maxRows, buckets.get(c).length)
   })
+  const hasControl = validEdges.some((e) => isControlEdge(e))
+  const topGap = hasControl ? CONTROL_TOP_GAP : 0
   const width = Math.max(640, PAD_X * 2 + cols.length * NODE_W + Math.max(0, cols.length - 1) * H_GAP)
-  const height = Math.max(380, PAD_Y * 2 + maxRows * NODE_H + Math.max(0, maxRows - 1) * V_GAP)
+  const height = Math.max(380, PAD_Y * 2 + topGap + maxRows * NODE_H + Math.max(0, maxRows - 1) * V_GAP)
 
   const pos = new Map()
   cols.forEach((c, colIndex) => {
     const colNodes = buckets.get(c)
     colNodes.forEach((n, rowIndex) => {
       const x = PAD_X + colIndex * (NODE_W + H_GAP)
-      const y = PAD_Y + rowIndex * (NODE_H + V_GAP)
+      const y = PAD_Y + topGap + rowIndex * (NODE_H + V_GAP)
       pos.set(String(n.id), { x, y })
     })
   })
@@ -357,7 +567,23 @@ const canvas = computed(() => {
         path: '',
         labelX: 0,
         labelY: 0,
-        label: String(e.trigger || 'on_data')
+        label: ''
+      }
+    }
+
+    if (isControlEdge(e)) {
+      const sx = fromPos.x + NODE_W / 2
+      const sy = fromPos.y - 8
+      const tx = toPos.x + NODE_W / 2
+      const ty = toPos.y - 8
+      const midY = Math.max(PAD_Y + 6, Math.min(sy, ty) - 26)
+      const d = `M ${sx} ${sy} C ${sx} ${midY}, ${tx} ${midY}, ${tx} ${ty}`
+      return {
+        ...e,
+        path: d,
+        labelX: (sx + tx) / 2,
+        labelY: Math.max(PAD_Y + 2, midY - 4),
+        label: String(e.trigger || '')
       }
     }
 
@@ -365,7 +591,7 @@ const canvas = computed(() => {
     const sy = fromPos.y + NODE_H / 2
     const tx = toPos.x
     const ty = toPos.y + NODE_H / 2
-    const delta = Math.max(24, Math.abs(tx - sx) * 0.25)
+    const delta = Math.max(22, Math.abs(tx - sx) * 0.24)
     const c1x = sx + delta
     const c2x = tx - delta
     const d = `M ${sx} ${sy} C ${c1x} ${sy}, ${c2x} ${ty}, ${tx} ${ty}`
@@ -375,7 +601,7 @@ const canvas = computed(() => {
       path: d,
       labelX: (sx + tx) / 2,
       labelY: (sy + ty) / 2 - 6,
-      label: String(e.trigger || 'on_data')
+      label: String(e.branch_label || '')
     }
   })
 
