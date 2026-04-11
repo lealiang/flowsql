@@ -387,6 +387,23 @@ int WebServer::Init(const std::string& db_path) {
         res.status = (rc == error::OK) ? 200 : (rc == error::CONFLICT ? 409 : (rc == error::NOT_FOUND ? 404 : (rc == error::UNAVAILABLE ? 503 : 400)));
         res.set_content(rsp, "application/json");
     });
+    server_.Post("/api/tasks/runtime/graph/query", [this](const httplib::Request& req, httplib::Response& res) {
+        std::string rsp; int32_t rc = HandleTaskRuntimeGraph("", req.body.empty() ? "{}" : req.body, rsp);
+        if (rc == error::OK) {
+            res.status = 200;
+        } else if (rc == error::BAD_REQUEST) {
+            res.status = 400;
+        } else if (rc == error::NOT_FOUND) {
+            res.status = 404;
+        } else if (rc == error::CONFLICT) {
+            res.status = 409;
+        } else if (rc == error::UNAVAILABLE) {
+            res.status = 503;
+        } else {
+            res.status = 500;
+        }
+        res.set_content(rsp, "application/json");
+    });
 
     // 数据库通道管理路由：转发给内部服务，去掉 /api 前缀
     auto db_proxy = [this](const std::string& target_uri, const std::string& req_body, httplib::Response& res) {
@@ -641,6 +658,10 @@ void WebServer::EnumApiRoutes(std::function<void(const RouteItem&)> cb) {
     cb({"POST", "/api/tasks/stream/list",
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleStreamListTask(u, req, rsp);
+        }});
+    cb({"POST", "/api/tasks/runtime/graph/query",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleTaskRuntimeGraph(u, req, rsp);
         }});
 
     // 代理 /api/channels/database/* → Gateway /channels/database/*
@@ -1015,6 +1036,11 @@ int32_t WebServer::HandleStreamStatusTask(const std::string&, const std::string&
 int32_t WebServer::HandleStreamListTask(const std::string&, const std::string& req, std::string& rsp) {
     const std::string body = req.empty() ? "{}" : req;
     return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/stream/list", body, &rsp);
+}
+
+int32_t WebServer::HandleTaskRuntimeGraph(const std::string&, const std::string& req, std::string& rsp) {
+    const std::string body = req.empty() ? "{}" : req;
+    return ProxyPostJson(scheduler_host_, scheduler_port_, "/tasks/runtime/graph/query", body, &rsp);
 }
 
 }  // namespace web

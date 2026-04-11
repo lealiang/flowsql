@@ -200,6 +200,32 @@ INTO dataframe.out;
 - 流批一体当前边界：单任务内暂不支持 batch + stream 混合 DAG 编排（Hybrid DAG）。
 - `Hybrid DAG`（batch+stream 混合编排）当前未实现，已列为后续候选能力。
 
+## SQL 任务类型判定规则（当前）
+
+SQL 任务类型由 Source 通道类型决定（看 `FROM`，不看 `INTO`）：
+
+- Source 全部是 stream 通道：判定为 `stream` 任务。
+- Source 全部是非 stream 通道（如 dataframe/database）：判定为 `batch` 任务。
+- Source 同时包含 stream 与非 stream：当前不支持，直接报错。
+
+补充说明：
+
+- `INTO` 目标通道类型不参与任务类型判定。
+- `USING` 本身不决定任务类型，但 `stream` 执行入口要求包含流式算子。
+- 任务类型与执行入口必须匹配：`stream` 走 `/api/tasks/stream/execute`，`batch` 走 `/api/tasks/batch/execute`。
+
+示例：
+
+```sql
+-- batch：Source 是 dataframe
+SELECT * FROM dataframe.VNAT INTO ring.spsc_stream;
+
+-- stream：Source 是 stream
+SELECT * FROM ring.spsc_stream
+USING builtin.passthrough_stream
+INTO dataframe.VNAT_COPY;
+```
+
 ## 流式任务执行契约
 
 ### API 入口

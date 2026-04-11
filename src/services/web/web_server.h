@@ -79,6 +79,7 @@ class WebServer {
     int32_t HandleStreamStopTask(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamStatusTask(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamListTask(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleTaskRuntimeGraph(const std::string& uri, const std::string& req, std::string& rsp);
 
     // 通知 Python Worker 重新加载算子
     void NotifyWorkerReload();

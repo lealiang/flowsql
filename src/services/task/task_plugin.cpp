@@ -26,12 +26,290 @@
 #include <cstring>
 #include <cstdlib>
 #include <set>
+#include <unordered_map>
 
 #include "task_store_sqlite.h"
 #include "task_sql_utils.h"
 
 namespace flowsql {
 namespace task {
+
+namespace {
+
+const char* TaskStatusToName(TaskStatus s) {
+    switch (s) {
+        case TaskStatus::kPending: return "pending";
+        case TaskStatus::kRunning: return "running";
+        case TaskStatus::kCompleted: return "completed";
+        case TaskStatus::kFailed: return "failed";
+        case TaskStatus::kStopped: return "stopped";
+        case TaskStatus::kCancelled: return "cancelled";
+        case TaskStatus::kTimeout: return "timeout";
+        default: return "failed";
+    }
+}
+
+int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+std::string BuildRuntimeGraphOperatorName(const SqlStatement& stmt) {
+    if (!stmt.operators.empty()) {
+        std::string out;
+        for (size_t i = 0; i < stmt.operators.size(); ++i) {
+            if (i != 0) out += " -> ";
+            out += stmt.operators[i].category;
+            out += ".";
+            out += stmt.operators[i].name;
+        }
+        return out;
+    }
+    if (!stmt.op_category.empty() && !stmt.op_name.empty()) {
+        return stmt.op_category + "." + stmt.op_name;
+    }
+    return "transfer";
+}
+
+std::string BuildLocalRuntimeGraph(const TaskRecord& rec,
+                                   const std::vector<std::string>& sqls,
+                                   uint64_t cursor,
+                                   bool include_events,
+                                   const std::string& runtime_kind) {
+    struct SqlView {
+        std::vector<std::string> sources;
+        std::string sink;
+        std::string op_name;
+    };
+    struct Edge {
+        std::string id;
+        std::string from;
+        std::string to;
+        std::string edge_kind;
+        std::string trigger;
+        std::string status;
+        uint64_t rows = 0;
+        uint64_t fire_count = 0;
+        int64_t last_fire_at_ms = 0;
+    };
+
+    std::vector<SqlView> sql_views;
+    sql_views.reserve(sqls.size());
+    SqlParser parser;
+    for (const auto& sql : sqls) {
+        SqlView view;
+        const auto stmt = parser.Parse(sql);
+        if (!stmt.error.empty()) {
+            view.sources = {"unknown.source"};
+            view.sink = "unknown.sink";
+            view.op_name = "operator";
+        } else {
+            view.sources = stmt.sources;
+            if (view.sources.empty() && !stmt.source.empty()) {
+                view.sources.push_back(stmt.source);
+            }
+            if (view.sources.empty()) view.sources = {"unknown.source"};
+            view.sink = stmt.dest.empty() ? "unknown.sink" : stmt.dest;
+            view.op_name = BuildRuntimeGraphOperatorName(stmt);
+        }
+        sql_views.push_back(std::move(view));
+    }
+    if (sql_views.empty()) {
+        SqlView view;
+        view.sources = {"unknown.source"};
+        view.sink = rec.result_target.empty() ? "unknown.sink" : rec.result_target;
+        view.op_name = rec.task_kind == "batch" ? "batch_worker" : "operator";
+        sql_views.push_back(std::move(view));
+    }
+
+    const std::string overall_status = TaskStatusToName(rec.status);
+    const int64_t now_ms = NowMs();
+    const std::string runtime_task_id = rec.runtime_task_id.empty() ? rec.task_id : rec.runtime_task_id;
+
+    std::unordered_map<std::string, size_t> channel_indices;
+    std::vector<std::string> channel_names;
+    channel_names.reserve(sql_views.size() * 2);
+    auto ensure_channel = [&](const std::string& name) {
+        const std::string key = name.empty() ? "unknown.channel" : name;
+        if (channel_indices.find(key) != channel_indices.end()) return;
+        channel_indices[key] = channel_names.size();
+        channel_names.push_back(key);
+    };
+    for (const auto& view : sql_views) {
+        for (const auto& src : view.sources) ensure_channel(src);
+        ensure_channel(view.sink);
+    }
+
+    std::vector<Edge> edges;
+    edges.reserve(sql_views.size() * 2);
+    size_t edge_seq = 0;
+    const std::string data_edge_status =
+        (overall_status == "running" || overall_status == "pending") ? "active" : "done";
+    for (size_t i = 0; i < sql_views.size(); ++i) {
+        const std::string op_id = "operator:sql" + std::to_string(i);
+        for (const auto& src : sql_views[i].sources) {
+            Edge edge;
+            edge.id = "edge:data:on_data:" + std::to_string(edge_seq++);
+            edge.from = "channel:" + src;
+            edge.to = op_id;
+            edge.edge_kind = "data";
+            edge.trigger = "on_data";
+            edge.status = data_edge_status;
+            edge.rows = (i == sql_views.size() - 1) ? static_cast<uint64_t>(std::max<int64_t>(rec.result_row_count, 0)) : 0;
+            edges.push_back(std::move(edge));
+        }
+        Edge sink_edge;
+        sink_edge.id = "edge:data:on_data:" + std::to_string(edge_seq++);
+        sink_edge.from = op_id;
+        sink_edge.to = "channel:" + sql_views[i].sink;
+        sink_edge.edge_kind = "data";
+        sink_edge.trigger = "on_data";
+        sink_edge.status = data_edge_status;
+        sink_edge.rows = (i == sql_views.size() - 1) ? static_cast<uint64_t>(std::max<int64_t>(rec.result_row_count, 0)) : 0;
+        edges.push_back(std::move(sink_edge));
+    }
+
+    rapidjson::StringBuffer out;
+    rapidjson::Writer<rapidjson::StringBuffer> w(out);
+    w.StartObject();
+    w.Key("task_id");
+    w.String(rec.task_id.c_str());
+    w.Key("runtime_task_id");
+    w.String(runtime_task_id.c_str());
+    w.Key("task_kind");
+    w.String(rec.task_kind.c_str());
+    w.Key("runtime_kind");
+    w.String(runtime_kind.c_str());
+    w.Key("status");
+    w.String(overall_status.c_str());
+    w.Key("snapshot_time_ms");
+    w.Int64(now_ms);
+
+    w.Key("nodes");
+    w.StartArray();
+    for (const auto& channel : channel_names) {
+        w.StartObject();
+        w.Key("id");
+        w.String(("channel:" + channel).c_str());
+        w.Key("kind");
+        w.String("channel");
+        w.Key("name");
+        w.String(channel.c_str());
+        w.Key("sql_index");
+        w.Int(0);
+        w.Key("status");
+        w.String(overall_status.c_str());
+        w.Key("phase");
+        w.String("");
+        w.Key("processed_rows");
+        w.Uint64(0);
+        w.Key("output_rows");
+        w.Uint64(0);
+        w.Key("error_code");
+        w.String("");
+        w.Key("error_message");
+        w.String("");
+        w.Key("start_at_ms");
+        w.Int64(0);
+        w.Key("end_at_ms");
+        w.Int64(0);
+        w.EndObject();
+    }
+    for (size_t i = 0; i < sql_views.size(); ++i) {
+        w.StartObject();
+        w.Key("id");
+        w.String(("operator:sql" + std::to_string(i)).c_str());
+        w.Key("kind");
+        w.String("operator");
+        w.Key("name");
+        w.String(sql_views[i].op_name.c_str());
+        w.Key("sql_index");
+        w.Uint64(static_cast<uint64_t>(i));
+        w.Key("status");
+        w.String(overall_status.c_str());
+        w.Key("phase");
+        w.String(overall_status == "running" ? "on_data" : "");
+        w.Key("processed_rows");
+        w.Uint64(i == sql_views.size() - 1 ? static_cast<uint64_t>(std::max<int64_t>(rec.result_row_count, 0)) : 0);
+        w.Key("output_rows");
+        w.Uint64(i == sql_views.size() - 1 ? static_cast<uint64_t>(std::max<int64_t>(rec.result_row_count, 0)) : 0);
+        w.Key("error_code");
+        w.String((i == sql_views.size() - 1) ? rec.error_code.c_str() : "");
+        w.Key("error_message");
+        w.String((i == sql_views.size() - 1) ? rec.error_message.c_str() : "");
+        w.Key("start_at_ms");
+        w.Int64(0);
+        w.Key("end_at_ms");
+        w.Int64(0);
+        w.EndObject();
+    }
+    w.EndArray();
+
+    w.Key("edges");
+    w.StartArray();
+    for (const auto& edge : edges) {
+        w.StartObject();
+        w.Key("id");
+        w.String(edge.id.c_str());
+        w.Key("from");
+        w.String(edge.from.c_str());
+        w.Key("to");
+        w.String(edge.to.c_str());
+        w.Key("edge_kind");
+        w.String(edge.edge_kind.c_str());
+        w.Key("trigger");
+        w.String(edge.trigger.c_str());
+        w.Key("status");
+        w.String(edge.status.c_str());
+        w.Key("rows");
+        w.Uint64(edge.rows);
+        w.Key("fire_count");
+        w.Uint64(edge.fire_count);
+        w.Key("last_fire_at_ms");
+        w.Int64(edge.last_fire_at_ms);
+        w.EndObject();
+    }
+    w.EndArray();
+
+    w.Key("events");
+    w.StartArray();
+    if (include_events) {
+        // 本地 batch 图仅返回快照，不维护增量事件流。
+    }
+    w.EndArray();
+    w.Key("next_cursor");
+    w.Uint64(cursor);
+    w.EndObject();
+    return out.GetString();
+}
+
+bool LoadTaskSqlPayloadFromStore(TaskStoreSqlite* store,
+                                 const std::string& task_id,
+                                 std::string* raw_sql_text,
+                                 std::vector<std::string>* sqls) {
+    if (!store || task_id.empty() || !raw_sql_text || !sqls) return false;
+    std::string sqls_json;
+    int sql_count = 0;
+    if (store->QueryTaskSqlPayload(task_id, raw_sql_text, &sqls_json, &sql_count) != 0) return false;
+    if (raw_sql_text->empty()) return false;
+    if (!ParseSqlsJson(sqls_json, sqls)) return false;
+    if (sql_count > 0 && static_cast<int>(sqls->size()) != sql_count) return false;
+    return true;
+}
+
+bool LoadTaskSqlsFromStore(TaskStoreSqlite* store, const std::string& task_id, std::vector<std::string>* sqls) {
+    if (!sqls) return false;
+    std::string raw_sql_text;
+    return LoadTaskSqlPayloadFromStore(store, task_id, &raw_sql_text, sqls);
+}
+
+bool LoadTaskRawSqlTextFromStore(TaskStoreSqlite* store, const std::string& task_id, std::string* raw_sql_text) {
+    if (!raw_sql_text) return false;
+    std::vector<std::string> sqls;
+    return LoadTaskSqlPayloadFromStore(store, task_id, raw_sql_text, &sqls);
+}
+
+}  // namespace
 
 TaskPlugin::TaskPlugin() = default;
 TaskPlugin::~TaskPlugin() = default;
@@ -293,22 +571,24 @@ int TaskPlugin::UpdateTaskKindAndRuntimeId(const std::string& task_id,
 }
 
 int TaskPlugin::CreateTask(const std::string& request_sql, std::string* task_id) {
-    return CreateTaskInternal(request_sql, "", 1, 0, task_id);
+    return CreateTaskInternal(request_sql, request_sql, BuildSqlsJson({request_sql}), 1, 0, task_id);
 }
 
 int TaskPlugin::CreateTaskInternal(const std::string& request_sql,
+                                   const std::string& raw_sql_text,
                                    const std::string& sqls_json,
                                    int sql_count,
                                    int timeout_s,
                                    std::string* task_id,
                                    const std::string& task_kind,
                                    const std::string& runtime_task_id) {
-    if (!task_id || request_sql.empty()) return -1;
+    if (!task_id || request_sql.empty() || raw_sql_text.empty() || sqls_json.empty() || sql_count <= 0) return -1;
     if (EnsureDb() != 0) return -1;
     const std::string id = MakeNowTaskId(++seq_);
     TaskStoreSqlite::TaskCreateParams params;
     params.task_id = id;
-    params.request_sql = TruncateSql(request_sql);
+    params.request_sql = TruncateSummary(request_sql);
+    params.raw_sql_text = raw_sql_text;
     params.sqls_json = sqls_json;
     params.sql_count = sql_count;
     params.timeout_s = timeout_s;
@@ -420,16 +700,11 @@ int TaskPlugin::ExecuteOneTask(const std::string& task_id, std::string* execute_
     if (IsTerminal(rec.status)) return 0;
     if (UpdateStatus(task_id, TaskStatus::kRunning, "", "", "", 0, 0, "") != 0) return 0;
 
-    std::string request_sql = rec.request_sql;
-    std::string sqls_json;
-    if (store_) (void)store_->QueryTaskSqlPayload(task_id, &request_sql, &sqls_json);
-
     std::vector<std::string> sqls;
-    if (!ParseSqlsJson(sqls_json, &sqls) && !request_sql.empty()) {
-        sqls.push_back(request_sql);
-    }
+    const bool sql_payload_ok = LoadTaskSqlsFromStore(store_.get(), task_id, &sqls);
     if (sqls.empty()) {
-        return UpdateStatus(task_id, TaskStatus::kFailed, "INVALID_SQLS", "empty sql list", "parse", 0, 0, "");
+        const std::string err = sql_payload_ok ? "empty sql list" : "invalid sql payload";
+        return UpdateStatus(task_id, TaskStatus::kFailed, "INVALID_SQLS", err, "parse", 0, 0, "");
     }
 
     std::set<std::string> intermediate_channels;
@@ -760,7 +1035,12 @@ int32_t TaskPlugin::HandleBatchExecute(const std::string&, const std::string& re
     const std::string sqls_json = BuildSqlsJson(sqls);
 
     std::string task_id;
-    if (CreateTaskInternal(request_summary, sqls_json, static_cast<int>(sqls.size()), timeout_s, &task_id) != 0) {
+    if (CreateTaskInternal(request_summary,
+                           sql_text,
+                           sqls_json,
+                           static_cast<int>(sqls.size()),
+                           timeout_s,
+                           &task_id) != 0) {
         rsp = BuildErrorJson("failed to create task");
         return error::INTERNAL_ERROR;
     }
@@ -1031,13 +1311,18 @@ int32_t TaskPlugin::HandleList(const std::string&, const std::string& req, std::
     w.Key("items");
     w.StartArray();
     for (const auto& it : items) {
+        std::string sql_text;
+        if (!LoadTaskRawSqlTextFromStore(store_.get(), it.task_id, &sql_text)) {
+            rsp = BuildErrorWithCodeJson("invalid task sql payload", "TASK_SQL_PAYLOAD_INVALID");
+            return error::INTERNAL_ERROR;
+        }
         w.StartObject();
         w.Key("id");
         w.String(it.task_id.c_str());
         w.Key("task_id");
         w.String(it.task_id.c_str());
         w.Key("sql_text");
-        w.String(it.request_sql.c_str());
+        w.String(sql_text.c_str());
         w.Key("task_kind");
         w.String(it.task_kind.c_str());
         w.Key("runtime_task_id");
@@ -1094,8 +1379,13 @@ int32_t TaskPlugin::HandleDetail(const std::string&, const std::string& req, std
     w.String(rec.runtime_task_id.c_str());
     w.Key("status");
     w.String(StatusName(rec.status));
+    std::string sql_text;
+    if (!LoadTaskRawSqlTextFromStore(store_.get(), rec.task_id, &sql_text)) {
+        rsp = BuildErrorWithCodeJson("invalid task sql payload", "TASK_SQL_PAYLOAD_INVALID");
+        return error::INTERNAL_ERROR;
+    }
     w.Key("sql_text");
-    w.String(rec.request_sql.c_str());
+    w.String(sql_text.c_str());
     w.Key("result_row_count");
     w.Int64(rec.result_row_count);
     w.Key("result_col_count");
@@ -1546,6 +1836,7 @@ int32_t TaskPlugin::HandleStreamExecute(const std::string&, const std::string& r
             : ("[group] " + std::to_string(sqls.size()) + " SQL nodes");
     const std::string sqls_json = BuildSqlsJson(sqls);
     if (CreateTaskInternal(TruncateSummary(request_summary),
+                           sql_text,
                            sqls_json,
                            static_cast<int>(sqls.size()),
                            timeout_s,
@@ -1974,6 +2265,11 @@ int32_t TaskPlugin::HandleStreamList(const std::string&, const std::string& req,
     w.Key("tasks");
     w.StartArray();
     for (const auto& item : items) {
+        std::string sql_text;
+        if (!LoadTaskRawSqlTextFromStore(store_.get(), item.task_id, &sql_text)) {
+            rsp = BuildErrorWithCodeJson("invalid task sql payload", "TASK_SQL_PAYLOAD_INVALID");
+            return error::INTERNAL_ERROR;
+        }
         std::string shared_hub_id;
         uint64_t subscriber_count = 0;
         rapidjson::Document shared_source_keys_doc;
@@ -2025,7 +2321,7 @@ int32_t TaskPlugin::HandleStreamList(const std::string&, const std::string& req,
         w.Key("status");
         w.String(StatusName(item.status));
         w.Key("sql_text");
-        w.String(item.request_sql.c_str());
+        w.String(sql_text.c_str());
         w.Key("error_code");
         w.String(item.error_code.c_str());
         w.Key("error_message");
@@ -2058,6 +2354,250 @@ int32_t TaskPlugin::HandleStreamList(const std::string&, const std::string& req,
     }
     w.EndArray();
     w.EndObject();
+    rsp = out.GetString();
+    return error::OK;
+}
+
+int32_t TaskPlugin::HandleRuntimeGraphQuery(const std::string&, const std::string& req, std::string& rsp) {
+    rapidjson::Document doc;
+    doc.Parse(req.c_str());
+    if (doc.HasParseError() || !doc.IsObject() || !doc.HasMember("task_id") || !doc["task_id"].IsString()) {
+        rsp = BuildErrorWithCodeJson(
+            "invalid request, expected {\"task_id\":\"...\"}",
+            "RUNTIME_GRAPH_CURSOR_INVALID");
+        return error::BAD_REQUEST;
+    }
+
+    const std::string task_id = doc["task_id"].GetString();
+    if (task_id.empty()) {
+        rsp = BuildErrorWithCodeJson("invalid request, task_id must not be empty",
+                                     "RUNTIME_GRAPH_CURSOR_INVALID");
+        return error::BAD_REQUEST;
+    }
+
+    uint64_t cursor = 0;
+    if (doc.HasMember("cursor")) {
+        const auto& cursor_v = doc["cursor"];
+        if (cursor_v.IsUint64()) {
+            cursor = cursor_v.GetUint64();
+        } else if (cursor_v.IsUint()) {
+            cursor = cursor_v.GetUint();
+        } else if (cursor_v.IsInt64()) {
+            if (cursor_v.GetInt64() < 0) {
+                rsp = BuildErrorWithCodeJson("invalid request, cursor must be >= 0",
+                                             "RUNTIME_GRAPH_CURSOR_INVALID");
+                return error::BAD_REQUEST;
+            }
+            cursor = static_cast<uint64_t>(cursor_v.GetInt64());
+        } else if (cursor_v.IsInt()) {
+            if (cursor_v.GetInt() < 0) {
+                rsp = BuildErrorWithCodeJson("invalid request, cursor must be >= 0",
+                                             "RUNTIME_GRAPH_CURSOR_INVALID");
+                return error::BAD_REQUEST;
+            }
+            cursor = static_cast<uint64_t>(cursor_v.GetInt());
+        } else {
+            rsp = BuildErrorWithCodeJson("invalid request, cursor must be integer",
+                                         "RUNTIME_GRAPH_CURSOR_INVALID");
+            return error::BAD_REQUEST;
+        }
+    }
+
+    bool include_events = true;
+    if (doc.HasMember("include_events")) {
+        if (!doc["include_events"].IsBool()) {
+            rsp = BuildErrorWithCodeJson("invalid request, include_events must be bool",
+                                         "RUNTIME_GRAPH_CURSOR_INVALID");
+            return error::BAD_REQUEST;
+        }
+        include_events = doc["include_events"].GetBool();
+    }
+
+    TaskRecord rec;
+    if (GetTask(task_id, &rec) != 0) {
+        rsp = BuildErrorWithCodeJson("task not found", "RUNTIME_GRAPH_TASK_NOT_FOUND");
+        return error::NOT_FOUND;
+    }
+
+    std::string raw_sql_text;
+    std::vector<std::string> sqls;
+    if (!LoadTaskSqlPayloadFromStore(store_.get(), task_id, &raw_sql_text, &sqls)) {
+        rsp = BuildErrorWithCodeJson("invalid task sql payload", "RUNTIME_GRAPH_SQL_PAYLOAD_INVALID");
+        return error::INTERNAL_ERROR;
+    }
+
+    const std::string degraded_runtime_kind =
+        rec.task_kind == "batch" ? "batch" : "single";
+
+    auto InjectSqlPayload = [&](rapidjson::Document* graph_doc) {
+        if (!graph_doc || !graph_doc->IsObject()) return;
+        auto& alloc = graph_doc->GetAllocator();
+
+        if (graph_doc->HasMember("sql_text")) {
+            (*graph_doc)["sql_text"].SetString(raw_sql_text.c_str(), alloc);
+        } else {
+            rapidjson::Value sql_text_v;
+            sql_text_v.SetString(raw_sql_text.c_str(), alloc);
+            graph_doc->AddMember("sql_text", sql_text_v, alloc);
+        }
+
+        rapidjson::Value sqls_v(rapidjson::kArrayType);
+        for (const auto& sql : sqls) {
+            rapidjson::Value one;
+            one.SetString(sql.c_str(), alloc);
+            sqls_v.PushBack(one, alloc);
+        }
+        if (graph_doc->HasMember("sqls")) {
+            (*graph_doc)["sqls"].Swap(sqls_v);
+        } else {
+            graph_doc->AddMember("sqls", sqls_v, alloc);
+        }
+    };
+
+    auto UpsertStringField = [](rapidjson::Document* graph_doc, const char* key, const std::string& value) {
+        if (!graph_doc || !graph_doc->IsObject() || !key) return;
+        auto& alloc = graph_doc->GetAllocator();
+        if (graph_doc->HasMember(key)) {
+            (*graph_doc)[key].SetString(value.c_str(), alloc);
+        } else {
+            rapidjson::Value k;
+            k.SetString(key, alloc);
+            rapidjson::Value v;
+            v.SetString(value.c_str(), alloc);
+            graph_doc->AddMember(k, v, alloc);
+        }
+    };
+
+    auto UpsertBoolField = [](rapidjson::Document* graph_doc, const char* key, bool value) {
+        if (!graph_doc || !graph_doc->IsObject() || !key) return;
+        auto& alloc = graph_doc->GetAllocator();
+        if (graph_doc->HasMember(key)) {
+            (*graph_doc)[key].SetBool(value);
+        } else {
+            rapidjson::Value k;
+            k.SetString(key, alloc);
+            rapidjson::Value v;
+            v.SetBool(value);
+            graph_doc->AddMember(k, v, alloc);
+        }
+    };
+
+    if (rec.runtime_task_id.empty()) {
+        const std::string local_graph = BuildLocalRuntimeGraph(rec, sqls, cursor, include_events, degraded_runtime_kind);
+        rapidjson::Document graph_doc;
+        graph_doc.Parse(local_graph.c_str());
+        if (graph_doc.HasParseError() || !graph_doc.IsObject()) {
+            rsp = BuildErrorWithCodeJson("invalid runtime graph payload", "RUNTIME_GRAPH_BUILD_FAILED");
+            return error::INTERNAL_ERROR;
+        }
+        InjectSqlPayload(&graph_doc);
+        UpsertStringField(&graph_doc, "graph_source", "reconstructed");
+        UpsertBoolField(&graph_doc, "degraded", true);
+        UpsertStringField(&graph_doc, "degrade_reason", "runtime_task_id_missing");
+        rapidjson::StringBuffer out;
+        rapidjson::Writer<rapidjson::StringBuffer> out_w(out);
+        graph_doc.Accept(out_w);
+        rsp = out.GetString();
+        return error::OK;
+    }
+
+    rapidjson::StringBuffer scheduler_req_buf;
+    rapidjson::Writer<rapidjson::StringBuffer> scheduler_req_w(scheduler_req_buf);
+    scheduler_req_w.StartObject();
+    scheduler_req_w.Key("task_id");
+    scheduler_req_w.String(rec.runtime_task_id.c_str());
+    scheduler_req_w.Key("task_kind");
+    scheduler_req_w.String(rec.task_kind.c_str());
+    scheduler_req_w.Key("cursor");
+    scheduler_req_w.Uint64(cursor);
+    scheduler_req_w.Key("include_events");
+    scheduler_req_w.Bool(include_events);
+    scheduler_req_w.Key("sqls");
+    scheduler_req_w.StartArray();
+    for (const auto& sql : sqls) {
+        scheduler_req_w.String(sql.c_str());
+    }
+    scheduler_req_w.EndArray();
+    scheduler_req_w.EndObject();
+
+    std::string scheduler_rsp;
+    const int32_t rc = scheduler_client_.QueryRuntimeGraph(scheduler_req_buf.GetString(), &scheduler_rsp);
+    if (rc != error::OK) {
+        bool runtime_not_found = (rc == error::NOT_FOUND);
+        if (!runtime_not_found && !scheduler_rsp.empty()) {
+            rapidjson::Document err_doc;
+            err_doc.Parse(scheduler_rsp.c_str());
+            if (!err_doc.HasParseError() && err_doc.IsObject()) {
+                if (err_doc.HasMember("error_code") && err_doc["error_code"].IsString()) {
+                    runtime_not_found =
+                        std::string(err_doc["error_code"].GetString()) == "RUNTIME_GRAPH_RUNTIME_NOT_FOUND";
+                }
+                if (!runtime_not_found && err_doc.HasMember("error") && err_doc["error"].IsString()) {
+                    const std::string err = err_doc["error"].GetString();
+                    runtime_not_found =
+                        err.find("runtime task not found") != std::string::npos ||
+                        err.find("stream task not found") != std::string::npos;
+                }
+            }
+        }
+        if (runtime_not_found) {
+            const std::string local_graph = BuildLocalRuntimeGraph(rec, sqls, cursor, include_events, degraded_runtime_kind);
+            rapidjson::Document graph_doc;
+            graph_doc.Parse(local_graph.c_str());
+            if (graph_doc.HasParseError() || !graph_doc.IsObject()) {
+                rsp = BuildErrorWithCodeJson("invalid runtime graph payload", "RUNTIME_GRAPH_BUILD_FAILED");
+                return error::INTERNAL_ERROR;
+            }
+            InjectSqlPayload(&graph_doc);
+            UpsertStringField(&graph_doc, "graph_source", "reconstructed");
+            UpsertBoolField(&graph_doc, "degraded", true);
+            UpsertStringField(&graph_doc, "degrade_reason", "runtime_not_found");
+            rapidjson::StringBuffer out;
+            rapidjson::Writer<rapidjson::StringBuffer> out_w(out);
+            graph_doc.Accept(out_w);
+            rsp = out.GetString();
+            return error::OK;
+        }
+        rsp = scheduler_rsp.empty()
+            ? BuildErrorWithCodeJson(
+                  rc == error::NOT_FOUND ? "runtime graph runtime not found" : "runtime graph build failed",
+                  rc == error::NOT_FOUND ? "RUNTIME_GRAPH_RUNTIME_NOT_FOUND" : "RUNTIME_GRAPH_BUILD_FAILED")
+            : scheduler_rsp;
+        return rc;
+    }
+
+    rapidjson::Document graph_doc;
+    graph_doc.Parse(scheduler_rsp.c_str());
+    if (graph_doc.HasParseError() || !graph_doc.IsObject()) {
+        rsp = BuildErrorWithCodeJson("invalid runtime graph payload", "RUNTIME_GRAPH_BUILD_FAILED");
+        return error::INTERNAL_ERROR;
+    }
+    auto& alloc = graph_doc.GetAllocator();
+    if (graph_doc.HasMember("task_id")) {
+        graph_doc["task_id"].SetString(task_id.c_str(), alloc);
+    } else {
+        rapidjson::Value task_id_v;
+        task_id_v.SetString(task_id.c_str(), alloc);
+        graph_doc.AddMember("task_id", task_id_v, alloc);
+    }
+    if (!graph_doc.HasMember("runtime_task_id")) {
+        rapidjson::Value runtime_task_id_v;
+        runtime_task_id_v.SetString(rec.runtime_task_id.c_str(), alloc);
+        graph_doc.AddMember("runtime_task_id", runtime_task_id_v, alloc);
+    }
+    if (!graph_doc.HasMember("task_kind")) {
+        rapidjson::Value task_kind_v;
+        task_kind_v.SetString(rec.task_kind.c_str(), alloc);
+        graph_doc.AddMember("task_kind", task_kind_v, alloc);
+    }
+    InjectSqlPayload(&graph_doc);
+    UpsertStringField(&graph_doc, "graph_source", "live");
+    UpsertBoolField(&graph_doc, "degraded", false);
+    UpsertStringField(&graph_doc, "degrade_reason", "");
+
+    rapidjson::StringBuffer out;
+    rapidjson::Writer<rapidjson::StringBuffer> out_w(out);
+    graph_doc.Accept(out_w);
     rsp = out.GetString();
     return error::OK;
 }
@@ -2110,6 +2650,10 @@ void TaskPlugin::EnumRoutes(std::function<void(const RouteItem&)> callback) {
     callback({"POST", "/tasks/stream/list",
               [this](const std::string& u, const std::string& req, std::string& rsp) {
                   return HandleStreamList(u, req, rsp);
+              }});
+    callback({"POST", "/tasks/runtime/graph/query",
+              [this](const std::string& u, const std::string& req, std::string& rsp) {
+                  return HandleRuntimeGraphQuery(u, req, rsp);
               }});
 }
 

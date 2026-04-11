@@ -70,6 +70,7 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
                         const std::string& operator_chain);
     int RunRetentionCleanup();
     int CreateTaskInternal(const std::string& request_sql,
+                           const std::string& raw_sql_text,
                            const std::string& sqls_json,
                            int sql_count,
                            int timeout_s,
@@ -108,6 +109,7 @@ class __attribute__((visibility("default"))) TaskPlugin : public IPlugin, public
     int32_t HandleStreamStop(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamStatus(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamList(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleRuntimeGraphQuery(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t ClassifySqlTaskKindViaScheduler(const std::string& sql,
                                             std::string* task_kind_out,
                                             std::string* err_rsp);

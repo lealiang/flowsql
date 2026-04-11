@@ -74,6 +74,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) override;
     int32_t StopStream(const std::string& req_json, std::string* rsp_json) override;
     int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) override;
+    int32_t QueryRuntimeGraph(const std::string& req_json, std::string* rsp_json) override;
 
  private:
     friend struct SchedulerPluginTestAccessor;
@@ -88,6 +89,7 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     int32_t HandleStreamStop(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamStatus(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleStreamList(const std::string& uri, const std::string& req, std::string& rsp);
+    int32_t HandleRuntimeGraphQuery(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleGetChannels(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleQueryStreamChannelDefinitions(const std::string& uri, const std::string& req, std::string& rsp);
     int32_t HandleQueryStreamChannels(const std::string& uri, const std::string& req, std::string& rsp);

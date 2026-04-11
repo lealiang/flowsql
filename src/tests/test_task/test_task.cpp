@@ -154,6 +154,23 @@ static bool UpdateTaskCreatedAt(const std::string& db_path, const std::string& t
     return ok;
 }
 
+static bool DeleteTaskSqlPayload(const std::string& db_path, const std::string& task_id) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(db_path.c_str(), &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return false;
+    }
+    sqlite3_stmt* stmt = nullptr;
+    bool ok = false;
+    if (sqlite3_prepare_v2(db, "DELETE FROM task_sql_payloads WHERE task_id=?1;", -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+        ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    }
+    if (stmt) sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return ok;
+}
+
 template <class Fn>
 static bool WaitUntil(Fn&& pred, int timeout_ms, int interval_ms = 50) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -1714,6 +1731,332 @@ int main() {
     }
 
     {
+        const std::string runtime_graph_dir = MakeTempDir("runtime_graph_routes");
+        std::atomic<int> graph_query_calls{0};
+
+        MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
+            {"POST", "/scheduler/stream/execute",
+             [](const std::string&, const std::string&, std::string& rsp) {
+                 rsp = R"({"runtime_task_id":"stream_runtime_graph_001"})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/runtime/graph/query",
+             [&graph_query_calls](const std::string&, const std::string& req, std::string& rsp) {
+                 rapidjson::Document d;
+                 d.Parse(req.c_str());
+                 ASSERT_TRUE(!d.HasParseError() && d.IsObject());
+                 ASSERT_TRUE(d.HasMember("task_id") && d["task_id"].IsString());
+                 ASSERT_EQ(std::string(d["task_id"].GetString()), "stream_runtime_graph_001");
+                 ASSERT_TRUE(d.HasMember("task_kind") && d["task_kind"].IsString());
+                 ASSERT_EQ(std::string(d["task_kind"].GetString()), "stream");
+                 ASSERT_TRUE(d.HasMember("sqls") && d["sqls"].IsArray());
+                 ASSERT_EQ(d["sqls"].Size(), rapidjson::SizeType(1));
+                 graph_query_calls.fetch_add(1);
+                 rsp = R"({
+                     "task_id":"stream_runtime_graph_001",
+                     "runtime_task_id":"stream_runtime_graph_001",
+                     "task_kind":"stream",
+                     "runtime_kind":"single",
+                     "status":"running",
+                     "snapshot_time_ms":1000,
+                     "nodes":[
+                         {"id":"channel:ring.in","kind":"channel","name":"ring.in","sql_index":0,"status":"running","phase":"","processed_rows":10,"output_rows":10,"error_code":"","error_message":"","start_at_ms":0,"end_at_ms":0},
+                         {"id":"operator:sql0","kind":"operator","name":"builtin.passthrough_stream","sql_index":0,"status":"running","phase":"on_data","processed_rows":10,"output_rows":10,"error_code":"","error_message":"","start_at_ms":0,"end_at_ms":0}
+                     ],
+                     "edges":[
+                         {"id":"e1","from":"channel:ring.in","to":"operator:sql0","edge_kind":"data","trigger":"on_data","status":"active","rows":10,"fire_count":1,"last_fire_at_ms":1000}
+                     ],
+                     "events":[],
+                     "next_cursor":0
+                 })";
+                 return error::OK;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + runtime_graph_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        auto local_routes = CollectRoutes(&p);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/runtime/graph/query") == 1);
+
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"sql_text":"SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document exec_doc;
+        exec_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!exec_doc.HasParseError() && exec_doc.IsObject());
+        ASSERT_TRUE(exec_doc.HasMember("task_id") && exec_doc["task_id"].IsString());
+        const std::string task_id = exec_doc["task_id"].GetString();
+
+        ASSERT_EQ(local_routes["POST:/tasks/runtime/graph/query"](
+                      "/tasks/runtime/graph/query",
+                      (std::string("{\"task_id\":\"") + task_id + "\",\"cursor\":0,\"include_events\":true}"),
+                      rsp),
+                  error::OK);
+        rapidjson::Document graph_doc;
+        graph_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!graph_doc.HasParseError() && graph_doc.IsObject());
+        ASSERT_TRUE(graph_doc.HasMember("task_id") && graph_doc["task_id"].IsString());
+        ASSERT_EQ(std::string(graph_doc["task_id"].GetString()), task_id);
+        ASSERT_TRUE(graph_doc.HasMember("snapshot_time_ms") && graph_doc["snapshot_time_ms"].IsInt64());
+        ASSERT_TRUE(!graph_doc.HasMember("version"));
+        ASSERT_TRUE(!graph_doc.HasMember("generated_at_ms"));
+        ASSERT_TRUE(graph_doc.HasMember("runtime_task_id") && graph_doc["runtime_task_id"].IsString());
+        ASSERT_EQ(std::string(graph_doc["runtime_task_id"].GetString()), "stream_runtime_graph_001");
+        ASSERT_TRUE(graph_doc.HasMember("graph_source") && graph_doc["graph_source"].IsString());
+        ASSERT_EQ(std::string(graph_doc["graph_source"].GetString()), "live");
+        ASSERT_TRUE(graph_doc.HasMember("degraded") && graph_doc["degraded"].IsBool());
+        ASSERT_TRUE(!graph_doc["degraded"].GetBool());
+        ASSERT_TRUE(graph_doc.HasMember("degrade_reason") && graph_doc["degrade_reason"].IsString());
+        ASSERT_EQ(std::string(graph_doc["degrade_reason"].GetString()), "");
+        ASSERT_TRUE(graph_doc.HasMember("sql_text") && graph_doc["sql_text"].IsString());
+        ASSERT_TRUE(std::string(graph_doc["sql_text"].GetString()).find("SELECT * FROM ring.in") != std::string::npos);
+        ASSERT_TRUE(graph_doc.HasMember("sqls") && graph_doc["sqls"].IsArray());
+        ASSERT_EQ(graph_doc["sqls"].Size(), rapidjson::SizeType(1));
+        ASSERT_TRUE(graph_doc.HasMember("nodes") && graph_doc["nodes"].IsArray());
+        ASSERT_EQ(graph_doc["nodes"].Size(), rapidjson::SizeType(2));
+        ASSERT_TRUE(graph_doc.HasMember("edges") && graph_doc["edges"].IsArray());
+        ASSERT_EQ(graph_doc["edges"].Size(), rapidjson::SizeType(1));
+
+        ASSERT_EQ(local_routes["POST:/tasks/runtime/graph/query"](
+                      "/tasks/runtime/graph/query",
+                      R"({"task_id":"not_exist"})",
+                      rsp),
+                  error::NOT_FOUND);
+        rapidjson::Document not_found_doc;
+        not_found_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!not_found_doc.HasParseError() && not_found_doc.IsObject());
+        ASSERT_TRUE(not_found_doc.HasMember("error_code") && not_found_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(not_found_doc["error_code"].GetString()), "RUNTIME_GRAPH_TASK_NOT_FOUND");
+
+        ASSERT_EQ(local_routes["POST:/tasks/runtime/graph/query"](
+                      "/tasks/runtime/graph/query",
+                      (std::string("{\"task_id\":\"") + task_id + "\",\"cursor\":\"bad\"}"),
+                      rsp),
+                  error::BAD_REQUEST);
+        rapidjson::Document bad_req_doc;
+        bad_req_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!bad_req_doc.HasParseError() && bad_req_doc.IsObject());
+        ASSERT_TRUE(bad_req_doc.HasMember("error_code") && bad_req_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(bad_req_doc["error_code"].GetString()), "RUNTIME_GRAPH_CURSOR_INVALID");
+
+        ASSERT_EQ(graph_query_calls.load(), 1);
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
+        const std::string runtime_graph_not_found_dir = MakeTempDir("runtime_graph_not_found");
+        std::atomic<int> graph_query_calls{0};
+
+        MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
+            {"POST", "/scheduler/stream/execute",
+             [](const std::string&, const std::string&, std::string& rsp) {
+                 rsp = R"({"runtime_task_id":"stream_runtime_graph_missing_001"})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/runtime/graph/query",
+             [&graph_query_calls](const std::string&, const std::string&, std::string& rsp) {
+                 graph_query_calls.fetch_add(1);
+                 rsp = R"({"error":"runtime task not found"})";
+                 return error::NOT_FOUND;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + runtime_graph_not_found_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        auto local_routes = CollectRoutes(&p);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/runtime/graph/query") == 1);
+
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"sql_text":"SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.out"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document exec_doc;
+        exec_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!exec_doc.HasParseError() && exec_doc.IsObject());
+        ASSERT_TRUE(exec_doc.HasMember("task_id") && exec_doc["task_id"].IsString());
+        const std::string task_id = exec_doc["task_id"].GetString();
+
+        ASSERT_EQ(local_routes["POST:/tasks/runtime/graph/query"](
+                      "/tasks/runtime/graph/query",
+                      (std::string("{\"task_id\":\"") + task_id + "\"}"),
+                      rsp),
+                  error::OK);
+        rapidjson::Document graph_doc;
+        graph_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!graph_doc.HasParseError() && graph_doc.IsObject());
+        ASSERT_TRUE(graph_doc.HasMember("task_id") && graph_doc["task_id"].IsString());
+        ASSERT_EQ(std::string(graph_doc["task_id"].GetString()), task_id);
+        ASSERT_TRUE(graph_doc.HasMember("runtime_kind") && graph_doc["runtime_kind"].IsString());
+        ASSERT_EQ(std::string(graph_doc["runtime_kind"].GetString()), "single");
+        ASSERT_TRUE(graph_doc.HasMember("nodes") && graph_doc["nodes"].IsArray());
+        ASSERT_TRUE(graph_doc["nodes"].Size() >= rapidjson::SizeType(2));
+        ASSERT_TRUE(graph_doc.HasMember("edges") && graph_doc["edges"].IsArray());
+        ASSERT_TRUE(graph_doc["edges"].Size() >= rapidjson::SizeType(2));
+        ASSERT_TRUE(graph_doc.HasMember("degraded") && graph_doc["degraded"].IsBool());
+        ASSERT_TRUE(graph_doc["degraded"].GetBool());
+        ASSERT_TRUE(graph_doc.HasMember("degrade_reason") && graph_doc["degrade_reason"].IsString());
+        ASSERT_EQ(std::string(graph_doc["degrade_reason"].GetString()), "runtime_not_found");
+        ASSERT_TRUE(graph_doc.HasMember("graph_source") && graph_doc["graph_source"].IsString());
+        ASSERT_EQ(std::string(graph_doc["graph_source"].GetString()), "reconstructed");
+        ASSERT_TRUE(graph_doc.HasMember("sqls") && graph_doc["sqls"].IsArray());
+        ASSERT_EQ(graph_doc["sqls"].Size(), rapidjson::SizeType(1));
+
+        ASSERT_EQ(graph_query_calls.load(), 1);
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
+        const std::string runtime_graph_chain_dir = MakeTempDir("runtime_graph_chain_edges");
+        std::atomic<int> graph_query_calls{0};
+
+        MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
+            {"POST", "/scheduler/stream/execute",
+             [](const std::string&, const std::string&, std::string& rsp) {
+                 rsp = R"({"runtime_task_id":"stream_runtime_graph_chain_missing_001","runtime_kind":"group","group_mode":"dag","node_count":2})";
+                 return error::OK;
+             }},
+            {"POST", "/scheduler/runtime/graph/query",
+             [&graph_query_calls](const std::string&, const std::string&, std::string& rsp) {
+                 graph_query_calls.fetch_add(1);
+                 rsp = R"({"error":"runtime task not found"})";
+                 return error::NOT_FOUND;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + runtime_graph_chain_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        auto local_routes = CollectRoutes(&p);
+        ASSERT_TRUE(local_routes.count("POST:/tasks/runtime/graph/query") == 1);
+
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"execution_kind":"group","group_mode":"dag","sql_text":"select * from dataframe.VNAT into ring.spsc_stream;select * from ring.spsc_stream USING builtin.passthrough_stream into dataframe.VNAT_COPY;"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document exec_doc;
+        exec_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!exec_doc.HasParseError() && exec_doc.IsObject());
+        ASSERT_TRUE(exec_doc.HasMember("task_id") && exec_doc["task_id"].IsString());
+        const std::string task_id = exec_doc["task_id"].GetString();
+
+        ASSERT_EQ(local_routes["POST:/tasks/runtime/graph/query"](
+                      "/tasks/runtime/graph/query",
+                      (std::string("{\"task_id\":\"") + task_id + "\"}"),
+                      rsp),
+                  error::OK);
+        rapidjson::Document graph_doc;
+        graph_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!graph_doc.HasParseError() && graph_doc.IsObject());
+        ASSERT_TRUE(graph_doc.HasMember("degraded") && graph_doc["degraded"].IsBool());
+        ASSERT_TRUE(graph_doc["degraded"].GetBool());
+        ASSERT_TRUE(graph_doc.HasMember("snapshot_time_ms") && graph_doc["snapshot_time_ms"].IsInt64());
+        ASSERT_TRUE(!graph_doc.HasMember("version"));
+        ASSERT_TRUE(!graph_doc.HasMember("generated_at_ms"));
+        ASSERT_TRUE(graph_doc.HasMember("edges") && graph_doc["edges"].IsArray());
+        ASSERT_EQ(graph_doc["edges"].Size(), rapidjson::SizeType(4));
+        for (const auto& edge : graph_doc["edges"].GetArray()) {
+            ASSERT_TRUE(edge.IsObject());
+            ASSERT_TRUE(edge.HasMember("edge_kind") && edge["edge_kind"].IsString());
+            ASSERT_EQ(std::string(edge["edge_kind"].GetString()), "data");
+        }
+
+        ASSERT_EQ(graph_query_calls.load(), 1);
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
+        const std::string sql_payload_guard_dir = MakeTempDir("sql_payload_guard");
+        const std::string sql_payload_db = sql_payload_guard_dir + "/task_store.db";
+
+        MockRouterHandle scheduler({
+            MakeSqlClassifyRoute(),
+            {"POST", "/scheduler/stream/execute",
+             [](const std::string&, const std::string&, std::string& rsp) {
+                 rsp = R"({"runtime_task_id":"stream_payload_guard_001","runtime_kind":"group","group_mode":"dag","node_count":2})";
+                 return error::OK;
+             }},
+        });
+        MockQuerier querier;
+        querier.AddHandle(&scheduler);
+
+        TaskPlugin p;
+        const std::string opt = "db_dir=" + sql_payload_guard_dir + ";disable_worker=1";
+        ASSERT_EQ(p.Option(opt.c_str()), 0);
+        ASSERT_EQ(p.Load(&querier), 0);
+        ASSERT_EQ(p.Start(), 0);
+
+        auto local_routes = CollectRoutes(&p);
+        std::string rsp;
+        ASSERT_EQ(local_routes["POST:/tasks/stream/execute"](
+                      "/tasks/stream/execute",
+                      R"({"execution_kind":"group","group_mode":"dag","sql_text":"SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.mid;SELECT * FROM stream.mid USING builtin.passthrough_stream INTO stream.out;"})",
+                      rsp),
+                  error::OK);
+        rapidjson::Document exec_doc;
+        exec_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!exec_doc.HasParseError() && exec_doc.IsObject());
+        ASSERT_TRUE(exec_doc.HasMember("task_id") && exec_doc["task_id"].IsString());
+        const std::string task_id = exec_doc["task_id"].GetString();
+        ASSERT_TRUE(DeleteTaskSqlPayload(sql_payload_db, task_id));
+
+        ASSERT_EQ(local_routes["POST:/tasks/detail"](
+                      "/tasks/detail", MakeTaskIdReq(task_id), rsp),
+                  error::INTERNAL_ERROR);
+        rapidjson::Document detail_doc;
+        detail_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!detail_doc.HasParseError() && detail_doc.IsObject());
+        ASSERT_TRUE(detail_doc.HasMember("error_code") && detail_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(detail_doc["error_code"].GetString()), "TASK_SQL_PAYLOAD_INVALID");
+
+        ASSERT_EQ(local_routes["POST:/tasks/runtime/graph/query"](
+                      "/tasks/runtime/graph/query",
+                      (std::string("{\"task_id\":\"") + task_id + "\"}"),
+                      rsp),
+                  error::INTERNAL_ERROR);
+        rapidjson::Document graph_doc;
+        graph_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!graph_doc.HasParseError() && graph_doc.IsObject());
+        ASSERT_TRUE(graph_doc.HasMember("error_code") && graph_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(graph_doc["error_code"].GetString()), "RUNTIME_GRAPH_SQL_PAYLOAD_INVALID");
+
+        ASSERT_EQ(local_routes["POST:/tasks/list"]("/tasks/list", "{}", rsp), error::INTERNAL_ERROR);
+        rapidjson::Document list_doc;
+        list_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!list_doc.HasParseError() && list_doc.IsObject());
+        ASSERT_TRUE(list_doc.HasMember("error_code") && list_doc["error_code"].IsString());
+        ASSERT_EQ(std::string(list_doc["error_code"].GetString()), "TASK_SQL_PAYLOAD_INVALID");
+
+        ASSERT_EQ(p.Stop(), 0);
+    }
+
+    {
         const std::string classify_dir = MakeTempDir("classify_routes");
         std::atomic<int> classify_calls{0};
         std::atomic<int> batch_execute_calls{0};
@@ -2084,6 +2427,37 @@ int main() {
         ASSERT_EQ(submit_doc["node_count"].GetUint(), 2u);
         const std::string group_task_id = submit_doc["task_id"].GetString();
         ASSERT_TRUE(!group_task_id.empty());
+
+        ASSERT_EQ(local_routes["POST:/tasks/detail"](
+                      "/tasks/detail", MakeTaskIdReq(group_task_id), rsp),
+                  error::OK);
+        rapidjson::Document detail_doc;
+        detail_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!detail_doc.HasParseError() && detail_doc.IsObject());
+        ASSERT_TRUE(detail_doc.HasMember("sql_text") && detail_doc["sql_text"].IsString());
+        const std::string detail_sql = detail_doc["sql_text"].GetString();
+        ASSERT_TRUE(detail_sql.find("SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.mid") != std::string::npos);
+        ASSERT_TRUE(detail_sql.find("SELECT * FROM stream.mid USING builtin.passthrough_stream INTO stream.out") != std::string::npos);
+        ASSERT_TRUE(detail_sql.find("[group]") == std::string::npos);
+
+        ASSERT_EQ(local_routes["POST:/tasks/list"]("/tasks/list", "{}", rsp), error::OK);
+        rapidjson::Document list_doc;
+        list_doc.Parse(rsp.c_str());
+        ASSERT_TRUE(!list_doc.HasParseError() && list_doc.IsObject());
+        ASSERT_TRUE(list_doc.HasMember("items") && list_doc["items"].IsArray());
+        bool found_group_task = false;
+        for (const auto& item : list_doc["items"].GetArray()) {
+            if (!item.IsObject() || !item.HasMember("task_id") || !item["task_id"].IsString()) continue;
+            if (std::string(item["task_id"].GetString()) != group_task_id) continue;
+            found_group_task = true;
+            ASSERT_TRUE(item.HasMember("sql_text") && item["sql_text"].IsString());
+            const std::string list_sql = item["sql_text"].GetString();
+            ASSERT_TRUE(list_sql.find("SELECT * FROM ring.in USING builtin.passthrough_stream INTO stream.mid") != std::string::npos);
+            ASSERT_TRUE(list_sql.find("[group]") == std::string::npos);
+            ASSERT_TRUE(item.HasMember("task_kind") && item["task_kind"].IsString());
+            ASSERT_EQ(std::string(item["task_kind"].GetString()), "stream");
+        }
+        ASSERT_TRUE(found_group_task);
 
         ASSERT_EQ(local_routes["POST:/tasks/stream/status"](
                       "/tasks/stream/status", MakeTaskIdReq(group_task_id), rsp),

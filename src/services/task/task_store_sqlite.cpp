@@ -44,6 +44,15 @@ static const char* kSchemaSql =
     "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
     "finished_at DATETIME"
     ");"
+    "CREATE TABLE IF NOT EXISTS task_sql_payloads ("
+    "task_id TEXT PRIMARY KEY,"
+    "raw_sql_text TEXT NOT NULL,"
+    "sqls_json TEXT NOT NULL,"
+    "sql_count INTEGER NOT NULL,"
+    "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    "FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_task_sql_payloads_created_at ON task_sql_payloads(created_at);"
     "CREATE TABLE IF NOT EXISTS task_events ("
     "id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "task_id TEXT NOT NULL,"
@@ -110,25 +119,6 @@ std::string TaskStoreSqlite::BuildDbPathNoLock() const {
 int TaskStoreSqlite::EnsureSchemaNoLock() {
     if (!db_) return -1;
     if (sqlite3_exec(db_, kSchemaSql, nullptr, nullptr, nullptr) != SQLITE_OK) return -1;
-    // 兼容历史库：老库缺列时自动补齐。
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN sqls_json TEXT NOT NULL DEFAULT '';",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN sql_count INTEGER NOT NULL DEFAULT 1;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN current_sql_index INTEGER NOT NULL DEFAULT 0;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN timeout_s INTEGER NOT NULL DEFAULT 0;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'batch';",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN runtime_task_id TEXT NOT NULL DEFAULT '';",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN result_col_count INTEGER NOT NULL DEFAULT 0;",
-                       nullptr, nullptr, nullptr);
-    (void)sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN started_at DATETIME;",
-                       nullptr, nullptr, nullptr);
     return 0;
 }
 
@@ -158,6 +148,7 @@ int TaskStoreSqlite::Open(const OpenOptions& options) {
         db_ = nullptr;
         return -1;
     }
+    (void)sqlite3_exec(db_, "PRAGMA foreign_keys=ON", nullptr, nullptr, nullptr);
     (void)sqlite3_exec(db_, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
     return EnsureSchemaNoLock();
 }
@@ -252,25 +243,60 @@ int TaskStoreSqlite::QueryLastTaskId(std::string* task_id) {
 }
 
 int TaskStoreSqlite::CreateTask(const TaskCreateParams& params) {
-    if (params.task_id.empty() || params.request_sql.empty()) return -1;
+    if (params.task_id.empty() || params.request_sql.empty() ||
+        params.raw_sql_text.empty() || params.sqls_json.empty() || params.sql_count <= 0) {
+        return -1;
+    }
     std::lock_guard<std::mutex> lock(db_mu_);
     if (!db_) return -1;
 
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE TRANSACTION;", nullptr, nullptr, nullptr) != SQLITE_OK) return -1;
+
+    bool ok = true;
     sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "INSERT INTO tasks(task_id, request_sql, sqls_json, sql_count, current_sql_index, timeout_s, task_kind, runtime_task_id, status) "
-        "VALUES(?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 'pending');";
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, params.task_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, params.request_sql.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, params.sqls_json.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 4, params.sql_count > 0 ? params.sql_count : 1);
-    sqlite3_bind_int(stmt, 5, params.timeout_s > 0 ? params.timeout_s : 0);
-    sqlite3_bind_text(stmt, 6, params.task_kind.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 7, params.runtime_task_id.c_str(), -1, SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? 0 : -1;
+    const char* task_sql =
+        "INSERT INTO tasks(task_id, request_sql, current_sql_index, timeout_s, task_kind, runtime_task_id, status) "
+        "VALUES(?1, ?2, 0, ?3, ?4, ?5, 'pending');";
+    if (sqlite3_prepare_v2(db_, task_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        ok = false;
+    } else {
+        sqlite3_bind_text(stmt, 1, params.task_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, params.request_sql.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, params.timeout_s > 0 ? params.timeout_s : 0);
+        sqlite3_bind_text(stmt, 4, params.task_kind.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, params.runtime_task_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE) ok = false;
+        sqlite3_finalize(stmt);
+        stmt = nullptr;
+    }
+
+    if (ok) {
+        const char* payload_sql =
+            "INSERT INTO task_sql_payloads(task_id, raw_sql_text, sqls_json, sql_count) "
+            "VALUES(?1, ?2, ?3, ?4);";
+        if (sqlite3_prepare_v2(db_, payload_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            sqlite3_bind_text(stmt, 1, params.task_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, params.raw_sql_text.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, params.sqls_json.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(stmt, 4, params.sql_count);
+            if (sqlite3_step(stmt) != SQLITE_DONE) ok = false;
+            sqlite3_finalize(stmt);
+            stmt = nullptr;
+        }
+    }
+
+    if (!ok) {
+        if (stmt) sqlite3_finalize(stmt);
+        (void)sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return -1;
+    }
+    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        (void)sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return -1;
+    }
+    return 0;
 }
 
 int TaskStoreSqlite::UpdateStatus(const TaskStatusUpdate& update) {
@@ -543,6 +569,18 @@ int TaskStoreSqlite::DeleteTaskNoLock(const std::string& task_id) {
     }
 
     if (ok) {
+        if (sqlite3_prepare_v2(db_, "DELETE FROM task_sql_payloads WHERE task_id=?1;", -1, &stmt, nullptr) !=
+            SQLITE_OK) {
+            ok = false;
+        } else {
+            sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) != SQLITE_DONE) ok = false;
+            sqlite3_finalize(stmt);
+            stmt = nullptr;
+        }
+    }
+
+    if (ok) {
         if (sqlite3_prepare_v2(db_, "DELETE FROM tasks WHERE task_id=?1;", -1, &stmt, nullptr) != SQLITE_OK) {
             ok = false;
         } else {
@@ -676,20 +714,32 @@ int TaskStoreSqlite::UpdateTaskKindAndRuntimeId(const std::string& task_id,
     return (rc == SQLITE_DONE && changed > 0) ? 0 : -1;
 }
 
-int TaskStoreSqlite::QueryTaskSqlPayload(const std::string& task_id, std::string* request_sql, std::string* sqls_json) {
-    if (task_id.empty() || !request_sql || !sqls_json) return -1;
+int TaskStoreSqlite::QueryTaskSqlPayload(const std::string& task_id,
+                                         std::string* raw_sql_text,
+                                         std::string* sqls_json,
+                                         int* sql_count) {
+    if (task_id.empty() || !raw_sql_text || !sqls_json) return -1;
     std::lock_guard<std::mutex> lock(db_mu_);
     if (!db_) return -1;
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT request_sql, IFNULL(sqls_json,'') FROM tasks WHERE task_id=?1;";
+    const char* sql =
+        "SELECT raw_sql_text, sqls_json, sql_count "
+        "FROM task_sql_payloads WHERE task_id=?1;";
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
     sqlite3_bind_text(stmt, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const unsigned char* req_sql = sqlite3_column_text(stmt, 0);
-        const unsigned char* sqls = sqlite3_column_text(stmt, 1);
-        if (req_sql) *request_sql = reinterpret_cast<const char*>(req_sql);
-        if (sqls) *sqls_json = reinterpret_cast<const char*>(sqls);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
     }
+    const unsigned char* raw = sqlite3_column_text(stmt, 0);
+    const unsigned char* sqls = sqlite3_column_text(stmt, 1);
+    if (!raw || !sqls) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    *raw_sql_text = reinterpret_cast<const char*>(raw);
+    *sqls_json = reinterpret_cast<const char*>(sqls);
+    if (sql_count) *sql_count = sqlite3_column_int(stmt, 2);
     sqlite3_finalize(stmt);
     return 0;
 }

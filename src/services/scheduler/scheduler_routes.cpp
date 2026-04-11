@@ -127,6 +127,10 @@ void SchedulerPlugin::EnumRoutes(std::function<void(const RouteItem&)> cb) {
         [this](const std::string& u, const std::string& req, std::string& rsp) {
             return HandleStreamList(u, req, rsp);
         }});
+    cb({"POST", "/scheduler/runtime/graph/query",
+        [this](const std::string& u, const std::string& req, std::string& rsp) {
+            return HandleRuntimeGraphQuery(u, req, rsp);
+        }});
     // 流式通道查询（管理面最小字段）
     cb({"POST", "/channels/stream/query",
         [this](const std::string& u, const std::string& req, std::string& rsp) {

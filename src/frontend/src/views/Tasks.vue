@@ -78,6 +78,13 @@
       <el-table :data="tasks" style="width: 100%" v-loading="loading">
         <el-table-column prop="id" label="任务ID" min-width="260" show-overflow-tooltip />
         <el-table-column prop="sql_text" label="SQL" show-overflow-tooltip min-width="300" />
+        <el-table-column prop="task_kind" label="任务类型" width="110">
+          <template #default="scope">
+            <el-tag :type="taskKindTag(scope.row.task_kind)">
+              {{ formatTaskKind(scope.row.task_kind) }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="status" label="状态" width="100">
           <template #default="scope">
             <el-tag :type="taskStatusTag(scope.row.status)">
@@ -86,7 +93,7 @@
           </template>
         </el-table-column>
         <el-table-column prop="created_at" label="创建时间" width="180" />
-        <el-table-column label="操作" width="280">
+        <el-table-column label="操作" width="360">
           <template #default="scope">
               <el-button
                 type="primary"
@@ -97,19 +104,26 @@
               >
                 查看结果
               </el-button>
-            <el-button
-              type="warning"
-              size="small"
-              :disabled="isTerminal(scope.row.status)"
-              @click="cancelTaskAction(scope.row)"
-            >
-              取消
-            </el-button>
-            <el-button
-              type="danger"
-              size="small"
-              :disabled="!isTerminal(scope.row.status)"
-              @click="deleteTask(scope.row)"
+              <el-button
+                type="warning"
+                size="small"
+                :disabled="isTerminal(scope.row.status)"
+                @click="cancelTaskAction(scope.row)"
+              >
+                取消
+              </el-button>
+              <el-button
+                size="small"
+                :disabled="!canOpenRuntimeGraph(scope.row)"
+                @click="openRuntimeGraph(scope.row)"
+              >
+                可视化
+              </el-button>
+              <el-button
+                type="danger"
+                size="small"
+                :disabled="!isTerminal(scope.row.status)"
+                @click="deleteTask(scope.row)"
             >
               删除
             </el-button>
@@ -156,9 +170,11 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { CaretRight, Refresh } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
 import api from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
+const router = useRouter()
 const sqlText = ref('')
 const executeMode = ref('sync')
 const executing = ref(false)
@@ -259,6 +275,29 @@ const taskStatusTag = (status) => {
   if (status === 'completed' || status === 'stopped') return 'success'
   if (status === 'running' || status === 'pending') return 'warning'
   return 'danger'
+}
+
+const formatTaskKind = (kind) => {
+  if (kind === 'stream') return 'stream'
+  if (kind === 'batch') return 'batch'
+  return kind || 'unknown'
+}
+
+const taskKindTag = (kind) => {
+  if (kind === 'stream') return 'warning'
+  if (kind === 'batch') return 'info'
+  return ''
+}
+
+const canOpenRuntimeGraph = (row) => {
+  const taskId = row?.id || row?.task_id
+  return Boolean(taskId)
+}
+
+const openRuntimeGraph = (row) => {
+  const taskId = row?.id || row?.task_id
+  if (!taskId) return
+  router.push({ name: 'TaskRuntime', params: { taskId: String(taskId) } })
 }
 
 const stopPolling = () => {

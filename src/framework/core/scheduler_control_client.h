@@ -33,6 +33,7 @@ class SchedulerControlClient {
     int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) const;
     int32_t StopStream(const std::string& req_json, std::string* rsp_json) const;
     int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) const;
+    int32_t QueryRuntimeGraph(const std::string& req_json, std::string* rsp_json) const;
 
  private:
     ISchedulerControlService* Acquire(std::string* err_rsp) const;
@@ -55,6 +56,7 @@ class RouterBackedSchedulerControlService : public ISchedulerControlService {
     int32_t ExecuteStream(const std::string& req_json, std::string* rsp_json) override;
     int32_t StopStream(const std::string& req_json, std::string* rsp_json) override;
     int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) override;
+    int32_t QueryRuntimeGraph(const std::string& req_json, std::string* rsp_json) override;
 
  private:
     int32_t Dispatch(const char* uri, const std::string& req_json, std::string* rsp_json) const;

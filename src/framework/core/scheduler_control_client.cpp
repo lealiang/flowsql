@@ -81,6 +81,13 @@ int32_t SchedulerControlClient::QueryStreamStatus(const std::string& req_json, s
     return control->QueryStreamStatus(req_json, rsp_json);
 }
 
+int32_t SchedulerControlClient::QueryRuntimeGraph(const std::string& req_json, std::string* rsp_json) const {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    auto* control = Acquire(rsp_json);
+    if (!control) return error::UNAVAILABLE;
+    return control->QueryRuntimeGraph(req_json, rsp_json);
+}
+
 int32_t RouterBackedSchedulerControlService::Dispatch(const char* uri,
                                                       const std::string& req_json,
                                                       std::string* rsp_json) const {
@@ -134,6 +141,11 @@ int32_t RouterBackedSchedulerControlService::StopStream(const std::string& req_j
 
 int32_t RouterBackedSchedulerControlService::QueryStreamStatus(const std::string& req_json, std::string* rsp_json) {
     return Dispatch("/scheduler/stream/status", req_json, rsp_json);
+}
+
+int32_t RouterBackedSchedulerControlService::QueryRuntimeGraph(const std::string& req_json,
+                                                               std::string* rsp_json) {
+    return Dispatch("/scheduler/runtime/graph/query", req_json, rsp_json);
 }
 
 }  // namespace flowsql

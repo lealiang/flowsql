@@ -9,6 +9,7 @@ add_executable(test_scheduler_mutation_guard
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_channel_admin.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_batch_runtime.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_runtime_retention.cpp
+    ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_runtime_graph.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_stream_executor.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_routes.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/scheduler_json_codec.cpp

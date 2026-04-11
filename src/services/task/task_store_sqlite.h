@@ -33,6 +33,7 @@ class TaskStoreSqlite {
     struct TaskCreateParams {
         std::string task_id;
         std::string request_sql;
+        std::string raw_sql_text;
         std::string sqls_json;
         int sql_count = 1;
         int timeout_s = 0;
@@ -101,7 +102,10 @@ class TaskStoreSqlite {
                                    const std::string& task_kind,
                                    const std::string& runtime_task_id);
 
-    int QueryTaskSqlPayload(const std::string& task_id, std::string* request_sql, std::string* sqls_json);
+    int QueryTaskSqlPayload(const std::string& task_id,
+                            std::string* raw_sql_text,
+                            std::string* sqls_json,
+                            int* sql_count = nullptr);
     int UpdateCurrentSqlIndex(const std::string& task_id, int index);
     int QueryTaskRuntimeFlags(const std::string& task_id, bool* terminal_now, bool* cancel_requested);
     int RequestCancelRunningTask(const std::string& task_id);

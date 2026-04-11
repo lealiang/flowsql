@@ -96,6 +96,12 @@ export default {
   stopStreamTask: (taskId) => api.post('/api/tasks/stream/stop', { task_id: taskId }),
   getStreamTaskStatus: (taskId) => api.post('/api/tasks/stream/status', { task_id: taskId }),
   listStreamTasks: (params = {}) => api.post('/api/tasks/stream/list', params),
+  getTaskRuntimeGraph: (taskId, cursor = 0, includeEvents = true) =>
+    api.post('/api/tasks/runtime/graph/query', {
+      task_id: taskId,
+      cursor,
+      include_events: includeEvents
+    }),
 
   // 数据库通道管理（WebPlugin 内部转发给 DatabasePlugin）
   listDbChannels: () => api.post('/api/channels/database/query', {}),

@@ -363,6 +363,11 @@ int32_t SchedulerPlugin::QueryStreamStatus(const std::string& req_json, std::str
     return HandleStreamStatus("/scheduler/stream/status", req_json, *rsp_json);
 }
 
+int32_t SchedulerPlugin::QueryRuntimeGraph(const std::string& req_json, std::string* rsp_json) {
+    if (!rsp_json) return error::INTERNAL_ERROR;
+    return HandleRuntimeGraphQuery("/scheduler/runtime/graph/query", req_json, *rsp_json);
+}
+
 // --- 算子查找 ---
 // 先查 C++ 静态算子（IQuerier），再查 Python 算子（IBridge）
 

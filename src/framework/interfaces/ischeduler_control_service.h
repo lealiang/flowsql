@@ -92,6 +92,16 @@ interface ISchedulerControlService {
      * @return 0 表示成功，非 0 表示失败。
      */
     virtual int32_t QueryStreamStatus(const std::string& req_json, std::string* rsp_json) = 0;
+    /**
+     * @brief 查询任务运行时 DAG 图快照（执行实例视图）。
+     * @param req_json 输入 JSON，请求体。
+     * @param rsp_json 输出 JSON，图快照结果。
+     * @return 0 表示成功，非 0 表示失败。
+     */
+    virtual int32_t QueryRuntimeGraph(const std::string& req_json, std::string* rsp_json) {
+        if (rsp_json) rsp_json->assign("{\"error\":\"runtime graph query not supported\"}");
+        return error::UNAVAILABLE;
+    }
 };
 
 }  // namespace flowsql
