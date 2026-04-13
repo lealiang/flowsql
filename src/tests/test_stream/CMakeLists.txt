@@ -2,6 +2,7 @@ project(test_stream)
 
 add_executable(${PROJECT_NAME}
     test_stream.cpp
+    ${CMAKE_SOURCE_DIR}/framework/core/stream_hub_channel.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/stream_task.cpp
     ${CMAKE_SOURCE_DIR}/services/scheduler/stream_runtime.cpp
 )

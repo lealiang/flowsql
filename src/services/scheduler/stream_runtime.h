@@ -54,6 +54,7 @@ class BlockingQueue {
     void Reset() {
         std::lock_guard<std::mutex> lock(mu_);
         closed_ = false;
+        q_.clear();
     }
 
  private:
@@ -102,6 +103,10 @@ class DelayQueue {
     void Reset() {
         std::lock_guard<std::mutex> lock(mu_);
         closed_ = false;
+        seq_ = 0;
+        while (!heap_.empty()) {
+            heap_.pop();
+        }
     }
 
  private:

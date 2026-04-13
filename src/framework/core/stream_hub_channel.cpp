@@ -89,17 +89,39 @@ int StreamHubChannel::Open() {
     if (opened_.load(std::memory_order_acquire)) return 0;
     if (!root_) return EINVAL;
 
-    int rc = root_->Open();
-    if (rc != 0) return rc;
-    for (const auto& partition : partitions_) {
-        if (!partition) return EINVAL;
-        rc = partition->Open();
+    const bool root_was_opened = root_->IsOpened();
+    int rc = 0;
+    if (!root_was_opened) {
+        rc = root_->Open();
         if (rc != 0) return rc;
+    }
+    size_t opened_partitions = 0;
+    for (size_t i = 0; i < partitions_.size(); ++i) {
+        const auto& partition = partitions_[i];
+        if (!partition) {
+            for (size_t j = 0; j < opened_partitions; ++j) {
+                if (partitions_[j]) (void)partitions_[j]->Close();
+            }
+            if (!root_was_opened) {
+                (void)root_->Close();
+            }
+            return EINVAL;
+        }
+        rc = partition->Open();
+        if (rc != 0) {
+            for (size_t j = 0; j < opened_partitions; ++j) {
+                if (partitions_[j]) (void)partitions_[j]->Close();
+            }
+            if (!root_was_opened) {
+                (void)root_->Close();
+            }
+            return rc;
+        }
+        opened_partitions = i + 1;
     }
 
     stop_requested_.store(false, std::memory_order_release);
     finished_.store(false, std::memory_order_release);
-    last_error_.clear();
     rr_cursor_.store(0, std::memory_order_release);
     opened_.store(true, std::memory_order_release);
     if (options_.mode == StreamHubMode::kSplit) {
@@ -246,7 +268,6 @@ void StreamHubChannel::DispatchLoop() {
                 continue;
             }
             if (rc != 0) {
-                last_error_ = "stream_hub split dispatch failed";
                 stop_requested_.store(true, std::memory_order_release);
                 root_->Cancel();
                 for (const auto& p : partitions_) {
@@ -281,7 +302,6 @@ void StreamHubChannel::DispatchLoop() {
             return;
         }
 
-        last_error_ = ev.err_msg.empty() ? "stream_hub split dispatch poll failed" : ev.err_msg;
         for (const auto& p : partitions_) {
             if (p) p->Cancel();
         }

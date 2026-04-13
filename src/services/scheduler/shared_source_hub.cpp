@@ -11,53 +11,14 @@
 #include <arrow/api.h>
 #include <framework/core/ring_stream_channel.h>
 
-#include <chrono>
 #include <cerrno>
 #include <cstddef>
 #include <utility>
 
+#include "scheduler_internal_utils.h"
+
 namespace flowsql {
 namespace scheduler {
-
-namespace {
-
-int64_t CurrentTimeMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-size_t NextPowerOfTwo(size_t value) {
-    if (value <= 1) return 1;
-    size_t v = value - 1;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    if (sizeof(size_t) >= 8) {
-        v |= v >> 32;
-    }
-    return v + 1;
-}
-
-std::string TrimAsciiSpace(const std::string& input) {
-    size_t first = 0;
-    while (first < input.size() &&
-           (input[first] == ' ' || input[first] == '\t' ||
-            input[first] == '\r' || input[first] == '\n')) {
-        ++first;
-    }
-    if (first >= input.size()) return "";
-    size_t last = input.size();
-    while (last > first &&
-           (input[last - 1] == ' ' || input[last - 1] == '\t' ||
-            input[last - 1] == '\r' || input[last - 1] == '\n')) {
-        --last;
-    }
-    return input.substr(first, last - first);
-}
-
-}  // namespace
 
 const char* SharedHubModeName(SharedHubMode mode) {
     switch (mode) {
@@ -201,7 +162,9 @@ int SharedSourceHub::BindWhereSignature(const std::string& where_signature, std:
     return 0;
 }
 
-std::shared_ptr<IStreamChannel> SharedSourceHub::BuildSubscriberInput(const std::string& subscriber_id) const {
+std::shared_ptr<IStreamChannel> SharedSourceHub::BuildSubscriberInput(const std::string& subscriber_id,
+                                                                      int* err_code) const {
+    if (err_code) *err_code = 0;
     RingStreamChannelOptions opts;
     opts.ring_size = NextPowerOfTwo(options_.queue_size == 0 ? 64 : options_.queue_size);
     opts.batch_rows = 1024;
@@ -209,7 +172,11 @@ std::shared_ptr<IStreamChannel> SharedSourceHub::BuildSubscriberInput(const std:
     opts.ring_mode = options_.ring_mode;
     opts.finite = false;
     auto channel = std::make_shared<RingStreamChannel>("ring", id_ + "." + subscriber_id, opts);
-    (void)channel->Open();
+    const int open_rc = channel->Open();
+    if (open_rc != 0) {
+        if (err_code) *err_code = open_rc;
+        return nullptr;
+    }
     return channel;
 }
 
@@ -218,6 +185,7 @@ int SharedSourceHub::AddSubscriber(const std::string& runtime_task_id,
                                    bool ready,
                                    SharedSubscriberHandle* out_handle,
                                    std::string* err_msg,
+                                   size_t max_subscribers,
                                    std::shared_ptr<IStreamChannel> input_override) {
     if (out_handle) out_handle->Release();
     if (runtime_task_id.empty()) {
@@ -241,10 +209,19 @@ int SharedSourceHub::AddSubscriber(const std::string& runtime_task_id,
             if (err_msg) *err_msg = "shared hub is terminal";
             return EBUSY;
         }
+        if (max_subscribers > 0 && subscribers_.size() >= max_subscribers) {
+            if (err_msg) *err_msg = "shared source subscribers exceeded max_subscribers_per_hub";
+            return EBUSY;
+        }
 
         subscriber_id = "sub" + std::to_string(++subscriber_seq_);
         if (!input) {
-            input = BuildSubscriberInput(subscriber_id);
+            int input_rc = 0;
+            input = BuildSubscriberInput(subscriber_id, &input_rc);
+            if (!input) {
+                if (err_msg) *err_msg = "create shared source subscriber input failed";
+                return input_rc != 0 ? input_rc : EIO;
+            }
         }
         SubscriberState state;
         state.subscriber_id = subscriber_id;
@@ -571,33 +548,19 @@ void SharedSourceHub::RunLoop() {
         }
 
         bool any_delivered = false;
+        std::vector<std::string> delivered_subscribers;
+        std::vector<std::string> dropped_subscribers;
+        delivered_subscribers.reserve(targets.size());
+        dropped_subscribers.reserve(targets.size());
         for (const auto& target : targets) {
             if (!target.input) continue;
             if (target.input->IsFull()) {
-                std::lock_guard<std::mutex> lock(mu_);
-                auto it = subscribers_.find(target.id);
-                if (it != subscribers_.end()) {
-                    ++it->second.dropped_batches;
-                    it->second.dropped_rows += rows;
-                    it->second.last_dropped_seq = seq;
-                }
-                ++dropped_batches_shared_;
-                dropped_rows_shared_ += rows;
-                last_dropped_seq_ = seq;
+                dropped_subscribers.push_back(target.id);
                 continue;
             }
             const int rc = target.input->Put(ev.batch.data, ev.batch.ts_ms);
             if (rc == EAGAIN) {
-                std::lock_guard<std::mutex> lock(mu_);
-                auto it = subscribers_.find(target.id);
-                if (it != subscribers_.end()) {
-                    ++it->second.dropped_batches;
-                    it->second.dropped_rows += rows;
-                    it->second.last_dropped_seq = seq;
-                }
-                ++dropped_batches_shared_;
-                dropped_rows_shared_ += rows;
-                last_dropped_seq_ = seq;
+                dropped_subscribers.push_back(target.id);
                 continue;
             }
             if (rc != 0) {
@@ -609,19 +572,36 @@ void SharedSourceHub::RunLoop() {
                 return;
             }
             any_delivered = true;
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = subscribers_.find(target.id);
-            if (it != subscribers_.end()) {
-                ++it->second.delivered_batches;
-                it->second.delivered_rows += rows;
-                it->second.last_delivered_seq = seq;
-            }
+            delivered_subscribers.push_back(target.id);
         }
-        if (any_delivered) {
+        if (!delivered_subscribers.empty() || !dropped_subscribers.empty()) {
             std::lock_guard<std::mutex> lock(mu_);
-            ++delivered_batches_;
-            delivered_rows_ += rows;
-            last_delivered_seq_ = seq;
+            for (const auto& subscriber_id : dropped_subscribers) {
+                auto it = subscribers_.find(subscriber_id);
+                if (it != subscribers_.end()) {
+                    ++it->second.dropped_batches;
+                    it->second.dropped_rows += rows;
+                    it->second.last_dropped_seq = seq;
+                }
+            }
+            if (!dropped_subscribers.empty()) {
+                dropped_batches_shared_ += static_cast<uint64_t>(dropped_subscribers.size());
+                dropped_rows_shared_ += rows * static_cast<uint64_t>(dropped_subscribers.size());
+                last_dropped_seq_ = seq;
+            }
+            for (const auto& subscriber_id : delivered_subscribers) {
+                auto it = subscribers_.find(subscriber_id);
+                if (it != subscribers_.end()) {
+                    ++it->second.delivered_batches;
+                    it->second.delivered_rows += rows;
+                    it->second.last_delivered_seq = seq;
+                }
+            }
+            if (any_delivered) {
+                ++delivered_batches_;
+                delivered_rows_ += rows;
+                last_delivered_seq_ = seq;
+            }
         }
     }
 }

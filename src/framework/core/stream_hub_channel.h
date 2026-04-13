@@ -101,7 +101,6 @@ class StreamHubChannel : public IStreamHubChannel {
 
     mutable std::mutex lifecycle_mu_;
     std::thread dispatch_thread_;
-    std::string last_error_;
 };
 
 }  // namespace flowsql

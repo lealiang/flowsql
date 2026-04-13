@@ -32,6 +32,7 @@
 #include <framework/core/fan_out_stream_channel.h>
 #include <framework/core/ring_stream_channel.h>
 #include <framework/core/stream_channel_adapter.h>
+#include <framework/core/stream_hub_channel.h>
 #include <framework/interfaces/ichannel.h>
 #include <framework/interfaces/idatabase_channel.h>
 #include <framework/interfaces/istream_channel.h>
@@ -1294,6 +1295,94 @@ void TestT22RingMpmcConcurrency() {
     ASSERT_EQ(ch.Close(), 0);
 }
 
+void TestT23RuntimeRestartClearsStaleReadyQueue() {
+    StreamRuntime runtime;
+    runtime.Start(1);
+
+    RingStreamChannelOptions opts;
+    opts.ring_mode = RingMode::SPSC;
+    opts.ring_size = 64;
+    auto blocker_source = std::make_shared<RingStreamChannel>("ring", "t23_blocker_src", opts);
+    ASSERT_EQ(blocker_source->Open(), 0);
+    ASSERT_EQ(blocker_source->Put(MakeBatch(1), 1), 0);
+
+    auto blocker_op = std::make_shared<MockStreamOperator>(ParallelStrategy::NONE, 1, 300);
+    auto blocker_out = std::make_shared<DummyOutputChannel>();
+    auto blocker_shard = std::make_shared<ShardRunner>(0, blocker_source, blocker_op, blocker_out, nullptr);
+    ASSERT_TRUE(runtime.TrySchedule(blocker_shard));
+    ASSERT_TRUE(WaitUntil([&]() { return blocker_op->IsInProcess(); }, 1000));
+
+    auto stale_source = std::make_shared<RingStreamChannel>("ring", "t23_stale_src", opts);
+    ASSERT_EQ(stale_source->Open(), 0);
+    auto stale_op = std::make_shared<MockStreamOperator>(ParallelStrategy::NONE, 1);
+    auto stale_out = std::make_shared<DummyOutputChannel>();
+    auto stale_shard = std::make_shared<ShardRunner>(0, stale_source, stale_op, stale_out, nullptr);
+    ASSERT_TRUE(runtime.TrySchedule(stale_shard));
+
+    runtime.Stop();
+    ASSERT_EQ(stale_op->ProcessCalls(), uint64_t(0));
+    ASSERT_EQ(stale_op->TickCalls(), uint64_t(0));
+
+    runtime.Start(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    ASSERT_EQ(stale_op->ProcessCalls(), uint64_t(0));
+    ASSERT_EQ(stale_op->TickCalls(), uint64_t(0));
+
+    blocker_source->Cancel();
+    stale_source->Cancel();
+    blocker_source->Close();
+    stale_source->Close();
+    runtime.Stop();
+}
+
+void TestT24FanOutOpenFailureRollback() {
+    RingStreamChannelOptions source_opts;
+    source_opts.ring_size = 64;
+    source_opts.ring_mode = RingMode::SPSC;
+    source_opts.overflow = OverflowPolicy::kDrop;
+    auto source = std::make_shared<RingStreamChannel>("ring", "t24_source", source_opts);
+    ASSERT_TRUE(!source->IsOpened());
+
+    RingStreamChannelOptions bad_partition_opts;
+    bad_partition_opts.ring_size = 3;  // 非 2 次幂，Open 必须失败
+    bad_partition_opts.ring_mode = RingMode::SPSC;
+    bad_partition_opts.overflow = OverflowPolicy::kDrop;
+
+    FanOutStreamChannel fanout("fanout", "t24_fanout", source, 3, FanOutMode::ROUND_ROBIN, "", bad_partition_opts);
+    const int rc = fanout.Open();
+    ASSERT_TRUE(rc != 0);
+    ASSERT_TRUE(!fanout.IsOpened());
+    ASSERT_TRUE(!source->IsOpened());
+    for (size_t i = 0; i < 3; ++i) {
+        auto p = fanout.GetPartition(i);
+        ASSERT_TRUE(p != nullptr);
+        ASSERT_TRUE(!p->IsOpened());
+    }
+}
+
+void TestT25StreamHubOpenFailureRollback() {
+    StreamHubOptions opts;
+    opts.mode = StreamHubMode::kSplit;
+    opts.partition_count = 4;
+    opts.partition_ring_mode = RingMode::SPSC;
+    opts.partition_ring_size = 3;  // 非 2 次幂，分区 Open 失败
+
+    StreamHubChannel hub("stream_hub", "t25_hub", opts);
+    const int rc = hub.Open();
+    ASSERT_TRUE(rc != 0);
+    ASSERT_TRUE(!hub.IsOpened());
+    ASSERT_EQ(hub.Put(MakeBatch(1), 1), EBADF);
+
+    auto root_ev = hub.PollNext(0);
+    ASSERT_EQ(root_ev.kind, PollEventKind::kError);
+    ASSERT_EQ(root_ev.err, -ENOTSUP);
+    for (size_t i = 0; i < hub.PartitionCount(); ++i) {
+        auto part = hub.GetPartition(i);
+        ASSERT_TRUE(part != nullptr);
+        ASSERT_TRUE(!part->IsOpened());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1387,6 +1476,18 @@ int main() {
     std::puts("[TEST] T22 Ring MPMC 并发正确性");
     TestT22RingMpmcConcurrency();
     std::puts("[PASS] T22");
+
+    std::puts("[TEST] T23 StreamRuntime Stop->Start 队列清理");
+    TestT23RuntimeRestartClearsStaleReadyQueue();
+    std::puts("[PASS] T23");
+
+    std::puts("[TEST] T24 FanOut Open 失败回滚");
+    TestT24FanOutOpenFailureRollback();
+    std::puts("[PASS] T24");
+
+    std::puts("[TEST] T25 StreamHub Open 失败回滚");
+    TestT25StreamHubOpenFailureRollback();
+    std::puts("[PASS] T25");
 
     std::puts("=== All stream tests passed ===");
     return 0;

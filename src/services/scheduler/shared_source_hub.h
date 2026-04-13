@@ -154,6 +154,7 @@ class SharedSourceHub final : public std::enable_shared_from_this<SharedSourceHu
                       bool ready,
                       SharedSubscriberHandle* out_handle,
                       std::string* err_msg,
+                      size_t max_subscribers = 0,
                       std::shared_ptr<IStreamChannel> input_override = nullptr);
     int MarkSubscriberReady(const std::string& subscriber_id);
     void RemoveSubscriber(const std::string& subscriber_id, bool close_stream = true);
@@ -181,7 +182,8 @@ class SharedSourceHub final : public std::enable_shared_from_this<SharedSourceHu
         uint64_t last_dropped_seq = 0;
     };
 
-    std::shared_ptr<IStreamChannel> BuildSubscriberInput(const std::string& subscriber_id) const;
+    std::shared_ptr<IStreamChannel> BuildSubscriberInput(const std::string& subscriber_id,
+                                                         int* err_code) const;
     bool AllFixedSubscribersReadyLocked() const;
     void MarkFailedLocked(int code, const std::string& message, int64_t now_ms);
     void RunLoop();

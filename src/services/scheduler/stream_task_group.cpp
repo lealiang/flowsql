@@ -122,8 +122,13 @@ int StreamTaskGroup::Start(std::string* err_msg) {
         return EINVAL;
     }
     started_ = true;
-    started_ms_ = CurrentTimeMs();
-    last_active_ms_ = started_ms_;
+    const int64_t now_ms = CurrentTimeMs();
+    started_ms_.store(now_ms, std::memory_order_relaxed);
+    last_active_ms_.store(now_ms, std::memory_order_relaxed);
+    finished_ms_.store(0, std::memory_order_relaxed);
+    std::atomic_store_explicit(&error_meta_,
+                               std::shared_ptr<const GroupErrorMeta>{},
+                               std::memory_order_release);
     status_.store(StreamGroupStatus::kPreparing, std::memory_order_release);
     runner_ = std::thread(&StreamTaskGroup::RunLoop, this);
     return 0;
@@ -170,12 +175,15 @@ StreamGroupSnapshot StreamTaskGroup::Snapshot() const {
     s.status = status_.load(std::memory_order_acquire);
     s.group_mode = "dag";
     s.stop_requested = stop_requested_.load(std::memory_order_acquire);
-    s.error_code = error_code_;
-    s.error_no = error_no_;
-    s.error_message = error_message_;
-    s.started_ms = started_ms_;
-    s.last_active_ms = last_active_ms_;
-    s.finished_ms = finished_ms_;
+    s.started_ms = started_ms_.load(std::memory_order_relaxed);
+    s.last_active_ms = last_active_ms_.load(std::memory_order_relaxed);
+    s.finished_ms = finished_ms_.load(std::memory_order_relaxed);
+    auto error_meta = std::atomic_load_explicit(&error_meta_, std::memory_order_acquire);
+    if (error_meta) {
+        s.error_no = error_meta->error_no;
+        s.error_code = error_meta->error_code;
+        s.error_message = error_meta->error_message;
+    }
 
     std::lock_guard<std::mutex> lock(mu_);
     s.node_count = static_cast<uint32_t>(nodes_.size());
@@ -412,8 +420,9 @@ bool StreamTaskGroup::HandleFailureOrTimeout(int64_t now_ms) {
         }
     }
 
-    if (timeout_s_ > 0 && started_ms_ > 0) {
-        const int64_t elapsed_ms = now_ms - started_ms_;
+    const int64_t started_ms = started_ms_.load(std::memory_order_relaxed);
+    if (timeout_s_ > 0 && started_ms > 0) {
+        const int64_t elapsed_ms = now_ms - started_ms;
         if (elapsed_ms >= static_cast<int64_t>(timeout_s_) * 1000) {
             std::vector<std::string> unfinished_nodes;
             {
@@ -559,9 +568,13 @@ void StreamTaskGroup::MarkGroupFailed(int code,
                                       const std::string& error_code) {
     if (status_.load(std::memory_order_acquire) == StreamGroupStatus::kFailed) return;
     status_.store(StreamGroupStatus::kFailed, std::memory_order_release);
-    error_code_ = error_code;
-    error_no_ = code;
-    error_message_ = message;
+    auto error_meta = std::make_shared<const GroupErrorMeta>(
+        GroupErrorMeta{
+            code,
+            error_code,
+            message,
+        });
+    std::atomic_store_explicit(&error_meta_, std::move(error_meta), std::memory_order_release);
     stop_requested_.store(true, std::memory_order_release);
     Touch(now_ms);
 }
@@ -575,13 +588,13 @@ void StreamTaskGroup::TryFinalize(int64_t now_ms) {
     } else {
         status_.store(StreamGroupStatus::kStopped, std::memory_order_release);
     }
-    finished_ms_ = now_ms;
+    finished_ms_.store(now_ms, std::memory_order_relaxed);
     Touch(now_ms);
     done_cv_.notify_all();
 }
 
 void StreamTaskGroup::Touch(int64_t now_ms) {
-    last_active_ms_ = now_ms;
+    last_active_ms_.store(now_ms, std::memory_order_relaxed);
 }
 
 }  // namespace scheduler

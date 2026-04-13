@@ -35,15 +35,6 @@ GroupNodeKind ParseNodeKind(const std::string& task_kind) {
     return task_kind == "batch" ? GroupNodeKind::kBatch : GroupNodeKind::kStream;
 }
 
-std::string ExtractErrorMessage(const std::string& json) {
-    rapidjson::Document d;
-    d.Parse(json.c_str());
-    if (d.HasParseError() || !d.IsObject() || !d.HasMember("error") || !d["error"].IsString()) {
-        return "";
-    }
-    return d["error"].GetString();
-}
-
 bool ParseChannelBaseLocal(const std::string& ref, std::string* base, std::string* err) {
     ParsedChannelRef parsed;
     if (!ParseChannelRef(ref, &parsed, err)) return false;

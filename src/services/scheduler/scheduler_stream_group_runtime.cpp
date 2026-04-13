@@ -27,6 +27,8 @@
 #include <framework/core/ring_stream_channel.h>
 #include <framework/core/sql_parser.h>
 
+#include "scheduler_internal_utils.h"
+
 namespace flowsql {
 namespace scheduler {
 
@@ -76,15 +78,6 @@ TaskSnapshot BuildBatchNodeSnapshot(const BatchRuntimeSnapshot& runtime_snapshot
     return snapshot;
 }
 
-std::string ExtractErrorMessage(const std::string& json) {
-    rapidjson::Document d;
-    d.Parse(json.c_str());
-    if (d.HasParseError() || !d.IsObject() || !d.HasMember("error") || !d["error"].IsString()) {
-        return "";
-    }
-    return d["error"].GetString();
-}
-
 bool ExtractRuntimeTaskId(const std::string& json, std::string* runtime_task_id) {
     if (!runtime_task_id) return false;
     runtime_task_id->clear();
@@ -110,11 +103,6 @@ std::string MakeSafeName(const std::string& input) {
         }
     }
     return out;
-}
-
-int64_t CurrentTimeMsLocal() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 }  // namespace
@@ -270,6 +258,7 @@ int32_t SchedulerPlugin::PrepareStreamGroupRuntimeResources(const std::string& r
                 true,
                 nullptr,
                 &sub_err,
+                0,
                 internal);
             if (add_rc != 0) {
                 *err_rsp = BuildExecutionErrorJson(
@@ -571,9 +560,9 @@ int32_t SchedulerPlugin::RegisterAndStartStreamGroup(const std::string& runtime_
     TouchRuntimeAccess(runtime_task_id);
 
     for (const auto& ss_runtime : runtime_build.share_set_runtimes) {
-        const int64_t deadline_ms = CurrentTimeMsLocal() + static_cast<int64_t>(share_set_ready_timeout_s) * 1000;
+        const int64_t deadline_ms = CurrentTimeMs() + static_cast<int64_t>(share_set_ready_timeout_s) * 1000;
         bool ready = false;
-        while (CurrentTimeMsLocal() < deadline_ms) {
+        while (CurrentTimeMs() < deadline_ms) {
             auto snapshot = group->Snapshot();
             if (snapshot.status == StreamGroupStatus::kFailed ||
                 snapshot.status == StreamGroupStatus::kCancelled ||

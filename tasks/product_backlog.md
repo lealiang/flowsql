@@ -1040,7 +1040,7 @@
 - In Scope：Story 14.11 ~ 14.13（统一加载、具名 Stream Sink 产品化、同源并发消费）
 - Out of Scope：跨任务共享 source 动态订阅、广播回放持久化、多主机分布式编排
 - 已拆分至 Epic 15：原 Story 14.5 / 14.6（路径 B 数据面能力）
-- 后续候选：Story 14.14（Hybrid DAG，batch + stream 混合编排）、Story 14.15（跨任务共享 source / late join）、Story 14.16（历史数据批处理补算）
+- 后续候选：Story 14.16（历史数据批处理补算）
 
 **已在 Sprint 13 落地**:
 - Story 14.7（路径 B 接口占位）已完成
@@ -1174,7 +1174,7 @@
 ---
 
 ### Story 14.14: Hybrid DAG（batch + stream 混合编排）
-**状态**: 📋 待规划（后续 Sprint）
+**状态**: ✅ 已完成（Sprint 17）
 **验收标准**:
 - 支持单任务内混合编排：`batch -> stream`、`stream -> batch`、以及多段组合拓扑
 - 统一提交契约与状态观测：任务依赖、超时、错误码、节点状态可在单任务维度查询

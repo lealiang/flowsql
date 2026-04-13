@@ -13,7 +13,6 @@
 #include <rapidjson/writer.h>
 
 #include <cstdio>
-#include <chrono>
 #include <common/error_code.h>
 #include <common/log.h>
 #include <algorithm>
@@ -57,11 +56,6 @@
 
 namespace flowsql {
 namespace scheduler {
-
-static int64_t CurrentTimeMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
 
 int SchedulerPlugin::Option(const char* arg) {
     if (!arg) return 0;

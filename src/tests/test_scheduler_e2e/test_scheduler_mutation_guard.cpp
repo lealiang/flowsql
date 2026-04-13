@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <framework/interfaces/ichannel.h>
+#include <framework/core/ring_stream_channel.h>
 #include <services/scheduler/scheduler_plugin.h>
 
 #define ASSERT_TRUE(expr)                                                                   \
@@ -570,6 +571,65 @@ int main() {
         group.Join();
         const auto final_snapshot = group.Snapshot();
         ASSERT_EQ(final_snapshot.status, flowsql::scheduler::StreamGroupStatus::kStopped);
+    }
+
+    // SharedSourceHub concurrent AddSubscriber must honor max_subscribers hard cap.
+    {
+        flowsql::RingStreamChannelOptions source_opts;
+        source_opts.ring_size = 64;
+        source_opts.ring_mode = flowsql::RingMode::SPSC;
+        source_opts.overflow = flowsql::OverflowPolicy::kDrop;
+        auto source = std::make_shared<flowsql::RingStreamChannel>("ring", "shared_cap_src", source_opts);
+        ASSERT_EQ(source->Open(), 0);
+
+        flowsql::scheduler::SharedHubOptions hub_opts;
+        hub_opts.queue_size = 64;
+        hub_opts.poll_timeout_ms = 10;
+        hub_opts.overflow_policy = flowsql::OverflowPolicy::kDrop;
+        hub_opts.ring_mode = flowsql::RingMode::SPSC;
+        auto hub = std::make_shared<flowsql::scheduler::SharedSourceHub>(
+            "shared_cap_hub",
+            flowsql::scheduler::SharedHubMode::kDynamic,
+            "ring.shared_cap_src",
+            std::vector<std::string>{"ring.shared_cap_src"},
+            source,
+            hub_opts);
+
+        constexpr int kThreads = 16;
+        std::atomic<int> success_count{0};
+        std::atomic<int> busy_count{0};
+        std::atomic<int> unexpected_rc{0};
+        std::vector<std::thread> workers;
+        workers.reserve(kThreads);
+        for (int i = 0; i < kThreads; ++i) {
+            workers.emplace_back([i, &hub, &success_count, &busy_count, &unexpected_rc]() {
+                std::string err_msg;
+                const int rc = hub->AddSubscriber(
+                    "runtime_sub_" + std::to_string(i),
+                    "",
+                    true,
+                    nullptr,
+                    &err_msg,
+                    1);
+                if (rc == 0) {
+                    success_count.fetch_add(1, std::memory_order_relaxed);
+                } else if (rc == EBUSY) {
+                    busy_count.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    unexpected_rc.store(rc, std::memory_order_release);
+                }
+            });
+        }
+        for (auto& th : workers) th.join();
+
+        ASSERT_EQ(unexpected_rc.load(std::memory_order_acquire), 0);
+        ASSERT_EQ(success_count.load(std::memory_order_relaxed), 1);
+        ASSERT_TRUE(busy_count.load(std::memory_order_relaxed) >= (kThreads - 1));
+        ASSERT_EQ(hub->SubscriberCount(), static_cast<size_t>(1));
+
+        hub->RequestStop();
+        hub->Join();
+        source->Close();
     }
 
     // Scheduler runtime retention: keep newest terminal runtime by max_count.

@@ -159,13 +159,14 @@ SQL 任务类型由 Source 通道类型决定（以 `FROM` 解析结果为准）
 
 1. Source 全部为 stream 通道：判定为 `stream`。
 2. Source 全部为非 stream 通道（如 dataframe/database）：判定为 `batch`。
-3. Source 混用 stream 与非 stream：当前直接报错，不支持混合 source。
+3. 同一条 SQL 的 Source 混用 stream 与非 stream：当前直接报错，不支持混合 source。
 
 补充约束：
 
 1. `INTO` 目标类型不参与任务类型判定。
 2. `USING` 不决定任务类型；但在 `stream` 执行路径中，语句必须包含流式算子。
 3. 任务入口与判定结果必须一致：`batch` 语句应走 batch API，`stream` 语句应走 stream API。
+4. 多 SQL group 允许不同语句分别判定为 `batch/stream`，整体可按 `mixed`（Hybrid DAG）执行；入口仍使用 stream group 执行接口。
 
 ### 数据库通道管理
 

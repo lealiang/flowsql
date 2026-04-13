@@ -187,9 +187,10 @@ INTO dataframe.out;
 | 任务类型 | SQL 数量 | 当前支持 | 提交入口 | 关键约束 | 未来规划 |
 |---|---|---|---|---|---|
 | Batch | 单 SQL | ✅ 支持 | `POST /api/tasks/batch/execute`（内部：`/tasks/batch/execute`） | 可 `mode=sync/async`；使用 `sql_text` 入参；若 SQL 被判定为 stream，将拒绝并提示使用 stream API | 持续支持 |
-| Batch | 多 SQL | ✅ 支持（顺序执行） | `POST /api/tasks/batch/execute`（`sql_text`） | 多 SQL 必须用分号 `;` 切分；不允许混入 stream SQL | `Hybrid DAG`（batch+stream 混编）为后续候选 |
+| Batch | 多 SQL | ✅ 支持（顺序执行） | `POST /api/tasks/batch/execute`（`sql_text`） | 多 SQL 必须用分号 `;` 切分；不允许混入 stream SQL | 持续支持 |
 | Stream | 单 SQL | ✅ 支持 | `POST /api/tasks/stream/execute`（内部：`/tasks/stream/execute`） | 仅异步；`execution_kind=single`；必须是 stream SQL；必须包含 `USING` 流式算子 | 持续支持 |
-| Stream | 多 SQL | ✅ 支持（Group DAG） | `POST /api/tasks/stream/execute`（`execution_kind=group` + `group_mode=dag` + `sql_text`） | 仅异步；多 SQL 必须用分号 `;` 切分；至少 2 条；仅支持 stream task kind（不支持 batch/stream 混合） | `Hybrid DAG`（batch+stream 混编）为后续候选 |
+| Stream | 多 SQL | ✅ 支持（Group DAG） | `POST /api/tasks/stream/execute`（`execution_kind=group` + `group_mode=dag` + `sql_text`） | 仅异步；多 SQL 必须用分号 `;` 切分；至少 2 条；纯 stream 编排可直接执行 | 持续支持 |
+| Mixed（batch+stream） | 多 SQL | ✅ 支持（Hybrid DAG） | `POST /api/tasks/stream/execute`（`execution_kind=group` + `group_mode=dag` + `sql_text`） | 仅异步；多 SQL 必须用分号 `;` 切分；每条 SQL 内部不得混用 stream 与非 stream source | 持续增强 |
 | Stream | 同源跨任务并发消费 | ✅ 支持（late join） | `POST /api/tasks/stream/execute`（多任务并行提交） | 新任务从加入时刻开始消费，不补历史；同源共享要求 `WHERE` 签名一致 | 持续支持 |
 
 说明：
@@ -197,8 +198,8 @@ INTO dataframe.out;
 - Stream 多 SQL 的 `group` 当前仅支持 `group_mode=dag`。
 - Stream 支持同一 source 的跨任务并发消费（late join）；任务间 stop/cancel/fail 相互隔离。
 - `POST /api/tasks/stream/status` 与 `POST /api/tasks/stream/list` 已提供共享消费观测字段：`shared_hub_id`、`shared_source_keys`、`subscriber_count`、`subscriber_stats`（含 `lag`）。
-- 流批一体当前边界：单任务内暂不支持 batch + stream 混合 DAG 编排（Hybrid DAG）。
-- `Hybrid DAG`（batch+stream 混合编排）当前未实现，已列为后续候选能力。
+- 流批一体已支持：单任务内可执行 batch + stream 混合 DAG（Hybrid DAG）。
+- 当前边界：同一条 SQL 的 source 不允许同时包含 stream 与非 stream；否则提交阶段报错。
 
 ## SQL 任务类型判定规则（当前）
 
@@ -206,7 +207,8 @@ SQL 任务类型由 Source 通道类型决定（看 `FROM`，不看 `INTO`）：
 
 - Source 全部是 stream 通道：判定为 `stream` 任务。
 - Source 全部是非 stream 通道（如 dataframe/database）：判定为 `batch` 任务。
-- Source 同时包含 stream 与非 stream：当前不支持，直接报错。
+- 同一条 SQL 的 Source 同时包含 stream 与非 stream：当前不支持，直接报错。
+- 多 SQL group 中允许不同语句分别判定为 `batch/stream`，整体按 `mixed` 编排执行。
 
 补充说明：
 

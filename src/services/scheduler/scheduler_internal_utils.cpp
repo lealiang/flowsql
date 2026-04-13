@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <regex>
@@ -303,6 +304,51 @@ std::string ExtractStageFromExecutionError(const std::string& error) {
     if (!std::regex_match(error, m, kPattern)) return "";
     if (m.size() < 3) return "";
     return m[2].str();
+}
+
+int64_t CurrentTimeMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+size_t NextPowerOfTwo(size_t value) {
+    if (value <= 1) return 1;
+    size_t v = value - 1;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    if (sizeof(size_t) >= 8) {
+        v |= v >> 32;
+    }
+    return v + 1;
+}
+
+std::string TrimAsciiSpace(const std::string& input) {
+    size_t first = 0;
+    while (first < input.size() &&
+           (input[first] == ' ' || input[first] == '\t' ||
+            input[first] == '\r' || input[first] == '\n')) {
+        ++first;
+    }
+    if (first >= input.size()) return "";
+    size_t last = input.size();
+    while (last > first &&
+           (input[last - 1] == ' ' || input[last - 1] == '\t' ||
+            input[last - 1] == '\r' || input[last - 1] == '\n')) {
+        --last;
+    }
+    return input.substr(first, last - first);
+}
+
+std::string ExtractErrorMessage(const std::string& json) {
+    rapidjson::Document d;
+    d.Parse(json.c_str());
+    if (d.HasParseError() || !d.IsObject() || !d.HasMember("error") || !d["error"].IsString()) {
+        return "";
+    }
+    return d["error"].GetString();
 }
 
 }  // namespace scheduler

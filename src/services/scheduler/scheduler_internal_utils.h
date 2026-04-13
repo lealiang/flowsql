@@ -11,6 +11,7 @@
 
 #include <rapidjson/document.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -53,6 +54,10 @@ std::string BuildOptionWithRoleJson(const rapidjson::Value* options, const std::
 std::string ReadRoleFromOption(const std::string& option);
 
 std::string ExtractStageFromExecutionError(const std::string& error);
+int64_t CurrentTimeMs();
+size_t NextPowerOfTwo(size_t value);
+std::string TrimAsciiSpace(const std::string& input);
+std::string ExtractErrorMessage(const std::string& json);
 
 }  // namespace scheduler
 }  // namespace flowsql

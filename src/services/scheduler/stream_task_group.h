@@ -142,6 +142,12 @@ class StreamTaskGroup final {
     bool IsTerminal() const;
 
  private:
+    struct GroupErrorMeta {
+        int error_no = 0;
+        std::string error_code;
+        std::string error_message;
+    };
+
     struct NodeState {
         GroupNodePlan plan;
         GroupNodeStatus status = GroupNodeStatus::kPending;
@@ -193,15 +199,13 @@ class StreamTaskGroup final {
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> cancel_requested_{false};
 
-    std::string error_code_;
-    int error_no_ = 0;
-    std::string error_message_;
+    std::shared_ptr<const GroupErrorMeta> error_meta_;
 
     bool pre_stop_invoked_ = false;
 
-    int64_t started_ms_ = 0;
-    int64_t last_active_ms_ = 0;
-    int64_t finished_ms_ = 0;
+    std::atomic<int64_t> started_ms_{0};
+    std::atomic<int64_t> last_active_ms_{0};
+    std::atomic<int64_t> finished_ms_{0};
 };
 
 }  // namespace scheduler

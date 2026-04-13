@@ -70,13 +70,39 @@ int FanOutStreamChannel::Open() {
     if (opened_.load(std::memory_order_acquire)) return 0;
     if (!source_) return EINVAL;
 
+    bool source_opened_here = false;
     if (!source_->IsOpened()) {
         int rc = source_->Open();
         if (rc != 0) return rc;
+        source_opened_here = true;
     }
-    for (const auto& p : partitions_) {
+    size_t opened_partitions = 0;
+    for (size_t i = 0; i < partitions_.size(); ++i) {
+        const auto& p = partitions_[i];
+        if (!p) {
+            for (size_t j = 0; j < opened_partitions; ++j) {
+                if (partitions_[j]) {
+                    (void)partitions_[j]->Close();
+                }
+            }
+            if (source_opened_here) {
+                (void)source_->Close();
+            }
+            return EINVAL;
+        }
         int rc = p->Open();
-        if (rc != 0) return rc;
+        if (rc != 0) {
+            for (size_t j = 0; j < opened_partitions; ++j) {
+                if (partitions_[j]) {
+                    (void)partitions_[j]->Close();
+                }
+            }
+            if (source_opened_here) {
+                (void)source_->Close();
+            }
+            return rc;
+        }
+        opened_partitions = i + 1;
     }
 
     stop_requested_.store(false, std::memory_order_release);
