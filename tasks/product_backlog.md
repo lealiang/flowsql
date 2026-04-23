@@ -1326,6 +1326,91 @@
 - 编辑态与运行态解耦：编辑页面不直接承载运行快照，运行快照仍由 Runtime 可视化页展示。
 - 保持与 SQL 入口一致的执行语义与错误码契约。
 
+---
+
+## Epic 18: 通用基线检测插件
+**优先级**: P1 | **状态**: 💡 设计阶段（Sprint 19 规划已完成，待实施）
+**价值**: 将基线能力从上游业务中解耦，建设可复用的 `baseline` 通用插件，统一支撑数值指标、比例指标和关系分布的异常检测，并提供高性能热路径、异步正式重建与可诊断的工程闭环。
+
+### Story 18.1: 公共接口与插件骨架
+**状态**: 📋 待规划
+**验收标准**:
+- 定义 `IBaselineService / IBaselineTask / IBaselineValueTask / IBaselineRatioTask / IBaselineRelationTask` 公共接口。
+- `baseline` 插件可被 `PluginLoader` 正常加载，并可通过 `IQuerier` 查询到服务接口。
+- 明确对外同步调用、对内异步重建的能力边界。
+
+---
+
+### Story 18.2: Task 生命周期与配置解析
+**状态**: 📋 待规划
+**验收标准**:
+- 支持创建 `ValueTask / RatioTask / RelationTask` 三类 task。
+- task 可返回 `Id / Name / Kind / ConfigJson` 等元信息。
+- 配置 JSON 可完成最小规格校验，非法配置可返回结构化错误。
+
+---
+
+### Story 18.3: `T1 / T2` 热路径公共状态层
+**状态**: 📋 待规划
+**验收标准**:
+- 可按 `(task, key)` 维护独立状态。
+- 支持 `bucket_id` 顺序校验、gap 处理和基础 flags 输出。
+- 公共状态层不与具体 `T1 / T2 / T3` 算法实现强耦合。
+
+---
+
+### Story 18.4: `T1` 热路径首版
+**状态**: 📋 待规划
+**验收标准**:
+- `IBaselineValueTask::SubmitObservation()` 可同步返回 `DetectorResult`。
+- `T1a / T1b` 统一走标量特征输入规格。
+- 支持数值型指标的基础评分、状态更新和结果解释。
+
+---
+
+### Story 18.5: `T2` 热路径首版
+**状态**: 📋 待规划
+**验收标准**:
+- `IBaselineRatioTask::SubmitObservation()` 可同步返回 `DetectorResult`。
+- 支持 `numerator / denominator` 输入链路和低分母门控。
+- 支持比例型指标的基础评分、状态更新和结果解释。
+
+---
+
+### Story 18.6: 异步正式重建基础设施
+**状态**: 📋 待规划
+**验收标准**:
+- 建立 `rebuild queue + rebuild worker` 慢路径基础设施。
+- `RequestRebuild()` 只负责入队，不阻塞热路径调用者。
+- `history_reader` 只进入慢路径，不允许进入同步评分链路。
+
+---
+
+### Story 18.7: 漂移证据、`shadow baseline` 与正式切换
+**状态**: 📋 待规划
+**验收标准**:
+- 支持旧基线失配后的漂移证据累积与重建触发。
+- `shadow baseline` 可在正式基线重建完成前临时接管在线评分。
+- candidate 验证、正式切换和 `shadow` 退出条件形成闭环。
+
+---
+
+### Story 18.8: `T3` 关系分布 task
+**状态**: 📋 待规划
+**验收标准**:
+- 一个 task 对应一个关系分布规格，而不是一个摘要特征。
+- `RelationObservationBlock` 只解析一次，完成摘要提取与路由。
+- 可将核心摘要特征路由到 `T1 / T2` 子检测器并输出结果。
+
+---
+
+### Story 18.9: 测试、诊断与稳定性补强
+**状态**: 📋 待规划
+**验收标准**:
+- 建立 `baseline` 插件的独立测试工程。
+- 覆盖插件加载、task 生命周期、`T1 / T2`、重建、`shadow`、`T3` 与并发边界。
+- 提供 task 级、series 级和服务级诊断能力。
+
 ## 优先级说明
 - **P0**: 核心功能，必须实现
 - **P1**: 重要功能，近期规划

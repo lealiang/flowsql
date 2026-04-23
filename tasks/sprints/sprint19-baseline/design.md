@@ -81,7 +81,7 @@ FeatureSpec = {
 
 ### 2.3 基线来源
 
-`基线来源`（Baseline Source）是上游为某个 `(key, feature)` 可选显式配置的候选基线提供者，用于在本级基线尚未 ready 或暂时不可用时，临时借用其他已 ready 来源的基线输出。它是统一机制，适用于所有特征类型，不限于 `T2`。
+`基线来源`（Baseline Source）是上游为某个 `(key, feature)` 可选显式配置的候选基线提供者，用于在本级基线尚未可服务或暂时不可用时，临时借用其他可服务来源的基线输出。它是统一机制，适用于所有特征类型，不限于 `T2`。
 
 统一定义为：
 
@@ -110,15 +110,21 @@ BaselineSourceConfig(key, feature) = [
 统一选择规则：
 
 ```text
-if Ready(self):
+if Serviceable(self):
     baseline_source = self
-else if exists first Ready(source_i), i >= 1:
+else if exists first Serviceable(source_i), i >= 1:
     baseline_source = source_i
 else:
     baseline_source = none
 ```
 
-其中 `Ready(source)` 表示该来源已经完成一次有效训练，并能够产出当前特征类型在线评分所需的基线输出。
+其中 `Serviceable(source)` 表示该来源当前已经具备为该特征类型在线评分产出所需基线输出的能力。它强调“当前可服务”，而不是强绑定某一种内部模型状态。
+
+补充说明：
+
+- 从算法语义上，`Serviceable(source)` 只要求该来源当前能提供在线评分所需的基线期望、尺度或等价解释量
+- 在分阶段工程实现中，若正式切换闭环尚未完成，可暂时允许“已训练且当前 bucket 可预测的 `candidate model`”作为可服务占位来源
+- 待正式切换闭环完成后，来源选择的稳定优先级应收口为“正式模型优先于 `candidate model` 占位来源”
 
 ### 2.4 统一建模单元
 
@@ -864,7 +870,7 @@ Model_T1a = {
   monthpos_dme_coeff,
   monthpos_last_weekday_coeff,
   event_coeff,
-  sigma_resid,
+  sigma_ref,
   train_start,
   train_end,
   delta,
@@ -1801,7 +1807,7 @@ normalized_score = 1 - (1 - score_point) * (1 - w_shift * score_shift)
 
 - 使用其他基线来源时，不新增专用 `reason_code`，仍沿用 `baseline_shift_up`、`baseline_shift_down`、`spike`、`drop`
 - `evidence` 应补充 `baseline_source_kind = self | configured_source | none`、`baseline_source_key` 与 `model_state`
-- 当 `baseline_source_kind = configured_source` 时，`confidence_base` 应低于本级 ready 状态，以反映其仅是冷启动期的借用参考
+- 当 `baseline_source_kind = configured_source` 时，`confidence_base` 应低于本级自有基线处于可服务状态时的水平，以反映其仅是冷启动期的借用参考；若本级正式模型已 ready，则该借用置信度还应低于正式模型直出时的水平
 
 ### 7.9 性能约束
 
@@ -2954,10 +2960,16 @@ RebuildRequest = {
 `shadow baseline` 的激活与退出规则：
 
 - 激活条件：当前不存在已激活的 `shadow baseline`，且本级或可用基线来源存在可参考服务模型，同时在线漂移证据已满足 `shift_confirmed`
+- `v1` 工程约束：为避免“刚确认漂移就触发重建，但新阶段 replay 长度还不足以完成当前简化 `holdout` 验证”，`shadow baseline` 与对应重建请求的实际激活还要满足最小可验证窗口约束；当前实现收口为连续确认点数 `c_t >= 3`
 - 激活粒度：按单特征序列 `Series = (key, feature)` 激活；对 `T3`，作用对象是 routed 后的摘要特征序列，而不是整个原始 `T3Block`
 - 主要退出条件：正式基线重建完成并成功切换。也就是说，`shadow baseline` 的主要职责就是在“旧基线已失配”与“新正式基线可用”之间提供一个临时桥接
 - 保护性退出条件：连续 gap 超过 `G_reset`，或其依附的参考模型 / 来源模型已失效
 - 非退出条件：`history_reader` 暂时不可用、重建历史不足、重建任务失败，或短时间内表面上“看起来恢复正常”，都不应直接撤销 `shadow baseline`
+
+补充说明：
+
+- 上述 `c_t >= 3` 属于当前 `v1` 为闭合“`shadow` 接管 -> 正式重建 -> `holdout` 验证 -> 正式切换”链路而增加的工程保护，不改变 `shift_confirmed` 本身的算法定义
+- 后续若正式切换验证支持更短的新阶段窗口，或引入更合适的短窗验证 / replay 策略，可再放宽这条实现约束
 
 `shadow baseline` 的最小正式规格：
 
@@ -2976,6 +2988,26 @@ ShadowState = {
 - `ref_model_id`：激活时冻结的参考服务模型；可以是本级正式模型，也可以是当前选中的可用基线来源模型
 - `delta`：参考模型之上的在线偏移量；这是 `shadow baseline` 的唯一核心自适应状态
 - `last_bucket`：最近一次处理的有效 `bucket_id`
+
+工程收口与分期说明：
+
+- `ref_model_id` 是算法语义名，表示“激活时冻结的参考服务模型”；它不要求工程上先建立全局 `model registry`，再来实现 `shadow baseline`
+- `Story 18.12` 允许先采用显式冻结引用模型的工程表示：
+
+```text
+ShadowState_v1 = {
+  active,
+  ref_kind,          // self_formal | self_candidate | source_formal | source_candidate
+  ref_source_key?,
+  ref_model_version,
+  frozen_ref_model,
+  delta,
+  last_bucket
+}
+```
+
+- 其中 `frozen_ref_model` 表示激活时刻冻结的引用模型句柄；`ref_source_key` 仅在来源模型下填写
+- `Story 18.12A` 再把这套工程表示正式收口为代码契约与测试要求，不再保留“算法语义里是 `ref_model_id`、工程实现里靠临时约定承载”的中间状态
 
 设计约束：
 
@@ -3031,6 +3063,22 @@ delta_t
 
 ```text
 sigma_shadow = k_shadow_sigma * sigma_ref
+```
+
+分阶段实现约束：
+
+- 设计目标上，`T1a / T1b` 的 `shadow baseline` 应按 `sigma_shadow = k_shadow_sigma * sigma_ref` 进行标准化评分
+- 但考虑当前 `T1` 主评分链尚未实现 `sigma_ref`，`Story 18.12` 先允许采用最小桥接口径：
+
+```text
+raw_score_shadow_t1_v1 = |x_t - μ_shadow,t^-| / k_shadow_sigma
+```
+
+- 这个口径只表达“桥接期分数放宽”，不等价于最终标准化残差，也不应作为长期正式语义
+- `Story 18.12A` 必须补齐 `sigma_ref` 的训练、持久化、predictor 输出与 `T1` 标准化评分，并把 `shadow` 评分切换为：
+
+```text
+z_shadow,t = (x_t - μ_shadow,t^-) / sigma_shadow
 ```
 
 - `T2` 继续复用原有 `phi_over / v_floor` 方差层，但在 `shadow baseline` 模式下，评分使用放宽后的有效方差：
@@ -3211,6 +3259,13 @@ candidate_pass
 - 基线层默认只保存模型状态、轻量在线状态和必要元数据，不保存可重放的历史观测。
 - `history_reader` 的缺失或失败，不得影响在线评分热路径；其影响只限于正式重建、回放验证等慢路径能力。
 - `history_reader` 返回的数据协议必须与在线 `Observation` 保持一致，避免为训练路径单独维护另一套输入语义。
+
+### 11.5 算法代码注释约束
+
+- 涉及基线算法的代码，必须提供清晰注释；这里的“基线算法代码”包括但不限于评分逻辑、漂移证据累积器、`shadow baseline`、正式重建、候选验证与切换、`T3` 摘要提取与 basis / support / stable head 相关逻辑。
+- 注释优先解释“为什么这样做”和“对应哪一层算法语义”，而不是机械复述代码字面含义。
+- 对状态迁移、重建触发条件、`shadow baseline` 接管 / 退出、`T3` basis 切换等非直观逻辑，必须在代码块前给出短而明确的说明。
+- 当实现直接对应本文中的某个概念、状态或公式时，注释应尽量沿用本文术语，便于设计与实现对照。
 
 ---
 

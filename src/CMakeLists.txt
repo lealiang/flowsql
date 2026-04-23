@@ -43,6 +43,7 @@ add_thirdparts()
 # 添加外部子项目
 add_subdirectory(${CMAKE_SOURCE_DIR}/plugins/npi ${CMAKE_BINARY_DIR}/npi_plugin)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_npi ${CMAKE_BINARY_DIR}/test_npi)
+add_subdirectory(${CMAKE_SOURCE_DIR}/plugins/baseline ${CMAKE_BINARY_DIR}/baseline_plugin)
 
 # Stage 1: 框架核心
 add_subdirectory(${CMAKE_SOURCE_DIR}/framework ${CMAKE_BINARY_DIR}/framework)
@@ -76,6 +77,7 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_builtin ${CMAKE_BINARY_DIR}/test
 # Stage 9: Task 异步任务服务
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/task ${CMAKE_BINARY_DIR}/task)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_task ${CMAKE_BINARY_DIR}/test_task)
+add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_baseline ${CMAKE_BINARY_DIR}/test_baseline)
 
 # Stage 3: Gateway 服务
 add_subdirectory(${CMAKE_SOURCE_DIR}/services/gateway ${CMAKE_BINARY_DIR}/gateway)

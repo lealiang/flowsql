@@ -127,6 +127,9 @@ tasks/
 
 - 尽量使用成熟的开源方案，不重复造轮子
 - 给代码提供必要的中文注释
+- `git worktree` 开发统一复用主工作区的 `.thirdparts_installed` 和 `.thirdparts_prefix`，禁止每个 worktree 各自维护一套第三方编译缓存
+- 新增 `thirdparts/*-config.cmake` 或新增第三方依赖时，必须先在主工作区完成一次下载 / 编译 / 安装缓存，再进入 `.worktrees/` 分支开发
+- 头文件库也遵循同一规则；不要因为“只包含头文件”就跳过主工作区缓存预热，例如 `Eigen 3`
 - 新建或修改 `*.h/*.hpp/*.cpp/*.cc` 文件时，文件头必须使用统一版权声明：
   `Copyright (C) 2026 LIHUO` + MIT License 说明块
 - 问题处理必须先核查再修改（强制）：

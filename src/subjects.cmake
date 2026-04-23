@@ -11,9 +11,31 @@ macro(add_subprojets parent)
 	endforeach()
 endmacro()
 
-# 第三方依赖的安装目录，独立于 build 目录，清理重建时不受影响
-set(THIRDPARTS_INSTALL_DIR ${CMAKE_SOURCE_DIR}/../.thirdparts_installed)
-set(THIRDPARTS_PREFIX_DIR  ${CMAKE_SOURCE_DIR}/../.thirdparts_prefix)
+# 第三方依赖缓存统一挂在 Git 主工作区根目录下。
+# 这样即使从 .worktrees/ 中开发，也会复用主工作区已经完成的缓存，
+# 避免每个 worktree 各自触发一套 ExternalProject 下载与编译。
+get_filename_component(FLOWSQL_PROJECT_ROOT "${CMAKE_SOURCE_DIR}/.." REALPATH)
+set(FLOWSQL_THIRDPARTS_ROOT "${FLOWSQL_PROJECT_ROOT}")
+
+find_program(FLOWSQL_GIT_EXECUTABLE git)
+if(FLOWSQL_GIT_EXECUTABLE)
+	execute_process(
+		COMMAND ${FLOWSQL_GIT_EXECUTABLE} rev-parse --git-common-dir
+		WORKING_DIRECTORY "${FLOWSQL_PROJECT_ROOT}"
+		RESULT_VARIABLE FLOWSQL_GIT_COMMON_DIR_RET
+		OUTPUT_VARIABLE FLOWSQL_GIT_COMMON_DIR_RAW
+		ERROR_QUIET
+		OUTPUT_STRIP_TRAILING_WHITESPACE
+	)
+	if(FLOWSQL_GIT_COMMON_DIR_RET EQUAL 0 AND NOT "${FLOWSQL_GIT_COMMON_DIR_RAW}" STREQUAL "")
+		get_filename_component(FLOWSQL_GIT_COMMON_DIR "${FLOWSQL_GIT_COMMON_DIR_RAW}" REALPATH BASE_DIR "${FLOWSQL_PROJECT_ROOT}")
+		get_filename_component(FLOWSQL_THIRDPARTS_ROOT "${FLOWSQL_GIT_COMMON_DIR}" DIRECTORY)
+	endif()
+endif()
+
+message(STATUS "thirdparts: shared cache root at ${FLOWSQL_THIRDPARTS_ROOT}")
+set(THIRDPARTS_INSTALL_DIR ${FLOWSQL_THIRDPARTS_ROOT}/.thirdparts_installed)
+set(THIRDPARTS_PREFIX_DIR  ${FLOWSQL_THIRDPARTS_ROOT}/.thirdparts_prefix)
 
 macro(add_thirdparts)
 	set(THIRDPARTS_DIR ${CMAKE_SOURCE_DIR}/../thirdparts)
