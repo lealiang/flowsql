@@ -10,48 +10,185 @@
 
 #include <common/error_code.h>
 
+#include <algorithm>
+#include <cmath>
+#include <ctime>
+#include <unordered_set>
+
+#include "plugins/baseline/model/calendar_feature_helper.h"
+
 namespace flowsql {
 namespace baseline {
 
 namespace {
 
-template <typename TModel>
-int PredictFormalModelInternal(const TModel* model,
-                               const EventCalendarSpec* task_calendar,
-                               int64_t bucket_id,
-                               double value,
-                               double sigma_ref,
-                               FormalPrediction* out) {
-    if (!out) return error::BAD_REQUEST;
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kRatioEps = 1e-6;
 
-    *out = FormalPrediction{};
-    out->bucket_id = bucket_id;
-    if (!model || model->metadata.kind == FormalModelKind::kNone) {
-        return error::UNAVAILABLE;
+double Sigmoid(double value) {
+    if (value >= 0.0) {
+        const double z = std::exp(-value);
+        return 1.0 / (1.0 + z);
+    }
+    const double z = std::exp(value);
+    return z / (1.0 + z);
+}
+
+double ClipRatio(double value) {
+    return std::max(kRatioEps, std::min(1.0 - kRatioEps, value));
+}
+
+int64_t ResolveDelta(const ValueFormalModel& model, const FormalPredictContext& context) {
+    if (model.delta > 0) return model.delta;
+    if (context.task_spec && context.task_spec->delta > 0) return context.task_spec->delta;
+    return 0;
+}
+
+int64_t ResolveDelta(const RatioFormalModel& model, const FormalPredictContext& context) {
+    if (model.delta > 0) return model.delta;
+    if (context.task_spec && context.task_spec->delta > 0) return context.task_spec->delta;
+    return 0;
+}
+
+std::string ResolveTimezone(const std::string& model_tz, const FormalPredictContext& context) {
+    if (!model_tz.empty()) return model_tz;
+    if (context.task_spec && !context.task_spec->tz.empty()) return context.task_spec->tz;
+    return "UTC";
+}
+
+double EvaluateFourier(const std::vector<double>& sin_coeff,
+                       const std::vector<double>& cos_coeff,
+                       double phase) {
+    double value = 0.0;
+    const std::size_t max_size = std::max(sin_coeff.size(), cos_coeff.size());
+    for (std::size_t i = 0; i < max_size; ++i) {
+        const double angle = 2.0 * kPi * static_cast<double>(i + 1) * phase;
+        if (i < sin_coeff.size()) value += sin_coeff[i] * std::sin(angle);
+        if (i < cos_coeff.size()) value += cos_coeff[i] * std::cos(angle);
+    }
+    return value;
+}
+
+double CenterAt(const std::vector<double>& centers, std::size_t index) {
+    return index < centers.size() ? centers[index] : 0.0;
+}
+
+double EvaluateMonthPos(const MonthPosBlock& block,
+                        int64_t bucket_id,
+                        int64_t delta,
+                        const std::string& tz) {
+    if (!block.enabled || delta <= 0) return 0.0;
+
+    double value = 0.0;
+    const int32_t dom = DayOfMonthLocal(bucket_id, delta, tz);
+    if (dom >= 1 && dom <= 31) {
+        for (std::size_t i = 0; i < block.dom_coeff.size(); ++i) {
+            const double indicator = (static_cast<int32_t>(i + 1) == dom) ? 1.0 : 0.0;
+            value += block.dom_coeff[i] * (indicator - block.dom_center[i]);
+        }
     }
 
+    if (!block.dme_coeff.empty()) {
+        const int32_t dme = DaysToMonthEndLocal(bucket_id, delta, tz);
+        const std::size_t dme_index = static_cast<std::size_t>(
+            std::max<int32_t>(0, std::min<int32_t>(dme, static_cast<int32_t>(block.dme_coeff.size() - 1))));
+        for (std::size_t i = 0; i < block.dme_coeff.size(); ++i) {
+            const double indicator = i == dme_index ? 1.0 : 0.0;
+            value += block.dme_coeff[i] * (indicator - CenterAt(block.dme_center, i));
+        }
+    }
+
+    std::tm local{};
+    const bool is_last_weekday = ResolveLocalTime(bucket_id, delta, tz, &local) &&
+                                 IsLastWeekdayOfMonthLocal(bucket_id, delta, tz);
+    for (std::size_t i = 0; i < block.lwd_coeff.size(); ++i) {
+        const double indicator =
+            (is_last_weekday && static_cast<int32_t>(i) == local.tm_wday) ? 1.0 : 0.0;
+        value += block.lwd_coeff[i] * (indicator - block.lwd_center[i]);
+    }
+    return value;
+}
+
+double EvaluateCore(const CoreBlock& block,
+                    int64_t bucket_id,
+                    int64_t train_start,
+                    int64_t delta,
+                    const std::string& tz) {
+    double value = block.beta0 + block.trend_k * static_cast<double>(bucket_id - train_start);
+    if (delta > 0) {
+        value += EvaluateFourier(block.day_sin, block.day_cos, PhaseDayLocal(bucket_id, delta, tz));
+        value += EvaluateFourier(block.week_sin, block.week_cos, PhaseWeekLocal(bucket_id, delta, tz));
+    }
+    return value;
+}
+
+double EvaluateEventBlock(const EventBlock& block,
+                          const FormalPredictContext& context,
+                          EventCalendarStatus event_status) {
+    if (!block.enabled || event_status != EventCalendarStatus::kEnabled ||
+        !context.task_spec || !context.event_calendar) {
+        return 0.0;
+    }
+
+    const std::vector<std::string> hit_events =
+        ResolveBucketEvents(*context.event_calendar, *context.task_spec, context.bucket_id);
+    if (hit_events.empty()) return 0.0;
+    const std::unordered_set<std::string> hit_set(hit_events.begin(), hit_events.end());
+
+    double value = 0.0;
+    const std::size_t count = std::min(block.active_event_codes.size(), block.coeff.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        if (hit_set.find(block.active_event_codes[i]) != hit_set.end()) {
+            value += block.coeff[i];
+        }
+    }
+    return value;
+}
+
+template <typename TModel>
+void FillCommonPrediction(const TModel& model,
+                          const FormalPredictContext& context,
+                          FormalPrediction* out) {
     out->ready = true;
-    out->model_kind = model->metadata.kind;
-    out->model_version = model->metadata.model_version;
-    out->value = value;
-    out->sigma_ref = sigma_ref;
-    out->event_status = EvaluateEventCalendarStatus(model->metadata, task_calendar);
-    out->event_enabled = (out->event_status == EventCalendarStatus::kEnabled);
-    return error::OK;
+    out->model_kind = model.metadata.kind;
+    out->model_version = model.metadata.model_version;
+    out->bucket_id = context.bucket_id;
+    out->readiness = model.readiness;
+    out->confidence_base = model.confidence_base_at_train;
+    out->event_status = EvaluateEventCalendarStatus(model.metadata, context.event_calendar);
+    out->event_enabled = out->event_status == EventCalendarStatus::kEnabled;
 }
 
 }  // namespace
 
 const char* FormalModelKindName(FormalModelKind kind) {
     switch (kind) {
-        case FormalModelKind::kValueInterceptFit:
-            return "value_intercept_fit";
-        case FormalModelKind::kRatioInterceptFit:
-            return "ratio_intercept_fit";
+        case FormalModelKind::kValueBaseline:
+            return "value_baseline";
+        case FormalModelKind::kRatioBaseline:
+            return "ratio_baseline";
         case FormalModelKind::kNone:
             break;
     }
     return "none";
+}
+
+const char* TransformKindName(TransformKind kind) {
+    switch (kind) {
+        case TransformKind::kIdentity:
+            return "identity";
+        case TransformKind::kLog1p:
+            return "log1p";
+        case TransformKind::kLogit:
+            return "logit";
+    }
+    return "identity";
+}
+
+TransformKind ParseTransformKind(const std::string& name) {
+    if (name == "log1p") return TransformKind::kLog1p;
+    if (name == "logit") return TransformKind::kLogit;
+    return TransformKind::kIdentity;
 }
 
 const char* EventCalendarStatusName(EventCalendarStatus status) {
@@ -69,27 +206,71 @@ const char* EventCalendarStatusName(EventCalendarStatus status) {
 }
 
 int PredictFormalModel(const ValueFormalModel* model,
+                       const FormalPredictContext& context,
+                       FormalPrediction* out) {
+    if (!out) return error::BAD_REQUEST;
+    *out = FormalPrediction{};
+    if (!model || model->metadata.kind != FormalModelKind::kValueBaseline) {
+        return error::UNAVAILABLE;
+    }
+
+    FillCommonPrediction(*model, context, out);
+    const int64_t delta = ResolveDelta(*model, context);
+    const std::string tz = ResolveTimezone(model->tz, context);
+    double value = EvaluateCore(model->core_block, context.bucket_id, model->train_start, delta, tz);
+    value += EvaluateMonthPos(model->monthpos_block, context.bucket_id, delta, tz);
+    value += EvaluateEventBlock(model->event_block, context, out->event_status);
+    out->value = value;
+    out->sigma_ref = model->sigma_ref;
+    return error::OK;
+}
+
+int PredictFormalModel(const RatioFormalModel* model,
+                       const FormalPredictContext& context,
+                       FormalPrediction* out) {
+    if (!out) return error::BAD_REQUEST;
+    *out = FormalPrediction{};
+    if (!model || model->metadata.kind != FormalModelKind::kRatioBaseline) {
+        return error::UNAVAILABLE;
+    }
+
+    FillCommonPrediction(*model, context, out);
+    const int64_t delta = ResolveDelta(*model, context);
+    const std::string tz = ResolveTimezone(model->tz, context);
+    double eta = EvaluateCore(model->core_block, context.bucket_id, model->train_start, delta, tz);
+    eta += EvaluateMonthPos(model->monthpos_block, context.bucket_id, delta, tz);
+    eta += EvaluateEventBlock(model->event_block, context, out->event_status);
+    out->value = ClipRatio(Sigmoid(eta));
+    out->sigma_ref = 0.0;
+    return error::OK;
+}
+
+int PredictFormalModel(const ValueFormalModel* model,
                        const EventCalendarSpec* task_calendar,
                        int64_t bucket_id,
                        FormalPrediction* out) {
-    // v1 的正式模型先落为“常数截距项”。
-    // 这里直接暴露训练得到的基线水平，后续再在相同 predictor 契约后面补趋势、
-    // 周期和事件项，而不改热路径调用方式。
-    return PredictFormalModelInternal(
-        model,
-        task_calendar,
-        bucket_id,
-        model ? model->intercept_x : 0.0,
-        model ? model->sigma_ref : 0.0,
-        out);
+    FormalPredictContext context;
+    context.bucket_id = bucket_id;
+    const int rc = PredictFormalModel(model, context, out);
+    if (rc == error::OK && out) {
+        out->event_status = EvaluateEventCalendarStatus(model->metadata, task_calendar);
+        out->event_enabled = out->event_status == EventCalendarStatus::kEnabled;
+    }
+    return rc;
 }
 
 int PredictFormalModel(const RatioFormalModel* model,
                        const EventCalendarSpec* task_calendar,
                        int64_t bucket_id,
                        FormalPrediction* out) {
-    return PredictFormalModelInternal(
-        model, task_calendar, bucket_id, model ? model->intercept_ratio : 0.0, 0.0, out);
+    FormalPredictContext context;
+    context.bucket_id = bucket_id;
+    const int rc = PredictFormalModel(model, context, out);
+    if (rc == error::OK && out) {
+        out->event_status = EvaluateEventCalendarStatus(model->metadata, task_calendar);
+        out->event_enabled = out->event_status == EventCalendarStatus::kEnabled;
+    }
+    return rc;
 }
 
 }  // namespace baseline

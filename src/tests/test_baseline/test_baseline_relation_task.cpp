@@ -9,8 +9,11 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <type_traits>
 
 #include <common/error_code.h>
+#include <framework/interfaces/ibaseline_service.h>
 #include <plugins/baseline/config_parser.h>
 #include <plugins/baseline/relation/relation_basis.h>
 #include <plugins/baseline/relation/relation_router.h>
@@ -25,6 +28,222 @@ bool NearlyEqual(double lhs, double rhs, double eps = 1e-9) {
     return std::fabs(lhs - rhs) <= eps;
 }
 
+class TestRelationSourceResolver : public IBaselineSourceResolver {
+ public:
+    int ResolveBaselineSource(const BaselineStringRef& key,
+                              const BaselineStringRef& feature,
+                              std::string* out_config_json) override {
+        last_key_ = key.data ? std::string(key.data, key.size) : "";
+        last_feature_ = feature.data ? std::string(feature.data, feature.size) : "";
+        ++call_count_;
+        if (out_config_json) {
+            *out_config_json =
+                R"({"baseline_sources":[{"source_key":"svc-source"}]})";
+        }
+        return error::OK;
+    }
+
+    int call_count() const { return call_count_; }
+    const std::string& last_key() const { return last_key_; }
+    const std::string& last_feature() const { return last_feature_; }
+
+ private:
+    int call_count_ = 0;
+    std::string last_key_;
+    std::string last_feature_;
+};
+
+void TestProtocolContract() {
+    std::printf("[TEST] Baseline protocol contract...\n");
+
+    using SubmitBlockSig =
+        int (IBaselineRelationTask::*)(const RelationObservationBlock&, FusionResult*);
+    static_assert(std::is_same_v<decltype(&IBaselineRelationTask::SubmitBlock),
+                                 SubmitBlockSig>);
+
+    using QueryFusionSig =
+        int (IBaselineService::*)(const BaselineStringRef&, std::string*) const;
+    static_assert(std::is_same_v<decltype(&IBaselineService::QueryKeyFusionSnapshotJson),
+                                 QueryFusionSig>);
+
+    HistoryFetchRequest fetch_req;
+    fetch_req.key = BaselineStringRef{"svc-a", 5};
+    fetch_req.feature = BaselineStringRef{"bytes_total", 11};
+    fetch_req.bucket_start = 100;
+    fetch_req.bucket_end = 120;
+
+    RelationMetricBlock metric_block;
+    metric_block.total = 10.0;
+    metric_block.flags = kRelationMetricHasActiveCount;
+    metric_block.active_count = 3;
+
+    DetectorResult detector_result;
+    detector_result.key = BaselineStringRef{"svc-a", 5};
+    detector_result.feature = BaselineStringRef{"bytes_total", 11};
+    detector_result.feature_type = BaselineStringRef{"t1a", 3};
+    detector_result.ts = 123;
+    detector_result.reason_code = BaselineReasonCode::kSpike;
+    detector_result.evidence.kind = BaselineEvidenceKind::kValue;
+    detector_result.evidence.value.baseline_source_kind = BaselineSourceKind::kSelf;
+
+    FusionResult fusion_result;
+    fusion_result.key = BaselineStringRef{"svc-a", 5};
+    fusion_result.ts = 123;
+    fusion_result.risk = 0.2;
+    fusion_result.dominant_single_count = 1;
+    fusion_result.dominant_single[0].feature = BaselineStringRef{"bytes_total", 11};
+    fusion_result.dominant_pattern_count = 1;
+    fusion_result.dominant_pattern[0].pattern = BaselineStringRef{"support_escape", 14};
+
+    (void)fetch_req;
+    (void)metric_block;
+    (void)detector_result;
+    (void)fusion_result;
+
+    std::printf("[PASS] Baseline protocol contract\n");
+}
+
+void TestParseValueTaskBaselineSourceConfig() {
+    std::printf("[TEST] Value task baseline source config parsing...\n");
+
+    const char* config_json = R"JSON(
+{
+  "name": "bytes_total",
+  "key": "service",
+  "feature": "bytes_total",
+  "feature_type": "t1a",
+  "feature_profile": "traffic",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "baseline_source_configs": [
+    {
+      "key": "svc-target",
+      "baseline_sources": [{"source_key": "svc-source"}]
+    }
+  ]
+}
+)JSON";
+
+    BaselineTaskSpec spec;
+    std::string err;
+    assert(ConfigParser::ParseValueTask(config_json, &spec, &err) == error::OK);
+    assert(spec.baseline_source_configs.size() == 1);
+    assert(spec.baseline_source_configs[0].key == "svc-target");
+    assert(spec.baseline_source_configs[0].config.sources.size() == 1);
+    assert(spec.baseline_source_configs[0].config.sources[0].source_key == "svc-source");
+
+    const char* bad_self_source_json = R"JSON(
+{
+  "name": "bytes_total",
+  "key": "svc-self",
+  "feature": "bytes_total",
+  "feature_type": "t1a",
+  "feature_profile": "traffic",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "baseline_source_configs": [
+    {
+      "key": "svc-self",
+      "baseline_sources": [{"source_key": "svc-self"}]
+    }
+  ]
+}
+)JSON";
+
+    assert(ConfigParser::ParseValueTask(bad_self_source_json, &spec, &err) ==
+           error::BAD_REQUEST);
+
+    const char* duplicate_key_json = R"JSON(
+{
+  "name": "bytes_total",
+  "key": "service",
+  "feature": "bytes_total",
+  "feature_type": "t1a",
+  "feature_profile": "traffic",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "baseline_source_configs": [
+    {
+      "key": "svc-target",
+      "baseline_sources": [{"source_key": "svc-source-a"}]
+    },
+    {
+      "key": "svc-target",
+      "baseline_sources": [{"source_key": "svc-source-b"}]
+    }
+  ]
+}
+)JSON";
+
+    assert(ConfigParser::ParseValueTask(duplicate_key_json, &spec, &err) ==
+           error::BAD_REQUEST);
+
+    const char* duplicate_source_json = R"JSON(
+{
+  "name": "bytes_total",
+  "key": "service",
+  "feature": "bytes_total",
+  "feature_type": "t1a",
+  "feature_profile": "traffic",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "baseline_source_configs": [
+    {
+      "key": "svc-target",
+      "baseline_sources": [
+        {"source_key": "svc-source"},
+        {"source_key": "svc-source"}
+      ]
+    }
+  ]
+}
+)JSON";
+
+    assert(ConfigParser::ParseValueTask(duplicate_source_json, &spec, &err) ==
+           error::BAD_REQUEST);
+
+    const char* task_global_source_json = R"JSON(
+{
+  "name": "bytes_total",
+  "key": "service",
+  "feature": "bytes_total",
+  "feature_type": "t1a",
+  "feature_profile": "traffic",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "baseline_source_config": [
+    {"source_key": "svc-source"}
+  ]
+}
+)JSON";
+
+    assert(ConfigParser::ParseValueTask(task_global_source_json, &spec, &err) ==
+           error::BAD_REQUEST);
+
+    const char* legacy_series_override_json = R"JSON(
+{
+  "name": "bytes_total",
+  "key": "service",
+  "feature": "bytes_total",
+  "feature_type": "t1a",
+  "feature_profile": "traffic",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "series_overrides": [
+    {
+      "key": "svc-target",
+      "baseline_sources": [{"source_key": "svc-source"}]
+    }
+  ]
+}
+)JSON";
+
+    assert(ConfigParser::ParseValueTask(legacy_series_override_json, &spec, &err) ==
+           error::BAD_REQUEST);
+
+    std::printf("[PASS] Value task baseline source config parsing\n");
+}
+
 void TestParseRelationTaskSpec() {
     std::printf("[TEST] Relation task spec parsing...\n");
 
@@ -34,6 +253,8 @@ void TestParseRelationTaskSpec() {
   "feature_base": "client_group_mix",
   "group_space_id": "client_group",
   "group_space_version": "v1",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
   "metric_set_id": "traffic",
   "metrics": ["conn_count", "bps", "pps"],
   "encode_type": "topk_other",
@@ -49,12 +270,16 @@ void TestParseRelationTaskSpec() {
 }
 )JSON";
 
-    RelationTaskSpec spec;
+    RelationTaskCreateSpec create_spec;
     std::string err;
-    assert(ConfigParser::ParseRelationTask(config_json, &spec, &err) == error::OK);
+    assert(ConfigParser::ParseRelationTask(config_json, &create_spec, &err) == error::OK);
+    const RelationTaskSpec& spec = create_spec.task_spec;
     assert(spec.feature_base == "client_group_mix");
     assert(spec.group_space_id == "client_group");
-    assert(spec.group_space_version == "v1");
+    assert(spec.group_space_version.has_value());
+    assert(*spec.group_space_version == "v1");
+    assert(create_spec.clock_spec.delta == 60);
+    assert(create_spec.clock_spec.tz == "Asia/Shanghai");
     assert(spec.metric_set_id == "traffic");
     assert(spec.metrics.size() == 3);
     assert(spec.metrics[0] == "conn_count");
@@ -66,6 +291,77 @@ void TestParseRelationTaskSpec() {
     assert(NearlyEqual(spec.support_policy.min_active_ratio, 0.2));
     assert(spec.summary_policy.k_head == 5);
     assert(spec.summary_policy.k_stable == 3);
+
+    const char* missing_clock_json = R"JSON(
+{
+  "name": "client_group_mix",
+  "feature_base": "client_group_mix",
+  "group_space_id": "client_group",
+  "metric_set_id": "traffic",
+  "metrics": ["conn_count"],
+  "encode_type": "exact_sparse",
+  "support_policy": {
+    "k_support": 8,
+    "min_hist_share": 0.005,
+    "min_active_ratio": 0.2
+  },
+  "summary_policy": {
+    "k_head": 5,
+    "k_stable": 3
+  }
+}
+)JSON";
+    assert(ConfigParser::ParseRelationTask(missing_clock_json, &create_spec, &err) ==
+           error::BAD_REQUEST);
+
+    const char* duplicate_metric_json = R"JSON(
+{
+  "name": "client_group_mix",
+  "feature_base": "client_group_mix",
+  "group_space_id": "client_group",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "metric_set_id": "traffic",
+  "metrics": ["conn_count", "conn_count"],
+  "encode_type": "exact_sparse",
+  "support_policy": {
+    "k_support": 8,
+    "min_hist_share": 0.005,
+    "min_active_ratio": 0.2
+  },
+  "summary_policy": {
+    "k_head": 5,
+    "k_stable": 3
+  }
+}
+)JSON";
+    assert(ConfigParser::ParseRelationTask(duplicate_metric_json, &create_spec, &err) ==
+           error::BAD_REQUEST);
+
+    const char* invalid_relation_policy_json = R"JSON(
+{
+  "name": "client_group_mix",
+  "feature_base": "client_group_mix",
+  "group_space_id": "client_group",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "metric_set_id": "traffic",
+  "metrics": ["conn_count"],
+  "encode_type": "exact_sparse",
+  "support_policy": {
+    "k_support": 2,
+    "min_hist_share": 0.005,
+    "min_active_ratio": 0.2
+  },
+  "summary_policy": {
+    "k_head": 5,
+    "k_stable": 3
+  }
+}
+)JSON";
+    assert(ConfigParser::ParseRelationTask(invalid_relation_policy_json,
+                                           &create_spec,
+                                           &err) == error::BAD_REQUEST);
 
     std::printf("[PASS] Relation task spec parsing\n");
 }
@@ -142,7 +438,7 @@ void TestExtractRelationSummaries() {
     const uint32_t group_idx[] = {11, 12, 50};
     const double values_exact[] = {50.0, 30.0, 20.0};
     const RelationMetricBlock metrics_exact[] = {
-        {100.0, 3, values_exact},
+        {100.0, kRelationMetricHasActiveCount, 3, values_exact},
     };
     const RelationObservationBlock block_exact{
         BaselineStringRef{"svc-a", 5},
@@ -170,7 +466,7 @@ void TestExtractRelationSummaries() {
 
     const double values_topk_other[] = {40.0, 30.0, 20.0};
     const RelationMetricBlock metrics_topk_other[] = {
-        {100.0, 0, values_topk_other},
+        {100.0, 0, 0, values_topk_other},
     };
     const RelationObservationBlock block_topk_other{
         BaselineStringRef{"svc-a", 5},
@@ -189,6 +485,24 @@ void TestExtractRelationSummaries() {
     assert(NearlyEqual(summary_topk_other.out_of_support_share, 0.3));
     assert(summary_topk_other.has_distinct_group_count == false);
 
+    const double values_zero_active[] = {60.0, 25.0, 15.0};
+    const RelationMetricBlock metrics_zero_active[] = {
+        {100.0, kRelationMetricHasActiveCount, 0, values_zero_active},
+    };
+    const RelationObservationBlock block_zero_active{
+        BaselineStringRef{"svc-a", 5},
+        12,
+        3,
+        group_idx,
+        1,
+        metrics_zero_active};
+
+    RelationMetricSummary summary_zero_active;
+    assert(RelationSummaryExtractor::ExtractMetricSummary(
+               block_zero_active, 0, basis, &summary_zero_active) == error::OK);
+    assert(summary_zero_active.has_distinct_group_count == true);
+    assert(NearlyEqual(summary_zero_active.distinct_group_count, 0.0));
+
     std::printf("[PASS] Relation summary extraction\n");
 }
 
@@ -198,26 +512,100 @@ void TestRelationRouter() {
     RelationTaskSpec spec;
     spec.feature_base = "client_group_mix";
     spec.metrics = {"conn_count"};
-    spec.summary_policy.k_stable = 2;
+    spec.summary_policy.k_stable = 3;
+
+    RelationTaskClockSpec clock_spec;
+    clock_spec.delta = 60;
+    clock_spec.tz = "Asia/Shanghai";
+
+    RelationServiceBasis basis;
+    basis.feature_base = "client_group_mix";
+    basis.metric_name = "conn_count";
+    basis.group_space_id = "client_group";
+    basis.k_head = 5;
+    basis.support_explicit = {11, 12, 13};
+    basis.stable_head = {11};
+    basis.head_proto_q = {1.0};
+
+    EventCalendarSpec calendar_spec;
+    calendar_spec.calendar_id = "relation-calendar";
+    calendar_spec.calendar_version = "v1";
+    calendar_spec.entries = {
+        EventCalendarEntry{"global_event",
+                           "global",
+                           "local_wall_clock",
+                           1711900800,
+                           1711987199,
+                           true,
+                           "",
+                           "",
+                           "Asia/Shanghai"},
+        EventCalendarEntry{"feature_event",
+                           "feature",
+                           "local_wall_clock",
+                           1711900800,
+                           1711987199,
+                           true,
+                           "client_group_mix_conn_count_entropy_shannon",
+                           "",
+                           "Asia/Shanghai"},
+        EventCalendarEntry{"other_feature_event",
+                           "feature",
+                           "local_wall_clock",
+                           1711900800,
+                           1711987199,
+                           true,
+                           "client_group_mix_conn_count_top1_share",
+                           "",
+                           "Asia/Shanghai"},
+    };
+
+    TestRelationSourceResolver resolver;
 
     std::vector<RelationRoutedFeatureSpec> routed_specs;
-    RelationRouter::BuildRoutedFeatureSpecs(spec, &routed_specs);
+    RelationRouter::BuildRoutedFeatureSpecs(spec,
+                                           basis,
+                                           clock_spec,
+                                           BaselineStringRef{"svc-a", 5},
+                                           &calendar_spec,
+                                           &resolver,
+                                           &routed_specs);
     assert(!routed_specs.empty());
 
     bool found_entropy = false;
+    bool found_stable_g1 = false;
     bool found_stable_g2 = false;
+    bool found_entropy_calendar = false;
     for (const auto& routed_spec : routed_specs) {
-        if (routed_spec.routed_feature_id ==
+        if (routed_spec.feature ==
             "client_group_mix_conn_count_entropy_shannon") {
             found_entropy = true;
+            assert(routed_spec.local_slot == 0);
+            assert(routed_spec.delta == 60);
+            assert(routed_spec.tz == "Asia/Shanghai");
+            assert(routed_spec.baseline_source_config.has_value());
+            assert(routed_spec.baseline_source_config->sources.size() == 1);
+            assert(routed_spec.baseline_source_config->sources[0].source_key ==
+                   "svc-source");
+            assert(routed_spec.event_calendar_spec.has_value());
+            assert(routed_spec.event_calendar_spec->entries.size() == 2);
+            found_entropy_calendar = true;
         }
-        if (routed_spec.routed_feature_id ==
+        if (routed_spec.feature ==
+            "client_group_mix_conn_count_stable_g1_share") {
+            found_stable_g1 = true;
+        }
+        if (routed_spec.feature ==
             "client_group_mix_conn_count_stable_g2_share") {
             found_stable_g2 = true;
         }
     }
     assert(found_entropy == true);
-    assert(found_stable_g2 == true);
+    assert(found_stable_g1 == true);
+    assert(found_entropy_calendar == true);
+    assert(found_stable_g2 == false);
+    assert(resolver.call_count() == static_cast<int>(routed_specs.size()));
+    assert(resolver.last_key() == "svc-a");
 
     RelationMetricSummary summary;
     summary.valid = true;
@@ -240,7 +628,7 @@ void TestRelationRouter() {
 
     bool found_ratio = false;
     for (const auto& routed_spec : routed_specs) {
-        if (routed_spec.routed_feature_id ==
+        if (routed_spec.feature ==
             "client_group_mix_conn_count_top1_share") {
             RatioObservation ratio_observation;
             assert(RelationRouter::BuildRatioObservation(
@@ -259,6 +647,8 @@ void TestRelationRouter() {
 }  // namespace
 
 int main() {
+    TestProtocolContract();
+    TestParseValueTaskBaselineSourceConfig();
     TestParseRelationTaskSpec();
     TestBuildRelationBasisAndEvalBasis();
     TestExtractRelationSummaries();

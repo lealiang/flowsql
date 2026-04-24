@@ -5,7 +5,12 @@ add_library(${PROJECT_NAME} SHARED
     config_parser.cpp
     detector/ratio_detector_core.cpp
     detector/value_detector_core.cpp
+    fusion/key_risk_fusion.cpp
+    fusion/relation_pattern_fusion.cpp
+    model/calendar_feature_helper.cpp
+    model/event_calendar_matcher.cpp
     model/formal_predictor.cpp
+    model/readiness_helper.cpp
     model/series_store.cpp
     relation/relation_basis.cpp
     relation/relation_router.cpp
@@ -18,6 +23,7 @@ add_library(${PROJECT_NAME} SHARED
     rebuild/rebuild_worker.cpp
     solver/solver_backend.cpp
     task/baseline_task_base.cpp
+    task/relation_task.cpp
     task/ratio_task.cpp
     task/task_registry.cpp
     task/value_task.cpp

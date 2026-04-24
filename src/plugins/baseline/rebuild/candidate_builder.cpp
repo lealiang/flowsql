@@ -8,7 +8,11 @@
 
 #include "candidate_builder.h"
 
+#include <common/error_code.h>
+
 #include <algorithm>
+
+#include "plugins/baseline/model/profile_config.h"
 
 namespace flowsql {
 namespace baseline {
@@ -16,8 +20,6 @@ namespace baseline {
 namespace {
 
 constexpr std::size_t kMinTrainPointCount = 2;
-constexpr std::size_t kMinReplayForHoldout = 3;
-constexpr std::size_t kSwitchValidationTail = 16;
 
 CandidateBuildStatus MapTrainFailure(FormalTrainFailureCode code) {
     switch (code) {
@@ -49,9 +51,34 @@ ReplayWindowSummary BuildWindowSummary(const TSeries& series,
     return summary;
 }
 
-std::size_t DecideHoldoutCount(std::size_t total_count) {
-    if (total_count < kMinReplayForHoldout) return 0;
-    return std::min(kSwitchValidationTail, total_count / 2);
+std::vector<std::size_t> CollectValueValidIndices(const ValueFeatureProfile& profile,
+                                                  const ValueReplaySeries& replay) {
+    std::vector<std::size_t> indices;
+    indices.reserve(replay.points.size());
+    for (std::size_t i = 0; i < replay.points.size(); ++i) {
+        if (profile.is_t1b && replay.points[i].sample_count < profile.n_train_min) continue;
+        indices.push_back(i);
+    }
+    return indices;
+}
+
+std::vector<std::size_t> CollectRatioValidIndices(const RatioFeatureProfile& profile,
+                                                  const RatioReplaySeries& replay) {
+    std::vector<std::size_t> indices;
+    indices.reserve(replay.points.size());
+    for (std::size_t i = 0; i < replay.points.size(); ++i) {
+        if (replay.points[i].denominator < static_cast<double>(profile.d_min_train)) continue;
+        indices.push_back(i);
+    }
+    return indices;
+}
+
+template <typename TSeries>
+std::size_t HoldoutStartIndex(const TSeries& series,
+                              const std::vector<std::size_t>& valid_indices,
+                              std::size_t holdout_valid_count) {
+    if (holdout_valid_count == 0 || valid_indices.empty()) return series.points.size();
+    return valid_indices[valid_indices.size() - holdout_valid_count];
 }
 
 }  // namespace
@@ -77,7 +104,11 @@ const char* CandidateBuildStatusName(CandidateBuildStatus status) {
 CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& profile,
                                                   const ValueReplaySeries& replay,
                                                   uint64_t candidate_model_version,
+                                                  const BaselineTaskSpec* task_spec,
+                                                  int64_t delta,
+                                                  const std::string& tz,
                                                   const EventCalendarSpec* event_calendar_spec,
+                                                  const CompiledEventCalendar* compiled_event_calendar,
                                                   ValueCandidateBuildResult* out) {
     if (!out) return CandidateBuildStatus::kTrainFailed;
     *out = ValueCandidateBuildResult{};
@@ -87,17 +118,20 @@ CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& pro
         return out->status = CandidateBuildStatus::kEmpty;
     }
 
-    // candidate builder 只负责把 replay 切成 train / holdout，并把训练职责下沉给 trainer。
-    // v1 的 holdout 固定取尾部，目的是让后续切换验证尽量贴近“最近阶段是否可服务”。
-    const std::size_t holdout_count = DecideHoldoutCount(replay.points.size());
-    const std::size_t train_count = replay.points.size() - holdout_count;
+    const SharedProfileConfig shared_config = DefaultSharedProfileConfig();
+    const std::vector<std::size_t> valid_indices = CollectValueValidIndices(profile, replay);
+    const std::size_t holdout_valid_count =
+        valid_indices.size() >= 2 * shared_config.n_val_switch ? shared_config.n_val_switch : 0;
+    const std::size_t holdout_begin =
+        HoldoutStartIndex(replay, valid_indices, holdout_valid_count);
+    const std::size_t train_count = holdout_begin;
 
     if (train_count < kMinTrainPointCount) {
         return out->status = CandidateBuildStatus::kInsufficientTrainData;
     }
 
     out->train_window = BuildWindowSummary(replay, 0, train_count);
-    out->holdout_window = BuildWindowSummary(replay, train_count, replay.points.size());
+    out->holdout_window = BuildWindowSummary(replay, holdout_begin, replay.points.size());
 
     ValueFormalTrainResult train_result;
     const ValueFormalTrainInput input{
@@ -105,9 +139,13 @@ CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& pro
         &replay,
         train_count,
         candidate_model_version,
-        static_cast<uint64_t>(holdout_count),
+        static_cast<uint64_t>(holdout_valid_count),
         out->train_window,
-        event_calendar_spec};
+        task_spec,
+        delta,
+        tz,
+        event_calendar_spec,
+        compiled_event_calendar};
     out->status = MapTrainFailure(FormalModelTrainer::TrainValue(input, &train_result));
     if (out->status != CandidateBuildStatus::kTrained || !train_result.model) {
         if (out->status == CandidateBuildStatus::kTrained) {
@@ -124,7 +162,11 @@ CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& pro
 CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& profile,
                                                   const RatioReplaySeries& replay,
                                                   uint64_t candidate_model_version,
+                                                  const BaselineTaskSpec* task_spec,
+                                                  int64_t delta,
+                                                  const std::string& tz,
                                                   const EventCalendarSpec* event_calendar_spec,
+                                                  const CompiledEventCalendar* compiled_event_calendar,
                                                   RatioCandidateBuildResult* out) {
     if (!out) return CandidateBuildStatus::kTrainFailed;
     *out = RatioCandidateBuildResult{};
@@ -134,16 +176,20 @@ CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& pro
         return out->status = CandidateBuildStatus::kEmpty;
     }
 
-    // T2 与 T1 共用相同的候选构建契约：先切尾部 holdout，再训练 train 段。
-    const std::size_t holdout_count = DecideHoldoutCount(replay.points.size());
-    const std::size_t train_count = replay.points.size() - holdout_count;
+    const SharedProfileConfig shared_config = DefaultSharedProfileConfig();
+    const std::vector<std::size_t> valid_indices = CollectRatioValidIndices(profile, replay);
+    const std::size_t holdout_valid_count =
+        valid_indices.size() >= 2 * shared_config.n_val_switch ? shared_config.n_val_switch : 0;
+    const std::size_t holdout_begin =
+        HoldoutStartIndex(replay, valid_indices, holdout_valid_count);
+    const std::size_t train_count = holdout_begin;
 
     if (train_count < kMinTrainPointCount) {
         return out->status = CandidateBuildStatus::kInsufficientTrainData;
     }
 
     out->train_window = BuildWindowSummary(replay, 0, train_count);
-    out->holdout_window = BuildWindowSummary(replay, train_count, replay.points.size());
+    out->holdout_window = BuildWindowSummary(replay, holdout_begin, replay.points.size());
 
     RatioFormalTrainResult train_result;
     const RatioFormalTrainInput input{
@@ -151,9 +197,13 @@ CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& pro
         &replay,
         train_count,
         candidate_model_version,
-        static_cast<uint64_t>(holdout_count),
+        static_cast<uint64_t>(holdout_valid_count),
         out->train_window,
-        event_calendar_spec};
+        task_spec,
+        delta,
+        tz,
+        event_calendar_spec,
+        compiled_event_calendar};
     out->status = MapTrainFailure(FormalModelTrainer::TrainRatio(input, &train_result));
     if (out->status != CandidateBuildStatus::kTrained || !train_result.model) {
         if (out->status == CandidateBuildStatus::kTrained) {
@@ -164,6 +214,30 @@ CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& pro
 
     out->candidate_model_version = candidate_model_version;
     out->candidate_model = std::move(train_result.model);
+    return out->status = CandidateBuildStatus::kTrained;
+}
+
+CandidateBuildStatus CandidateBuilder::BuildRelationMetricBases(
+    const RelationBasisBuildInput& input,
+    const RelationServiceBasis* incumbent_basis,
+    const RelationTaskSpec& task_spec,
+    RelationMetricCandidateBuildResult* out) {
+    if (!out) return CandidateBuildStatus::kTrainFailed;
+    *out = RelationMetricCandidateBuildResult{};
+
+    if (RelationBasisBuilder::BuildServiceBasis(input, &out->candidate_service_basis) !=
+        error::OK) {
+        return out->status = CandidateBuildStatus::kTrainFailed;
+    }
+
+    if (RelationBasisBuilder::BuildEvalBasis(incumbent_basis,
+                                             task_spec,
+                                             &out->candidate_eval_basis) != error::OK) {
+        *out = RelationMetricCandidateBuildResult{};
+        return out->status = CandidateBuildStatus::kTrainFailed;
+    }
+
+    out->lineage_compatibility = out->candidate_eval_basis.compatibility;
     return out->status = CandidateBuildStatus::kTrained;
 }
 

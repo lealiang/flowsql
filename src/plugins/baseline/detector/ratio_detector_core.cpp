@@ -15,27 +15,21 @@
 #include <utility>
 
 #include "plugins/baseline/common/result_builder.h"
+#include "plugins/baseline/model/profile_config.h"
 
 namespace flowsql {
 namespace baseline {
 
 namespace {
 
-constexpr uint32_t kT2TrainMinRateCore = 50;
-constexpr uint32_t kT2TrainMinRatioBursty = 100;
-constexpr double kT2PriorRateCore = 2.0;
-constexpr double kT2PriorRatioBursty = 4.0;
-constexpr double kT2PhiOverRateCore = 1.5;
-constexpr double kT2PhiOverRatioBursty = 2.0;
-constexpr const char* kCandidateStateTrained = "trained";
-constexpr double kRatioVarianceFloor = 0.25;
-constexpr double kRatioShiftWeight = 0.8;
-constexpr double kPointWarn = 3.0;
-constexpr double kPointCrit = 5.0;
 constexpr double kShadowConfidenceCap = 0.8;
 constexpr double kShadowScoreScale = 1.5;
-constexpr uint32_t kMinShiftConfirmForRebuild = 3;
-constexpr DriftConfig kDriftConfig{};
+constexpr double kRatioClipEps = 1e-6;
+
+const SharedProfileConfig& SharedConfig() {
+    static const SharedProfileConfig config = DefaultSharedProfileConfig();
+    return config;
+}
 
 std::string CopyKey(const BaselineStringRef& key) {
     if (!key.data || key.size == 0) return "";
@@ -50,7 +44,7 @@ void FillBadRequestResult(DetectorResult* out) {
 
 struct SelectedRatioBaseline {
     bool ready = false;
-    BaselineProvider provider = BaselineProvider::kFormal;
+    BaselineProvider provider = BaselineProvider::kNone;
     BaselineSourceDecision decision;
     FormalPrediction prediction;
     ShadowRefKind shadow_ref_kind = ShadowRefKind::kNone;
@@ -73,22 +67,18 @@ bool BuildProfile(const RatioDetectorCoreSpec& spec,
     profile.feature_type = spec.feature_type;
     profile.feature_profile = spec.feature_profile;
 
-    if (spec.feature_profile == "rate_core") {
-        profile.d_min_train = kT2TrainMinRateCore;
-        profile.s_prior = kT2PriorRateCore;
-        profile.phi_over = kT2PhiOverRateCore;
-    } else if (spec.feature_profile == "ratio_bursty") {
-        profile.d_min_train = kT2TrainMinRatioBursty;
-        profile.s_prior = kT2PriorRatioBursty;
-        profile.phi_over = kT2PhiOverRatioBursty;
-    } else {
+    T2ProfileConfig profile_config;
+    if (!GetT2ProfileConfig(spec.feature_profile, &profile_config)) {
         if (err) *err = "unsupported t2 feature_profile";
         return false;
     }
 
-    profile.d_score_min = (profile.d_min_train + 1) / 2;
-    profile.d_shift_min = profile.d_min_train * 2;
-    profile.kappa_den = static_cast<double>(profile.d_min_train);
+    profile.d_min_train = profile_config.d_min_train;
+    profile.d_score_min = profile_config.d_score_min();
+    profile.d_shift_min = profile_config.d_shift_min();
+    profile.kappa_den = profile_config.kappa_den();
+    profile.s_prior = profile_config.s_prior;
+    profile.phi_over = profile_config.phi_over;
 
     *out = std::move(profile);
     return true;
@@ -144,20 +134,6 @@ bool PredictServiceableModel(const RatioSeriesRuntimeState& state,
         }
         return true;
     }
-
-    if (state.formal_state.candidate_state == kCandidateStateTrained &&
-        PredictFormalModel(state.candidate_model.get(), task_calendar, bucket_id, &prediction) ==
-            error::OK &&
-        prediction.ready) {
-        if (out_prediction) *out_prediction = prediction;
-        if (out_model) *out_model = state.candidate_model;
-        if (out_ref_kind) {
-            *out_ref_kind = source_kind ? ShadowRefKind::kSourceCandidate
-                                        : ShadowRefKind::kSelfCandidate;
-        }
-        return true;
-    }
-
     return false;
 }
 
@@ -166,11 +142,12 @@ SelectedRatioBaseline ResolveServiceableBaseline(
     int64_t bucket_id,
     const EventCalendarSpec* task_calendar,
     const std::unordered_map<std::string, RatioSeriesRuntimeState>& runtime_by_key,
-    const std::unordered_map<std::string, BaselineSourceConfig>& series_override_map) {
+    const BaselineSourceConfig* baseline_source_config) {
     SelectedRatioBaseline selected;
 
-    // T2 与 T1 共用相同的基线来源优先级：先看 self，再按静态配置尝试来源 key。
-    // 每一级都优先 formal，只有 formal 不可服务时才允许使用已训练 candidate。
+    // Sprint 20 BaselineA 对 T2 明确收口为 formal-only 来源：
+    // 先尝试 self formal，再按静态配置依次尝试 configured source formal。
+    // candidate model 仍可保留给慢路径状态观测，但不参与正式来源决策。
     auto self_it = runtime_by_key.find(key);
     if (self_it != runtime_by_key.end() &&
         PredictServiceableModel(self_it->second,
@@ -182,14 +159,14 @@ SelectedRatioBaseline ResolveServiceableBaseline(
                                 false)) {
         selected.ready = true;
         selected.provider = BaselineProvider::kFormal;
-        selected.decision.kind = BaselineSourceDecisionKind::kSelf;
+        selected.decision.selected_kind = BaselineSourceKind::kSelf;
+        selected.decision.serviceable = true;
         return selected;
     }
 
-    auto override_it = series_override_map.find(key);
-    if (override_it == series_override_map.end()) return selected;
+    if (!baseline_source_config) return selected;
 
-    for (const auto& source_ref : override_it->second) {
+    for (const auto& source_ref : baseline_source_config->sources) {
         auto source_it = runtime_by_key.find(source_ref.source_key);
         if (source_it == runtime_by_key.end()) continue;
         if (!PredictServiceableModel(source_it->second,
@@ -204,8 +181,9 @@ SelectedRatioBaseline ResolveServiceableBaseline(
 
         selected.ready = true;
         selected.provider = BaselineProvider::kSource;
-        selected.decision.kind = BaselineSourceDecisionKind::kConfiguredSource;
-        selected.decision.source_key = source_ref.source_key;
+        selected.decision.selected_kind = BaselineSourceKind::kConfiguredSource;
+        selected.decision.selected_source_key = source_ref.source_key;
+        selected.decision.serviceable = true;
         return selected;
     }
 
@@ -213,12 +191,13 @@ SelectedRatioBaseline ResolveServiceableBaseline(
 }
 
 double ComputePointScoreFromAbsResidual(double abs_residual) {
-    if (abs_residual <= kPointWarn) return 0.0;
-    return ClipUnit((abs_residual - kPointWarn) / (kPointCrit - kPointWarn));
+    const SharedProfileConfig& config = SharedConfig();
+    if (abs_residual <= config.z_warn) return 0.0;
+    return ClipUnit((abs_residual - config.z_warn) / (config.z_crit - config.z_warn));
 }
 
 double ComputeNormalizedScore(double score_point, double score_shift) {
-    return 1.0 - (1.0 - score_point) * (1.0 - kRatioShiftWeight * score_shift);
+    return 1.0 - (1.0 - score_point) * (1.0 - SharedConfig().w_shift * score_shift);
 }
 
 BaselineReasonCode DriftReasonCode(DriftDirection direction) {
@@ -233,6 +212,122 @@ BaselineReasonCode DriftReasonCode(DriftDirection direction) {
     return BaselineReasonCode::kUnknown;
 }
 
+BaselineStringRef StringRefOf(const std::string& value) {
+    if (value.empty()) return BaselineStringRef{};
+    return BaselineStringRef{value.c_str(), static_cast<uint32_t>(value.size())};
+}
+
+void FillResultIdentity(const RatioDetectorCoreSpec& spec,
+                        const RatioFeatureProfile& profile,
+                        const RatioObservation& obs,
+                        DetectorResult* out) {
+    if (!out) return;
+    out->key = obs.key;
+    out->feature = StringRefOf(spec.routed_feature_id);
+    out->feature_type = StringRefOf(profile.feature_type);
+    out->ts = obs.bucket_id;
+}
+
+BaselineSourceKind SourceKindFromShadowRef(ShadowRefKind kind) {
+    return ShadowRefUsesSource(kind) ? BaselineSourceKind::kConfiguredSource
+                                     : BaselineSourceKind::kSelf;
+}
+
+BaselineModelState EvidenceModelState(const std::string& model_state) {
+    if (model_state == "cold_start") return BaselineModelState::kColdStart;
+    if (model_state == "shadow_self" || model_state == "shadow_source") {
+        return BaselineModelState::kShadow;
+    }
+    if (model_state == "serviceable_source") {
+        return BaselineModelState::kConfiguredSource;
+    }
+    if (model_state == "candidate_self" || model_state == "candidate_source") {
+        return BaselineModelState::kCandidate;
+    }
+    if (model_state == "serviceable_self") {
+        return BaselineModelState::kFormal;
+    }
+    return BaselineModelState::kUnknown;
+}
+
+double DriftDirectionSign(DriftDirection direction) {
+    switch (direction) {
+        case DriftDirection::kUp:
+            return 1.0;
+        case DriftDirection::kDown:
+            return -1.0;
+        case DriftDirection::kNone:
+            break;
+    }
+    return 0.0;
+}
+
+double ClipProbability(double value) {
+    return std::min(1.0 - kRatioClipEps, std::max(kRatioClipEps, value));
+}
+
+double Logit(double value) {
+    const double clipped = ClipProbability(value);
+    return std::log(clipped / (1.0 - clipped));
+}
+
+double ComputeSmoothedRatio(const RatioObservation& obs,
+                            const RatioFormalModel& model) {
+    return ClipProbability((obs.numerator + model.alpha0) /
+                           (obs.denominator + model.alpha0 + model.beta0));
+}
+
+double ComputeEffectiveVariance(const RatioFeatureProfile& profile,
+                                const T2ProfileConfig& profile_config,
+                                double denominator,
+                                double p_hat_t) {
+    const double var_ideal = denominator * p_hat_t * (1.0 - p_hat_t);
+    const double var_model = var_ideal * profile.phi_over;
+    return std::max(profile_config.v_floor, var_model);
+}
+
+void FillRatioEvidence(DetectorResult* out,
+                       const RatioSeriesRuntimeState& runtime_state,
+                       const RatioObservation& obs,
+                       double p_smooth,
+                       double x_t,
+                       double p_hat_t,
+                       double var_eff_t,
+                       double r_t,
+                       double rho_t,
+                       double score_point,
+                       double score_shift,
+                       bool shadow_active) {
+    if (!out) return;
+
+    out->evidence.kind = BaselineEvidenceKind::kRatio;
+    out->evidence.ratio = RatioEvidence{};
+
+    RatioEvidence& evidence = out->evidence.ratio;
+    evidence.numerator = obs.numerator;
+    evidence.denominator = obs.denominator;
+    evidence.p_smooth = p_smooth;
+    evidence.x_t = x_t;
+    evidence.p_hat_t = p_hat_t;
+    evidence.var_eff_t = var_eff_t;
+    evidence.r_t = r_t;
+    evidence.rho_t = rho_t;
+    evidence.p_shift_t = runtime_state.last_p_shift;
+    evidence.dir_t = DriftDirectionSign(runtime_state.drift_state.direction);
+    evidence.score_point = score_point;
+    evidence.score_shift = score_shift;
+    evidence.baseline_source_kind = runtime_state.baseline_source.selected_kind;
+    evidence.model_state = EvidenceModelState(runtime_state.model_state);
+    evidence.shadow_active = shadow_active;
+
+    if (runtime_state.baseline_source.selected_kind == BaselineSourceKind::kConfiguredSource &&
+        !runtime_state.baseline_source.selected_source_key.empty()) {
+        evidence.field_flags |= kBaselineEvidenceHasSourceKey;
+        evidence.baseline_source_key =
+            StringRefOf(runtime_state.baseline_source.selected_source_key);
+    }
+}
+
 }  // namespace
 
 RatioDetectorCore::RatioDetectorCore(const RatioDetectorCoreSpec& spec)
@@ -243,8 +338,10 @@ RatioDetectorCore::RatioDetectorCore(const RatioDetectorCoreSpec& spec)
         profile_.feature_profile = spec_.feature_profile;
     }
 
-    for (const auto& series_override : spec_.series_overrides) {
-        series_override_map_.emplace(series_override.key, series_override.baseline_sources);
+    // 本 core 的 feature 固定，来源配置必须按运行时 key 单独生效，
+    // 避免一个 task 下未配置的 key 误借用其他 key 的基线来源。
+    for (const auto& source_config : spec_.baseline_source_configs) {
+        baseline_source_config_by_key_.emplace(source_config.key, source_config.config);
     }
 }
 
@@ -253,16 +350,19 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
     if (!out_submit) return error::BAD_REQUEST;
     *out_submit = DetectorSubmitOutput{};
     out_submit->rebuild_intent.routed_feature_id = spec_.routed_feature_id;
+    FillResultIdentity(spec_, profile_, obs, &out_submit->detector_result);
 
     std::string err;
     int rc = ValidateObservation(profile_, obs, &err);
     if (rc != error::OK) {
         FillBadRequestResult(&out_submit->detector_result);
+        FillResultIdentity(spec_, profile_, obs, &out_submit->detector_result);
         return rc;
     }
 
     const double observed_ratio = ComputeObservedRatio(obs);
     const double rho_t = ComputeRho(profile_, obs.denominator);
+    const bool gate_train = obs.denominator >= static_cast<double>(profile_.d_min_train);
     const bool gate_score = obs.denominator >= static_cast<double>(profile_.d_score_min);
     const bool gate_shift = obs.denominator >= static_cast<double>(profile_.d_shift_min);
     const std::string key = CopyKey(obs.key);
@@ -287,7 +387,7 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
     out_submit->detector_result.confidence = 0.0;
     out_submit->detector_result.direction = BaselineDirection::kUnknown;
     out_submit->detector_result.severity = BaselineSeverity::kInfo;
-    out_submit->detector_result.provider = BaselineProvider::kFormal;
+    out_submit->detector_result.provider = BaselineProvider::kNone;
     out_submit->detector_result.reason = BaselineReasonCode::kUnknown;
 
     bool enqueue_rebuild = false;
@@ -295,15 +395,23 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
     {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
         auto& runtime_state = runtime_by_key_[key];
+        UpdateCoverageStats(&runtime_state.readiness_state, obs.bucket_id, gate_train);
+        double p_smooth = 0.0;
+        double x_t = 0.0;
+        double p_hat_t = 0.0;
+        double var_eff_t = 0.0;
         double residual = 0.0;
         double score_point = 0.0;
         double score_shift = 0.0;
         DriftDirection drift_direction = runtime_state.drift_state.direction;
         bool serviceable = false;
         bool shadow_active = false;
-        BaselineProvider confidence_provider = BaselineProvider::kFormal;
+        T2ProfileConfig profile_config;
+        (void)GetT2ProfileConfig(profile_.feature_profile, &profile_config);
+        const SharedProfileConfig& shared_config = SharedConfig();
+        const DriftConfig& drift_config = shared_config.drift;
 
-        if (runtime_state.shadow_state.active && update.gap > kDriftConfig.g_reset) {
+        if (runtime_state.shadow_state.active && update.gap > drift_config.g_reset) {
             runtime_state.shadow_state.Reset();
         }
 
@@ -319,43 +427,42 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
                 shadow_prediction.ready) {
                 serviceable = true;
                 shadow_active = true;
-                const double p_shadow =
-                    std::min(1.0 - 1e-6,
-                             std::max(1e-6,
-                                      shadow_prediction.value + runtime_state.shadow_state.delta));
-                const double shadow_var = std::max(
-                    kRatioVarianceFloor,
-                    profile_.phi_over * obs.denominator * p_shadow * (1.0 - p_shadow));
+                const RatioFormalModel& shadow_model =
+                    *runtime_state.shadow_state.frozen_ref_model;
+                p_smooth = ComputeSmoothedRatio(obs, shadow_model);
+                x_t = Logit(p_smooth);
+                p_hat_t = ClipProbability(
+                    shadow_prediction.value + runtime_state.shadow_state.delta);
+                var_eff_t = ComputeEffectiveVariance(
+                    profile_, profile_config, obs.denominator, p_hat_t);
                 residual =
-                    (obs.numerator - obs.denominator * p_shadow) / std::sqrt(shadow_var);
+                    (obs.numerator - obs.denominator * p_hat_t) / std::sqrt(var_eff_t);
 
                 runtime_state.model_state =
                     ShadowRefUsesSource(runtime_state.shadow_state.ref_kind)
                         ? "shadow_source"
                         : "shadow_self";
-                runtime_state.baseline_source.kind =
-                    ShadowRefUsesSource(runtime_state.shadow_state.ref_kind)
-                        ? BaselineSourceDecisionKind::kConfiguredSource
-                        : BaselineSourceDecisionKind::kSelf;
-                runtime_state.baseline_source.source_key =
+                runtime_state.baseline_source.selected_kind =
+                    SourceKindFromShadowRef(runtime_state.shadow_state.ref_kind);
+                runtime_state.baseline_source.selected_source_key =
                     runtime_state.shadow_state.ref_source_key;
+                runtime_state.baseline_source.serviceable = true;
                 out_submit->detector_result.provider = BaselineProvider::kShadow;
                 out_submit->detector_result.flags |= kBaselineFlagShadowActive;
-                confidence_provider =
-                    ShadowRefUsesSource(runtime_state.shadow_state.ref_kind)
-                        ? BaselineProvider::kSource
-                        : BaselineProvider::kFormal;
+                RefreshOnlineReadiness(&runtime_state.readiness_state,
+                                       shared_config,
+                                       shadow_prediction.readiness,
+                                       runtime_state.baseline_source.selected_kind);
 
                 if (gate_score) {
                     out_submit->detector_result.raw_score =
                         std::fabs(residual) / kShadowScoreScale;
                     score_point = ComputePointScoreFromAbsResidual(
                         out_submit->detector_result.raw_score);
-
-                    runtime_state.shadow_state.delta =
-                        (1.0 - kDriftConfig.alpha) * runtime_state.shadow_state.delta +
-                        kDriftConfig.alpha * (observed_ratio - shadow_prediction.value);
                 }
+                runtime_state.shadow_state.delta =
+                    (1.0 - drift_config.alpha) * runtime_state.shadow_state.delta +
+                    drift_config.alpha * (observed_ratio - shadow_prediction.value);
                 runtime_state.shadow_state.last_bucket_id = obs.bucket_id;
             } else {
                 runtime_state.shadow_state.Reset();
@@ -365,28 +472,36 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
         if (!serviceable) {
             // 常态路径先决出“当前 bucket 用谁来解释”，然后才进入残差 / 漂移评分。
             // 如果 self 与 source 都不可服务，热路径只推进公共时序状态，不制造伪异常。
+            const BaselineSourceConfig* baseline_source_config = nullptr;
+            auto source_config_it = baseline_source_config_by_key_.find(key);
+            if (source_config_it != baseline_source_config_by_key_.end()) {
+                baseline_source_config = &source_config_it->second;
+            }
             const SelectedRatioBaseline selected = ResolveServiceableBaseline(
                 key,
                 obs.bucket_id,
                 TaskEventCalendar(spec_),
                 runtime_by_key_,
-                series_override_map_);
+                baseline_source_config);
             runtime_state.baseline_source = selected.decision;
             if (selected.ready) {
                 serviceable = true;
-                const double p_hat =
-                    std::min(1.0 - 1e-6, std::max(1e-6, selected.prediction.value));
-                const double var_eff = std::max(
-                    kRatioVarianceFloor,
-                    profile_.phi_over * obs.denominator * p_hat * (1.0 - p_hat));
-                residual =
-                    (obs.numerator - obs.denominator * p_hat) / std::sqrt(var_eff);
                 runtime_state.model_state =
-                    selected.decision.kind == BaselineSourceDecisionKind::kSelf
+                    selected.decision.selected_kind == BaselineSourceKind::kSelf
                         ? "serviceable_self"
                         : "serviceable_source";
                 out_submit->detector_result.provider = selected.provider;
-                confidence_provider = selected.provider;
+                p_smooth = ComputeSmoothedRatio(obs, *selected.model);
+                x_t = Logit(p_smooth);
+                p_hat_t = ClipProbability(selected.prediction.value);
+                var_eff_t = ComputeEffectiveVariance(
+                    profile_, profile_config, obs.denominator, p_hat_t);
+                residual =
+                    (obs.numerator - obs.denominator * p_hat_t) / std::sqrt(var_eff_t);
+                RefreshOnlineReadiness(&runtime_state.readiness_state,
+                                       shared_config,
+                                       selected.prediction.readiness,
+                                       selected.decision.selected_kind);
 
                 if (gate_score) {
                     out_submit->detector_result.raw_score = std::fabs(residual);
@@ -396,7 +511,7 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
 
                 const DriftUpdateResult drift_result = UpdateDriftState(
                     &runtime_state.drift_state,
-                    kDriftConfig,
+                    drift_config,
                     obs.bucket_id,
                     residual,
                     gate_shift);
@@ -404,27 +519,27 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
                 runtime_state.last_shift_confirmed = drift_result.shift_confirmed;
                 drift_direction = drift_result.direction;
                 score_shift =
-                    ClipUnit((drift_result.p_shift - kDriftConfig.p_shift_low) /
-                             (kDriftConfig.p_shift_high - kDriftConfig.p_shift_low));
+                    ClipUnit((drift_result.p_shift - drift_config.p_shift_low) /
+                             (drift_config.p_shift_high - drift_config.p_shift_low));
 
                 // 漂移确认时先启用 shadow 桥接，并把重建起点近似回退到连续确认段开头。
                 // 这样慢路径可以尽量多看到“新阶段”样本，而不是继续被旧阶段稀释。
                 if (drift_result.shift_confirmed &&
-                    runtime_state.drift_state.confirm_count >= kMinShiftConfirmForRebuild &&
+                    runtime_state.drift_state.confirm_count >= drift_config.m_shift &&
                     !runtime_state.shadow_state.active &&
                     !runtime_state.shift_rebuild_pending &&
                     selected.model) {
                     runtime_state.shadow_state.active = true;
                     runtime_state.shadow_state.ref_kind = selected.shadow_ref_kind;
                     runtime_state.shadow_state.ref_source_key =
-                        selected.decision.kind == BaselineSourceDecisionKind::kConfiguredSource
-                            ? selected.decision.source_key
+                        selected.decision.selected_kind ==
+                                BaselineSourceKind::kConfiguredSource
+                            ? selected.decision.selected_source_key
                             : "";
                     runtime_state.shadow_state.ref_model_version =
                         selected.prediction.model_version;
                     runtime_state.shadow_state.frozen_ref_model = selected.model;
-                    runtime_state.shadow_state.delta =
-                        observed_ratio - selected.prediction.value;
+                    runtime_state.shadow_state.delta = observed_ratio - p_hat_t;
                     runtime_state.shadow_state.last_bucket_id = obs.bucket_id;
                     runtime_state.model_state =
                         ShadowRefUsesSource(selected.shadow_ref_kind)
@@ -443,15 +558,17 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
                     out_submit->detector_result.raw_score = 0.0;
                     score_point = 0.0;
                     shadow_active = true;
-                    confidence_provider =
-                        ShadowRefUsesSource(selected.shadow_ref_kind)
-                            ? BaselineProvider::kSource
-                            : BaselineProvider::kFormal;
                 }
             } else {
                 runtime_state.model_state = "cold_start";
+                runtime_state.baseline_source = BaselineSourceDecision{};
                 runtime_state.last_p_shift = 0.0;
                 runtime_state.last_shift_confirmed = false;
+                RefreshOnlineReadiness(&runtime_state.readiness_state,
+                                       shared_config,
+                                       ModelReadiness::kNotReady,
+                                       BaselineSourceKind::kNone);
+                out_submit->detector_result.provider = BaselineProvider::kNone;
             }
         }
 
@@ -472,13 +589,25 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
             out_submit->detector_result.severity = SeverityFromNormalizedScore(
                 out_submit->detector_result.normalized_score);
 
-            const double confidence_base =
-                shadow_active
-                    ? std::min(ConfidenceBaseForProvider(confidence_provider),
-                               kShadowConfidenceCap)
-                    : ConfidenceBaseForProvider(confidence_provider);
+            double confidence_base = runtime_state.readiness_state.confidence_base;
+            if (shadow_active) {
+                confidence_base = std::min(confidence_base, kShadowConfidenceCap);
+            }
             out_submit->detector_result.confidence =
                 confidence_base / std::max(rho_t, 1.0);
+
+            FillRatioEvidence(&out_submit->detector_result,
+                              runtime_state,
+                              obs,
+                              p_smooth,
+                              x_t,
+                              p_hat_t,
+                              var_eff_t,
+                              residual,
+                              rho_t,
+                              score_point,
+                              score_shift,
+                              shadow_active);
         }
 
         runtime_state.last_numerator = obs.numerator;
@@ -643,7 +772,8 @@ void RatioDetectorCore::MarkRebuildFailure(const DetectorRebuildFailure& failure
         failure.candidate_state.empty() ? "fetch_failed" : failure.candidate_state;
     runtime_state.formal_state.candidate_model_version = 0;
     runtime_state.formal_state.candidate_model_kind = "none";
-    runtime_state.formal_state.switch_state = "none";
+    runtime_state.formal_state.switch_state =
+        failure.switch_state.empty() ? "none" : failure.switch_state;
     runtime_state.formal_state.last_candidate_loss = 0.0;
     runtime_state.formal_state.last_incumbent_loss = 0.0;
     runtime_state.formal_state.last_validation_count = 0;

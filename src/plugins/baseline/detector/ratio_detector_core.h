@@ -25,6 +25,7 @@
 #include "plugins/baseline/model/formal_model.h"
 #include "plugins/baseline/model/formal_model_state.h"
 #include "plugins/baseline/model/formal_predictor.h"
+#include "plugins/baseline/model/readiness_helper.h"
 #include "plugins/baseline/model/series_override.h"
 #include "plugins/baseline/model/series_state.h"
 #include "plugins/baseline/model/series_store.h"
@@ -56,6 +57,7 @@ struct RatioSeriesRuntimeState {
     bool last_shift_confirmed = false;
     std::string model_state = "cold_start";
     BaselineSourceDecision baseline_source;
+    ReadinessState readiness_state;
     FormalModelState formal_state;
     DriftState drift_state;
     RatioShadowState shadow_state;
@@ -71,7 +73,7 @@ struct RatioDetectorCoreSpec {
     std::string feature_type;
     std::string feature_profile;
     std::optional<EventCalendarSpec> event_calendar_spec;
-    std::vector<SeriesOverride> series_overrides;
+    std::vector<SeriesBaselineSourceConfig> baseline_source_configs;
 };
 
 struct RatioSeriesSnapshot {
@@ -134,7 +136,7 @@ class RatioDetectorCore {
     SeriesStore series_store_;
     mutable std::mutex runtime_mutex_;
     std::unordered_map<std::string, RatioSeriesRuntimeState> runtime_by_key_;
-    std::unordered_map<std::string, BaselineSourceConfig> series_override_map_;
+    std::unordered_map<std::string, BaselineSourceConfig> baseline_source_config_by_key_;
 };
 
 }  // namespace baseline

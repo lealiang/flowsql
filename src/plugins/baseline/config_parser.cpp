@@ -249,6 +249,110 @@ int ParseEventCalendarSpec(const rapidjson::Value& obj,
     return error::OK;
 }
 
+int ParseBaselineSources(const rapidjson::Value& items,
+                         const std::string& self_key,
+                         const char* field_name,
+                         BaselineSourceConfig* out,
+                         std::string* err) {
+    if (!out) return error::BAD_REQUEST;
+    *out = BaselineSourceConfig{};
+    if (!items.IsArray()) {
+        if (err) *err = std::string(field_name) + " must be an array";
+        return error::BAD_REQUEST;
+    }
+    if (items.Empty()) {
+        if (err) *err = std::string(field_name) + " must not be empty";
+        return error::BAD_REQUEST;
+    }
+
+    BaselineSourceConfig config;
+    config.sources.reserve(items.Size());
+    std::unordered_set<std::string> source_keys;
+    for (rapidjson::SizeType i = 0; i < items.Size(); ++i) {
+        if (!items[i].IsObject()) {
+            if (err) *err = std::string(field_name) + " must contain objects only";
+            return error::BAD_REQUEST;
+        }
+
+        BaselineSourceRef source_ref;
+        const int rc = RequireString(items[i], "source_key", &source_ref.source_key, err);
+        if (rc != error::OK) return rc;
+        if (source_ref.source_key == self_key) {
+            if (err) *err = "baseline source must not point to self";
+            return error::BAD_REQUEST;
+        }
+        if (!source_keys.insert(source_ref.source_key).second) {
+            if (err) *err = std::string(field_name) + " must not contain duplicate source_key";
+            return error::BAD_REQUEST;
+        }
+        config.sources.push_back(std::move(source_ref));
+    }
+
+    *out = std::move(config);
+    return error::OK;
+}
+
+int ParseBaselineSourceConfigs(const rapidjson::Value& obj,
+                               std::vector<SeriesBaselineSourceConfig>* out,
+                               std::string* err) {
+    if (!out) return error::BAD_REQUEST;
+    out->clear();
+
+    if (obj.HasMember("baseline_source_config")) {
+        if (err) {
+            *err = "baseline_source_config is task-global and not supported; use baseline_source_configs";
+        }
+        return error::BAD_REQUEST;
+    }
+    if (obj.HasMember("series_overrides")) {
+        if (err) *err = "series_overrides is no longer supported; use baseline_source_configs";
+        return error::BAD_REQUEST;
+    }
+    if (!obj.HasMember("baseline_source_configs")) return error::OK;
+    if (!obj["baseline_source_configs"].IsArray()) {
+        if (err) *err = "baseline_source_configs must be an array";
+        return error::BAD_REQUEST;
+    }
+
+    const auto& entries = obj["baseline_source_configs"];
+    if (entries.Empty()) {
+        if (err) *err = "baseline_source_configs must not be empty";
+        return error::BAD_REQUEST;
+    }
+
+    std::unordered_set<std::string> keys;
+    out->reserve(entries.Size());
+    for (rapidjson::SizeType i = 0; i < entries.Size(); ++i) {
+        if (!entries[i].IsObject()) {
+            if (err) *err = "baseline_source_configs must contain objects only";
+            return error::BAD_REQUEST;
+        }
+
+        SeriesBaselineSourceConfig entry;
+        int rc = RequireString(entries[i], "key", &entry.key, err);
+        if (rc != error::OK) return rc;
+        if (!keys.insert(entry.key).second) {
+            if (err) *err = "baseline_source_configs must not contain duplicate key";
+            return error::BAD_REQUEST;
+        }
+        if (!entries[i].HasMember("baseline_sources")) {
+            if (err) *err = "missing field: baseline_sources";
+            return error::BAD_REQUEST;
+        }
+        rc = ParseBaselineSources(
+            entries[i]["baseline_sources"],
+            entry.key,
+            "baseline_sources",
+            &entry.config,
+            err);
+        if (rc != error::OK) return rc;
+
+        out->push_back(std::move(entry));
+    }
+
+    return error::OK;
+}
+
 int ParseScalarTaskInternal(const char* config_json,
                             BaselineTaskSpec* out,
                             std::string* err) {
@@ -265,74 +369,8 @@ int ParseScalarTaskInternal(const char* config_json,
     if ((rc = RequireString(doc, "feature_profile", &spec.feature_profile, err)) != error::OK) return rc;
     if ((rc = RequirePositiveInt64(doc, "delta", &spec.delta, err)) != error::OK) return rc;
     if ((rc = RequireString(doc, "tz", &spec.tz, err)) != error::OK) return rc;
+    if ((rc = ParseBaselineSourceConfigs(doc, &spec.baseline_source_configs, err)) != error::OK) return rc;
     if ((rc = ParseEventCalendarSpec(doc, &spec.event_calendar_spec, err)) != error::OK) return rc;
-
-    if (doc.HasMember("series_overrides")) {
-        if (!doc["series_overrides"].IsArray()) {
-            if (err) *err = "series_overrides must be an array";
-            return error::BAD_REQUEST;
-        }
-
-        const auto& overrides = doc["series_overrides"];
-        std::unordered_set<std::string> override_keys;
-        spec.series_overrides.reserve(overrides.Size());
-        for (rapidjson::SizeType i = 0; i < overrides.Size(); ++i) {
-            if (!overrides[i].IsObject()) {
-                if (err) *err = "series_overrides must contain objects only";
-                return error::BAD_REQUEST;
-            }
-
-            SeriesOverride series_override;
-            if ((rc = RequireString(overrides[i], "key", &series_override.key, err)) != error::OK) {
-                return rc;
-            }
-            if (!override_keys.insert(series_override.key).second) {
-                if (err) *err = "series_overrides must not contain duplicate key";
-                return error::BAD_REQUEST;
-            }
-
-            if (!overrides[i].HasMember("baseline_sources") ||
-                !overrides[i]["baseline_sources"].IsArray()) {
-                if (err) *err = "baseline_sources must be an array";
-                return error::BAD_REQUEST;
-            }
-
-            const auto& baseline_sources = overrides[i]["baseline_sources"];
-            if (baseline_sources.Empty()) {
-                if (err) *err = "baseline_sources must not be empty";
-                return error::BAD_REQUEST;
-            }
-
-            std::unordered_set<std::string> source_keys;
-            series_override.baseline_sources.reserve(baseline_sources.Size());
-            for (rapidjson::SizeType j = 0; j < baseline_sources.Size(); ++j) {
-                if (!baseline_sources[j].IsObject()) {
-                    if (err) *err = "baseline_sources must contain objects only";
-                    return error::BAD_REQUEST;
-                }
-
-                BaselineSourceRef source_ref;
-                if ((rc = RequireString(
-                         baseline_sources[j], "source_key", &source_ref.source_key, err)) != error::OK) {
-                    return rc;
-                }
-                // `self` 是隐式第一优先级，不允许在配置里再次把自己写成来源，
-                // 否则会把“回退来源”语义和“本级基线”语义混在一起。
-                if (source_ref.source_key == series_override.key) {
-                    if (err) *err = "baseline source must not point to self";
-                    return error::BAD_REQUEST;
-                }
-                if (!source_keys.insert(source_ref.source_key).second) {
-                    if (err) *err = "baseline_sources must not contain duplicate source_key";
-                    return error::BAD_REQUEST;
-                }
-
-                series_override.baseline_sources.push_back(std::move(source_ref));
-            }
-
-            spec.series_overrides.push_back(std::move(series_override));
-        }
-    }
 
     OptionalString(doc, "name", &spec.name);
     if (spec.name.empty()) spec.name = spec.feature;
@@ -452,7 +490,7 @@ int ConfigParser::ParseRatioTask(const char* config_json,
 }
 
 int ConfigParser::ParseRelationTask(const char* config_json,
-                                    RelationTaskSpec* out,
+                                    RelationTaskCreateSpec* out,
                                     std::string* err) {
     if (!out) return error::BAD_REQUEST;
 
@@ -460,7 +498,8 @@ int ConfigParser::ParseRelationTask(const char* config_json,
     int rc = ParseObject(config_json, &doc, err);
     if (rc != error::OK) return rc;
 
-    RelationTaskSpec spec;
+    RelationTaskCreateSpec create_spec;
+    RelationTaskSpec& spec = create_spec.task_spec;
     if ((rc = RequireString(doc, "feature_base", &spec.feature_base, err)) != error::OK) return rc;
     if ((rc = RequireString(doc, "group_space_id", &spec.group_space_id, err)) != error::OK) return rc;
     if ((rc = RequireString(doc, "metric_set_id", &spec.metric_set_id, err)) != error::OK) return rc;
@@ -468,17 +507,30 @@ int ConfigParser::ParseRelationTask(const char* config_json,
     if ((rc = ParseMetricList(doc, &spec.metrics, err)) != error::OK) return rc;
     if ((rc = ParseSupportPolicy(doc, &spec.support_policy, err)) != error::OK) return rc;
     if ((rc = ParseSummaryPolicy(doc, &spec.summary_policy, err)) != error::OK) return rc;
+    if ((rc = RequirePositiveInt64(doc, "delta", &create_spec.clock_spec.delta, err)) != error::OK) return rc;
+    if ((rc = RequireString(doc, "tz", &create_spec.clock_spec.tz, err)) != error::OK) return rc;
+    if ((rc = ParseEventCalendarSpec(doc, &create_spec.event_calendar_spec, err)) != error::OK) return rc;
 
     OptionalString(doc, "name", &spec.name);
-    OptionalString(doc, "group_space_version", &spec.group_space_version);
+    if (doc.HasMember("group_space_version")) {
+        std::string group_space_version;
+        if ((rc = OptionalNonEmptyString(doc, "group_space_version", &group_space_version, err)) != error::OK) {
+            return rc;
+        }
+        if (!group_space_version.empty()) spec.group_space_version = group_space_version;
+    }
     if (!IsAllowedValue(spec.encode_type, {"exact_sparse", "topk_other"})) {
         if (err) *err = "relation encode_type must be exact_sparse or topk_other";
+        return error::BAD_REQUEST;
+    }
+    if (spec.support_policy.k_support < spec.summary_policy.k_stable) {
+        if (err) *err = "support_policy.k_support must be >= summary_policy.k_stable";
         return error::BAD_REQUEST;
     }
     if (spec.name.empty()) spec.name = spec.feature_base;
     spec.config_json = config_json;
 
-    *out = std::move(spec);
+    *out = std::move(create_spec);
     return error::OK;
 }
 

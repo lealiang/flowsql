@@ -25,7 +25,7 @@ class ConfigParser {
                               BaselineTaskSpec* out,
                               std::string* err);
     static int ParseRelationTask(const char* config_json,
-                                 RelationTaskSpec* out,
+                                 RelationTaskCreateSpec* out,
                                  std::string* err);
 };
 

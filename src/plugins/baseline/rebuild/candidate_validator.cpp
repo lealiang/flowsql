@@ -8,11 +8,13 @@
 
 #include "candidate_validator.h"
 
+#include <algorithm>
 #include <common/error_code.h>
 
 #include <cmath>
 
 #include "plugins/baseline/model/formal_predictor.h"
+#include "plugins/baseline/model/profile_config.h"
 
 namespace flowsql {
 namespace baseline {
@@ -22,8 +24,7 @@ namespace {
 constexpr double kHuberDelta = 1.5;
 constexpr double kShadowAlpha = 0.2;
 constexpr double kRatioVarianceFloor = 0.25;
-constexpr double kSwitchEps = 0.05;
-
+constexpr double kSwitchLossAbsTol = 1e-12;
 double HuberLoss(double residual) {
     const double abs_residual = std::fabs(residual);
     if (abs_residual <= kHuberDelta) {
@@ -66,10 +67,14 @@ CandidateValidationResult FinalizeValidationResult(CandidateValidationResult res
         return result;
     }
 
+    const SharedProfileConfig shared_config = DefaultSharedProfileConfig();
     // 切换判定不要求 candidate 严格优于 incumbent。
-    // 这里保留一个很小的工程容忍带，避免因为有限 holdout、shadow 近似 replay
-    // 或数值抖动导致频繁拒绝本来已经足够好的新模型。
-    result.pass = result.candidate_loss <= (1.0 + kSwitchEps) * result.incumbent_loss;
+    // 当两边 holdout 损失都已经接近 0 时，纯相对比较会被浮点噪声放大，
+    // 使“数值上等价”的候选模型被误拒绝。这里补一个极小的绝对容忍带，
+    // 仅用于 near-zero 区间稳定 formal switch，不改变正常量级下的相对判定语义。
+    const double tolerance =
+        std::max(kSwitchLossAbsTol, shared_config.eps_switch * result.incumbent_loss);
+    result.pass = result.candidate_loss <= (result.incumbent_loss + tolerance);
     result.status = result.pass ? CandidateValidationStatus::kPassed
                                 : CandidateValidationStatus::kFailed;
     return result;
@@ -289,6 +294,22 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
             (point.numerator - point.denominator * incumbent_p) / std::sqrt(var_incumbent));
         ++result.validation_count;
     }
+    return FinalizeValidationResult(result);
+}
+
+CandidateValidationResult CandidateValidator::ValidateRelationAggregate(
+    double candidate_loss_sum,
+    double incumbent_loss_sum,
+    uint64_t validation_feature_count) {
+    CandidateValidationResult result;
+    result.validation_count = validation_feature_count;
+
+    if (validation_feature_count > 0) {
+        const double denom = static_cast<double>(validation_feature_count);
+        result.candidate_loss = candidate_loss_sum / denom;
+        result.incumbent_loss = incumbent_loss_sum / denom;
+    }
+
     return FinalizeValidationResult(result);
 }
 

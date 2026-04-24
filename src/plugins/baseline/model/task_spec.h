@@ -28,8 +28,8 @@ struct BaselineTaskSpec {
     std::string feature_profile;
     int64_t delta = 0;
     std::string tz;
+    std::vector<SeriesBaselineSourceConfig> baseline_source_configs;
     std::optional<EventCalendarSpec> event_calendar_spec;
-    std::vector<SeriesOverride> series_overrides;
     std::string config_json;
 };
 
@@ -49,13 +49,24 @@ struct RelationTaskSpec {
     std::string name;
     std::string feature_base;
     std::string group_space_id;
-    std::string group_space_version;
+    std::optional<std::string> group_space_version;
     std::string metric_set_id;
     std::vector<std::string> metrics;
     std::string encode_type;
     RelationSupportPolicySpec support_policy;
     RelationSummaryPolicySpec summary_policy;
     std::string config_json;
+};
+
+struct RelationTaskClockSpec {
+    int64_t delta = 0;
+    std::string tz;
+};
+
+struct RelationTaskCreateSpec {
+    RelationTaskSpec task_spec;
+    RelationTaskClockSpec clock_spec;
+    std::optional<EventCalendarSpec> event_calendar_spec;
 };
 
 }  // namespace baseline

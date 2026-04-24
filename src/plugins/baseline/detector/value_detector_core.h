@@ -26,6 +26,7 @@
 #include "plugins/baseline/model/formal_model.h"
 #include "plugins/baseline/model/formal_model_state.h"
 #include "plugins/baseline/model/formal_predictor.h"
+#include "plugins/baseline/model/readiness_helper.h"
 #include "plugins/baseline/model/series_override.h"
 #include "plugins/baseline/model/series_state.h"
 #include "plugins/baseline/model/series_store.h"
@@ -50,7 +51,7 @@ struct ValueFeatureProfile {
 // 是为了后续按设计切换变换函数时，不需要回退到 task 层改调用链。
 inline double TransformValueObservation(const ValueFeatureProfile& profile,
                                         double value) {
-    (void)profile;
+    if (profile.transform_name == "identity") return value;
     return std::log1p(value);
 }
 
@@ -65,6 +66,7 @@ struct ValueSeriesRuntimeState {
     bool last_shift_confirmed = false;
     std::string model_state = "cold_start";
     BaselineSourceDecision baseline_source;
+    ReadinessState readiness_state;
     FormalModelState formal_state;
     DriftState drift_state;
     ValueShadowState shadow_state;
@@ -79,8 +81,9 @@ struct ValueDetectorCoreSpec {
     std::string routed_feature_id;
     std::string feature_type;
     std::string feature_profile;
+    std::optional<std::string> transform_kind;
     std::optional<EventCalendarSpec> event_calendar_spec;
-    std::vector<SeriesOverride> series_overrides;
+    std::vector<SeriesBaselineSourceConfig> baseline_source_configs;
 };
 
 struct ValueSeriesSnapshot {
@@ -143,7 +146,7 @@ class ValueDetectorCore {
     SeriesStore series_store_;
     mutable std::mutex runtime_mutex_;
     std::unordered_map<std::string, ValueSeriesRuntimeState> runtime_by_key_;
-    std::unordered_map<std::string, BaselineSourceConfig> series_override_map_;
+    std::unordered_map<std::string, BaselineSourceConfig> baseline_source_config_by_key_;
 };
 
 }  // namespace baseline

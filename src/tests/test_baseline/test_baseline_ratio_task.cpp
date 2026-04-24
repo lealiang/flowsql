@@ -7,6 +7,7 @@
  */
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -22,6 +23,48 @@ namespace {
 
 static BaselineStringRef Ref(const char* s) {
     return BaselineStringRef{s, static_cast<uint32_t>(std::char_traits<char>::length(s))};
+}
+
+static bool NearlyEqual(double lhs, double rhs, double eps = 1e-9) {
+    return std::fabs(lhs - rhs) <= eps;
+}
+
+static double Logit(double p) {
+    return std::log(p / (1.0 - p));
+}
+
+static std::shared_ptr<RatioFormalModel> BuildFormalModel(
+    double p_hat,
+    uint64_t version,
+    ModelReadiness readiness = ModelReadiness::kMonthposReady) {
+    auto model = std::make_shared<RatioFormalModel>();
+    model->metadata.kind = FormalModelKind::kRatioBaseline;
+    model->metadata.model_version = version;
+    model->readiness = readiness;
+    model->transform_name = "logit";
+    model->delta = 60;
+    model->tz = "UTC";
+    model->train_start = 0;
+    model->train_end = 0;
+    model->feature_profile = "rate_core";
+    model->m0 = p_hat;
+    model->alpha0 = 2.0 * p_hat;
+    model->beta0 = 2.0 * (1.0 - p_hat);
+    model->confidence_base_at_train = 1.0;
+    model->core_block.beta0 = Logit(p_hat);
+    return model;
+}
+
+static void ApplyFormalModel(RatioDetectorCore* core,
+                             const char* key,
+                             std::shared_ptr<RatioFormalModel> model) {
+    assert(core != nullptr);
+    RatioApplyFormalModelResult apply_result;
+    apply_result.candidate_trained = true;
+    apply_result.candidate_generation = model ? model->metadata.model_version : 0;
+    apply_result.switch_state = "formal_apply";
+    apply_result.full_model = std::move(model);
+    core->ApplyFormalModel(key, apply_result);
 }
 
 static void TestRatioDetectorCoreSubmitAndSnapshot() {
@@ -87,11 +130,200 @@ static void TestRatioDetectorCoreMarkRebuildFailure() {
     std::printf("[PASS] RatioDetectorCore rebuild failure snapshot\n");
 }
 
+static void TestRatioDetectorCoreRatioEvidenceAndIdentity() {
+    std::printf("[TEST] RatioDetectorCore ratio evidence and identity...\n");
+
+    RatioDetectorCoreSpec spec;
+    spec.owner_task_id = "ratio-task-3";
+    spec.routed_feature_id = "svc_success_rate";
+    spec.feature_type = "t2";
+    spec.feature_profile = "rate_core";
+
+    RatioDetectorCore core(spec);
+    ApplyFormalModel(&core, "svc-c", BuildFormalModel(0.8, 1));
+
+    DetectorSubmitOutput submit;
+    const RatioObservation obs{Ref("svc-c"), 20, 90.0, 100.0};
+    assert(core.Submit(obs, &submit) == error::OK);
+
+    const double p_smooth = (90.0 + 1.6) / (100.0 + 1.6 + 0.4);
+    const double x_t = Logit(p_smooth);
+    const double var_eff = 1.5 * 100.0 * 0.8 * 0.2;
+    const double r_t = (90.0 - 100.0 * 0.8) / std::sqrt(var_eff);
+    const double rho_t = std::sqrt(1.0 + 50.0 / 100.0);
+
+    assert(submit.detector_result.status == error::OK);
+    assert(submit.detector_result.key.data != nullptr);
+    assert(std::string(submit.detector_result.key.data,
+                       submit.detector_result.key.size) == "svc-c");
+    assert(submit.detector_result.feature.data != nullptr);
+    assert(std::string(submit.detector_result.feature.data,
+                       submit.detector_result.feature.size) == "svc_success_rate");
+    assert(submit.detector_result.feature_type.data != nullptr);
+    assert(std::string(submit.detector_result.feature_type.data,
+                       submit.detector_result.feature_type.size) == "t2");
+    assert(submit.detector_result.ts == 20);
+    assert(submit.detector_result.provider == BaselineProvider::kFormal);
+    assert(NearlyEqual(submit.detector_result.confidence, 1.0 / rho_t));
+    assert(submit.detector_result.evidence.kind == BaselineEvidenceKind::kRatio);
+    assert(NearlyEqual(submit.detector_result.evidence.ratio.numerator, 90.0));
+    assert(NearlyEqual(submit.detector_result.evidence.ratio.denominator, 100.0));
+    assert(NearlyEqual(submit.detector_result.evidence.ratio.p_smooth, p_smooth));
+    assert(NearlyEqual(submit.detector_result.evidence.ratio.x_t, x_t));
+    assert(NearlyEqual(submit.detector_result.evidence.ratio.p_hat_t, 0.8));
+    assert(NearlyEqual(submit.detector_result.evidence.ratio.var_eff_t, var_eff));
+    assert(NearlyEqual(submit.detector_result.evidence.ratio.r_t, r_t));
+    assert(NearlyEqual(submit.detector_result.evidence.ratio.rho_t, rho_t));
+    assert(submit.detector_result.evidence.ratio.baseline_source_kind ==
+           BaselineSourceKind::kSelf);
+    assert(submit.detector_result.evidence.ratio.model_state ==
+           BaselineModelState::kFormal);
+    assert(!submit.detector_result.evidence.ratio.shadow_active);
+
+    std::printf("[PASS] RatioDetectorCore ratio evidence and identity\n");
+}
+
+static void TestRatioDetectorCoreConfiguredSourceConfidence() {
+    std::printf("[TEST] RatioDetectorCore configured source confidence...\n");
+
+    RatioDetectorCoreSpec spec;
+    spec.owner_task_id = "ratio-task-4";
+    spec.routed_feature_id = "svc_success_rate";
+    spec.feature_type = "t2";
+    spec.feature_profile = "rate_core";
+    SeriesBaselineSourceConfig source_config;
+    source_config.key = "svc-target";
+    source_config.config.sources.push_back(BaselineSourceRef{"svc-source"});
+    spec.baseline_source_configs.push_back(source_config);
+
+    RatioDetectorCore core(spec);
+    ApplyFormalModel(&core, "svc-source", BuildFormalModel(0.7, 1));
+
+    DetectorSubmitOutput submit;
+    const RatioObservation obs{Ref("svc-target"), 40, 70.0, 100.0};
+    assert(core.Submit(obs, &submit) == error::OK);
+
+    const double rho_t = std::sqrt(1.0 + 50.0 / 100.0);
+    assert(submit.detector_result.provider == BaselineProvider::kSource);
+    assert(NearlyEqual(submit.detector_result.confidence, 0.8 / rho_t));
+    assert(submit.detector_result.evidence.kind == BaselineEvidenceKind::kRatio);
+    assert((submit.detector_result.evidence.ratio.field_flags &
+            kBaselineEvidenceHasSourceKey) != 0);
+    assert(submit.detector_result.evidence.ratio.baseline_source_kind ==
+           BaselineSourceKind::kConfiguredSource);
+    assert(submit.detector_result.evidence.ratio.baseline_source_key.data != nullptr);
+    assert(std::string(submit.detector_result.evidence.ratio.baseline_source_key.data,
+                       submit.detector_result.evidence.ratio.baseline_source_key.size) ==
+           "svc-source");
+    assert(submit.detector_result.evidence.ratio.model_state ==
+           BaselineModelState::kConfiguredSource);
+
+    std::printf("[PASS] RatioDetectorCore configured source confidence\n");
+}
+
+static void TestRatioDetectorCoreProfileDifferenceIsEffective() {
+    std::printf("[TEST] RatioDetectorCore profile difference is effective...\n");
+
+    RatioDetectorCoreSpec rate_spec;
+    rate_spec.owner_task_id = "ratio-task-4a";
+    rate_spec.routed_feature_id = "svc_success_rate";
+    rate_spec.feature_type = "t2";
+    rate_spec.feature_profile = "rate_core";
+
+    RatioDetectorCoreSpec bursty_spec = rate_spec;
+    bursty_spec.owner_task_id = "ratio-task-4b";
+    bursty_spec.feature_profile = "ratio_bursty";
+
+    RatioDetectorCore rate_core(rate_spec);
+    RatioDetectorCore ratio_bursty(bursty_spec);
+    ApplyFormalModel(&rate_core, "svc-profile", BuildFormalModel(0.5, 1));
+    ApplyFormalModel(&ratio_bursty, "svc-profile", BuildFormalModel(0.5, 1));
+
+    DetectorSubmitOutput rate_submit;
+    DetectorSubmitOutput bursty_submit;
+    const RatioObservation obs{Ref("svc-profile"), 45, 30.0, 40.0};
+    assert(rate_core.Submit(obs, &rate_submit) == error::OK);
+    assert(ratio_bursty.Submit(obs, &bursty_submit) == error::OK);
+
+    const double rate_rho = std::sqrt(1.0 + 50.0 / 40.0);
+    const double bursty_rho = std::sqrt(1.0 + 100.0 / 40.0);
+    assert(rate_submit.detector_result.raw_score > 0.0);
+    assert(bursty_submit.detector_result.raw_score == 0.0);
+    assert(NearlyEqual(rate_submit.detector_result.confidence, 0.7 / rate_rho));
+    assert(NearlyEqual(bursty_submit.detector_result.confidence, 0.7 / bursty_rho));
+    assert(rate_submit.detector_result.confidence > bursty_submit.detector_result.confidence);
+
+    std::printf("[PASS] RatioDetectorCore profile difference is effective\n");
+}
+
+static void TestRatioDetectorCoreColdStartUsesNoneProvider() {
+    std::printf("[TEST] RatioDetectorCore cold start uses none provider...\n");
+
+    RatioDetectorCoreSpec spec;
+    spec.owner_task_id = "ratio-task-5";
+    spec.routed_feature_id = "svc_success_rate";
+    spec.feature_type = "t2";
+    spec.feature_profile = "rate_core";
+
+    RatioDetectorCore core(spec);
+
+    DetectorSubmitOutput submit;
+    const RatioObservation obs{Ref("svc-none"), 50, 8.0, 10.0};
+    assert(core.Submit(obs, &submit) == error::OK);
+
+    assert(submit.detector_result.provider == BaselineProvider::kNone);
+    assert(submit.detector_result.raw_score == 0.0);
+    assert(submit.detector_result.normalized_score == 0.0);
+    assert(submit.detector_result.confidence == 0.0);
+    assert(submit.detector_result.reason_code == BaselineReasonCode::kUnknown);
+    assert(submit.detector_result.evidence.kind == BaselineEvidenceKind::kNone);
+
+    std::printf("[PASS] RatioDetectorCore cold start uses none provider\n");
+}
+
+static void TestRatioDetectorCoreShadowConfidenceAndReason() {
+    std::printf("[TEST] RatioDetectorCore shadow confidence and reason...\n");
+
+    RatioDetectorCoreSpec spec;
+    spec.owner_task_id = "ratio-task-6";
+    spec.routed_feature_id = "svc_success_rate";
+    spec.feature_type = "t2";
+    spec.feature_profile = "rate_core";
+
+    RatioDetectorCore core(spec);
+    ApplyFormalModel(&core, "svc-shadow", BuildFormalModel(0.1, 1));
+
+    DetectorSubmitOutput first;
+    DetectorSubmitOutput second;
+    DetectorSubmitOutput third;
+    assert(core.Submit(RatioObservation{Ref("svc-shadow"), 201, 90.0, 100.0}, &first) == error::OK);
+    assert(core.Submit(RatioObservation{Ref("svc-shadow"), 202, 90.0, 100.0}, &second) == error::OK);
+    assert(core.Submit(RatioObservation{Ref("svc-shadow"), 203, 90.0, 100.0}, &third) == error::OK);
+
+    const double rho_t = std::sqrt(1.0 + 50.0 / 100.0);
+    assert((first.detector_result.flags & kBaselineFlagShadowActive) == 0);
+    assert((second.detector_result.flags & kBaselineFlagShadowActive) == 0);
+    assert((third.detector_result.flags & kBaselineFlagShadowActive) != 0);
+    assert(third.detector_result.provider == BaselineProvider::kShadow);
+    assert(NearlyEqual(third.detector_result.confidence, 0.8 / rho_t));
+    assert(third.detector_result.reason == BaselineReasonCode::kBaselineShiftUp);
+    assert(third.detector_result.evidence.kind == BaselineEvidenceKind::kRatio);
+    assert(third.detector_result.evidence.ratio.shadow_active);
+    assert(third.detector_result.evidence.ratio.model_state == BaselineModelState::kShadow);
+
+    std::printf("[PASS] RatioDetectorCore shadow confidence and reason\n");
+}
+
 }  // namespace
 
 int main() {
     TestRatioDetectorCoreSubmitAndSnapshot();
     TestRatioDetectorCoreMarkRebuildFailure();
+    TestRatioDetectorCoreRatioEvidenceAndIdentity();
+    TestRatioDetectorCoreConfiguredSourceConfidence();
+    TestRatioDetectorCoreProfileDifferenceIsEffective();
+    TestRatioDetectorCoreColdStartUsesNoneProvider();
+    TestRatioDetectorCoreShadowConfidenceAndReason();
     std::printf("[DONE] test_baseline_ratio_task\n");
     return 0;
 }

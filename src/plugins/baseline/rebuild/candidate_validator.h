@@ -11,10 +11,10 @@
 
 #include <cstdint>
 
+#include "plugins/baseline/detector/ratio_detector_core.h"
+#include "plugins/baseline/detector/value_detector_core.h"
 #include "plugins/baseline/model/shadow_state.h"
 #include "plugins/baseline/rebuild/replay_runner.h"
-#include "plugins/baseline/task/ratio_task.h"
-#include "plugins/baseline/task/value_task.h"
 
 namespace flowsql {
 namespace baseline {
@@ -55,6 +55,11 @@ class CandidateValidator {
         const RatioFormalModel* candidate_model,
         const RatioFormalModel* incumbent_formal_model,
         const RatioShadowState* incumbent_shadow_state);
+
+    static CandidateValidationResult ValidateRelationAggregate(
+        double candidate_loss_sum,
+        double incumbent_loss_sum,
+        uint64_t validation_feature_count);
 };
 
 }  // namespace baseline

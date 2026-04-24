@@ -15,6 +15,8 @@
 #include <rapidjson/writer.h>
 
 #include "baseline_task_base.h"
+#include "plugins/baseline/fusion/key_risk_fusion.h"
+#include "plugins/baseline/model/event_calendar_matcher.h"
 #include "plugins/baseline/model/formal_predictor.h"
 #include "plugins/baseline/rebuild/candidate_builder.h"
 #include "plugins/baseline/rebuild/candidate_validator.h"
@@ -56,7 +58,9 @@ std::shared_ptr<ValueFormalModel> TrainFullValueModel(
     const ValueFeatureProfile& profile,
     const ValueReplaySeries& replay,
     uint64_t model_version,
-    const EventCalendarSpec* event_calendar_spec) {
+    const BaselineTaskSpec* task_spec,
+    const EventCalendarSpec* event_calendar_spec,
+    const CompiledEventCalendar* compiled_event_calendar) {
     ValueFormalTrainResult train_result;
     const ValueFormalTrainInput input{
         &profile,
@@ -65,7 +69,11 @@ std::shared_ptr<ValueFormalModel> TrainFullValueModel(
         model_version,
         0,
         replay.window,
-        event_calendar_spec};
+        task_spec,
+        task_spec ? task_spec->delta : 0,
+        task_spec ? task_spec->tz : "",
+        event_calendar_spec,
+        compiled_event_calendar};
     if (FormalModelTrainer::TrainValue(input, &train_result) !=
         FormalTrainFailureCode::kNone) {
         return nullptr;
@@ -73,12 +81,24 @@ std::shared_ptr<ValueFormalModel> TrainFullValueModel(
     return train_result.model;
 }
 
+bool CompileSeriesEventCalendar(const BaselineTaskSpec& spec,
+                                const std::string& series_key,
+                                CompiledEventCalendar* out_calendar) {
+    if (!out_calendar || !spec.event_calendar_spec) return false;
+    BaselineTaskSpec series_spec = spec;
+    series_spec.key = series_key;
+    std::string err;
+    return CompileEventCalendar(*spec.event_calendar_spec, series_spec, out_calendar, &err) ==
+           error::OK;
+}
+
 }  // namespace
 
 BaselineValueTask::BaselineValueTask(TaskRegistry* registry,
                                      RebuildQueue* rebuild_queue,
                                      std::string task_id,
-                                     const BaselineTaskSpec& spec)
+                                     const BaselineTaskSpec& spec,
+                                     KeyRiskFusion* key_risk_fusion)
     : BaselineTaskBase(registry,
                        rebuild_queue,
                        std::move(task_id),
@@ -86,14 +106,15 @@ BaselineValueTask::BaselineValueTask(TaskRegistry* registry,
                        spec.name,
                        spec.config_json),
       spec_(spec),
-      history_binding_(std::make_shared<ValueHistoryBinding>()) {
+      history_binding_(std::make_shared<ValueHistoryBinding>()),
+      key_risk_fusion_(key_risk_fusion) {
     ValueDetectorCoreSpec core_spec;
     core_spec.owner_task_id = TaskId();
     core_spec.routed_feature_id = spec_.feature;
     core_spec.feature_type = spec_.feature_type;
     core_spec.feature_profile = spec_.feature_profile;
     core_spec.event_calendar_spec = spec_.event_calendar_spec;
-    core_spec.series_overrides = spec_.series_overrides;
+    core_spec.baseline_source_configs = spec_.baseline_source_configs;
     core_ = std::make_shared<ValueDetectorCore>(core_spec);
 
     rebuild_runtime_ = std::make_shared<RebuildTaskRuntime>(
@@ -131,8 +152,8 @@ int BaselineValueTask::QueryTaskSnapshotJson(std::string* out_json) const {
     writer.String(profile.feature_profile.c_str());
     writer.Key("transform_name");
     writer.String(profile.transform_name.c_str());
-    writer.Key("series_override_count");
-    writer.Uint64(spec_.series_overrides.size());
+    writer.Key("baseline_source_config_count");
+    writer.Uint64(spec_.baseline_source_configs.size());
     writer.Key("series_count");
     writer.Uint64(core_ ? core_->Size() : 0);
     writer.Key("event_calendar_present");
@@ -184,10 +205,10 @@ int BaselineValueTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     writer.Key("model_state");
     writer.String(snapshot.runtime_state.model_state.c_str());
     writer.Key("baseline_source_kind");
-    writer.String(BaselineSourceDecisionKindName(
-        snapshot.runtime_state.baseline_source.kind));
+    writer.String(BaselineSourceKindName(
+        snapshot.runtime_state.baseline_source.selected_kind));
     writer.Key("baseline_source_key");
-    writer.String(snapshot.runtime_state.baseline_source.source_key.c_str());
+    writer.String(snapshot.runtime_state.baseline_source.selected_source_key.c_str());
     writer.Key("task_calendar_present");
     writer.Bool(spec_.event_calendar_spec.has_value());
     writer.Key("task_calendar_id");
@@ -382,8 +403,11 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
     }
     if (!reader) {
         core_->MarkRebuildFailure(
-            DetectorRebuildFailure{
-                request.key, request.bucket_start_hint, request.bucket_end, "fetch_failed"});
+            DetectorRebuildFailure{request.key,
+                                   request.bucket_start_hint,
+                                   request.bucket_end,
+                                   "fetch_failed",
+                                   "rebuild_blocked"});
         return error::UNAVAILABLE;
     }
 
@@ -392,6 +416,7 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
         static_cast<uint32_t>(request.key.size())};
     const HistoryFetchRequest fetch_req{
         key_ref,
+        BaselineStringRef{spec_.feature.c_str(), static_cast<uint32_t>(spec_.feature.size())},
         request.bucket_start_hint,
         request.bucket_end};
 
@@ -414,12 +439,25 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
     ValueRebuildContext rebuild_context;
     core_->BuildRebuildContext(request.key, &rebuild_context);
 
+    CompiledEventCalendar compiled_event_calendar;
+    const CompiledEventCalendar* compiled_event_calendar_ptr =
+        CompileSeriesEventCalendar(spec_, request.key, &compiled_event_calendar)
+            ? &compiled_event_calendar
+            : nullptr;
+
+    BaselineTaskSpec series_task_spec = spec_;
+    series_task_spec.key = request.key;
+
     ValueCandidateBuildResult build_result;
     CandidateBuilder::BuildValue(
         core_->profile(),
         replay,
         rebuild_context.next_model_version,
+        &series_task_spec,
+        spec_.delta,
+        spec_.tz,
         TaskEventCalendar(spec_),
+        compiled_event_calendar_ptr,
         &build_result);
     CandidateValidationResult validation_result;
     std::shared_ptr<ValueFormalModel> full_model;
@@ -441,7 +479,9 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
                 core_->profile(),
                 replay,
                 build_result.candidate_model_version,
-                TaskEventCalendar(spec_));
+                &series_task_spec,
+                TaskEventCalendar(spec_),
+                compiled_event_calendar_ptr);
             if (!full_model) {
                 validation_result.pass = false;
                 validation_result.status = CandidateValidationStatus::kFailed;
@@ -496,6 +536,13 @@ int BaselineValueTask::SubmitObservation(const ValueObservation& obs,
     *out = submit_output.detector_result;
     if (rc != error::OK) return rc;
 
+    if (key_risk_fusion_) {
+        key_risk_fusion_->UpdateSingleDetectorResult(
+            obs.bucket_id,
+            FusionSourceId{TaskId(), FusionSourceKind::kDirectSingle, 0},
+            *out);
+    }
+
     if (submit_output.rebuild_intent.required) {
         RebuildRequest request;
         request.task_kind = BaselineTaskKind::kValue;
@@ -533,6 +580,7 @@ void BaselineValueTask::OnClosingLocked() {
     if (rebuild_queue_) rebuild_queue_->CancelTask(TaskId());
     if (rebuild_runtime_) rebuild_runtime_->CloseAndWait();
     if (core_) core_->Clear();
+    if (key_risk_fusion_) key_risk_fusion_->RemoveTaskContributions(TaskId());
 }
 
 }  // namespace baseline

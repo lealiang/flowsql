@@ -34,6 +34,7 @@ struct DetectorRebuildFailure {
     int64_t request_bucket_start = 0;
     int64_t request_bucket_end = 0;
     std::string candidate_state;
+    std::string switch_state = "none";
 };
 
 }  // namespace baseline

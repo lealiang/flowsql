@@ -22,6 +22,7 @@ namespace baseline {
 class TaskRegistry;
 class RebuildQueue;
 class RebuildWorker;
+class KeyRiskFusion;
 
 class __attribute__((visibility("default"))) BaselinePlugin : public IPlugin, public IBaselineService {
  public:
@@ -39,10 +40,13 @@ class __attribute__((visibility("default"))) BaselinePlugin : public IPlugin, pu
     int CreateRatioTask(const char* config_json,
                         IBaselineRatioTask** out) override;
     int CreateRelationTask(const char* config_json,
+                           IBaselineSourceResolver* resolver,
                            IBaselineRelationTask** out) override;
     void ListTasks(std::function<void(const char* task_id,
                                       const char* task_name,
                                       BaselineTaskKind kind)> cb) override;
+    int QueryKeyFusionSnapshotJson(const BaselineStringRef& key,
+                                   std::string* out_json) const override;
     int QueryServiceStatsJson(std::string* out_json) const override;
 
  private:
@@ -51,6 +55,7 @@ class __attribute__((visibility("default"))) BaselinePlugin : public IPlugin, pu
     std::unique_ptr<TaskRegistry> task_registry_;
     std::unique_ptr<RebuildQueue> rebuild_queue_;
     std::unique_ptr<RebuildWorker> rebuild_worker_;
+    std::unique_ptr<KeyRiskFusion> key_risk_fusion_;
 };
 
 }  // namespace baseline

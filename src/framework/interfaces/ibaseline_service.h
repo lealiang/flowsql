@@ -59,6 +59,13 @@ interface IBaselineRelationHistoryReader {
                       std::function<int(const RelationObservationBlock&)> on_block) = 0;
 };
 
+interface IBaselineSourceResolver {
+    virtual ~IBaselineSourceResolver() = default;
+    virtual int ResolveBaselineSource(const BaselineStringRef& key,
+                                      const BaselineStringRef& feature,
+                                      std::string* out_config_json) = 0;
+};
+
 interface IBaselineValueTask : public IBaselineTask {
     virtual int SetHistoryReader(IBaselineValueHistoryReader* reader) = 0;
     virtual int SubmitObservation(const ValueObservation& obs,
@@ -74,7 +81,7 @@ interface IBaselineRatioTask : public IBaselineTask {
 interface IBaselineRelationTask : public IBaselineTask {
     virtual int SetHistoryReader(IBaselineRelationHistoryReader* reader) = 0;
     virtual int SubmitBlock(const RelationObservationBlock& block,
-                            DetectorResult* out) = 0;
+                            FusionResult* out) = 0;
 };
 
 interface IBaselineService {
@@ -85,12 +92,15 @@ interface IBaselineService {
     virtual int CreateRatioTask(const char* config_json,
                                 IBaselineRatioTask** out) = 0;
     virtual int CreateRelationTask(const char* config_json,
+                                   IBaselineSourceResolver* resolver,
                                    IBaselineRelationTask** out) = 0;
 
     virtual void ListTasks(std::function<void(const char* task_id,
                                               const char* task_name,
                                               BaselineTaskKind kind)> cb) = 0;
 
+    virtual int QueryKeyFusionSnapshotJson(const BaselineStringRef& key,
+                                           std::string* out_json) const = 0;
     virtual int QueryServiceStatsJson(std::string* out_json) const = 0;
 };
 

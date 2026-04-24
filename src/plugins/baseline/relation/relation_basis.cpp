@@ -138,12 +138,14 @@ RelationLineageCompatibility RelationBasisBuilder::DetermineCompatibility(
         return RelationLineageCompatibility::kNewLineage;
     }
 
-    if (incumbent_basis->group_space_version == task_spec.group_space_version) {
+    const std::string task_group_space_version =
+        task_spec.group_space_version.value_or("");
+
+    if (incumbent_basis->group_space_version == task_group_space_version) {
         return RelationLineageCompatibility::kIdentical;
     }
 
-    if (incumbent_basis->group_space_version.empty() ||
-        task_spec.group_space_version.empty()) {
+    if (incumbent_basis->group_space_version.empty() || !task_spec.group_space_version.has_value()) {
         return RelationLineageCompatibility::kCompatible;
     }
 

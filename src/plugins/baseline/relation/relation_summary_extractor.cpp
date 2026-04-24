@@ -106,9 +106,7 @@ int RelationSummaryExtractor::ExtractMetricSummary(
         out_summary->stable_headk_coverage += share;
     }
 
-    // `RelationMetricBlock` 目前没有显式 presence bit。这里把
-    // active_count == 0 且 total > 0 视为“未提供”，避免把缺失误判成 0 个活跃 group。
-    if (metric.active_count > 0 || metric.total == 0.0) {
+    if ((metric.flags & kRelationMetricHasActiveCount) != 0) {
         out_summary->has_distinct_group_count = true;
         out_summary->distinct_group_count = static_cast<double>(metric.active_count);
     }

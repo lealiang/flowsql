@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "plugins/baseline/relation/relation_basis.h"
 #include "formal_model_trainer.h"
 
 namespace flowsql {
@@ -46,18 +47,39 @@ struct RatioCandidateBuildResult {
     std::shared_ptr<RatioFormalModel> candidate_model;
 };
 
+struct RelationMetricCandidateBuildResult {
+    CandidateBuildStatus status = CandidateBuildStatus::kNone;
+    RelationLineageCompatibility lineage_compatibility =
+        RelationLineageCompatibility::kCompatible;
+    RelationServiceBasis candidate_service_basis;
+    RelationEvalBasis candidate_eval_basis;
+};
+
 class CandidateBuilder {
  public:
     static CandidateBuildStatus BuildValue(const ValueFeatureProfile& profile,
                                            const ValueReplaySeries& replay,
                                            uint64_t candidate_model_version,
+                                           const BaselineTaskSpec* task_spec,
+                                           int64_t delta,
+                                           const std::string& tz,
                                            const EventCalendarSpec* event_calendar_spec,
+                                           const CompiledEventCalendar* compiled_event_calendar,
                                            ValueCandidateBuildResult* out);
     static CandidateBuildStatus BuildRatio(const RatioFeatureProfile& profile,
                                            const RatioReplaySeries& replay,
                                            uint64_t candidate_model_version,
+                                           const BaselineTaskSpec* task_spec,
+                                           int64_t delta,
+                                           const std::string& tz,
                                            const EventCalendarSpec* event_calendar_spec,
+                                           const CompiledEventCalendar* compiled_event_calendar,
                                            RatioCandidateBuildResult* out);
+    static CandidateBuildStatus BuildRelationMetricBases(
+        const RelationBasisBuildInput& input,
+        const RelationServiceBasis* incumbent_basis,
+        const RelationTaskSpec& task_spec,
+        RelationMetricCandidateBuildResult* out);
 };
 
 }  // namespace baseline

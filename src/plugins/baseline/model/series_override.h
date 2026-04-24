@@ -9,6 +9,8 @@
 #ifndef _FLOWSQL_PLUGINS_BASELINE_MODEL_SERIES_OVERRIDE_H_
 #define _FLOWSQL_PLUGINS_BASELINE_MODEL_SERIES_OVERRIDE_H_
 
+#include <framework/interfaces/ibaseline_types.h>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -20,31 +22,30 @@ struct BaselineSourceRef {
     std::string source_key;
 };
 
-using BaselineSourceConfig = std::vector<BaselineSourceRef>;
+struct BaselineSourceConfig {
+    std::vector<BaselineSourceRef> sources;
 
-struct SeriesOverride {
-    std::string key;
-    BaselineSourceConfig baseline_sources;
+    bool empty() const { return sources.empty(); }
 };
 
-enum class BaselineSourceDecisionKind : uint8_t {
-    kSelf = 0,
-    kConfiguredSource = 1,
-    kNone = 2,
+struct SeriesBaselineSourceConfig {
+    std::string key;
+    BaselineSourceConfig config;
 };
 
 struct BaselineSourceDecision {
-    BaselineSourceDecisionKind kind = BaselineSourceDecisionKind::kNone;
-    std::string source_key;
+    BaselineSourceKind selected_kind = BaselineSourceKind::kNone;
+    std::string selected_source_key;
+    bool serviceable = false;
 };
 
-inline const char* BaselineSourceDecisionKindName(BaselineSourceDecisionKind kind) {
+inline const char* BaselineSourceKindName(BaselineSourceKind kind) {
     switch (kind) {
-        case BaselineSourceDecisionKind::kSelf:
+        case BaselineSourceKind::kSelf:
             return "self";
-        case BaselineSourceDecisionKind::kConfiguredSource:
+        case BaselineSourceKind::kConfiguredSource:
             return "configured_source";
-        case BaselineSourceDecisionKind::kNone:
+        case BaselineSourceKind::kNone:
             break;
     }
     return "none";

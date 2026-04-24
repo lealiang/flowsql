@@ -4,13 +4,19 @@ add_executable(${PROJECT_NAME} test_baseline_plugin.cpp)
 add_executable(test_baseline_value_task
     test_baseline_value_task.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/detector/value_detector_core.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/event_calendar_matcher.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/formal_predictor.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/readiness_helper.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/series_store.cpp
 )
 add_executable(test_baseline_ratio_task
     test_baseline_ratio_task.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/detector/ratio_detector_core.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/event_calendar_matcher.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/formal_predictor.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/readiness_helper.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/series_store.cpp
 )
 add_executable(test_baseline_relation_task
@@ -20,6 +26,20 @@ add_executable(test_baseline_relation_task
     ${CMAKE_SOURCE_DIR}/plugins/baseline/relation/relation_router.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/relation/relation_summary_extractor.cpp
 )
+add_executable(test_baseline_model_helpers
+    test_baseline_model_helpers.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/fusion/relation_pattern_fusion.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/event_calendar_matcher.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/formal_predictor.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/readiness_helper.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/relation/relation_basis.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rebuild/candidate_builder.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rebuild/candidate_validator.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rebuild/formal_model_trainer.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/solver/solver_backend.cpp
+)
+add_executable(test_baseline_task_headers test_baseline_task_headers.cpp)
 add_executable(test_baseline_rebuild test_baseline_rebuild.cpp)
 add_executable(test_baseline_concurrency test_baseline_concurrency.cpp)
 
@@ -27,6 +47,8 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_value_task PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_ratio_task PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_relation_task PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_model_helpers PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_task_headers PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_rebuild PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_concurrency PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -34,12 +56,16 @@ add_dependencies(${PROJECT_NAME} flowsql_common flowsql_baseline)
 add_dependencies(test_baseline_value_task flowsql_common)
 add_dependencies(test_baseline_ratio_task flowsql_common)
 add_dependencies(test_baseline_relation_task flowsql_common)
+add_dependencies(test_baseline_model_helpers flowsql_common)
+add_dependencies(test_baseline_task_headers flowsql_common)
 add_dependencies(test_baseline_rebuild flowsql_common flowsql_baseline)
 add_dependencies(test_baseline_concurrency flowsql_common flowsql_baseline)
 target_link_libraries(${PROJECT_NAME} flowsql_common)
 target_link_libraries(test_baseline_value_task flowsql_common)
 target_link_libraries(test_baseline_ratio_task flowsql_common)
 target_link_libraries(test_baseline_relation_task flowsql_common)
+target_link_libraries(test_baseline_model_helpers flowsql_common)
+target_link_libraries(test_baseline_task_headers flowsql_common)
 target_link_libraries(test_baseline_rebuild flowsql_common)
 target_link_libraries(test_baseline_concurrency flowsql_common)
 
@@ -47,6 +73,10 @@ target_compile_options(${PROJECT_NAME} PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_value_task PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_ratio_task PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_relation_task PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_model_helpers PRIVATE -UNDEBUG)
+
+add_thirddepen(test_baseline_model_helpers eigen rapidjson)
+target_compile_options(test_baseline_task_headers PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rebuild PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_concurrency PRIVATE -UNDEBUG)
 
@@ -60,6 +90,12 @@ set_target_properties(test_baseline_ratio_task PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 set_target_properties(test_baseline_relation_task PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_model_helpers PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_task_headers PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 set_target_properties(test_baseline_rebuild PROPERTIES

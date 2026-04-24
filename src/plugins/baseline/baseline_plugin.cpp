@@ -13,11 +13,14 @@
 #include <rapidjson/writer.h>
 
 #include "config_parser.h"
+#include "fusion/key_risk_fusion.h"
 #include "rebuild/rebuild_queue.h"
 #include "rebuild/rebuild_worker.h"
 #include "solver/solver_backend.h"
-#include "task/baseline_task_base.h"
+#include "task/relation_task.h"
 #include "task/task_registry.h"
+#include "task/ratio_task.h"
+#include "task/value_task.h"
 
 namespace flowsql {
 namespace baseline {
@@ -25,7 +28,8 @@ namespace baseline {
 BaselinePlugin::BaselinePlugin()
     : task_registry_(std::make_unique<TaskRegistry>()),
       rebuild_queue_(std::make_unique<RebuildQueue>()),
-      rebuild_worker_(std::make_unique<RebuildWorker>(rebuild_queue_.get())) {}
+      rebuild_worker_(std::make_unique<RebuildWorker>(rebuild_queue_.get())),
+      key_risk_fusion_(std::make_unique<KeyRiskFusion>()) {}
 
 BaselinePlugin::~BaselinePlugin() = default;
 
@@ -45,6 +49,7 @@ int BaselinePlugin::Unload() {
     task_registry_ = std::make_unique<TaskRegistry>();
     rebuild_queue_ = std::make_unique<RebuildQueue>();
     rebuild_worker_ = std::make_unique<RebuildWorker>(rebuild_queue_.get());
+    key_risk_fusion_ = std::make_unique<KeyRiskFusion>();
     querier_ = nullptr;
     return error::OK;
 }
@@ -54,6 +59,7 @@ int BaselinePlugin::Start() {
         rebuild_queue_ = std::make_unique<RebuildQueue>();
         rebuild_worker_ = std::make_unique<RebuildWorker>(rebuild_queue_.get());
     }
+    if (!key_risk_fusion_) key_risk_fusion_ = std::make_unique<KeyRiskFusion>();
     return rebuild_worker_->Start();
 }
 
@@ -67,6 +73,7 @@ int BaselinePlugin::Stop() {
     if (rebuild_worker_) rebuild_worker_->Stop();
     rebuild_queue_ = std::make_unique<RebuildQueue>();
     rebuild_worker_ = std::make_unique<RebuildWorker>(rebuild_queue_.get());
+    key_risk_fusion_ = std::make_unique<KeyRiskFusion>();
     return error::OK;
 }
 
@@ -84,7 +91,8 @@ int BaselinePlugin::CreateValueTask(const char* config_json,
         task_registry_.get(),
         rebuild_queue_.get(),
         task_registry_->AllocateTaskId(BaselineTaskKind::kValue),
-        spec);
+        spec,
+        key_risk_fusion_.get());
     rc = task_registry_->Register(task);
     if (rc != error::OK) return rc;
 
@@ -106,7 +114,8 @@ int BaselinePlugin::CreateRatioTask(const char* config_json,
         task_registry_.get(),
         rebuild_queue_.get(),
         task_registry_->AllocateTaskId(BaselineTaskKind::kRatio),
-        spec);
+        spec,
+        key_risk_fusion_.get());
     rc = task_registry_->Register(task);
     if (rc != error::OK) return rc;
 
@@ -115,23 +124,28 @@ int BaselinePlugin::CreateRatioTask(const char* config_json,
 }
 
 int BaselinePlugin::CreateRelationTask(const char* config_json,
+                                       IBaselineSourceResolver* resolver,
                                        IBaselineRelationTask** out) {
     if (!out) return error::BAD_REQUEST;
     *out = nullptr;
 
-    RelationTaskSpec spec;
+    RelationTaskCreateSpec create_spec;
     std::string err;
-    int rc = ConfigParser::ParseRelationTask(config_json, &spec, &err);
+    int rc = ConfigParser::ParseRelationTask(config_json, &create_spec, &err);
     if (rc != error::OK) return rc;
 
     const std::string task_id =
         task_registry_->AllocateTaskId(BaselineTaskKind::kRelation);
-    spec.task_id = task_id;
+    create_spec.task_spec.task_id = task_id;
     auto task = std::make_shared<BaselineRelationTask>(
         task_registry_.get(),
         rebuild_queue_.get(),
         task_id,
-        spec);
+        create_spec.task_spec,
+        create_spec.clock_spec,
+        create_spec.event_calendar_spec,
+        resolver,
+        key_risk_fusion_.get());
     rc = task_registry_->Register(task);
     if (rc != error::OK) return rc;
 
@@ -146,6 +160,12 @@ void BaselinePlugin::ListTasks(std::function<void(const char* task_id,
     task_registry_->List(std::move(cb));
 }
 
+int BaselinePlugin::QueryKeyFusionSnapshotJson(const BaselineStringRef& key,
+                                               std::string* out_json) const {
+    if (!key_risk_fusion_) return error::UNAVAILABLE;
+    return key_risk_fusion_->QueryKeyFusionSnapshotJson(key, out_json);
+}
+
 int BaselinePlugin::QueryServiceStatsJson(std::string* out_json) const {
     if (!out_json) return error::BAD_REQUEST;
 
@@ -158,6 +178,8 @@ int BaselinePlugin::QueryServiceStatsJson(std::string* out_json) const {
     writer.Uint64(rebuild_queue_ ? rebuild_queue_->Size() : 0);
     writer.Key("rebuild_worker_running");
     writer.Bool(rebuild_worker_ && rebuild_worker_->Running());
+    writer.Key("key_fusion_key_count");
+    writer.Uint64(key_risk_fusion_ ? key_risk_fusion_->KeyCount() : 0);
     writer.EndObject();
     *out_json = buf.GetString();
     return error::OK;

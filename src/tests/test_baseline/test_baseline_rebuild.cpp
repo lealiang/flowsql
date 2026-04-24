@@ -50,7 +50,7 @@ class BlockingRelationHistoryReader : public IBaselineRelationHistoryReader {
 
         const uint32_t group_idx[] = {11, 12};
         const double values[] = {70.0, 30.0};
-        const RelationMetricBlock metric{100.0, 2, values};
+        const RelationMetricBlock metric{100.0, 0, 2, values};
         const RelationObservationBlock block{
             BaselineStringRef{key_.c_str(), static_cast<uint32_t>(key_.size())},
             10,
@@ -102,14 +102,14 @@ void TestRebuildWithoutHistoryReader() {
     const char* ratio_cfg =
         R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
     const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
+        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
 
     IBaselineValueTask* value_task = nullptr;
     IBaselineRatioTask* ratio_task = nullptr;
     IBaselineRelationTask* relation_task = nullptr;
     assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
     assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(service->CreateRelationTask(relation_cfg, &relation_task) == error::OK);
+    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
 
     assert(value_task->SubmitObservation(
                ValueObservation{BaselineStringRef{"svc-no-reader", 13}, 10, 8.0, 0},
@@ -117,7 +117,7 @@ void TestRebuildWithoutHistoryReader() {
 
     DetectorResult value_result{};
     DetectorResult ratio_result{};
-    DetectorResult relation_result{};
+    FusionResult relation_result{};
     assert(value_task->SubmitObservation(
                ValueObservation{BaselineStringRef{"svc-no-reader", 13}, 10, 8.0, 0},
                &value_result) == error::OK);
@@ -127,7 +127,7 @@ void TestRebuildWithoutHistoryReader() {
 
     const uint32_t group_idx[] = {11, 12};
     const double values[] = {7.0, 3.0};
-    const RelationMetricBlock metric{10.0, 2, values};
+    const RelationMetricBlock metric{10.0, 0, 2, values};
     const RelationObservationBlock block{
         BaselineStringRef{"svc-no-reader", 13},
         10,
@@ -168,21 +168,21 @@ void TestRebuildWithoutHistoryReader() {
                                                &value_series_snapshot) == error::OK);
     auto value_series_doc = ParseJson(value_series_snapshot);
     assert(std::string(value_series_doc["candidate_state"].GetString()) == "fetch_failed");
-    assert(std::string(value_series_doc["switch_state"].GetString()) == "none");
+    assert(std::string(value_series_doc["switch_state"].GetString()) == "rebuild_blocked");
 
     std::string ratio_series_snapshot;
     assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-no-reader", 13},
                                                &ratio_series_snapshot) == error::OK);
     auto ratio_series_doc = ParseJson(ratio_series_snapshot);
     assert(std::string(ratio_series_doc["candidate_state"].GetString()) == "fetch_failed");
-    assert(std::string(ratio_series_doc["switch_state"].GetString()) == "none");
+    assert(std::string(ratio_series_doc["switch_state"].GetString()) == "rebuild_blocked");
 
     std::string relation_series_snapshot;
     assert(relation_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-no-reader", 13},
                                                   &relation_series_snapshot) == error::OK);
     auto relation_series_doc = ParseJson(relation_series_snapshot);
     assert(std::string(relation_series_doc["candidate_state"].GetString()) == "fetch_failed");
-    assert(std::string(relation_series_doc["switch_state"].GetString()) == "none");
+    assert(std::string(relation_series_doc["switch_state"].GetString()) == "rebuild_blocked");
 
     assert(value_task->Close() == error::OK);
     assert(ratio_task->Close() == error::OK);
@@ -198,10 +198,10 @@ void TestRelationReaderSwapConflictWhileRebuildInflight() {
     auto* service = env.service;
 
     const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
+        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
 
     IBaselineRelationTask* relation_task = nullptr;
-    assert(service->CreateRelationTask(relation_cfg, &relation_task) == error::OK);
+    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
 
     BlockingRelationHistoryReader blocking_reader;
     DummyRelationHistoryReader alternate_reader;

@@ -12,25 +12,25 @@
 
 #include <cmath>
 #include <limits>
+#include <string>
 #include <utility>
 
 #include "plugins/baseline/common/result_builder.h"
+#include "plugins/baseline/model/profile_config.h"
 namespace flowsql {
 namespace baseline {
 
 namespace {
 
-constexpr uint32_t kT1bTrainMinContCore = 50;
-constexpr uint32_t kT1bTrainMinContTail = 100;
 constexpr const char* kCandidateStateTrained = "trained";
-constexpr double kValueShiftWeight = 0.8;
-constexpr double kPointWarn = 3.0;
-constexpr double kPointCrit = 5.0;
 constexpr double kShadowConfidenceCap = 0.8;
 constexpr double kT1SigmaRefFloor = 1e-3;
 constexpr double kShadowSigmaScale = 1.5;
-constexpr uint32_t kMinShiftConfirmForRebuild = 3;
-constexpr DriftConfig kDriftConfig{};
+
+const SharedProfileConfig& SharedConfig() {
+    static const SharedProfileConfig config = DefaultSharedProfileConfig();
+    return config;
+}
 
 std::string CopyKey(const BaselineStringRef& key) {
     if (!key.data || key.size == 0) return "";
@@ -70,19 +70,25 @@ bool BuildProfile(const ValueDetectorCoreSpec& spec,
 
     if (spec.feature_type == "t1a") {
         profile.is_t1b = false;
+        if (spec.transform_kind.has_value()) {
+            if (*spec.transform_kind != "identity" && *spec.transform_kind != "log1p") {
+                if (err) *err = "unsupported t1a transform_kind";
+                return false;
+            }
+            profile.transform_name = *spec.transform_kind;
+        }
     } else if (spec.feature_type == "t1b") {
-        profile.is_t1b = true;
-        if (spec.feature_profile == "cont_core") {
-            profile.n_train_min = kT1bTrainMinContCore;
-        } else if (spec.feature_profile == "cont_tail") {
-            profile.n_train_min = kT1bTrainMinContTail;
-        } else {
+        T1bProfileConfig profile_config;
+        if (!GetT1bProfileConfig(spec.feature_profile, &profile_config)) {
             if (err) *err = "unsupported t1b feature_profile";
             return false;
         }
-        profile.n_score_min = (profile.n_train_min + 1) / 2;
-        profile.n_shift_min = profile.n_train_min * 2;
-        profile.kappa_sample = static_cast<double>(profile.n_train_min);
+        profile.is_t1b = true;
+        profile.transform_name = profile_config.transform_name_override;
+        profile.n_train_min = profile_config.n_train_min;
+        profile.n_score_min = profile_config.n_score_min();
+        profile.n_shift_min = profile_config.n_shift_min();
+        profile.kappa_sample = profile_config.kappa_sample();
     } else {
         if (err) *err = "unsupported value feature_type";
         return false;
@@ -162,7 +168,7 @@ SelectedValueBaseline ResolveServiceableBaseline(
     int64_t bucket_id,
     const EventCalendarSpec* task_calendar,
     const std::unordered_map<std::string, ValueSeriesRuntimeState>& runtime_by_key,
-    const std::unordered_map<std::string, BaselineSourceConfig>& series_override_map) {
+    const BaselineSourceConfig* baseline_source_config) {
     SelectedValueBaseline selected;
 
     // 基线来源的优先级固定为：先尝试本 key 的可服务模型，再按静态配置回退到来源 key。
@@ -179,14 +185,14 @@ SelectedValueBaseline ResolveServiceableBaseline(
                                 false)) {
         selected.ready = true;
         selected.provider = BaselineProvider::kFormal;
-        selected.decision.kind = BaselineSourceDecisionKind::kSelf;
+        selected.decision.selected_kind = BaselineSourceKind::kSelf;
+        selected.decision.serviceable = true;
         return selected;
     }
 
-    auto override_it = series_override_map.find(key);
-    if (override_it == series_override_map.end()) return selected;
+    if (!baseline_source_config) return selected;
 
-    for (const auto& source_ref : override_it->second) {
+    for (const auto& source_ref : baseline_source_config->sources) {
         auto source_it = runtime_by_key.find(source_ref.source_key);
         if (source_it == runtime_by_key.end()) continue;
         if (!PredictServiceableModel(source_it->second,
@@ -201,8 +207,9 @@ SelectedValueBaseline ResolveServiceableBaseline(
 
         selected.ready = true;
         selected.provider = BaselineProvider::kSource;
-        selected.decision.kind = BaselineSourceDecisionKind::kConfiguredSource;
-        selected.decision.source_key = source_ref.source_key;
+        selected.decision.selected_kind = BaselineSourceKind::kConfiguredSource;
+        selected.decision.selected_source_key = source_ref.source_key;
+        selected.decision.serviceable = true;
         return selected;
     }
 
@@ -210,18 +217,116 @@ SelectedValueBaseline ResolveServiceableBaseline(
 }
 
 double ComputePointScoreFromAbsResidual(double abs_residual) {
-    if (abs_residual <= kPointWarn) return 0.0;
-    return ClipUnit((abs_residual - kPointWarn) / (kPointCrit - kPointWarn));
+    const SharedProfileConfig& config = SharedConfig();
+    if (abs_residual <= config.z_warn) return 0.0;
+    return ClipUnit((abs_residual - config.z_warn) / (config.z_crit - config.z_warn));
 }
 
 double ComputeNormalizedScore(double score_point, double score_shift) {
-    return 1.0 - (1.0 - score_point) * (1.0 - kValueShiftWeight * score_shift);
+    return 1.0 - (1.0 - score_point) * (1.0 - SharedConfig().w_shift * score_shift);
 }
 
 double EffectiveValueSigma(double sigma_ref,
                            double rho_t,
                            double extra_scale = 1.0) {
     return std::max(kT1SigmaRefFloor, sigma_ref) * std::max(rho_t, 1.0) * extra_scale;
+}
+
+BaselineStringRef StringRefOf(const std::string& value) {
+    if (value.empty()) return BaselineStringRef{};
+    return BaselineStringRef{value.c_str(), static_cast<uint32_t>(value.size())};
+}
+
+void FillResultIdentity(const ValueDetectorCoreSpec& spec,
+                        const ValueFeatureProfile& profile,
+                        const ValueObservation& obs,
+                        DetectorResult* out) {
+    if (!out) return;
+    out->key = obs.key;
+    out->feature = StringRefOf(spec.routed_feature_id);
+    out->feature_type = StringRefOf(profile.feature_type);
+    out->ts = obs.bucket_id;
+}
+
+BaselineSourceKind SourceKindFromShadowRef(ShadowRefKind kind) {
+    return ShadowRefUsesSource(kind) ? BaselineSourceKind::kConfiguredSource
+                                     : BaselineSourceKind::kSelf;
+}
+
+BaselineModelState EvidenceModelState(const std::string& model_state) {
+    if (model_state == "cold_start") return BaselineModelState::kColdStart;
+    if (model_state == "shadow_self" || model_state == "shadow_source") {
+        return BaselineModelState::kShadow;
+    }
+    if (model_state == "serviceable_source") {
+        return BaselineModelState::kConfiguredSource;
+    }
+    if (model_state == "candidate_self" || model_state == "candidate_source") {
+        return BaselineModelState::kCandidate;
+    }
+    if (model_state == "serviceable_self") {
+        return BaselineModelState::kFormal;
+    }
+    return BaselineModelState::kUnknown;
+}
+
+double DriftDirectionSign(DriftDirection direction) {
+    switch (direction) {
+        case DriftDirection::kUp:
+            return 1.0;
+        case DriftDirection::kDown:
+            return -1.0;
+        case DriftDirection::kNone:
+            break;
+    }
+    return 0.0;
+}
+
+void FillValueEvidence(DetectorResult* out,
+                       const ValueFeatureProfile& profile,
+                       const ValueSeriesRuntimeState& runtime_state,
+                       double y_t,
+                       double x_t,
+                       double baseline_mu_t,
+                       double residual,
+                       double z_t,
+                       double score_point,
+                       double score_shift,
+                       uint64_t sample_count,
+                       double sigma_eff_t,
+                       bool shadow_active) {
+    if (!out) return;
+
+    out->evidence.kind = BaselineEvidenceKind::kValue;
+    out->evidence.value = ValueEvidence{};
+
+    ValueEvidence& evidence = out->evidence.value;
+    evidence.y_t = y_t;
+    evidence.x_t = x_t;
+    evidence.baseline_mu_t = baseline_mu_t;
+    evidence.resid_r_t = residual;
+    evidence.z_t = z_t;
+    evidence.p_shift_t = runtime_state.last_p_shift;
+    evidence.dir_t = DriftDirectionSign(runtime_state.drift_state.direction);
+    evidence.score_point = score_point;
+    evidence.score_shift = score_shift;
+    evidence.baseline_source_kind = runtime_state.baseline_source.selected_kind;
+    evidence.model_state = EvidenceModelState(runtime_state.model_state);
+    evidence.shadow_active = shadow_active;
+
+    if (profile.is_t1b) {
+        evidence.field_flags |= kBaselineEvidenceHasSampleCount;
+        evidence.field_flags |= kBaselineEvidenceHasSigmaEff;
+        evidence.sample_count = sample_count;
+        evidence.sigma_eff_t = sigma_eff_t;
+    }
+
+    if (runtime_state.baseline_source.selected_kind == BaselineSourceKind::kConfiguredSource &&
+        !runtime_state.baseline_source.selected_source_key.empty()) {
+        evidence.field_flags |= kBaselineEvidenceHasSourceKey;
+        evidence.baseline_source_key =
+            StringRefOf(runtime_state.baseline_source.selected_source_key);
+    }
 }
 
 BaselineReasonCode DriftReasonCode(DriftDirection direction) {
@@ -246,8 +351,10 @@ ValueDetectorCore::ValueDetectorCore(const ValueDetectorCoreSpec& spec)
         profile_.feature_profile = spec_.feature_profile;
     }
 
-    for (const auto& series_override : spec_.series_overrides) {
-        series_override_map_.emplace(series_override.key, series_override.baseline_sources);
+    // 来源配置的真实生效粒度是 `(key, feature)`。本 core 的 feature 固定，
+    // 因此热路径只需要按运行时 key 做一次 O(1) 查找。
+    for (const auto& source_config : spec_.baseline_source_configs) {
+        baseline_source_config_by_key_.emplace(source_config.key, source_config.config);
     }
 }
 
@@ -256,11 +363,13 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
     if (!out_submit) return error::BAD_REQUEST;
     *out_submit = DetectorSubmitOutput{};
     out_submit->rebuild_intent.routed_feature_id = spec_.routed_feature_id;
+    FillResultIdentity(spec_, profile_, obs, &out_submit->detector_result);
 
     std::string err;
     int rc = ValidateObservation(profile_, obs, &err);
     if (rc != error::OK) {
         FillBadRequestResult(&out_submit->detector_result);
+        FillResultIdentity(spec_, profile_, obs, &out_submit->detector_result);
         return rc;
     }
 
@@ -298,16 +407,21 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
     {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
         auto& runtime_state = runtime_by_key_[key];
+        UpdateCoverageStats(&runtime_state.readiness_state, obs.bucket_id, true);
         double residual = 0.0;
+        double baseline_mu_t = 0.0;
         double z_t = 0.0;
+        double sigma_eff_t = 0.0;
         double score_point = 0.0;
         double score_shift = 0.0;
         DriftDirection drift_direction = runtime_state.drift_state.direction;
         bool serviceable = false;
         bool shadow_active = false;
-        BaselineProvider confidence_provider = BaselineProvider::kFormal;
 
-        if (runtime_state.shadow_state.active && update.gap > kDriftConfig.g_reset) {
+        const SharedProfileConfig& shared_config = SharedConfig();
+        const DriftConfig& drift_config = shared_config.drift;
+
+        if (runtime_state.shadow_state.active && update.gap > drift_config.g_reset) {
             runtime_state.shadow_state.Reset();
         }
 
@@ -326,37 +440,42 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                 shadow_active = true;
                 const double mu_shadow =
                     shadow_prediction.value + runtime_state.shadow_state.delta;
+                baseline_mu_t = mu_shadow;
                 residual = x_t - mu_shadow;
                 runtime_state.model_state =
                     ShadowRefUsesSource(runtime_state.shadow_state.ref_kind)
                         ? "shadow_source"
                         : "shadow_self";
-                runtime_state.baseline_source.kind =
+                runtime_state.baseline_source.selected_kind =
                     ShadowRefUsesSource(runtime_state.shadow_state.ref_kind)
-                        ? BaselineSourceDecisionKind::kConfiguredSource
-                        : BaselineSourceDecisionKind::kSelf;
-                runtime_state.baseline_source.source_key =
+                        ? BaselineSourceKind::kConfiguredSource
+                        : BaselineSourceKind::kSelf;
+                runtime_state.baseline_source.selected_source_key =
                     runtime_state.shadow_state.ref_source_key;
+                runtime_state.baseline_source.serviceable = true;
                 out_submit->detector_result.provider = BaselineProvider::kShadow;
                 out_submit->detector_result.flags |= kBaselineFlagShadowActive;
-                confidence_provider =
-                    ShadowRefUsesSource(runtime_state.shadow_state.ref_kind)
-                        ? BaselineProvider::kSource
-                        : BaselineProvider::kFormal;
+                const BaselineSourceKind shadow_source_kind =
+                    SourceKindFromShadowRef(runtime_state.shadow_state.ref_kind);
+                RefreshOnlineReadiness(&runtime_state.readiness_state,
+                                       shared_config,
+                                       shadow_prediction.readiness,
+                                       shadow_source_kind);
 
                 if (gate_score) {
                     const double sigma_shadow =
                         EffectiveValueSigma(shadow_prediction.sigma_ref,
                                             rho_t,
                                             kShadowSigmaScale);
+                    sigma_eff_t = sigma_shadow;
                     z_t = residual / sigma_shadow;
                     out_submit->detector_result.raw_score = std::fabs(z_t);
                     score_point =
                         ComputePointScoreFromAbsResidual(out_submit->detector_result.raw_score);
 
                     runtime_state.shadow_state.delta =
-                        (1.0 - kDriftConfig.alpha) * runtime_state.shadow_state.delta +
-                        kDriftConfig.alpha * (x_t - shadow_prediction.value);
+                        (1.0 - drift_config.alpha) * runtime_state.shadow_state.delta +
+                        drift_config.alpha * (x_t - shadow_prediction.value);
                 }
                 runtime_state.shadow_state.last_bucket_id = obs.bucket_id;
             } else {
@@ -368,22 +487,38 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
             // 常态路径先解析当前 bucket 应该使用哪个“可服务基线”。
             // 只有拿到可预测模型之后，才计算残差、漂移证据和点异常分数；
             // 冷启动或来源都不可服务时，只保留时序状态，不强行给出异常解释。
+            const BaselineSourceConfig* baseline_source_config = nullptr;
+            auto source_config_it = baseline_source_config_by_key_.find(key);
+            if (source_config_it != baseline_source_config_by_key_.end()) {
+                baseline_source_config = &source_config_it->second;
+            }
             const SelectedValueBaseline selected = ResolveServiceableBaseline(
-                key, obs.bucket_id, TaskEventCalendar(spec_), runtime_by_key_, series_override_map_);
+                key,
+                obs.bucket_id,
+                TaskEventCalendar(spec_),
+                runtime_by_key_,
+                baseline_source_config);
             runtime_state.baseline_source = selected.decision;
             if (selected.ready) {
                 serviceable = true;
                 runtime_state.model_state =
-                    selected.decision.kind == BaselineSourceDecisionKind::kSelf
-                        ? "serviceable_self"
-                        : "serviceable_source";
+                    selected.shadow_ref_kind == ShadowRefKind::kSelfCandidate
+                        ? "candidate_self"
+                        : selected.shadow_ref_kind == ShadowRefKind::kSourceCandidate
+                              ? "candidate_source"
+                              : selected.decision.selected_kind == BaselineSourceKind::kSelf
+                                    ? "serviceable_self"
+                                    : "serviceable_source";
                 out_submit->detector_result.provider = selected.provider;
-                confidence_provider = selected.provider;
+                baseline_mu_t = selected.prediction.value;
                 residual = x_t - selected.prediction.value;
+                RefreshOnlineReadiness(&runtime_state.readiness_state,
+                                       shared_config,
+                                       selected.prediction.readiness,
+                                       selected.decision.selected_kind);
                 if (gate_score) {
-                    const double sigma_eff =
-                        EffectiveValueSigma(selected.prediction.sigma_ref, rho_t);
-                    z_t = residual / sigma_eff;
+                    sigma_eff_t = EffectiveValueSigma(selected.prediction.sigma_ref, rho_t);
+                    z_t = residual / sigma_eff_t;
                     out_submit->detector_result.raw_score = std::fabs(z_t);
                     score_point =
                         ComputePointScoreFromAbsResidual(out_submit->detector_result.raw_score);
@@ -391,7 +526,7 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
 
                 const DriftUpdateResult drift_result = UpdateDriftState(
                     &runtime_state.drift_state,
-                    kDriftConfig,
+                    drift_config,
                     obs.bucket_id,
                     z_t,
                     gate_shift);
@@ -399,21 +534,22 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                 runtime_state.last_shift_confirmed = drift_result.shift_confirmed;
                 drift_direction = drift_result.direction;
                 score_shift =
-                    ClipUnit((drift_result.p_shift - kDriftConfig.p_shift_low) /
-                             (kDriftConfig.p_shift_high - kDriftConfig.p_shift_low));
+                    ClipUnit((drift_result.p_shift - drift_config.p_shift_low) /
+                             (drift_config.p_shift_high - drift_config.p_shift_low));
 
                 // 漂移确认后，不直接继续用旧 formal 硬扛，而是激活 shadow 并异步排队重建。
                 // `rebuild_start_hint` 近似取连续确认段的起点，让慢路径优先回放新阶段数据。
                 if (drift_result.shift_confirmed &&
-                    runtime_state.drift_state.confirm_count >= kMinShiftConfirmForRebuild &&
+                    runtime_state.drift_state.confirm_count >= drift_config.m_shift &&
                     !runtime_state.shadow_state.active &&
                     !runtime_state.shift_rebuild_pending &&
                     selected.model) {
                     runtime_state.shadow_state.active = true;
                     runtime_state.shadow_state.ref_kind = selected.shadow_ref_kind;
                     runtime_state.shadow_state.ref_source_key =
-                        selected.decision.kind == BaselineSourceDecisionKind::kConfiguredSource
-                            ? selected.decision.source_key
+                        selected.decision.selected_kind ==
+                                BaselineSourceKind::kConfiguredSource
+                            ? selected.decision.selected_source_key
                             : "";
                     runtime_state.shadow_state.ref_model_version =
                         selected.prediction.model_version;
@@ -437,10 +573,6 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                     out_submit->detector_result.raw_score = 0.0;
                     score_point = 0.0;
                     shadow_active = true;
-                    confidence_provider =
-                        ShadowRefUsesSource(selected.shadow_ref_kind)
-                            ? BaselineProvider::kSource
-                            : BaselineProvider::kFormal;
                 }
             } else {
                 runtime_state.model_state = "cold_start";
@@ -466,13 +598,26 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
             out_submit->detector_result.severity = SeverityFromNormalizedScore(
                 out_submit->detector_result.normalized_score);
 
-            const double confidence_base =
-                shadow_active
-                    ? std::min(ConfidenceBaseForProvider(confidence_provider),
-                               kShadowConfidenceCap)
-                    : ConfidenceBaseForProvider(confidence_provider);
+            double confidence_base = runtime_state.readiness_state.confidence_base;
+            if (shadow_active) {
+                confidence_base = std::min(confidence_base, kShadowConfidenceCap);
+            }
             out_submit->detector_result.confidence =
                 confidence_base / std::max(rho_t, 1.0);
+
+            FillValueEvidence(&out_submit->detector_result,
+                              profile_,
+                              runtime_state,
+                              obs.value,
+                              x_t,
+                              baseline_mu_t,
+                              residual,
+                              z_t,
+                              score_point,
+                              score_shift,
+                              obs.sample_count,
+                              sigma_eff_t,
+                              shadow_active);
         }
 
         runtime_state.last_sample_count = obs.sample_count;
@@ -639,7 +784,8 @@ void ValueDetectorCore::MarkRebuildFailure(const DetectorRebuildFailure& failure
         failure.candidate_state.empty() ? "fetch_failed" : failure.candidate_state;
     runtime_state.formal_state.candidate_model_version = 0;
     runtime_state.formal_state.candidate_model_kind = "none";
-    runtime_state.formal_state.switch_state = "none";
+    runtime_state.formal_state.switch_state =
+        failure.switch_state.empty() ? "none" : failure.switch_state;
     runtime_state.formal_state.last_candidate_loss = 0.0;
     runtime_state.formal_state.last_incumbent_loss = 0.0;
     runtime_state.formal_state.last_validation_count = 0;
