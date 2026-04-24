@@ -102,6 +102,8 @@ BaselineSourceConfig(key, feature) = [
 约束：
 
 - `BaselineSourceConfig` 由上游配置 / 注册层可选提供，不作为每条运行时 `Observation` 的必带字段
+- `BaselineSourceConfig` 的生效粒度固定为单个 `Series = (key, feature)`；不得把某个 `key` 的来源配置扩散到同一 task 下的其他 `key`
+- 若工程实现中一个 task 承载多个 runtime `key`，则必须通过 `(key, feature) -> BaselineSourceConfig?` 的查找表或等价 resolver 获取来源配置，而不是在 task 级保存一份全局 `BaselineSourceConfig`
 - 算法层只消费该配置并选择可用来源，不负责推断来源关系
 - `source_i` 必须与 `self` 共享同一 `feature` 身份、同一时间粒度、同一 `bucket_id` 对齐方式，以及同一统计口径；若口径不一致，则禁止配置为同一特征的基线来源
 - 该机制不预设树形父子结构，也不要求来源之间存在固定层级语义
@@ -397,7 +399,7 @@ BaselineTaskSpec = {
   feature_profile,
   delta,
   tz,
-  baseline_source_config?,
+  baseline_source_configs?,
   event_calendar_spec?,
   history_reader?
 }
@@ -406,9 +408,36 @@ BaselineTaskSpec = {
 说明：
 
 - `feature_profile`：该特征所属 profile 或等价静态参数集
-- `baseline_source_config`：可选的基线来源配置，沿用第 `2.3` 节定义
+- `baseline_source_configs`：可选的基线来源配置集合，沿用第 `2.3` 节定义；其每个元素的语义归属是 `BaselineSourceConfig(key, feature)`，不是 task 级全局默认值
 - `event_calendar_spec`：可选的事件日历静态规格，仅用于构造 `h_event(t)`
 - `history_reader`：可选的历史数据读取接口，仅用于正式重建、回放验证等慢路径
+
+补充约束：
+
+- 对 `T1 / T2`，`BaselineTaskSpec` 描述的是一个 `feature` 的静态算法规格；运行时实际建模对象仍然是 `Series = (key, feature)`。
+- 若一个 `ValueTask / RatioTask` 同时接收多个 `key` 的观测，`baseline_source_configs` 必须按运行时 `key` 匹配，未匹配的 `key` 视为 absent。
+- 禁止把 `baseline_source_configs?` 解释为“该 task 下所有 `key` 共享同一来源配置”。
+
+工程结构可表达为：
+
+```text
+baseline_source_configs? = [
+  {
+    key,
+    baseline_sources: [ { source_key }, ... ]
+  },
+  ...
+]
+```
+
+字段语义必须无歧义：
+
+- `baseline_source_configs` 是 `T1 / T2` 任务规格中唯一允许出现的来源配置字段，字段名使用复数，因为它表达的是“按 `key` 索引的一组单序列来源配置”。
+- `baseline_source_configs[i].key` 是该条配置生效的运行时 `key`；结合当前 task 的 `feature` 后，才构成完整建模单元 `(key, feature)`。
+- `baseline_source_configs[i].baseline_sources` 是该 `(key, feature)` 的候选外部来源列表，不包含 `self`，`self` 由算法选择规则隐式置于最高优先级。
+- `baseline_source_configs` 中不得出现重复 `key`；单条 `baseline_sources` 中不得出现重复 `source_key`，也不得把 `source_key` 配成同一个 `key`。
+- 顶层单数 `baseline_source_config` 不允许作为 `T1 / T2` task 级字段使用，避免被误解为“task 下所有 `key` 共用同一来源配置”。
+- 单数 `BaselineSourceConfig?` 只表示已经按 `(key, feature)` 解析后的单序列来源配置，可由 relation routed 特征或内部 resolver 物化使用。
 
 `EventCalendarSpec` 摘要定义为：
 

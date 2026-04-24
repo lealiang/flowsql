@@ -1329,87 +1329,110 @@
 ---
 
 ## Epic 18: 通用基线检测插件
-**优先级**: P1 | **状态**: 💡 设计阶段（Sprint 19 规划已完成，待实施）
+**优先级**: P1 | **状态**: 🚧 重新规划并实施中（Sprint 20 BaselineA）
 **价值**: 将基线能力从上游业务中解耦，建设可复用的 `baseline` 通用插件，统一支撑数值指标、比例指标和关系分布的异常检测，并提供高性能热路径、异步正式重建与可诊断的工程闭环。
 
-### Story 18.1: 公共接口与插件骨架
-**状态**: 📋 待规划
+**历史说明**:
+- Sprint 19 已完成统一算法设计，但实现迭代失败；评审结论以 `tasks/sprints/sprint19-baseline/review.md` 和 `tasks/sprints/sprint19-baseline/retrospective.md` 为准。
+- 原 `18.1 ~ 18.9` 属于 Sprint 19 的第一版 Story 分解，现已归档，仅保留历史参考，不再作为当前实施入口。
+- 当前实施基线以 `tasks/sprints/sprint20-baselineA/code-design.md` 和 `tasks/sprints/sprint20-baselineA/planning.md` 为准。
+
+### Story 18.10: 统一协议与任务规格闭环
+**状态**: ✅ 已完成（Sprint 20 BaselineA）
 **验收标准**:
-- 定义 `IBaselineService / IBaselineTask / IBaselineValueTask / IBaselineRatioTask / IBaselineRelationTask` 公共接口。
-- `baseline` 插件可被 `PluginLoader` 正常加载，并可通过 `IQuerier` 查询到服务接口。
-- 明确对外同步调用、对内异步重建的能力边界。
+- 补齐 `DetectorResult / FusionResult / evidence` 正式输出协议。
+- 补齐 `BaselineTaskSpec / RelationTaskSpec / RelationTaskClockSpec` 及 `HistoryReader / BaselineSourceResolver / QueryKeyFusionSnapshotJson` 接口。
+- 所有 task 配置在创建阶段完成正式字段校验，`?` 字段的 absent 语义明确且一致。
 
 ---
 
-### Story 18.2: Task 生命周期与配置解析
-**状态**: 📋 待规划
+### Story 18.11: 共享时间、事件与 readiness 基础层
+**状态**: ✅ 已完成（Sprint 20 BaselineA）
 **验收标准**:
-- 支持创建 `ValueTask / RatioTask / RelationTask` 三类 task。
-- task 可返回 `Id / Name / Kind / ConfigJson` 等元信息。
-- 配置 JSON 可完成最小规格校验，非法配置可返回结构化错误。
+- 建立 `profile_config / calendar_feature_helper / event_calendar_matcher / readiness_helper` 共享基础层。
+- 统一 `DST`、`day/week` 相位、`monthpos`、事件命中与 `readiness` 计算口径。
+- 共享主参数、`T1b` 参数、`T2` 参数及其派生值统一收口，不再散落在 detector / trainer 中。
 
 ---
 
-### Story 18.3: `T1 / T2` 热路径公共状态层
-**状态**: 📋 待规划
+### Story 18.12: 正式模型 schema 与 predictor 落地
+**状态**: ✅ 已完成（Sprint 20 BaselineA）
 **验收标准**:
-- 可按 `(task, key)` 维护独立状态。
-- 支持 `bucket_id` 顺序校验、gap 处理和基础 flags 输出。
-- 公共状态层不与具体 `T1 / T2 / T3` 算法实现强耦合。
+- 正式模型可表达 `T1 / T2` 所需的 `Core / monthpos / event` 块结构与训练摘要元数据。
+- predictor 可基于 `bucket_id + delta + tz + compiled events` 生成正式预测值。
+- 模型对象持久化事件版本、readiness 元数据和训练 digest，支撑后续重建与验证。
 
 ---
 
-### Story 18.4: `T1` 热路径首版
-**状态**: 📋 待规划
+### Story 18.13: 插件与 task 编排层重构
+**状态**: ✅ 已完成（Sprint 20 BaselineA）
 **验收标准**:
-- `IBaselineValueTask::SubmitObservation()` 可同步返回 `DetectorResult`。
-- `T1a / T1b` 统一走标量特征输入规格。
-- 支持数值型指标的基础评分、状态更新和结果解释。
+- `ValueTask / RatioTask / RelationTask` 三类 task 均支持 task-bound 注入、状态持有、submit 编排和 snapshot。
+- `relation_task` 具备独立 runtime 结构，不再隐含在公共壳层中。
+- task 壳层只负责编排与生命周期，不再承载求解器和算法目标函数。
 
 ---
 
-### Story 18.5: `T2` 热路径首版
-**状态**: 📋 待规划
+### Story 18.14: `T1` 训练与正式重建慢路径
+**状态**: 🚧 进行中（Sprint 20 BaselineA）
 **验收标准**:
-- `IBaselineRatioTask::SubmitObservation()` 可同步返回 `DetectorResult`。
-- 支持 `numerator / denominator` 输入链路和低分母门控。
-- 支持比例型指标的基础评分、状态更新和结果解释。
+- 实现 `WeightedHuberRidgeBlockSolver`、`TrainCore / MonthPos / Event`、`sigma` 估计与 `candidate vs incumbent` 验证。
+- `formal_model_state` 收口 `candidate_state / switch_state`，`rebuild_worker` 完成正式重建闭环。
+- `T1` 历史回放、训练、验证、切换状态全部可测试。
 
 ---
 
-### Story 18.6: 异步正式重建基础设施
-**状态**: 📋 待规划
+### Story 18.15: `T1` 在线评分、漂移证据与 `shadow baseline`
+**状态**: 🚧 进行中（Sprint 20 BaselineA）
 **验收标准**:
-- 建立 `rebuild queue + rebuild worker` 慢路径基础设施。
-- `RequestRebuild()` 只负责入队，不阻塞热路径调用者。
-- `history_reader` 只进入慢路径，不允许进入同步评分链路。
+- `T1a / T1b` 热路径正式接入 predictor、`ReadinessState`、`DriftState` 与 `ShadowState`。
+- `ValueEvidence`、`RebuildIntent`、`sample_count -> gate / rho / sigma_eff` 等正式证据链路全部生效。
+- `shadow baseline` 能激活、更新、退出，并与正式重建触发闭环。
 
 ---
 
-### Story 18.7: 漂移证据、`shadow baseline` 与正式切换
-**状态**: 📋 待规划
+### Story 18.16: `T2` 训练与在线评分闭环
+**状态**: 🚧 进行中（Sprint 20 BaselineA）
 **验收标准**:
-- 支持旧基线失配后的漂移证据累积与重建触发。
-- `shadow baseline` 可在正式基线重建完成前临时接管在线评分。
-- candidate 验证、正式切换和 `shadow` 退出条件形成闭环。
+- `T2` 完整实现 `m0 / alpha0 / beta0 / p_smooth / logit / sigmoid / variance layer` 数学路径。
+- `rate_core / ratio_bursty` 的 profile 差异、来源借用和正式重建全部落地。
+- `RatioEvidence`、`baseline_source_key` 与比例类正式评分链路闭环成立。
 
 ---
 
-### Story 18.8: `T3` 关系分布 task
-**状态**: 📋 待规划
+### Story 18.17: `T3` basis、摘要特征与 routed detector
+**状态**: 🚧 进行中（Sprint 20 BaselineA）
 **验收标准**:
-- 一个 task 对应一个关系分布规格，而不是一个摘要特征。
-- `RelationObservationBlock` 只解析一次，完成摘要提取与路由。
-- 可将核心摘要特征路由到 `T1 / T2` 子检测器并输出结果。
+- 补齐 `ServiceBasis / EvalBasis / lineage` 结构与兼容判断。
+- 实现 `entropy_shannon / top1_share / headK_share / out_of_support_share / distinct_group_count / stable_g[i]_share / stable_headK_coverage / stable_headK_mix_drift` 摘要特征。
+- routed detector 真实复用 `ValueDetectorCore / RatioDetectorCore`，并支持 relation snapshot 与 basis 可比较输出。
 
 ---
 
-### Story 18.9: 测试、诊断与稳定性补强
-**状态**: 📋 待规划
+### Story 18.18: 模式融合层与 key 级风险合成
+**状态**: 🚧 进行中（Sprint 20 BaselineA）
 **验收标准**:
-- 建立 `baseline` 插件的独立测试工程。
-- 覆盖插件加载、task 生命周期、`T1 / T2`、重建、`shadow`、`T3` 与并发边界。
-- 提供 task 级、series 级和服务级诊断能力。
+- 实现 `relation_pattern_fusion` 与 `key_risk_fusion`，正式落地 `core_P / support_P / oppose_P` 和 `lambda_sup / lambda_opp / lambda_P(pattern)`。
+- 输出 `Risk_T1T2 / Risk_single_T3 / Risk_pattern / Risk_T3 / Risk(Key,t)` 与 `FusionResult`。
+- `QueryKeyFusionSnapshotJson`、`FusionSourceId` 与 `RemoveTaskContributions(task_id)` 全部闭环。
+
+---
+
+### Story 18.19: `T3` 正式重建、验证与 lineage 切换
+**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**验收标准**:
+- `T3` 正式重建同时产出 `CandidateServiceBasis / CandidateEvalBasis`。
+- `candidate vs incumbent` 比较严格在共同 `EvalBasis` 上完成，并处理兼容与 `new lineage` 两条路径。
+- `shadow baseline` 在 routed 序列与正式切换之间形成桥接闭环。
+
+---
+
+### Story 18.20: 测试收口、死代码清理与最终一致性审查
+**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**验收标准**:
+- 建立覆盖 `T1 / T2 / T3 / fusion / rebuild / relation snapshot / concurrency` 的完整测试矩阵。
+- 删除旧的 `intercept-only`、常数预测和其他占位路径，清理无效死代码。
+- 以 `design.md + code-design.md` 为基准完成最终一致性审查，确认不再出现“只有壳、没有算法”的偏差。
 
 ## 优先级说明
 - **P0**: 核心功能，必须实现
