@@ -11,6 +11,8 @@
 
 #include <framework/interfaces/ibaseline_types.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -21,14 +23,13 @@
 
 #include "plugins/baseline/detector/detector_common.h"
 #include "plugins/baseline/model/drift_state.h"
-#include "plugins/baseline/model/event_calendar_spec.h"
+#include "plugins/baseline/model/event_calendar_matcher.h"
 #include "plugins/baseline/model/formal_model.h"
 #include "plugins/baseline/model/formal_model_state.h"
 #include "plugins/baseline/model/formal_predictor.h"
 #include "plugins/baseline/model/readiness_helper.h"
 #include "plugins/baseline/model/series_override.h"
 #include "plugins/baseline/model/series_state.h"
-#include "plugins/baseline/model/series_store.h"
 #include "plugins/baseline/model/shadow_state.h"
 #include "plugins/baseline/rebuild/replay_runner.h"
 
@@ -72,7 +73,9 @@ struct RatioDetectorCoreSpec {
     std::string routed_feature_id;
     std::string feature_type;
     std::string feature_profile;
-    std::optional<EventCalendarSpec> event_calendar_spec;
+    int64_t delta = 0;
+    std::string tz;
+    std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar;
     std::vector<SeriesBaselineSourceConfig> baseline_source_configs;
 };
 
@@ -102,8 +105,10 @@ struct RatioApplyFormalModelResult {
     uint64_t validation_count = 0;
     bool candidate_trained = false;
     uint64_t candidate_generation = 0;
-    std::string candidate_state = "none";
-    std::string switch_state = "none";
+    RebuildCandidateState candidate_state = RebuildCandidateState::kNone;
+    RebuildSwitchState switch_state = RebuildSwitchState::kIdle;
+    RebuildFailureReason failure_reason = RebuildFailureReason::kNone;
+    std::string failure_reason_detail;
     bool replace_formal_model = false;
     std::shared_ptr<RatioFormalModel> full_model;
 };
@@ -117,26 +122,51 @@ class RatioDetectorCore {
                             RatioSeriesSnapshot* out_snapshot) const;
     int GetSeriesState(const BaselineStringRef& key, SeriesState* out_state) const;
     int BuildRebuildContext(const std::string& key, RatioRebuildContext* out_context) const;
+    void MarkRebuildEnqueued(const std::string& key);
+    void MarkCandidateBuilding(const std::string& key);
+    void MarkCandidateBuilt(const std::string& key,
+                            uint64_t candidate_model_version,
+                            const char* candidate_model_kind);
+    void MarkCandidateValidating(const std::string& key,
+                                 uint64_t candidate_model_version,
+                                 const char* candidate_model_kind);
     void ApplyFormalModel(const std::string& key,
                           const RatioApplyFormalModelResult& apply_result);
     void MarkRebuildFailure(const DetectorRebuildFailure& failure);
     void ClearPendingRebuild(const std::string& key);
     void Clear();
     size_t Size() const;
+    uint64_t PrunedKeyCount() const;
+    int64_t IdlePruneBucketGap() const;
 
     const RatioFeatureProfile& profile() const { return profile_; }
-    const std::optional<EventCalendarSpec>& event_calendar_spec() const {
-        return spec_.event_calendar_spec;
-    }
     const std::string& routed_feature_id() const { return spec_.routed_feature_id; }
 
  private:
+    struct RatioSeriesShardEntry {
+        SeriesState series_state;
+        RatioSeriesRuntimeState runtime_state;
+    };
+
+    struct RuntimeShardState {
+        mutable std::mutex mutex;
+        std::unordered_map<std::string, RatioSeriesShardEntry> states;
+        size_t prune_cursor = 0;
+    };
+
+    static constexpr size_t kShardCount = 64;
+
+    size_t RuntimeShardIndex(const std::string& key) const {
+        return std::hash<std::string>{}(key) % runtime_shards_.size();
+    }
+
     RatioDetectorCoreSpec spec_;
     RatioFeatureProfile profile_;
-    SeriesStore series_store_;
-    mutable std::mutex runtime_mutex_;
-    std::unordered_map<std::string, RatioSeriesRuntimeState> runtime_by_key_;
+    std::array<RuntimeShardState, kShardCount> runtime_shards_;
     std::unordered_map<std::string, BaselineSourceConfig> baseline_source_config_by_key_;
+    std::atomic<uint64_t> prune_cursor_{0};
+    std::atomic<int64_t> last_pruned_bucket_{-1};
+    std::atomic<uint64_t> pruned_key_count_total_{0};
 };
 
 }  // namespace baseline

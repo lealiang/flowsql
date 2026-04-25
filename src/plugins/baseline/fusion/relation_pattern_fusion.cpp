@@ -95,6 +95,47 @@ double Top2Mean(const std::vector<double>& values) {
     return 0.5 * (top[0] + top[1]);
 }
 
+void InsertTopSingle(const StoredDominantSingleProjection& candidate,
+                     std::array<StoredDominantSingleProjection, kBaselineDominantSingleLimit>* top,
+                     uint32_t* count) {
+    if (!top || !count || candidate.a_f <= 0.0) return;
+
+    uint32_t insert_at = *count;
+    while (insert_at > 0 && (*top)[insert_at - 1].a_f < candidate.a_f) {
+        if (insert_at < kBaselineDominantSingleLimit) {
+            (*top)[insert_at] = (*top)[insert_at - 1];
+        }
+        --insert_at;
+    }
+
+    if (insert_at >= kBaselineDominantSingleLimit) return;
+    (*top)[insert_at] = candidate;
+    if (*count < kBaselineDominantSingleLimit) {
+        ++(*count);
+    }
+}
+
+void InsertTopPattern(const StoredDominantPatternProjection& candidate,
+                      std::array<StoredDominantPatternProjection, kBaselineDominantPatternLimit>* top,
+                      uint32_t* count) {
+    if (!top || !count || candidate.weighted_score <= 0.0) return;
+
+    uint32_t insert_at = *count;
+    while (insert_at > 0 &&
+           (*top)[insert_at - 1].weighted_score < candidate.weighted_score) {
+        if (insert_at < kBaselineDominantPatternLimit) {
+            (*top)[insert_at] = (*top)[insert_at - 1];
+        }
+        --insert_at;
+    }
+
+    if (insert_at >= kBaselineDominantPatternLimit) return;
+    (*top)[insert_at] = candidate;
+    if (*count < kBaselineDominantPatternLimit) {
+        ++(*count);
+    }
+}
+
 void AppendSupportingFeature(const std::string& feature,
                              std::vector<std::string>* out_features) {
     if (!out_features || feature.empty()) return;
@@ -334,13 +375,11 @@ int RelationPatternFusion::Compute(const RelationPatternFusionInput& input,
     }
 
     std::sort(ranked_singles.begin(), ranked_singles.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs.first > rhs.first;
-              });
-    for (size_t i = 0; i < ranked_singles.size() &&
-                       i < static_cast<size_t>(kBaselineDominantSingleLimit);
-         ++i) {
-        out->fusion_result.dominant_singles.push_back(ranked_singles[i].second);
+              [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+    for (const auto& item : ranked_singles) {
+        InsertTopSingle(item.second,
+                        &out->fusion_result.dominant_singles,
+                        &out->fusion_result.dominant_single_count);
     }
 
     std::vector<double> single_evidence;
@@ -390,12 +429,12 @@ int RelationPatternFusion::Compute(const RelationPatternFusionInput& input,
         for (size_t i = 0; i < metric_hits.size() &&
                            i < static_cast<size_t>(kBaselinePatternMetricsHitLimit);
              ++i) {
-            projection.metrics_hit.push_back(metric_hits[i].second);
+            AppendStoredMetricHit(&projection, metric_hits[i].second);
         }
         for (size_t i = 0; i < supporting_features.size() &&
                            i < static_cast<size_t>(kBaselinePatternSupportingFeatureLimit);
              ++i) {
-            projection.supporting_features.push_back(supporting_features[i]);
+            AppendStoredSupportingFeature(&projection, supporting_features[i]);
         }
 
         ranked_patterns.emplace_back(projection.weighted_score, projection);
@@ -408,13 +447,11 @@ int RelationPatternFusion::Compute(const RelationPatternFusionInput& input,
     }
 
     std::sort(ranked_patterns.begin(), ranked_patterns.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs.first > rhs.first;
-              });
-    for (size_t i = 0; i < ranked_patterns.size() &&
-                       i < static_cast<size_t>(kBaselineDominantPatternLimit);
-         ++i) {
-        out->fusion_result.dominant_patterns.push_back(ranked_patterns[i].second);
+              [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+    for (const auto& item : ranked_patterns) {
+        InsertTopPattern(item.second,
+                         &out->fusion_result.dominant_patterns,
+                         &out->fusion_result.dominant_pattern_count);
     }
 
     double risk_pattern = 0.0;

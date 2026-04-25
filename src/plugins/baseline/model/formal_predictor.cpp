@@ -245,33 +245,5 @@ int PredictFormalModel(const RatioFormalModel* model,
     return error::OK;
 }
 
-int PredictFormalModel(const ValueFormalModel* model,
-                       const EventCalendarSpec* task_calendar,
-                       int64_t bucket_id,
-                       FormalPrediction* out) {
-    FormalPredictContext context;
-    context.bucket_id = bucket_id;
-    const int rc = PredictFormalModel(model, context, out);
-    if (rc == error::OK && out) {
-        out->event_status = EvaluateEventCalendarStatus(model->metadata, task_calendar);
-        out->event_enabled = out->event_status == EventCalendarStatus::kEnabled;
-    }
-    return rc;
-}
-
-int PredictFormalModel(const RatioFormalModel* model,
-                       const EventCalendarSpec* task_calendar,
-                       int64_t bucket_id,
-                       FormalPrediction* out) {
-    FormalPredictContext context;
-    context.bucket_id = bucket_id;
-    const int rc = PredictFormalModel(model, context, out);
-    if (rc == error::OK && out) {
-        out->event_status = EvaluateEventCalendarStatus(model->metadata, task_calendar);
-        out->event_enabled = out->event_status == EventCalendarStatus::kEnabled;
-    }
-    return rc;
-}
-
 }  // namespace baseline
 }  // namespace flowsql

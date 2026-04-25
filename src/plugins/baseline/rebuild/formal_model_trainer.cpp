@@ -47,7 +47,7 @@ template <typename TModel>
 void FillCommonMetadata(uint64_t model_version,
                         uint64_t holdout_count,
                         const ReplayWindowSummary& train_window,
-                        const EventCalendarSpec* event_calendar_spec,
+                        const CompiledEventCalendar* compiled_event_calendar,
                         TModel* model) {
     if (!model) return;
     model->metadata.model_version = model_version;
@@ -55,9 +55,9 @@ void FillCommonMetadata(uint64_t model_version,
     model->metadata.observation_count = train_window.observation_count;
     model->metadata.train_bucket_start = train_window.first_bucket_id;
     model->metadata.train_bucket_end = train_window.last_bucket_id;
-    if (event_calendar_spec) {
-        model->metadata.calendar_id = event_calendar_spec->calendar_id;
-        model->metadata.calendar_version = event_calendar_spec->calendar_version;
+    if (compiled_event_calendar) {
+        model->metadata.calendar_id = compiled_event_calendar->calendar_id;
+        model->metadata.calendar_version = compiled_event_calendar->calendar_version;
     } else {
         model->metadata.calendar_id.clear();
         model->metadata.calendar_version.clear();
@@ -427,9 +427,9 @@ bool BuildEventFitSpec(const ValueFormalTrainInput& input,
                        int64_t delta,
                        const std::string& tz,
                        BlockFitSpec* out_spec,
-                       std::vector<std::string>* out_codes) {
+    std::vector<std::string>* out_codes) {
     if (!out_spec || !out_codes) return false;
-    if (!input.event_calendar_spec || !input.compiled_event_calendar ||
+    if (!input.compiled_event_calendar ||
         input.compiled_event_calendar->enabled_event_codes.empty()) {
         return false;
     }
@@ -666,9 +666,9 @@ bool BuildEventFitSpec(const RatioFormalTrainInput& input,
                        int64_t delta,
                        const std::string& tz,
                        BlockFitSpec* out_spec,
-                       std::vector<std::string>* out_codes) {
+    std::vector<std::string>* out_codes) {
     if (!out_spec || !out_codes) return false;
-    if (!input.event_calendar_spec || !input.compiled_event_calendar ||
+    if (!input.compiled_event_calendar ||
         input.compiled_event_calendar->enabled_event_codes.empty()) {
         return false;
     }
@@ -754,7 +754,11 @@ FormalTrainFailureCode FormalModelTrainer::TrainValue(const ValueFormalTrainInpu
     auto model = std::make_shared<ValueFormalModel>();
     model->metadata.kind = FormalModelKind::kValueBaseline;
     FillCommonMetadata(
-        input.model_version, input.holdout_count, input.train_window, input.event_calendar_spec, model.get());
+        input.model_version,
+        input.holdout_count,
+        input.train_window,
+        input.compiled_event_calendar,
+        model.get());
     model->transform_name = input.profile->transform_name;
     model->solver_name = DefaultBlockSolverConfig().solver_name;
     model->fit_strategy = "stage_fit";
@@ -849,8 +853,8 @@ FormalTrainFailureCode FormalModelTrainer::TrainValue(const ValueFormalTrainInpu
                 event_spec, DefaultBlockSolverConfig(), &event_fit) == error::OK &&
             !event_fit.beta.empty()) {
             model->event_block.enabled = true;
-            model->event_block.calendar_id = input.event_calendar_spec->calendar_id;
-            model->event_block.calendar_version = input.event_calendar_spec->calendar_version;
+            model->event_block.calendar_id = input.compiled_event_calendar->calendar_id;
+            model->event_block.calendar_version = input.compiled_event_calendar->calendar_version;
             model->event_block.active_event_codes = std::move(event_codes);
             model->event_block.coeff = std::move(event_fit.beta);
             model->fit_summary.push_back(BuildDigest(
@@ -938,7 +942,11 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
     auto model = std::make_shared<RatioFormalModel>();
     model->metadata.kind = FormalModelKind::kRatioBaseline;
     FillCommonMetadata(
-        input.model_version, input.holdout_count, input.train_window, input.event_calendar_spec, model.get());
+        input.model_version,
+        input.holdout_count,
+        input.train_window,
+        input.compiled_event_calendar,
+        model.get());
     model->transform_name = "logit";
     model->solver_name = DefaultBlockSolverConfig().solver_name;
     model->fit_strategy = "stage_fit";
@@ -1036,8 +1044,8 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
                 event_spec, DefaultBlockSolverConfig(), &event_fit) == error::OK &&
             !event_fit.beta.empty()) {
             model->event_block.enabled = true;
-            model->event_block.calendar_id = input.event_calendar_spec->calendar_id;
-            model->event_block.calendar_version = input.event_calendar_spec->calendar_version;
+            model->event_block.calendar_id = input.compiled_event_calendar->calendar_id;
+            model->event_block.calendar_version = input.compiled_event_calendar->calendar_version;
             model->event_block.active_event_codes = std::move(event_codes);
             model->event_block.coeff = std::move(event_fit.beta);
             model->fit_summary.push_back(BuildDigest(

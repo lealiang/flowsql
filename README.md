@@ -52,6 +52,12 @@ docker compose -f config/docker-compose-postgres.yml up -d
 - CMake 3.12+，C++17 编译器（GCC 7+），Linux
 - Python 3.8+（Python 算子运行时）
 
+### 系统编译依赖
+
+- `libicu-dev`（或提供 `libicuuc` / `libicui18n` 的等价开发包）
+  - 用途：Baseline 插件的业务时区换算
+  - 对应 CMake 依赖：`find_package(ICU REQUIRED COMPONENTS uc i18n)`
+
 ```bash
 pip3 install -e src/python/ --break-system-packages
 ```

@@ -34,6 +34,7 @@ class RebuildTaskRuntime;
 class KeyRiskFusion;
 struct RebuildRequest;
 struct RelationHistoryBinding;
+struct RelationTaskTestAccess;
 
 struct StoredRelationDetectorResult {
     bool available = false;
@@ -63,15 +64,20 @@ struct RelationRoutedFeatureRuntime {
 struct RelationMetricRuntimeState {
     RelationServiceBasis service_basis;
     RelationEvalBasis eval_basis;
+    RelationServiceBasis routed_basis_snapshot;
+    bool routed_runtime_materialized = false;
     std::vector<RelationRoutedFeatureRuntime> routed_features;
 };
 
 struct RelationTaskKeyRuntimeState {
     uint64_t seen_block_count = 0;
+    int64_t last_bucket_id = 0;
     std::unordered_map<std::string, RelationMetricRuntimeState> metrics_by_name;
     StoredFusionResult last_fusion_result;
-    std::string candidate_state = "none";
-    std::string switch_state = "none";
+    RebuildCandidateState candidate_state = RebuildCandidateState::kNone;
+    RebuildSwitchState switch_state = RebuildSwitchState::kIdle;
+    RebuildFailureReason failure_reason = RebuildFailureReason::kNone;
+    std::string failure_reason_detail;
     RelationLineageCompatibility last_lineage_compatibility =
         RelationLineageCompatibility::kCompatible;
     double last_candidate_loss = 0.0;
@@ -80,6 +86,7 @@ struct RelationTaskKeyRuntimeState {
     ReplayWindowSummary last_replay_window;
     ReplayWindowSummary last_train_window;
     ReplayWindowSummary last_holdout_window;
+    RebuildStageTrace stage_trace;
 };
 
 class BaselineRelationTask final : public IBaselineRelationTask, public BaselineTaskBase {
@@ -112,6 +119,8 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
     void OnClosingLocked() override;
 
  private:
+    friend struct RelationTaskTestAccess;
+
     int ExecuteRebuild(const RebuildRequest& request);
 
     RelationTaskSpec spec_;
@@ -120,6 +129,9 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
     IBaselineSourceResolver* source_resolver_ = nullptr;
     mutable std::mutex runtime_mutex_;
     std::unordered_map<std::string, RelationTaskKeyRuntimeState> runtime_by_key_;
+    size_t runtime_prune_cursor_ = 0;
+    int64_t last_runtime_pruned_bucket_ = -1;
+    uint64_t pruned_key_count_total_ = 0;
     std::shared_ptr<RelationHistoryBinding> history_binding_;
     std::shared_ptr<RebuildTaskRuntime> rebuild_runtime_;
     KeyRiskFusion* key_risk_fusion_ = nullptr;

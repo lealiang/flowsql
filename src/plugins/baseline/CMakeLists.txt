@@ -1,4 +1,5 @@
 project(flowsql_baseline)
+find_package(ICU REQUIRED COMPONENTS uc i18n)
 
 add_library(${PROJECT_NAME} SHARED
     baseline_plugin.cpp
@@ -29,9 +30,13 @@ add_library(${PROJECT_NAME} SHARED
     task/value_task.cpp
 )
 
-target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(${PROJECT_NAME} PUBLIC
+    ${CMAKE_SOURCE_DIR}
+    ${ICU_INCLUDE_DIRS}
+)
 
 add_thirddepen(${PROJECT_NAME} eigen rapidjson)
+target_link_libraries(${PROJECT_NAME} ${ICU_LIBRARIES})
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output

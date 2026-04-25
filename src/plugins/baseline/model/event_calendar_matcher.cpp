@@ -104,11 +104,6 @@ int CompileEventCalendar(const EventCalendarSpec& spec,
             if (err) *err = "key scoped event must set key";
             return error::BAD_REQUEST;
         }
-        if (entry.alignment_mode == "local_wall_clock" && entry.tz.empty()) {
-            if (err) *err = "local_wall_clock event must set tz";
-            return error::BAD_REQUEST;
-        }
-
         auto code_it = code_index_by_name.find(entry.event_code);
         if (code_it == code_index_by_name.end()) {
             const std::size_t next_index = out->enabled_event_codes.size();

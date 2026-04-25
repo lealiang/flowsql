@@ -14,7 +14,9 @@
 #include <common/error_code.h>
 #include <framework/interfaces/ibaseline_types.h>
 #include <plugins/baseline/detector/detector_common.h>
+#define private public
 #include <plugins/baseline/detector/value_detector_core.h>
+#undef private
 
 using namespace flowsql;
 using namespace flowsql::baseline;
@@ -56,9 +58,38 @@ static void ApplyFormalModel(ValueDetectorCore* core,
     ValueApplyFormalModelResult apply_result;
     apply_result.candidate_trained = true;
     apply_result.candidate_generation = model ? model->metadata.model_version : 0;
-    apply_result.switch_state = "formal_apply";
+    apply_result.candidate_state = RebuildCandidateState::kAccepted;
+    apply_result.switch_state = RebuildSwitchState::kFormalApplied;
     apply_result.full_model = std::move(model);
     core->ApplyFormalModel(key, apply_result);
+}
+
+static std::shared_ptr<const CompiledEventCalendar> BuildCompiledCalendar(const char* feature,
+                                                                          const char* key) {
+    EventCalendarSpec calendar;
+    calendar.calendar_id = "ops-calendar";
+    calendar.calendar_version = "v1";
+    calendar.entries.push_back(EventCalendarEntry{
+        "deploy",
+        "key_feature",
+        "absolute_utc",
+        20 * 60,
+        21 * 60,
+        true,
+        feature,
+        key,
+        ""});
+
+    BaselineTaskSpec task_spec;
+    task_spec.key = key;
+    task_spec.feature = feature;
+    task_spec.delta = 60;
+    task_spec.tz = "UTC";
+
+    CompiledEventCalendar compiled;
+    std::string err;
+    assert(CompileEventCalendar(calendar, task_spec, &compiled, &err) == error::OK);
+    return std::make_shared<CompiledEventCalendar>(std::move(compiled));
 }
 
 static void TestValueDetectorCoreSubmitAndSnapshot() {
@@ -110,12 +141,19 @@ static void TestValueDetectorCoreMarkRebuildFailure() {
     failure.key = "svc-b";
     failure.request_bucket_start = 7;
     failure.request_bucket_end = 12;
-    failure.candidate_state = "fetch_failed";
+    failure.candidate_state = RebuildCandidateState::kFailed;
+    failure.switch_state = RebuildSwitchState::kRebuildBlocked;
+    failure.failure_reason = RebuildFailureReason::kUnavailable;
     core.MarkRebuildFailure(failure);
 
     ValueSeriesSnapshot snapshot;
     assert(core.BuildSeriesSnapshot(Ref("svc-b"), &snapshot) == error::OK);
-    assert(snapshot.runtime_state.formal_state.candidate_state == "fetch_failed");
+    assert(snapshot.runtime_state.formal_state.candidate_state ==
+           RebuildCandidateState::kFailed);
+    assert(snapshot.runtime_state.formal_state.switch_state ==
+           RebuildSwitchState::kRebuildBlocked);
+    assert(snapshot.runtime_state.formal_state.failure_reason ==
+           RebuildFailureReason::kUnavailable);
     assert(snapshot.runtime_state.formal_state.last_replay_window.request_bucket_start == 7);
     assert(snapshot.runtime_state.formal_state.last_replay_window.request_bucket_end == 12);
     assert(snapshot.runtime_state.shift_rebuild_pending == false);
@@ -237,6 +275,130 @@ static void TestValueDetectorCoreConfiguredSourceConfidence() {
     std::printf("[PASS] ValueDetectorCore configured source confidence\n");
 }
 
+static void TestValueDetectorCoreDoesNotServeCandidateModel() {
+    std::printf("[TEST] ValueDetectorCore does not serve candidate model...\n");
+
+    ValueDetectorCoreSpec spec;
+    spec.owner_task_id = "value-task-candidate";
+    spec.routed_feature_id = "bytes_total";
+    spec.feature_type = "t1a";
+    spec.feature_profile = "traffic";
+
+    ValueDetectorCore core(spec);
+    const std::string key = "svc-candidate-only";
+    const size_t shard_id = core.RuntimeShardIndex(key);
+    {
+        std::lock_guard<std::mutex> lock(core.runtime_shards_[shard_id].mutex);
+        auto& runtime_state = core.runtime_shards_[shard_id].states[key].runtime_state;
+        runtime_state.candidate_model = BuildFormalModel(std::log1p(7.0), 1.0, 7);
+        runtime_state.formal_state.candidate_generation = 7;
+        runtime_state.formal_state.candidate_model_version = 7;
+        runtime_state.formal_state.candidate_model_kind = "value_baseline";
+    }
+
+    DetectorSubmitOutput submit;
+    assert(core.Submit(ValueObservation{BaselineStringRef{key.c_str(),
+                                                          static_cast<uint32_t>(key.size())},
+                                       50,
+                                       7.0,
+                                       0},
+                       &submit) == error::OK);
+
+    assert(submit.detector_result.provider == BaselineProvider::kNone);
+    assert(submit.detector_result.evidence.kind == BaselineEvidenceKind::kNone);
+
+    std::printf("[PASS] ValueDetectorCore does not serve candidate model\n");
+}
+
+static void TestValueDetectorCoreUsesShardedRuntimeStorage() {
+    std::printf("[TEST] ValueDetectorCore uses sharded runtime storage...\n");
+
+    ValueDetectorCoreSpec spec;
+    spec.owner_task_id = "value-task-shards";
+    spec.routed_feature_id = "bytes_total";
+    spec.feature_type = "t1a";
+    spec.feature_profile = "traffic";
+
+    ValueDetectorCore core(spec);
+    assert(ValueDetectorCore::kShardCount > 1);
+
+    std::string key_a = "svc-shard-a";
+    std::string key_b = "svc-shard-b";
+    size_t shard_a = core.RuntimeShardIndex(key_a);
+    size_t shard_b = core.RuntimeShardIndex(key_b);
+    for (int i = 0; shard_a == shard_b && i < 256; ++i) {
+        key_b = "svc-shard-b-" + std::to_string(i);
+        shard_b = core.RuntimeShardIndex(key_b);
+    }
+    assert(shard_a != shard_b);
+
+    DetectorSubmitOutput submit;
+    assert(core.Submit(ValueObservation{BaselineStringRef{key_a.c_str(),
+                                                          static_cast<uint32_t>(key_a.size())},
+                                       10,
+                                       9.0,
+                                       0},
+                       &submit) == error::OK);
+    assert(core.Submit(ValueObservation{BaselineStringRef{key_b.c_str(),
+                                                          static_cast<uint32_t>(key_b.size())},
+                                       10,
+                                       11.0,
+                                       0},
+                       &submit) == error::OK);
+
+    assert(core.runtime_shards_[shard_a].states.find(key_a) !=
+           core.runtime_shards_[shard_a].states.end());
+    assert(core.runtime_shards_[shard_b].states.find(key_b) !=
+           core.runtime_shards_[shard_b].states.end());
+
+    std::printf("[PASS] ValueDetectorCore uses sharded runtime storage\n");
+}
+
+static void TestValueDetectorCoreKeyFeatureEventCalendar() {
+    std::printf("[TEST] ValueDetectorCore key_feature event calendar...\n");
+
+    ValueDetectorCoreSpec spec;
+    spec.owner_task_id = "value-task-6";
+    spec.routed_feature_id = "bytes_total";
+    spec.feature_type = "t1a";
+    spec.feature_profile = "traffic";
+    spec.delta = 60;
+    spec.tz = "UTC";
+    spec.compiled_event_calendar = BuildCompiledCalendar("bytes_total", "svc-match");
+
+    ValueDetectorCore core(spec);
+
+    auto model = BuildFormalModel(std::log1p(4.0), 1.0, 1, ModelReadiness::kCoreNoMonthReady);
+    model->metadata.calendar_id = "ops-calendar";
+    model->metadata.calendar_version = "v1";
+    model->event_block.enabled = true;
+    model->event_block.calendar_id = "ops-calendar";
+    model->event_block.calendar_version = "v1";
+    model->event_block.active_event_codes = {"deploy"};
+    model->event_block.coeff = {2.0};
+
+    ApplyFormalModel(&core, "svc-match", model);
+    ApplyFormalModel(&core, "svc-other", model);
+
+    DetectorSubmitOutput match_submit;
+    DetectorSubmitOutput other_submit;
+    assert(core.Submit(ValueObservation{Ref("svc-match"), 20, 4.0, 0}, &match_submit) ==
+           error::OK);
+    assert(core.Submit(ValueObservation{Ref("svc-other"), 20, 4.0, 0}, &other_submit) ==
+           error::OK);
+
+    assert(match_submit.detector_result.evidence.kind == BaselineEvidenceKind::kValue);
+    assert(other_submit.detector_result.evidence.kind == BaselineEvidenceKind::kValue);
+    assert(NearlyEqual(match_submit.detector_result.evidence.value.baseline_mu_t,
+                       std::log1p(4.0) + 2.0));
+    assert(NearlyEqual(other_submit.detector_result.evidence.value.baseline_mu_t,
+                       std::log1p(4.0)));
+    assert(match_submit.detector_result.evidence.value.baseline_mu_t >
+           other_submit.detector_result.evidence.value.baseline_mu_t);
+
+    std::printf("[PASS] ValueDetectorCore key_feature event calendar\n");
+}
+
 static void TestValueDetectorCoreShadowConfidenceAndReason() {
     std::printf("[TEST] ValueDetectorCore shadow confidence and reason...\n");
 
@@ -269,6 +431,39 @@ static void TestValueDetectorCoreShadowConfidenceAndReason() {
     std::printf("[PASS] ValueDetectorCore shadow confidence and reason\n");
 }
 
+static void TestValueDetectorCorePrunesIdleKeys() {
+    std::printf("[TEST] ValueDetectorCore prunes idle keys...\n");
+
+    ValueDetectorCoreSpec spec;
+    spec.owner_task_id = "value-task-prune";
+    spec.routed_feature_id = "bytes_total";
+    spec.feature_type = "t1a";
+    spec.feature_profile = "traffic";
+
+    ValueDetectorCore core(spec);
+
+    DetectorSubmitOutput submit;
+    assert(core.Submit(ValueObservation{Ref("svc-stale-a"), 1, 10.0, 0}, &submit) == error::OK);
+    assert(core.Submit(ValueObservation{Ref("svc-stale-b"), 1, 11.0, 0}, &submit) == error::OK);
+
+    for (int64_t bucket = 5000; bucket < 5070; ++bucket) {
+        assert(core.Submit(
+                   ValueObservation{Ref("svc-hot"), bucket, static_cast<double>(bucket), 0},
+                   &submit) == error::OK);
+    }
+
+    assert(core.IdlePruneBucketGap() > 0);
+    assert(core.PrunedKeyCount() >= 2);
+    assert(core.Size() == 1);
+
+    ValueSeriesSnapshot hot_snapshot;
+    assert(core.BuildSeriesSnapshot(Ref("svc-hot"), &hot_snapshot) == error::OK);
+    assert(core.BuildSeriesSnapshot(Ref("svc-stale-a"), &hot_snapshot) == error::NOT_FOUND);
+    assert(core.BuildSeriesSnapshot(Ref("svc-stale-b"), &hot_snapshot) == error::NOT_FOUND);
+
+    std::printf("[PASS] ValueDetectorCore prunes idle keys\n");
+}
+
 }  // namespace
 
 int main() {
@@ -277,7 +472,11 @@ int main() {
     TestValueDetectorCoreValueEvidenceAndIdentity();
     TestValueDetectorCoreT1bSampleCountAndConfidence();
     TestValueDetectorCoreConfiguredSourceConfidence();
+    TestValueDetectorCoreDoesNotServeCandidateModel();
+    TestValueDetectorCoreUsesShardedRuntimeStorage();
+    TestValueDetectorCoreKeyFeatureEventCalendar();
     TestValueDetectorCoreShadowConfidenceAndReason();
+    TestValueDetectorCorePrunesIdleKeys();
     std::printf("[DONE] test_baseline_value_task\n");
     return 0;
 }

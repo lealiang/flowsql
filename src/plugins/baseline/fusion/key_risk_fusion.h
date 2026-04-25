@@ -10,6 +10,7 @@
 #define _FLOWSQL_PLUGINS_BASELINE_FUSION_KEY_RISK_FUSION_H_
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -82,6 +83,7 @@ class KeyRiskFusion {
     struct ShardState {
         mutable std::mutex mutex;
         std::unordered_map<std::string, KeyRiskFusionState> states;
+        size_t prune_cursor = 0;
     };
 
     static constexpr size_t kShardCount = 64;
@@ -102,14 +104,18 @@ class KeyRiskFusion {
     int QueryKeyFusionSnapshotJson(const BaselineStringRef& key,
                                    std::string* out_json) const;
     size_t KeyCount() const;
+    uint64_t PrunedKeyCount() const;
+    int64_t IdlePruneBucketGap() const;
 
  private:
-
     size_t ShardIndex(const std::string& key) const;
     static void WriteSnapshotJson(const KeyRiskFusionSnapshot& snapshot,
                                   std::string* out_json);
 
     std::array<ShardState, kShardCount> shards_;
+    std::atomic<uint64_t> prune_cursor_{0};
+    std::atomic<int64_t> last_pruned_bucket_{-1};
+    std::atomic<uint64_t> pruned_key_count_total_{0};
 };
 
 }  // namespace baseline

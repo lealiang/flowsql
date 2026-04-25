@@ -63,7 +63,6 @@ class CandidateBuilder {
                                            const BaselineTaskSpec* task_spec,
                                            int64_t delta,
                                            const std::string& tz,
-                                           const EventCalendarSpec* event_calendar_spec,
                                            const CompiledEventCalendar* compiled_event_calendar,
                                            ValueCandidateBuildResult* out);
     static CandidateBuildStatus BuildRatio(const RatioFeatureProfile& profile,
@@ -72,7 +71,6 @@ class CandidateBuilder {
                                            const BaselineTaskSpec* task_spec,
                                            int64_t delta,
                                            const std::string& tz,
-                                           const EventCalendarSpec* event_calendar_spec,
                                            const CompiledEventCalendar* compiled_event_calendar,
                                            RatioCandidateBuildResult* out);
     static CandidateBuildStatus BuildRelationMetricBases(

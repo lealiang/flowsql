@@ -107,7 +107,6 @@ CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& pro
                                                   const BaselineTaskSpec* task_spec,
                                                   int64_t delta,
                                                   const std::string& tz,
-                                                  const EventCalendarSpec* event_calendar_spec,
                                                   const CompiledEventCalendar* compiled_event_calendar,
                                                   ValueCandidateBuildResult* out) {
     if (!out) return CandidateBuildStatus::kTrainFailed;
@@ -144,7 +143,6 @@ CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& pro
         task_spec,
         delta,
         tz,
-        event_calendar_spec,
         compiled_event_calendar};
     out->status = MapTrainFailure(FormalModelTrainer::TrainValue(input, &train_result));
     if (out->status != CandidateBuildStatus::kTrained || !train_result.model) {
@@ -165,7 +163,6 @@ CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& pro
                                                   const BaselineTaskSpec* task_spec,
                                                   int64_t delta,
                                                   const std::string& tz,
-                                                  const EventCalendarSpec* event_calendar_spec,
                                                   const CompiledEventCalendar* compiled_event_calendar,
                                                   RatioCandidateBuildResult* out) {
     if (!out) return CandidateBuildStatus::kTrainFailed;
@@ -202,7 +199,6 @@ CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& pro
         task_spec,
         delta,
         tz,
-        event_calendar_spec,
         compiled_event_calendar};
     out->status = MapTrainFailure(FormalModelTrainer::TrainRatio(input, &train_result));
     if (out->status != CandidateBuildStatus::kTrained || !train_result.model) {

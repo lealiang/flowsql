@@ -14,7 +14,9 @@
 #include <common/error_code.h>
 #include <framework/interfaces/ibaseline_types.h>
 #include <plugins/baseline/detector/detector_common.h>
+#define private public
 #include <plugins/baseline/detector/ratio_detector_core.h>
+#undef private
 
 using namespace flowsql;
 using namespace flowsql::baseline;
@@ -62,9 +64,38 @@ static void ApplyFormalModel(RatioDetectorCore* core,
     RatioApplyFormalModelResult apply_result;
     apply_result.candidate_trained = true;
     apply_result.candidate_generation = model ? model->metadata.model_version : 0;
-    apply_result.switch_state = "formal_apply";
+    apply_result.candidate_state = RebuildCandidateState::kAccepted;
+    apply_result.switch_state = RebuildSwitchState::kFormalApplied;
     apply_result.full_model = std::move(model);
     core->ApplyFormalModel(key, apply_result);
+}
+
+static std::shared_ptr<const CompiledEventCalendar> BuildCompiledCalendar(const char* feature,
+                                                                          const char* key) {
+    EventCalendarSpec calendar;
+    calendar.calendar_id = "ops-calendar";
+    calendar.calendar_version = "v1";
+    calendar.entries.push_back(EventCalendarEntry{
+        "deploy",
+        "key_feature",
+        "absolute_utc",
+        20 * 60,
+        21 * 60,
+        true,
+        feature,
+        key,
+        ""});
+
+    BaselineTaskSpec task_spec;
+    task_spec.key = key;
+    task_spec.feature = feature;
+    task_spec.delta = 60;
+    task_spec.tz = "UTC";
+
+    CompiledEventCalendar compiled;
+    std::string err;
+    assert(CompileEventCalendar(calendar, task_spec, &compiled, &err) == error::OK);
+    return std::make_shared<CompiledEventCalendar>(std::move(compiled));
 }
 
 static void TestRatioDetectorCoreSubmitAndSnapshot() {
@@ -117,12 +148,19 @@ static void TestRatioDetectorCoreMarkRebuildFailure() {
     failure.key = "svc-b";
     failure.request_bucket_start = 7;
     failure.request_bucket_end = 12;
-    failure.candidate_state = "fetch_failed";
+    failure.candidate_state = RebuildCandidateState::kFailed;
+    failure.switch_state = RebuildSwitchState::kRebuildBlocked;
+    failure.failure_reason = RebuildFailureReason::kUnavailable;
     core.MarkRebuildFailure(failure);
 
     RatioSeriesSnapshot snapshot;
     assert(core.BuildSeriesSnapshot(Ref("svc-b"), &snapshot) == error::OK);
-    assert(snapshot.runtime_state.formal_state.candidate_state == "fetch_failed");
+    assert(snapshot.runtime_state.formal_state.candidate_state ==
+           RebuildCandidateState::kFailed);
+    assert(snapshot.runtime_state.formal_state.switch_state ==
+           RebuildSwitchState::kRebuildBlocked);
+    assert(snapshot.runtime_state.formal_state.failure_reason ==
+           RebuildFailureReason::kUnavailable);
     assert(snapshot.runtime_state.formal_state.last_replay_window.request_bucket_start == 7);
     assert(snapshot.runtime_state.formal_state.last_replay_window.request_bucket_end == 12);
     assert(snapshot.runtime_state.shift_rebuild_pending == false);
@@ -221,6 +259,92 @@ static void TestRatioDetectorCoreConfiguredSourceConfidence() {
     std::printf("[PASS] RatioDetectorCore configured source confidence\n");
 }
 
+static void TestRatioDetectorCoreUsesShardedRuntimeStorage() {
+    std::printf("[TEST] RatioDetectorCore uses sharded runtime storage...\n");
+
+    RatioDetectorCoreSpec spec;
+    spec.owner_task_id = "ratio-task-shards";
+    spec.routed_feature_id = "success_rate";
+    spec.feature_type = "t2";
+    spec.feature_profile = "rate_core";
+
+    RatioDetectorCore core(spec);
+    assert(RatioDetectorCore::kShardCount > 1);
+
+    std::string key_a = "svc-ratio-shard-a";
+    std::string key_b = "svc-ratio-shard-b";
+    size_t shard_a = core.RuntimeShardIndex(key_a);
+    size_t shard_b = core.RuntimeShardIndex(key_b);
+    for (int i = 0; shard_a == shard_b && i < 256; ++i) {
+        key_b = "svc-ratio-shard-b-" + std::to_string(i);
+        shard_b = core.RuntimeShardIndex(key_b);
+    }
+    assert(shard_a != shard_b);
+
+    DetectorSubmitOutput submit;
+    assert(core.Submit(RatioObservation{BaselineStringRef{key_a.c_str(),
+                                                          static_cast<uint32_t>(key_a.size())},
+                                       10,
+                                       95.0,
+                                       100.0},
+                       &submit) == error::OK);
+    assert(core.Submit(RatioObservation{BaselineStringRef{key_b.c_str(),
+                                                          static_cast<uint32_t>(key_b.size())},
+                                       10,
+                                       97.0,
+                                       100.0},
+                       &submit) == error::OK);
+
+    assert(core.runtime_shards_[shard_a].states.find(key_a) !=
+           core.runtime_shards_[shard_a].states.end());
+    assert(core.runtime_shards_[shard_b].states.find(key_b) !=
+           core.runtime_shards_[shard_b].states.end());
+
+    std::printf("[PASS] RatioDetectorCore uses sharded runtime storage\n");
+}
+
+static void TestRatioDetectorCoreKeyFeatureEventCalendar() {
+    std::printf("[TEST] RatioDetectorCore key_feature event calendar...\n");
+
+    RatioDetectorCoreSpec spec;
+    spec.owner_task_id = "ratio-task-5";
+    spec.routed_feature_id = "svc_success_rate";
+    spec.feature_type = "t2";
+    spec.feature_profile = "rate_core";
+    spec.delta = 60;
+    spec.tz = "UTC";
+    spec.compiled_event_calendar = BuildCompiledCalendar("svc_success_rate", "svc-match");
+
+    RatioDetectorCore core(spec);
+
+    auto model = BuildFormalModel(0.3, 1, ModelReadiness::kCoreNoMonthReady);
+    model->metadata.calendar_id = "ops-calendar";
+    model->metadata.calendar_version = "v1";
+    model->event_block.enabled = true;
+    model->event_block.calendar_id = "ops-calendar";
+    model->event_block.calendar_version = "v1";
+    model->event_block.active_event_codes = {"deploy"};
+    model->event_block.coeff = {1.0};
+
+    ApplyFormalModel(&core, "svc-match", model);
+    ApplyFormalModel(&core, "svc-other", model);
+
+    DetectorSubmitOutput match_submit;
+    DetectorSubmitOutput other_submit;
+    assert(core.Submit(RatioObservation{Ref("svc-match"), 20, 30.0, 100.0}, &match_submit) ==
+           error::OK);
+    assert(core.Submit(RatioObservation{Ref("svc-other"), 20, 30.0, 100.0}, &other_submit) ==
+           error::OK);
+
+    assert(match_submit.detector_result.evidence.kind == BaselineEvidenceKind::kRatio);
+    assert(other_submit.detector_result.evidence.kind == BaselineEvidenceKind::kRatio);
+    assert(match_submit.detector_result.evidence.ratio.p_hat_t >
+           other_submit.detector_result.evidence.ratio.p_hat_t);
+    assert(NearlyEqual(other_submit.detector_result.evidence.ratio.p_hat_t, 0.3));
+
+    std::printf("[PASS] RatioDetectorCore key_feature event calendar\n");
+}
+
 static void TestRatioDetectorCoreProfileDifferenceIsEffective() {
     std::printf("[TEST] RatioDetectorCore profile difference is effective...\n");
 
@@ -314,6 +438,44 @@ static void TestRatioDetectorCoreShadowConfidenceAndReason() {
     std::printf("[PASS] RatioDetectorCore shadow confidence and reason\n");
 }
 
+static void TestRatioDetectorCorePrunesIdleKeys() {
+    std::printf("[TEST] RatioDetectorCore prunes idle keys...\n");
+
+    RatioDetectorCoreSpec spec;
+    spec.owner_task_id = "ratio-task-prune";
+    spec.routed_feature_id = "svc_success_rate";
+    spec.feature_type = "t2";
+    spec.feature_profile = "rate_core";
+
+    RatioDetectorCore core(spec);
+
+    DetectorSubmitOutput submit;
+    assert(core.Submit(RatioObservation{Ref("svc-stale-a"), 1, 8.0, 10.0}, &submit) ==
+           error::OK);
+    assert(core.Submit(RatioObservation{Ref("svc-stale-b"), 1, 7.0, 10.0}, &submit) ==
+           error::OK);
+
+    for (int64_t bucket = 5000; bucket < 5070; ++bucket) {
+        assert(core.Submit(
+                   RatioObservation{Ref("svc-hot"),
+                                    bucket,
+                                    static_cast<double>((bucket % 50) + 40),
+                                    100.0},
+                   &submit) == error::OK);
+    }
+
+    assert(core.IdlePruneBucketGap() > 0);
+    assert(core.PrunedKeyCount() >= 2);
+    assert(core.Size() == 1);
+
+    RatioSeriesSnapshot hot_snapshot;
+    assert(core.BuildSeriesSnapshot(Ref("svc-hot"), &hot_snapshot) == error::OK);
+    assert(core.BuildSeriesSnapshot(Ref("svc-stale-a"), &hot_snapshot) == error::NOT_FOUND);
+    assert(core.BuildSeriesSnapshot(Ref("svc-stale-b"), &hot_snapshot) == error::NOT_FOUND);
+
+    std::printf("[PASS] RatioDetectorCore prunes idle keys\n");
+}
+
 }  // namespace
 
 int main() {
@@ -321,9 +483,12 @@ int main() {
     TestRatioDetectorCoreMarkRebuildFailure();
     TestRatioDetectorCoreRatioEvidenceAndIdentity();
     TestRatioDetectorCoreConfiguredSourceConfidence();
+    TestRatioDetectorCoreUsesShardedRuntimeStorage();
+    TestRatioDetectorCoreKeyFeatureEventCalendar();
     TestRatioDetectorCoreProfileDifferenceIsEffective();
     TestRatioDetectorCoreColdStartUsesNoneProvider();
     TestRatioDetectorCoreShadowConfidenceAndReason();
+    TestRatioDetectorCorePrunesIdleKeys();
     std::printf("[DONE] test_baseline_ratio_task\n");
     return 0;
 }

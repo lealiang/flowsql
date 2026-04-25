@@ -168,6 +168,11 @@ bool IsAllowedValue(const std::string& value,
     return false;
 }
 
+void ApplyDefaultTimezone(std::string* tz) {
+    if (!tz || !tz->empty()) return;
+    *tz = "Asia/Shanghai";
+}
+
 int ParseEventCalendarSpec(const rapidjson::Value& obj,
                            std::optional<EventCalendarSpec>* out,
                            std::string* err) {
@@ -368,7 +373,8 @@ int ParseScalarTaskInternal(const char* config_json,
     if ((rc = RequireString(doc, "feature_type", &spec.feature_type, err)) != error::OK) return rc;
     if ((rc = RequireString(doc, "feature_profile", &spec.feature_profile, err)) != error::OK) return rc;
     if ((rc = RequirePositiveInt64(doc, "delta", &spec.delta, err)) != error::OK) return rc;
-    if ((rc = RequireString(doc, "tz", &spec.tz, err)) != error::OK) return rc;
+    if ((rc = OptionalNonEmptyString(doc, "tz", &spec.tz, err)) != error::OK) return rc;
+    ApplyDefaultTimezone(&spec.tz);
     if ((rc = ParseBaselineSourceConfigs(doc, &spec.baseline_source_configs, err)) != error::OK) return rc;
     if ((rc = ParseEventCalendarSpec(doc, &spec.event_calendar_spec, err)) != error::OK) return rc;
 
@@ -508,7 +514,8 @@ int ConfigParser::ParseRelationTask(const char* config_json,
     if ((rc = ParseSupportPolicy(doc, &spec.support_policy, err)) != error::OK) return rc;
     if ((rc = ParseSummaryPolicy(doc, &spec.summary_policy, err)) != error::OK) return rc;
     if ((rc = RequirePositiveInt64(doc, "delta", &create_spec.clock_spec.delta, err)) != error::OK) return rc;
-    if ((rc = RequireString(doc, "tz", &create_spec.clock_spec.tz, err)) != error::OK) return rc;
+    if ((rc = OptionalNonEmptyString(doc, "tz", &create_spec.clock_spec.tz, err)) != error::OK) return rc;
+    ApplyDefaultTimezone(&create_spec.clock_spec.tz);
     if ((rc = ParseEventCalendarSpec(doc, &create_spec.event_calendar_spec, err)) != error::OK) return rc;
 
     OptionalString(doc, "name", &spec.name);

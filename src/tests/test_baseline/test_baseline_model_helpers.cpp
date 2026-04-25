@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <framework/interfaces/ibaseline_types.h>
+#include <plugins/baseline/config_parser.h>
 #include <plugins/baseline/fusion/relation_pattern_fusion.h>
 #include <plugins/baseline/model/calendar_feature_helper.h>
 #include <plugins/baseline/model/event_calendar_matcher.h>
@@ -23,6 +24,7 @@
 #include <plugins/baseline/model/profile_config.h>
 #include <plugins/baseline/model/readiness_helper.h>
 #include <plugins/baseline/model/task_spec.h>
+#include <plugins/baseline/task/rebuild_outcome_helper.h>
 #include <plugins/baseline/relation/relation_basis.h>
 #include <plugins/baseline/rebuild/candidate_builder.h>
 #include <plugins/baseline/rebuild/candidate_validator.h>
@@ -260,6 +262,59 @@ void TestEventCalendarMatcherScopeAndOverlap() {
     std::printf("[PASS] Event calendar matcher scope and overlap\n");
 }
 
+void TestConfigParserTimezoneDefault() {
+    std::printf("[TEST] Config parser timezone default...\n");
+
+    BaselineTaskSpec value_spec;
+    std::string err;
+    const int value_rc = ConfigParser::ParseValueTask(
+        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"t1b","feature_profile":"cont_core","delta":60})",
+        &value_spec,
+        &err);
+    assert(value_rc == error::OK);
+    assert(value_spec.tz == "Asia/Shanghai");
+
+    RelationTaskCreateSpec relation_spec;
+    err.clear();
+    const int relation_rc = ConfigParser::ParseRelationTask(
+        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2},"delta":60})",
+        &relation_spec,
+        &err);
+    assert(relation_rc == error::OK);
+    assert(relation_spec.clock_spec.tz == "Asia/Shanghai");
+
+    std::printf("[PASS] Config parser timezone default\n");
+}
+
+void TestEventCalendarLocalWallClockInheritsTaskTimezone() {
+    std::printf("[TEST] Event calendar local wall clock inherits task timezone...\n");
+
+    BaselineTaskSpec task = BuildEventTask();
+    EventCalendarSpec calendar;
+    calendar.calendar_id = "ops";
+    calendar.calendar_version = "v1";
+
+    EventCalendarEntry local_wall_clock;
+    local_wall_clock.event_code = "month_close";
+    local_wall_clock.scope_type = "global";
+    local_wall_clock.alignment_mode = "local_wall_clock";
+    local_wall_clock.start_ts = task.delta * 100 + 50;
+    local_wall_clock.end_ts = task.delta * 101 + 10;
+    calendar.entries.push_back(local_wall_clock);
+
+    CompiledEventCalendar compiled;
+    std::string err;
+    assert(CompileEventCalendar(calendar, task, &compiled, &err) == error::OK);
+    assert(compiled.entries.size() == 1);
+    assert(compiled.entries[0].tz.empty());
+
+    const std::vector<std::string> events = ResolveBucketEvents(compiled, task, 100);
+    assert(events.size() == 1);
+    assert(events[0] == "month_close");
+
+    std::printf("[PASS] Event calendar local wall clock inherits task timezone\n");
+}
+
 void TestReadinessHelper() {
     std::printf("[TEST] Readiness helper...\n");
 
@@ -366,13 +421,145 @@ void TestRelationPatternFusionSupportEscape() {
     assert(pattern_it->projection.pattern == "support_escape");
     assert(pattern_it->projection.feature_base == "client_group_mix");
     assert(pattern_it->projection.score_pattern > 0.9);
-    assert(pattern_it->projection.metrics_hit.size() == 1);
+    assert(pattern_it->projection.metrics_hit_count == 1);
     assert(pattern_it->projection.metrics_hit[0] == "conn_count");
-    assert(pattern_it->projection.supporting_features.size() >= 2);
-    assert(output.fusion_result.dominant_patterns.size() >= 1);
+    assert(pattern_it->projection.supporting_feature_count >= 2);
+    assert(output.fusion_result.dominant_pattern_count >= 1);
     assert(output.fusion_result.dominant_patterns[0].pattern == "support_escape");
 
     std::printf("[PASS] Relation pattern fusion support_escape\n");
+}
+
+void TestRelationPatternFusionRemainingPatterns() {
+    std::printf("[TEST] Relation pattern fusion remaining patterns...\n");
+
+    {
+        RelationPatternFusionInput input;
+        input.key = "svc-head";
+        input.bucket_id = 11;
+        input.feature_base = "client_group_mix";
+        input.singles = {
+            FusionSingleContribution{1,
+                                     "conn_count",
+                                     RelationSummaryKind::kTop1Share,
+                                     BuildFusionDetectorResult("svc-head",
+                                                               "client_group_mix_conn_count_top1_share",
+                                                               BaselineDirection::kUp,
+                                                               0.90,
+                                                               1.00,
+                                                               3)},
+            FusionSingleContribution{2,
+                                     "conn_count",
+                                     RelationSummaryKind::kHeadKShare,
+                                     BuildFusionDetectorResult("svc-head",
+                                                               "client_group_mix_conn_count_headK_share",
+                                                               BaselineDirection::kUp,
+                                                               0.70,
+                                                               1.00,
+                                                               3)},
+            FusionSingleContribution{3,
+                                     "conn_count",
+                                     RelationSummaryKind::kEntropyShannon,
+                                     BuildFusionDetectorResult("svc-head",
+                                                               "client_group_mix_conn_count_entropy_shannon",
+                                                               BaselineDirection::kDown,
+                                                               0.60,
+                                                               1.00,
+                                                               3)},
+        };
+
+        RelationPatternFusionOutput output;
+        assert(RelationPatternFusion::Compute(input, &output) == error::OK);
+        const auto pattern_it = std::find_if(output.pattern_contributions.begin(),
+                                             output.pattern_contributions.end(),
+                                             [](const FusionPatternContribution& item) {
+                                                 return item.pattern ==
+                                                        PatternCode::kHeadConcentration;
+                                             });
+        assert(pattern_it != output.pattern_contributions.end());
+        assert(pattern_it->projection.pattern == "head_concentration");
+        assert(pattern_it->projection.score_pattern > 0.9);
+    }
+
+    {
+        RelationPatternFusionInput input;
+        input.key = "svc-dilution";
+        input.bucket_id = 12;
+        input.feature_base = "client_group_mix";
+        input.singles = {
+            FusionSingleContribution{1,
+                                     "conn_count",
+                                     RelationSummaryKind::kStableHeadCoverage,
+                                     BuildFusionDetectorResult("svc-dilution",
+                                                               "client_group_mix_conn_count_stable_head_coverage",
+                                                               BaselineDirection::kDown,
+                                                               0.90,
+                                                               1.00,
+                                                               3)},
+            FusionSingleContribution{2,
+                                     "conn_count",
+                                     RelationSummaryKind::kOutOfSupportShare,
+                                     BuildFusionDetectorResult("svc-dilution",
+                                                               "client_group_mix_conn_count_out_of_support_share",
+                                                               BaselineDirection::kUp,
+                                                               0.70,
+                                                               1.00,
+                                                               3)},
+            FusionSingleContribution{3,
+                                     "conn_count",
+                                     RelationSummaryKind::kEntropyShannon,
+                                     BuildFusionDetectorResult("svc-dilution",
+                                                               "client_group_mix_conn_count_entropy_shannon",
+                                                               BaselineDirection::kUp,
+                                                               0.60,
+                                                               1.00,
+                                                               3)},
+        };
+
+        RelationPatternFusionOutput output;
+        assert(RelationPatternFusion::Compute(input, &output) == error::OK);
+        const auto pattern_it = std::find_if(output.pattern_contributions.begin(),
+                                             output.pattern_contributions.end(),
+                                             [](const FusionPatternContribution& item) {
+                                                 return item.pattern ==
+                                                        PatternCode::kLegacyHeadDilution;
+                                             });
+        assert(pattern_it != output.pattern_contributions.end());
+        assert(pattern_it->projection.pattern == "legacy_head_dilution");
+        assert(pattern_it->projection.score_pattern > 0.9);
+    }
+
+    {
+        RelationPatternFusionInput input;
+        input.key = "svc-mix";
+        input.bucket_id = 13;
+        input.feature_base = "client_group_mix";
+        input.singles = {
+            FusionSingleContribution{1,
+                                     "conn_count",
+                                     RelationSummaryKind::kStableHeadMixDrift,
+                                     BuildFusionDetectorResult("svc-mix",
+                                                               "client_group_mix_conn_count_stable_head_mix_drift",
+                                                               BaselineDirection::kUp,
+                                                               0.90,
+                                                               1.00,
+                                                               3)},
+        };
+
+        RelationPatternFusionOutput output;
+        assert(RelationPatternFusion::Compute(input, &output) == error::OK);
+        const auto pattern_it = std::find_if(output.pattern_contributions.begin(),
+                                             output.pattern_contributions.end(),
+                                             [](const FusionPatternContribution& item) {
+                                                 return item.pattern ==
+                                                        PatternCode::kStableHeadMixShift;
+                                             });
+        assert(pattern_it != output.pattern_contributions.end());
+        assert(pattern_it->projection.pattern == "stable_head_mix_shift");
+        assert(pattern_it->projection.score_pattern > 0.8);
+    }
+
+    std::printf("[PASS] Relation pattern fusion remaining patterns\n");
 }
 
 void TestCandidateBuilderRelationBasisViews() {
@@ -681,7 +868,6 @@ void TestFormalModelTrainerStagesForValue() {
     input.task_spec = &task;
     input.delta = delta;
     input.tz = "UTC";
-    input.event_calendar_spec = &calendar;
     input.compiled_event_calendar = &compiled;
 
     assert(FormalModelTrainer::TrainValue(input, &result) == FormalTrainFailureCode::kNone);
@@ -801,7 +987,6 @@ void TestFormalModelTrainerStagesForRatio() {
     input.task_spec = &task;
     input.delta = delta;
     input.tz = "UTC";
-    input.event_calendar_spec = &calendar;
     input.compiled_event_calendar = &compiled;
 
     assert(FormalModelTrainer::TrainRatio(input, &result) == FormalTrainFailureCode::kNone);
@@ -873,7 +1058,7 @@ void TestCandidateBuilderHoldoutTailSplit() {
 
     const ValueFeatureProfile profile = BuildValueT1aProfile();
     ValueCandidateBuildResult result;
-    assert(CandidateBuilder::BuildValue(profile, replay, 3, nullptr, delta, "UTC", nullptr, nullptr, &result) ==
+    assert(CandidateBuilder::BuildValue(profile, replay, 3, nullptr, delta, "UTC", nullptr, &result) ==
            CandidateBuildStatus::kTrained);
     assert(result.train_window.observation_count == 20);
     assert(result.holdout_window.observation_count == 0);
@@ -987,14 +1172,64 @@ void TestCandidateValidatorShadowPrequentialReplay() {
     std::printf("[PASS] Candidate validator shadow prequential replay\n");
 }
 
+void TestRebuildOutcomeHelpers() {
+    std::printf("[TEST] Rebuild outcome helpers...\n");
+
+    struct DummyOutcome {
+        RebuildCandidateState candidate_state = RebuildCandidateState::kNone;
+        RebuildSwitchState switch_state = RebuildSwitchState::kIdle;
+        RebuildFailureReason failure_reason = RebuildFailureReason::kNone;
+        std::string failure_reason_detail;
+    };
+
+    DummyOutcome outcome;
+    SetRebuildAcceptedOutcome(&outcome);
+    assert(outcome.candidate_state == RebuildCandidateState::kAccepted);
+    assert(outcome.switch_state == RebuildSwitchState::kFormalApplied);
+    assert(outcome.failure_reason == RebuildFailureReason::kNone);
+    assert(outcome.failure_reason_detail.empty());
+
+    SetRebuildRejectedOutcome(&outcome, "holdout_failed");
+    assert(outcome.candidate_state == RebuildCandidateState::kRejected);
+    assert(outcome.switch_state == RebuildSwitchState::kIdle);
+    assert(outcome.failure_reason == RebuildFailureReason::kValidationFailed);
+    assert(outcome.failure_reason_detail == "holdout_failed");
+
+    ApplyBuildFailureOutcome(CandidateBuildStatus::kSolverUnavailable, &outcome);
+    assert(outcome.candidate_state == RebuildCandidateState::kFailed);
+    assert(outcome.switch_state == RebuildSwitchState::kIdle);
+    assert(outcome.failure_reason == RebuildFailureReason::kUnavailable);
+    assert(outcome.failure_reason_detail == "solver_unavailable");
+
+    ApplyValidationFailureOutcome(CandidateValidationStatus::kInsufficientHoldout, false, &outcome);
+    assert(outcome.candidate_state == RebuildCandidateState::kFailed);
+    assert(outcome.switch_state == RebuildSwitchState::kIdle);
+    assert(outcome.failure_reason == RebuildFailureReason::kInsufficientData);
+    assert(outcome.failure_reason_detail == "insufficient_holdout");
+
+    ApplyValidationFailureOutcome(CandidateValidationStatus::kPassed,
+                                  true,
+                                  &outcome,
+                                  RebuildSwitchState::kRebuildBlocked);
+    assert(outcome.candidate_state == RebuildCandidateState::kFailed);
+    assert(outcome.switch_state == RebuildSwitchState::kRebuildBlocked);
+    assert(outcome.failure_reason == RebuildFailureReason::kTrainFailed);
+    assert(outcome.failure_reason_detail == "full_model_train_failed");
+
+    std::printf("[PASS] Rebuild outcome helpers\n");
+}
+
 }  // namespace
 
 int main() {
     TestProfileConfigDefaultsAndDerivedValues();
     TestCalendarFeatureHelper();
     TestEventCalendarMatcherScopeAndOverlap();
+    TestConfigParserTimezoneDefault();
+    TestEventCalendarLocalWallClockInheritsTaskTimezone();
     TestReadinessHelper();
     TestRelationPatternFusionSupportEscape();
+    TestRelationPatternFusionRemainingPatterns();
     TestCandidateBuilderRelationBasisViews();
     TestCandidateValidatorRelationAggregate();
     TestFormalModelSchemaAndPredictor();
@@ -1004,5 +1239,6 @@ int main() {
     TestCandidateBuilderHoldoutTailSplit();
     TestCandidateValidatorNearZeroTolerance();
     TestCandidateValidatorShadowPrequentialReplay();
+    TestRebuildOutcomeHelpers();
     return 0;
 }

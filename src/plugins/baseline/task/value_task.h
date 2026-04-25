@@ -13,6 +13,7 @@
 
 #include "baseline_task_base.h"
 #include "plugins/baseline/detector/value_detector_core.h"
+#include "plugins/baseline/model/event_calendar_matcher.h"
 #include "plugins/baseline/model/task_spec.h"
 
 namespace flowsql {
@@ -31,6 +32,7 @@ class BaselineValueTask final : public IBaselineValueTask, public BaselineTaskBa
                       RebuildQueue* rebuild_queue,
                       std::string task_id,
                       const BaselineTaskSpec& spec,
+                      std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar,
                       KeyRiskFusion* key_risk_fusion);
 
     const char* Id() const override;
@@ -55,6 +57,7 @@ class BaselineValueTask final : public IBaselineValueTask, public BaselineTaskBa
     int ExecuteRebuild(const RebuildRequest& request);
 
     BaselineTaskSpec spec_;
+    std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar_;
     std::shared_ptr<ValueDetectorCore> core_;
     std::shared_ptr<ValueHistoryBinding> history_binding_;
     std::shared_ptr<RebuildTaskRuntime> rebuild_runtime_;

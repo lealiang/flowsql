@@ -167,22 +167,28 @@ void TestRebuildWithoutHistoryReader() {
     assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-no-reader", 13},
                                                &value_series_snapshot) == error::OK);
     auto value_series_doc = ParseJson(value_series_snapshot);
-    assert(std::string(value_series_doc["candidate_state"].GetString()) == "fetch_failed");
+    assert(std::string(value_series_doc["candidate_state"].GetString()) == "failed");
     assert(std::string(value_series_doc["switch_state"].GetString()) == "rebuild_blocked");
+    assert(value_series_doc.HasMember("failure_reason"));
+    assert(std::string(value_series_doc["failure_reason"].GetString()) == "unavailable");
 
     std::string ratio_series_snapshot;
     assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-no-reader", 13},
                                                &ratio_series_snapshot) == error::OK);
     auto ratio_series_doc = ParseJson(ratio_series_snapshot);
-    assert(std::string(ratio_series_doc["candidate_state"].GetString()) == "fetch_failed");
+    assert(std::string(ratio_series_doc["candidate_state"].GetString()) == "failed");
     assert(std::string(ratio_series_doc["switch_state"].GetString()) == "rebuild_blocked");
+    assert(ratio_series_doc.HasMember("failure_reason"));
+    assert(std::string(ratio_series_doc["failure_reason"].GetString()) == "unavailable");
 
     std::string relation_series_snapshot;
     assert(relation_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-no-reader", 13},
                                                   &relation_series_snapshot) == error::OK);
     auto relation_series_doc = ParseJson(relation_series_snapshot);
-    assert(std::string(relation_series_doc["candidate_state"].GetString()) == "fetch_failed");
+    assert(std::string(relation_series_doc["candidate_state"].GetString()) == "failed");
     assert(std::string(relation_series_doc["switch_state"].GetString()) == "rebuild_blocked");
+    assert(relation_series_doc.HasMember("failure_reason"));
+    assert(std::string(relation_series_doc["failure_reason"].GetString()) == "unavailable");
 
     assert(value_task->Close() == error::OK);
     assert(ratio_task->Close() == error::OK);

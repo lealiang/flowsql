@@ -10,8 +10,8 @@
 #define _FLOWSQL_PLUGINS_BASELINE_FUSION_FUSION_TYPES_H_
 
 #include <algorithm>
+#include <array>
 #include <string>
-#include <vector>
 
 #include <framework/interfaces/ibaseline_types.h>
 
@@ -33,8 +33,10 @@ struct StoredDominantPatternProjection {
     std::string feature_base;
     double score_pattern = 0.0;
     double weighted_score = 0.0;
-    std::vector<std::string> metrics_hit;
-    std::vector<std::string> supporting_features;
+    uint32_t metrics_hit_count = 0;
+    std::array<std::string, kBaselinePatternMetricsHitLimit> metrics_hit;
+    uint32_t supporting_feature_count = 0;
+    std::array<std::string, kBaselinePatternSupportingFeatureLimit> supporting_features;
 };
 
 struct StoredFusionResult {
@@ -42,13 +44,30 @@ struct StoredFusionResult {
     std::string key;
     int64_t ts = 0;
     double risk = 0.0;
-    std::vector<StoredDominantSingleProjection> dominant_singles;
-    std::vector<StoredDominantPatternProjection> dominant_patterns;
+    uint32_t dominant_single_count = 0;
+    std::array<StoredDominantSingleProjection, kBaselineDominantSingleLimit> dominant_singles;
+    uint32_t dominant_pattern_count = 0;
+    std::array<StoredDominantPatternProjection, kBaselineDominantPatternLimit> dominant_patterns;
 };
 
 inline BaselineStringRef MakeOwnedStringRef(const std::string& value) {
     return BaselineStringRef{value.empty() ? nullptr : value.c_str(),
                              static_cast<uint32_t>(value.size())};
+}
+
+inline void AppendStoredMetricHit(StoredDominantPatternProjection* projection,
+                                  const std::string& metric) {
+    if (!projection || projection->metrics_hit_count >= kBaselinePatternMetricsHitLimit) return;
+    projection->metrics_hit[projection->metrics_hit_count++] = metric;
+}
+
+inline void AppendStoredSupportingFeature(StoredDominantPatternProjection* projection,
+                                          const std::string& feature) {
+    if (!projection ||
+        projection->supporting_feature_count >= kBaselinePatternSupportingFeatureLimit) {
+        return;
+    }
+    projection->supporting_features[projection->supporting_feature_count++] = feature;
 }
 
 inline void MaterializeStoredFusionResult(const StoredFusionResult& stored,
@@ -62,9 +81,8 @@ inline void MaterializeStoredFusionResult(const StoredFusionResult& stored,
     out->ts = stored.ts;
     out->risk = stored.risk;
 
-    const uint32_t single_count = std::min<uint32_t>(
-        static_cast<uint32_t>(stored.dominant_singles.size()),
-        kBaselineDominantSingleLimit);
+    const uint32_t single_count =
+        std::min<uint32_t>(stored.dominant_single_count, kBaselineDominantSingleLimit);
     out->dominant_single_count = single_count;
     for (uint32_t i = 0; i < single_count; ++i) {
         const auto& src = stored.dominant_singles[i];
@@ -78,9 +96,8 @@ inline void MaterializeStoredFusionResult(const StoredFusionResult& stored,
         dst.persistence = src.persistence;
     }
 
-    const uint32_t pattern_count = std::min<uint32_t>(
-        static_cast<uint32_t>(stored.dominant_patterns.size()),
-        kBaselineDominantPatternLimit);
+    const uint32_t pattern_count =
+        std::min<uint32_t>(stored.dominant_pattern_count, kBaselineDominantPatternLimit);
     out->dominant_pattern_count = pattern_count;
     for (uint32_t i = 0; i < pattern_count; ++i) {
         const auto& src = stored.dominant_patterns[i];
@@ -89,17 +106,15 @@ inline void MaterializeStoredFusionResult(const StoredFusionResult& stored,
         dst.feature_base = MakeOwnedStringRef(src.feature_base);
         dst.score_pattern = src.score_pattern;
 
-        const uint32_t metric_count = std::min<uint32_t>(
-            static_cast<uint32_t>(src.metrics_hit.size()),
-            kBaselinePatternMetricsHitLimit);
+        const uint32_t metric_count =
+            std::min<uint32_t>(src.metrics_hit_count, kBaselinePatternMetricsHitLimit);
         dst.metrics_hit_count = metric_count;
         for (uint32_t j = 0; j < metric_count; ++j) {
             dst.metrics_hit[j] = MakeOwnedStringRef(src.metrics_hit[j]);
         }
 
         const uint32_t support_count = std::min<uint32_t>(
-            static_cast<uint32_t>(src.supporting_features.size()),
-            kBaselinePatternSupportingFeatureLimit);
+            src.supporting_feature_count, kBaselinePatternSupportingFeatureLimit);
         dst.supporting_feature_count = support_count;
         for (uint32_t j = 0; j < support_count; ++j) {
             dst.supporting_features[j] = MakeOwnedStringRef(src.supporting_features[j]);

@@ -12,6 +12,7 @@
 #include <common/error_code.h>
 #include <framework/interfaces/ibaseline_types.h>
 
+#include <array>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -23,6 +24,8 @@ namespace baseline {
 
 class SeriesStore {
  public:
+    static constexpr size_t kShardCount = 64;
+
     int ApplyObservation(const BaselineStringRef& key,
                          int64_t bucket_id,
                          SeriesPersistenceMode mode,
@@ -33,8 +36,9 @@ class SeriesStore {
         const std::string key_copy = CopyKey(key);
         if (key_copy.empty()) return error::BAD_REQUEST;
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto& state = states_[key_copy];
+        ShardState& shard = shards_[ShardIndex(key_copy)];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto& state = shard.states[key_copy];
         *out = state.ApplyObservation(bucket_id, mode, is_anomalous);
         return out->status;
     }
@@ -48,8 +52,9 @@ class SeriesStore {
         const std::string key_copy = CopyKey(key);
         if (key_copy.empty()) return error::BAD_REQUEST;
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto& state = states_[key_copy];
+        ShardState& shard = shards_[ShardIndex(key_copy)];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto& state = shard.states[key_copy];
         *out = state.ApplyObservation(bucket_id, SeriesPersistenceMode::kByAnomaly, is_anomalous);
         return out->status;
     }
@@ -60,26 +65,39 @@ class SeriesStore {
         const std::string key_copy = CopyKey(key);
         if (key_copy.empty()) return error::BAD_REQUEST;
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = states_.find(key_copy);
-        if (it == states_.end()) return error::NOT_FOUND;
+        const ShardState& shard = shards_[ShardIndex(key_copy)];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.states.find(key_copy);
+        if (it == shard.states.end()) return error::NOT_FOUND;
         *out = it->second;
         return error::OK;
     }
 
     size_t Size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return states_.size();
+        size_t total = 0;
+        for (const auto& shard : shards_) {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            total += shard.states.size();
+        }
+        return total;
+    }
+
+    size_t ShardIndex(const std::string& key) const {
+        return std::hash<std::string>{}(key) % shards_.size();
     }
 
  private:
+    struct ShardState {
+        mutable std::mutex mutex;
+        std::unordered_map<std::string, SeriesState> states;
+    };
+
     static std::string CopyKey(const BaselineStringRef& key) {
         if (!key.data || key.size == 0) return "";
         return std::string(key.data, key.size);
     }
 
-    mutable std::mutex mutex_;
-    std::unordered_map<std::string, SeriesState> states_;
+    std::array<ShardState, kShardCount> shards_;
 };
 
 }  // namespace baseline

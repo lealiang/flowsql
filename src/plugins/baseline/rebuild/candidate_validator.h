@@ -46,7 +46,9 @@ class CandidateValidator {
         const ReplayWindowSummary& holdout_window,
         const ValueFormalModel* candidate_model,
         const ValueFormalModel* incumbent_formal_model,
-        const ValueShadowState* incumbent_shadow_state);
+        const ValueShadowState* incumbent_shadow_state,
+        const BaselineTaskSpec* task_spec = nullptr,
+        const CompiledEventCalendar* compiled_event_calendar = nullptr);
 
     static CandidateValidationResult ValidateRatio(
         const RatioFeatureProfile& profile,
@@ -54,7 +56,9 @@ class CandidateValidator {
         const ReplayWindowSummary& holdout_window,
         const RatioFormalModel* candidate_model,
         const RatioFormalModel* incumbent_formal_model,
-        const RatioShadowState* incumbent_shadow_state);
+        const RatioShadowState* incumbent_shadow_state,
+        const BaselineTaskSpec* task_spec = nullptr,
+        const CompiledEventCalendar* compiled_event_calendar = nullptr);
 
     static CandidateValidationResult ValidateRelationAggregate(
         double candidate_loss_sum,

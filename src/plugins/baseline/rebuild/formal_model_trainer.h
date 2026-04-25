@@ -17,7 +17,6 @@
 #include "plugins/baseline/detector/ratio_detector_core.h"
 #include "plugins/baseline/detector/value_detector_core.h"
 #include "plugins/baseline/model/event_calendar_matcher.h"
-#include "plugins/baseline/model/event_calendar_spec.h"
 #include "plugins/baseline/model/task_spec.h"
 #include "plugins/baseline/rebuild/replay_runner.h"
 
@@ -43,7 +42,6 @@ struct ValueFormalTrainInput {
     const BaselineTaskSpec* task_spec = nullptr;
     int64_t delta = 0;
     std::string tz;
-    const EventCalendarSpec* event_calendar_spec = nullptr;
     const CompiledEventCalendar* compiled_event_calendar = nullptr;
 };
 
@@ -62,7 +60,6 @@ struct RatioFormalTrainInput {
     const BaselineTaskSpec* task_spec = nullptr;
     int64_t delta = 0;
     std::string tz;
-    const EventCalendarSpec* event_calendar_spec = nullptr;
     const CompiledEventCalendar* compiled_event_calendar = nullptr;
 };
 

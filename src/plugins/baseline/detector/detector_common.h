@@ -13,6 +13,8 @@
 
 #include <string>
 
+#include "plugins/baseline/model/formal_model_state.h"
+
 namespace flowsql {
 namespace baseline {
 
@@ -33,8 +35,10 @@ struct DetectorRebuildFailure {
     std::string key;
     int64_t request_bucket_start = 0;
     int64_t request_bucket_end = 0;
-    std::string candidate_state;
-    std::string switch_state = "none";
+    RebuildCandidateState candidate_state = RebuildCandidateState::kFailed;
+    RebuildSwitchState switch_state = RebuildSwitchState::kIdle;
+    RebuildFailureReason failure_reason = RebuildFailureReason::kUnavailable;
+    std::string failure_reason_detail;
 };
 
 }  // namespace baseline

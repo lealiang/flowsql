@@ -9,15 +9,21 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <rapidjson/document.h>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 
 #include <common/error_code.h>
 #include <framework/interfaces/ibaseline_service.h>
 #include <plugins/baseline/config_parser.h>
+#include <plugins/baseline/fusion/key_risk_fusion.h>
 #include <plugins/baseline/relation/relation_basis.h>
 #include <plugins/baseline/relation/relation_router.h>
 #include <plugins/baseline/relation/relation_summary_extractor.h>
+#include <plugins/baseline/task/relation_task.h>
+
+#include "relation_task_test_access.h"
 
 using namespace flowsql;
 using namespace flowsql::baseline;
@@ -26,6 +32,14 @@ namespace {
 
 bool NearlyEqual(double lhs, double rhs, double eps = 1e-9) {
     return std::fabs(lhs - rhs) <= eps;
+}
+
+rapidjson::Document ParseJson(const std::string& json) {
+    rapidjson::Document doc;
+    doc.Parse(json.c_str());
+    assert(!doc.HasParseError());
+    assert(doc.IsObject());
+    return doc;
 }
 
 class TestRelationSourceResolver : public IBaselineSourceResolver {
@@ -421,6 +435,131 @@ void TestBuildRelationBasisAndEvalBasis() {
     std::printf("[PASS] Relation basis build and eval basis\n");
 }
 
+void TestRelationTaskSeedMetricBasisViaTestAccess() {
+    std::printf("[TEST] Relation task seed metric basis via test access...\n");
+
+    RelationTaskSpec spec;
+    spec.task_id = "relation-seed";
+    spec.name = "client_group_mix";
+    spec.feature_base = "client_group_mix";
+    spec.group_space_id = "client_group";
+    spec.group_space_version = "v2";
+    spec.metric_set_id = "net_metrics";
+    spec.metrics = {"conn_count"};
+    spec.encode_type = "exact_sparse";
+    spec.support_policy.k_support = 8;
+    spec.support_policy.min_hist_share = 0.01;
+    spec.support_policy.min_active_ratio = 0.2;
+    spec.summary_policy.k_head = 2;
+    spec.summary_policy.k_stable = 2;
+
+    RelationTaskClockSpec clock_spec;
+    clock_spec.delta = 60;
+    clock_spec.tz = "UTC";
+
+    KeyRiskFusion fusion;
+    BaselineRelationTask task(
+        nullptr, nullptr, "relation-seed", spec, clock_spec, std::nullopt, nullptr, &fusion);
+
+    RelationServiceBasis basis;
+    basis.basis_version = 7;
+    basis.feature_base = "client_group_mix";
+    basis.metric_name = "conn_count";
+    basis.group_space_id = "client_group";
+    basis.group_space_version = "v1";
+    basis.k_head = 2;
+    basis.support_explicit = {11, 12, 13};
+    basis.stable_head = {11, 12};
+    basis.head_proto_q = {0.8, 0.2};
+
+    RelationTaskTestAccess::SeedMetricBasis(&task, "svc-new-lineage", "conn_count", basis);
+
+    std::string snapshot;
+    assert(task.QuerySeriesSnapshotJson(BaselineStringRef{"svc-new-lineage", 15}, &snapshot) ==
+           error::OK);
+    auto doc = ParseJson(snapshot);
+    assert(doc["basis_metric_count"].GetUint64() == 1);
+    assert(doc["metrics"].IsArray());
+    assert(doc["metrics"].Size() == 1);
+    assert(doc["metrics"][0]["basis_version"].GetUint64() == 7);
+    assert(std::string(doc["metrics"][0]["service_basis"]["group_space_version"].GetString()) ==
+           "v1");
+
+    std::printf("[PASS] Relation task seed metric basis via test access\n");
+}
+
+void TestKeyRiskFusionRemoveTaskContributionsByTaskId() {
+    std::printf("[TEST] KeyRiskFusion remove task contributions by task id...\n");
+
+    KeyRiskFusion fusion;
+    const std::string key = "svc-fusion-mixed";
+    const int64_t ts = 42;
+
+    DetectorResult direct_result;
+    direct_result.status = error::OK;
+    direct_result.key = BaselineStringRef{key.c_str(), static_cast<uint32_t>(key.size())};
+    direct_result.feature = BaselineStringRef{"bytes_total", 11};
+    direct_result.ts = ts;
+    direct_result.normalized_score = 0.9;
+    direct_result.confidence = 1.0;
+    direct_result.persistence = 3;
+    direct_result.direction = BaselineDirection::kUp;
+    direct_result.reason_code = BaselineReasonCode::kBaselineShiftUp;
+
+    DetectorResult routed_result = direct_result;
+    routed_result.feature = BaselineStringRef{"client_group_mix_conn_count_entropy_shannon", 43};
+    routed_result.normalized_score = 0.8;
+    routed_result.reason_code = BaselineReasonCode::kSpike;
+
+    FusionResult pattern_result;
+    pattern_result.key = BaselineStringRef{key.c_str(), static_cast<uint32_t>(key.size())};
+    pattern_result.ts = ts;
+    pattern_result.risk = 0.7;
+    pattern_result.dominant_pattern_count = 1;
+    pattern_result.dominant_pattern[0].pattern = BaselineStringRef{"support_escape", 14};
+    pattern_result.dominant_pattern[0].feature_base = BaselineStringRef{"client_group_mix", 16};
+    pattern_result.dominant_pattern[0].score_pattern = 0.7;
+    pattern_result.dominant_pattern[0].metrics_hit_count = 1;
+    pattern_result.dominant_pattern[0].metrics_hit[0] = BaselineStringRef{"conn_count", 10};
+    pattern_result.dominant_pattern[0].supporting_feature_count = 1;
+    pattern_result.dominant_pattern[0].supporting_features[0] =
+        BaselineStringRef{"client_group_mix_conn_count_entropy_shannon", 43};
+
+    fusion.UpdateSingleDetectorResult(
+        ts, FusionSourceId{"value-task", FusionSourceKind::kDirectSingle, 0}, direct_result);
+    fusion.UpdateSingleDetectorResult(
+        ts, FusionSourceId{"relation-task", FusionSourceKind::kRoutedSingle, 1}, routed_result);
+    fusion.UpdateRelationFusionResult(
+        ts, FusionSourceId{"relation-task", FusionSourceKind::kRelationPattern, 2}, pattern_result);
+
+    KeyRiskFusionSnapshot snapshot;
+    assert(fusion.QueryKeyFusionSnapshot(key, &snapshot) == error::OK);
+    assert(snapshot.available);
+    assert(snapshot.active_window.available);
+    assert(snapshot.active_window.ts == ts);
+    assert(snapshot.active_window.dominant_single_count == 2);
+    assert(snapshot.active_window.dominant_pattern_count == 1);
+
+    fusion.RemoveTaskContributions("value-task");
+    assert(fusion.QueryKeyFusionSnapshot(key, &snapshot) == error::OK);
+    assert(snapshot.available);
+    assert(snapshot.active_window.available);
+    assert(snapshot.active_window.dominant_single_count == 1);
+    assert(snapshot.active_window.dominant_singles[0].feature ==
+           "client_group_mix_conn_count_entropy_shannon");
+    assert(snapshot.active_window.dominant_pattern_count == 1);
+
+    fusion.RemoveTaskContributions("relation-task");
+    std::string snapshot_json;
+    assert(fusion.QueryKeyFusionSnapshotJson(
+               BaselineStringRef{key.c_str(), static_cast<uint32_t>(key.size())},
+               &snapshot_json) == error::OK);
+    auto doc = ParseJson(snapshot_json);
+    assert(doc["available"].GetBool() == false);
+
+    std::printf("[PASS] KeyRiskFusion remove task contributions by task id\n");
+}
+
 void TestExtractRelationSummaries() {
     std::printf("[TEST] Relation summary extraction...\n");
 
@@ -576,7 +715,9 @@ void TestRelationRouter() {
     bool found_stable_g1 = false;
     bool found_stable_g2 = false;
     bool found_entropy_calendar = false;
+    std::unordered_set<int32_t> local_slots;
     for (const auto& routed_spec : routed_specs) {
+        assert(local_slots.insert(routed_spec.local_slot).second);
         if (routed_spec.feature ==
             "client_group_mix_conn_count_entropy_shannon") {
             found_entropy = true;
@@ -651,6 +792,8 @@ int main() {
     TestParseValueTaskBaselineSourceConfig();
     TestParseRelationTaskSpec();
     TestBuildRelationBasisAndEvalBasis();
+    TestRelationTaskSeedMetricBasisViaTestAccess();
+    TestKeyRiskFusionRemoveTaskContributionsByTaskId();
     TestExtractRelationSummaries();
     TestRelationRouter();
     std::printf("[DONE] test_baseline_relation_task\n");

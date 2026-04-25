@@ -14,6 +14,7 @@
 
 #include "config_parser.h"
 #include "fusion/key_risk_fusion.h"
+#include "model/event_calendar_matcher.h"
 #include "rebuild/rebuild_queue.h"
 #include "rebuild/rebuild_worker.h"
 #include "solver/solver_backend.h"
@@ -24,6 +25,37 @@
 
 namespace flowsql {
 namespace baseline {
+
+namespace {
+
+int CompileStaticTaskCalendar(const BaselineTaskSpec& spec,
+                              std::shared_ptr<const CompiledEventCalendar>* out_calendar) {
+    if (!out_calendar) return error::BAD_REQUEST;
+    out_calendar->reset();
+    if (!spec.event_calendar_spec.has_value()) return error::OK;
+
+    CompiledEventCalendar compiled;
+    std::string err;
+    const int rc = CompileEventCalendar(*spec.event_calendar_spec, spec, &compiled, &err);
+    if (rc != error::OK) return rc;
+    *out_calendar = std::make_shared<CompiledEventCalendar>(std::move(compiled));
+    return error::OK;
+}
+
+int ValidateRelationTaskCalendar(const RelationTaskCreateSpec& create_spec) {
+    if (!create_spec.event_calendar_spec.has_value()) return error::OK;
+
+    BaselineTaskSpec task_spec;
+    task_spec.feature = create_spec.task_spec.feature_base;
+    task_spec.delta = create_spec.clock_spec.delta;
+    task_spec.tz = create_spec.clock_spec.tz;
+
+    CompiledEventCalendar compiled;
+    std::string err;
+    return CompileEventCalendar(*create_spec.event_calendar_spec, task_spec, &compiled, &err);
+}
+
+}  // namespace
 
 BaselinePlugin::BaselinePlugin()
     : task_registry_(std::make_unique<TaskRegistry>()),
@@ -87,11 +119,16 @@ int BaselinePlugin::CreateValueTask(const char* config_json,
     int rc = ConfigParser::ParseValueTask(config_json, &spec, &err);
     if (rc != error::OK) return rc;
 
+    std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar;
+    rc = CompileStaticTaskCalendar(spec, &compiled_event_calendar);
+    if (rc != error::OK) return rc;
+
     auto task = std::make_shared<BaselineValueTask>(
         task_registry_.get(),
         rebuild_queue_.get(),
         task_registry_->AllocateTaskId(BaselineTaskKind::kValue),
         spec,
+        compiled_event_calendar,
         key_risk_fusion_.get());
     rc = task_registry_->Register(task);
     if (rc != error::OK) return rc;
@@ -110,11 +147,16 @@ int BaselinePlugin::CreateRatioTask(const char* config_json,
     int rc = ConfigParser::ParseRatioTask(config_json, &spec, &err);
     if (rc != error::OK) return rc;
 
+    std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar;
+    rc = CompileStaticTaskCalendar(spec, &compiled_event_calendar);
+    if (rc != error::OK) return rc;
+
     auto task = std::make_shared<BaselineRatioTask>(
         task_registry_.get(),
         rebuild_queue_.get(),
         task_registry_->AllocateTaskId(BaselineTaskKind::kRatio),
         spec,
+        compiled_event_calendar,
         key_risk_fusion_.get());
     rc = task_registry_->Register(task);
     if (rc != error::OK) return rc;
@@ -132,6 +174,8 @@ int BaselinePlugin::CreateRelationTask(const char* config_json,
     RelationTaskCreateSpec create_spec;
     std::string err;
     int rc = ConfigParser::ParseRelationTask(config_json, &create_spec, &err);
+    if (rc != error::OK) return rc;
+    rc = ValidateRelationTaskCalendar(create_spec);
     if (rc != error::OK) return rc;
 
     const std::string task_id =
@@ -180,6 +224,10 @@ int BaselinePlugin::QueryServiceStatsJson(std::string* out_json) const {
     writer.Bool(rebuild_worker_ && rebuild_worker_->Running());
     writer.Key("key_fusion_key_count");
     writer.Uint64(key_risk_fusion_ ? key_risk_fusion_->KeyCount() : 0);
+    writer.Key("key_fusion_idle_prune_bucket_gap");
+    writer.Int64(key_risk_fusion_ ? key_risk_fusion_->IdlePruneBucketGap() : 0);
+    writer.Key("key_fusion_pruned_key_count_total");
+    writer.Uint64(key_risk_fusion_ ? key_risk_fusion_->PrunedKeyCount() : 0);
     writer.EndObject();
     *out_json = buf.GetString();
     return error::OK;

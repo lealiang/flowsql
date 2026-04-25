@@ -22,11 +22,13 @@
 #include "plugins/baseline/fusion/key_risk_fusion.h"
 #include "plugins/baseline/fusion/relation_pattern_fusion.h"
 #include "plugins/baseline/relation/relation_summary_extractor.h"
+#include "plugins/baseline/model/runtime_state_prune.h"
 #include "plugins/baseline/rebuild/candidate_builder.h"
 #include "plugins/baseline/rebuild/candidate_validator.h"
 #include "plugins/baseline/rebuild/formal_model_trainer.h"
 #include "plugins/baseline/rebuild/rebuild_queue.h"
 #include "plugins/baseline/rebuild/rebuild_worker.h"
+#include "plugins/baseline/task/rebuild_outcome_helper.h"
 
 namespace flowsql {
 namespace baseline {
@@ -46,6 +48,28 @@ namespace {
 std::string CopyKey(const BaselineStringRef& key) {
     if (!key.data || key.size == 0) return "";
     return std::string(key.data, key.size);
+}
+
+void MaybePruneRuntimeByKeyLocked(
+    std::unordered_map<std::string, RelationTaskKeyRuntimeState>* runtime_by_key,
+    size_t* prune_cursor,
+    uint64_t* pruned_key_count_total,
+    int64_t* last_pruned_bucket,
+    int64_t current_bucket) {
+    if (!runtime_by_key || !prune_cursor || !pruned_key_count_total || !last_pruned_bucket ||
+        current_bucket <= *last_pruned_bucket) {
+        return;
+    }
+
+    *last_pruned_bucket = current_bucket;
+    *pruned_key_count_total +=
+        PruneBoundedStateMap(runtime_by_key,
+                            prune_cursor,
+                            kRuntimeIdlePruneScanLimit,
+                            [current_bucket](const RelationTaskKeyRuntimeState& runtime_state) {
+                                return RuntimeStateIdleBeyondGap(runtime_state.last_bucket_id,
+                                                                 current_bucket);
+                            });
 }
 
 int ValidateRelationBlock(const RelationTaskSpec& spec,
@@ -157,8 +181,11 @@ struct RelationApplyPlan {
 };
 
 struct RelationTaskRebuildResult {
-    std::string candidate_state = "none";
-    std::string switch_state = "none";
+    RebuildCandidateState candidate_state = RebuildCandidateState::kNone;
+    RebuildSwitchState switch_state = RebuildSwitchState::kIdle;
+    RebuildFailureReason failure_reason = RebuildFailureReason::kNone;
+    std::string failure_reason_detail;
+    RebuildStageTrace stage_trace;
     RelationLineageCompatibility lineage_compatibility =
         RelationLineageCompatibility::kIdentical;
     double candidate_loss = 0.0;
@@ -228,6 +255,25 @@ bool CanReuseRoutedFeatureRuntime(const RelationRoutedFeatureRuntime& runtime,
     return true;
 }
 
+bool SameRelationServiceBasis(const RelationServiceBasis& lhs,
+                              const RelationServiceBasis& rhs) {
+    return lhs.basis_version == rhs.basis_version &&
+           lhs.feature_base == rhs.feature_base &&
+           lhs.metric_name == rhs.metric_name &&
+           lhs.group_space_id == rhs.group_space_id &&
+           lhs.group_space_version == rhs.group_space_version &&
+           lhs.k_head == rhs.k_head &&
+           lhs.support_explicit == rhs.support_explicit &&
+           lhs.stable_head == rhs.stable_head &&
+           lhs.head_proto_q == rhs.head_proto_q;
+}
+
+bool NeedsRoutedRuntimeRefresh(const RelationMetricRuntimeState& metric_runtime) {
+    if (!metric_runtime.routed_runtime_materialized) return true;
+    return !SameRelationServiceBasis(metric_runtime.service_basis,
+                                     metric_runtime.routed_basis_snapshot);
+}
+
 StoredRelationDetectorResult CaptureDetectorResult(const DetectorResult& result) {
     StoredRelationDetectorResult stored;
     stored.available = true;
@@ -280,18 +326,16 @@ FusionResult BuildPatternContributionResult(const std::string& key,
         MakeOwnedStringRef(pattern.projection.feature_base);
     result.dominant_pattern[0].score_pattern = pattern.projection.score_pattern;
 
-    const uint32_t metric_count = std::min<uint32_t>(
-        static_cast<uint32_t>(pattern.projection.metrics_hit.size()),
-        kBaselinePatternMetricsHitLimit);
+    const uint32_t metric_count = std::min<uint32_t>(pattern.projection.metrics_hit_count,
+                                                     kBaselinePatternMetricsHitLimit);
     result.dominant_pattern[0].metrics_hit_count = metric_count;
     for (uint32_t i = 0; i < metric_count; ++i) {
         result.dominant_pattern[0].metrics_hit[i] =
             MakeOwnedStringRef(pattern.projection.metrics_hit[i]);
     }
 
-    const uint32_t support_count = std::min<uint32_t>(
-        static_cast<uint32_t>(pattern.projection.supporting_features.size()),
-        kBaselinePatternSupportingFeatureLimit);
+    const uint32_t support_count = std::min<uint32_t>(pattern.projection.supporting_feature_count,
+                                                      kBaselinePatternSupportingFeatureLimit);
     result.dominant_pattern[0].supporting_feature_count = support_count;
     for (uint32_t i = 0; i < support_count; ++i) {
         result.dominant_pattern[0].supporting_features[i] =
@@ -312,11 +356,38 @@ const StoredFusionResult* SelectResultForBucket(const KeyRiskFusionSnapshot& sna
     return nullptr;
 }
 
+BaselineTaskSpec BuildRoutedTaskSpec(const RelationRoutedFeatureSpec& spec,
+                                     const std::string& key) {
+    BaselineTaskSpec task_spec;
+    task_spec.key = key;
+    task_spec.feature = spec.feature;
+    task_spec.delta = spec.delta;
+    task_spec.tz = spec.tz;
+    task_spec.event_calendar_spec = spec.event_calendar_spec;
+    return task_spec;
+}
+
+std::shared_ptr<const CompiledEventCalendar> CompileRoutedEventCalendar(
+    const RelationRoutedFeatureSpec& spec,
+    const std::string& key) {
+    if (!spec.event_calendar_spec.has_value()) return nullptr;
+
+    BaselineTaskSpec task_spec = BuildRoutedTaskSpec(spec, key);
+    CompiledEventCalendar compiled;
+    std::string err;
+    if (CompileEventCalendar(*spec.event_calendar_spec, task_spec, &compiled, &err) != error::OK) {
+        return nullptr;
+    }
+    return std::make_shared<CompiledEventCalendar>(std::move(compiled));
+}
+
 RelationRoutedFeatureRuntime BuildRoutedFeatureRuntime(const std::string& task_id,
                                                        const std::string& key,
                                                        const RelationRoutedFeatureSpec& spec) {
     RelationRoutedFeatureRuntime runtime;
     runtime.spec = spec;
+    const std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar =
+        CompileRoutedEventCalendar(spec, key);
 
     if (spec.detector_kind == RelationRoutedDetectorKind::kValue) {
         ValueDetectorCoreSpec core_spec;
@@ -325,7 +396,9 @@ RelationRoutedFeatureRuntime BuildRoutedFeatureRuntime(const std::string& task_i
         core_spec.feature_type = spec.feature_type;
         core_spec.feature_profile = spec.feature_profile;
         core_spec.transform_kind = spec.transform_kind;
-        core_spec.event_calendar_spec = spec.event_calendar_spec;
+        core_spec.delta = spec.delta;
+        core_spec.tz = spec.tz;
+        core_spec.compiled_event_calendar = compiled_event_calendar;
         if (spec.baseline_source_config.has_value()) {
             core_spec.baseline_source_configs.push_back(
                 SeriesBaselineSourceConfig{key, *spec.baseline_source_config});
@@ -339,7 +412,9 @@ RelationRoutedFeatureRuntime BuildRoutedFeatureRuntime(const std::string& task_i
     core_spec.routed_feature_id = spec.feature;
     core_spec.feature_type = spec.feature_type;
     core_spec.feature_profile = spec.feature_profile;
-    core_spec.event_calendar_spec = spec.event_calendar_spec;
+    core_spec.delta = spec.delta;
+    core_spec.tz = spec.tz;
+    core_spec.compiled_event_calendar = compiled_event_calendar;
     if (spec.baseline_source_config.has_value()) {
         core_spec.baseline_source_configs.push_back(
             SeriesBaselineSourceConfig{key, *spec.baseline_source_config});
@@ -392,6 +467,8 @@ void MaterializeMetricRuntime(const std::string& task_id,
     }
 
     metric_runtime->routed_features = std::move(refreshed);
+    metric_runtime->routed_basis_snapshot = metric_runtime->service_basis;
+    metric_runtime->routed_runtime_materialized = true;
 }
 
 RelationRoutedFeatureRuntime* FindRoutedFeatureRuntime(RelationMetricRuntimeState* metric_runtime,
@@ -458,8 +535,8 @@ ReplayWindowSummary BuildReplayWindowSummary(const TReplaySeries& replay,
 std::shared_ptr<ValueFormalModel> TrainFullValueModel(const ValueFeatureProfile& profile,
                                                       const ValueReplaySeries& replay,
                                                       uint64_t model_version,
-                                                      int64_t delta,
-                                                      const std::string& tz) {
+                                                      const BaselineTaskSpec* task_spec,
+                                                      const CompiledEventCalendar* compiled_event_calendar) {
     ValueFormalTrainResult train_result;
     const ValueFormalTrainInput input{
         &profile,
@@ -468,11 +545,10 @@ std::shared_ptr<ValueFormalModel> TrainFullValueModel(const ValueFeatureProfile&
         model_version,
         0,
         replay.window,
-        nullptr,
-        delta,
-        tz,
-        nullptr,
-        nullptr};
+        task_spec,
+        task_spec ? task_spec->delta : 0,
+        task_spec ? task_spec->tz : "",
+        compiled_event_calendar};
     if (FormalModelTrainer::TrainValue(input, &train_result) != FormalTrainFailureCode::kNone) {
         return nullptr;
     }
@@ -482,8 +558,8 @@ std::shared_ptr<ValueFormalModel> TrainFullValueModel(const ValueFeatureProfile&
 std::shared_ptr<RatioFormalModel> TrainFullRatioModel(const RatioFeatureProfile& profile,
                                                       const RatioReplaySeries& replay,
                                                       uint64_t model_version,
-                                                      int64_t delta,
-                                                      const std::string& tz) {
+                                                      const BaselineTaskSpec* task_spec,
+                                                      const CompiledEventCalendar* compiled_event_calendar) {
     RatioFormalTrainResult train_result;
     const RatioFormalTrainInput input{
         &profile,
@@ -492,11 +568,10 @@ std::shared_ptr<RatioFormalModel> TrainFullRatioModel(const RatioFeatureProfile&
         model_version,
         0,
         replay.window,
-        nullptr,
-        delta,
-        tz,
-        nullptr,
-        nullptr};
+        task_spec,
+        task_spec ? task_spec->delta : 0,
+        task_spec ? task_spec->tz : "",
+        compiled_event_calendar};
     if (FormalModelTrainer::TrainRatio(input, &train_result) != FormalTrainFailureCode::kNone) {
         return nullptr;
     }
@@ -710,9 +785,11 @@ int BaselineRelationTask::QueryTaskSnapshotJson(std::string* out_json) const {
     if (rebuild_runtime_) rebuild_runtime_->Snapshot(&rebuild_snapshot);
     size_t key_runtime_count = 0;
     size_t routed_feature_count = 0;
+    uint64_t pruned_key_count_total = 0;
     {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
         key_runtime_count = runtime_by_key_.size();
+        pruned_key_count_total = pruned_key_count_total_;
         for (const auto& entry : runtime_by_key_) {
             for (const auto& metric_entry : entry.second.metrics_by_name) {
                 routed_feature_count += metric_entry.second.routed_features.size();
@@ -753,6 +830,10 @@ int BaselineRelationTask::QueryTaskSnapshotJson(std::string* out_json) const {
     writer.Uint64(routed_feature_count);
     writer.Key("key_runtime_count");
     writer.Uint64(key_runtime_count);
+    writer.Key("idle_prune_bucket_gap");
+    writer.Int64(kRuntimeIdlePruneBucketGap);
+    writer.Key("pruned_key_count_total");
+    writer.Uint64(pruned_key_count_total);
     writer.Key("reader_bound");
     writer.Bool(history_binding_ && history_binding_->HasReader());
     writer.Key("rebuild_pending");
@@ -793,12 +874,24 @@ int BaselineRelationTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     writer.String(key_copy.c_str());
     writer.Key("seen_block_count");
     writer.Uint64(runtime_state.seen_block_count);
+    writer.Key("last_bucket_id");
+    writer.Int64(runtime_state.last_bucket_id);
     writer.Key("basis_metric_count");
     writer.Uint64(runtime_state.metrics_by_name.size());
     writer.Key("candidate_state");
-    writer.String(runtime_state.candidate_state.c_str());
+    writer.String(RebuildCandidateStateName(runtime_state.candidate_state));
     writer.Key("switch_state");
-    writer.String(runtime_state.switch_state.c_str());
+    writer.String(RebuildSwitchStateName(runtime_state.switch_state));
+    writer.Key("stage_seen_building");
+    writer.Bool(runtime_state.stage_trace.stage_seen_building);
+    writer.Key("stage_seen_built");
+    writer.Bool(runtime_state.stage_trace.stage_seen_built);
+    writer.Key("stage_seen_validating");
+    writer.Bool(runtime_state.stage_trace.stage_seen_validating);
+    writer.Key("failure_reason");
+    writer.String(RebuildFailureReasonName(runtime_state.failure_reason));
+    writer.Key("failure_reason_detail");
+    writer.String(runtime_state.failure_reason_detail.c_str());
     writer.Key("lineage_compatibility");
     writer.String(RelationLineageCompatibilityName(runtime_state.last_lineage_compatibility));
     writer.Key("last_candidate_loss");
@@ -822,10 +915,11 @@ int BaselineRelationTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     writer.Key("risk");
     writer.Double(runtime_state.last_fusion_result.risk);
     writer.Key("dominant_single_count");
-    writer.Uint(static_cast<uint32_t>(runtime_state.last_fusion_result.dominant_singles.size()));
+    writer.Uint(runtime_state.last_fusion_result.dominant_single_count);
     writer.Key("dominant_single");
     writer.StartArray();
-    for (const auto& dominant : runtime_state.last_fusion_result.dominant_singles) {
+    for (uint32_t i = 0; i < runtime_state.last_fusion_result.dominant_single_count; ++i) {
+        const auto& dominant = runtime_state.last_fusion_result.dominant_singles[i];
         writer.StartObject();
         writer.Key("feature");
         writer.String(dominant.feature.c_str());
@@ -841,10 +935,11 @@ int BaselineRelationTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     }
     writer.EndArray();
     writer.Key("dominant_pattern_count");
-    writer.Uint(static_cast<uint32_t>(runtime_state.last_fusion_result.dominant_patterns.size()));
+    writer.Uint(runtime_state.last_fusion_result.dominant_pattern_count);
     writer.Key("dominant_pattern");
     writer.StartArray();
-    for (const auto& pattern : runtime_state.last_fusion_result.dominant_patterns) {
+    for (uint32_t i = 0; i < runtime_state.last_fusion_result.dominant_pattern_count; ++i) {
+        const auto& pattern = runtime_state.last_fusion_result.dominant_patterns[i];
         writer.StartObject();
         writer.Key("pattern");
         writer.String(pattern.pattern.c_str());
@@ -854,12 +949,14 @@ int BaselineRelationTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
         writer.Double(pattern.score_pattern);
         writer.Key("metrics_hit");
         writer.StartArray();
-        for (const auto& metric : pattern.metrics_hit) writer.String(metric.c_str());
+        for (uint32_t j = 0; j < pattern.metrics_hit_count; ++j) {
+            writer.String(pattern.metrics_hit[j].c_str());
+        }
         writer.EndArray();
         writer.Key("supporting_features");
         writer.StartArray();
-        for (const auto& feature : pattern.supporting_features) {
-            writer.String(feature.c_str());
+        for (uint32_t j = 0; j < pattern.supporting_feature_count; ++j) {
+            writer.String(pattern.supporting_features[j].c_str());
         }
         writer.EndArray();
         writer.EndObject();
@@ -989,7 +1086,6 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
     }
 
     RelationTaskRebuildResult rebuild_result;
-    rebuild_result.candidate_state = "fetch_failed";
     rebuild_result.replay_window.request_bucket_start = request.bucket_start_hint;
     rebuild_result.replay_window.request_bucket_end = request.bucket_end;
     rebuild_result.train_window.request_bucket_start = request.bucket_start_hint;
@@ -1001,8 +1097,16 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                                            bool apply_basis_refresh) {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
         auto& runtime_state = runtime_by_key_[request.key];
+        runtime_state.last_bucket_id =
+            std::max({runtime_state.last_bucket_id,
+                      result.replay_window.last_bucket_id,
+                      result.train_window.last_bucket_id,
+                      result.holdout_window.last_bucket_id,
+                      request.bucket_end});
         runtime_state.candidate_state = result.candidate_state;
         runtime_state.switch_state = result.switch_state;
+        runtime_state.failure_reason = result.failure_reason;
+        runtime_state.failure_reason_detail = result.failure_reason_detail;
         runtime_state.last_lineage_compatibility = result.lineage_compatibility;
         runtime_state.last_candidate_loss = result.candidate_loss;
         runtime_state.last_incumbent_loss = result.incumbent_loss;
@@ -1010,6 +1114,7 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
         runtime_state.last_replay_window = result.replay_window;
         runtime_state.last_train_window = result.train_window;
         runtime_state.last_holdout_window = result.holdout_window;
+        runtime_state.stage_trace = result.stage_trace;
         if (apply_basis_refresh) {
             for (const auto& metric_name : spec_.metrics) {
                 auto basis_it = result.service_basis_by_metric.find(metric_name);
@@ -1021,14 +1126,7 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                 if (eval_it != result.eval_basis_by_metric.end()) {
                     metric_runtime.eval_basis = eval_it->second;
                 }
-                MaterializeMetricRuntime(TaskId(),
-                                         request.key,
-                                         spec_,
-                                         clock_spec_,
-                                         event_calendar_spec_,
-                                         source_resolver_,
-                                         metric_name,
-                                         &metric_runtime);
+                metric_runtime.routed_runtime_materialized = false;
                 for (auto& routed_feature : metric_runtime.routed_features) {
                     routed_feature.last_detector_result = StoredRelationDetectorResult{};
                 }
@@ -1037,10 +1135,20 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
     };
 
     if (!reader) {
-        rebuild_result.switch_state = "rebuild_blocked";
+        SetRebuildFailureOutcome(&rebuild_result,
+                                 RebuildFailureReason::kUnavailable,
+                                 "history_reader_missing",
+                                 RebuildSwitchState::kRebuildBlocked);
         persist_result(rebuild_result, false);
         return error::UNAVAILABLE;
     }
+
+    rebuild_result.candidate_state = RebuildCandidateState::kBuilding;
+    rebuild_result.switch_state = RebuildSwitchState::kRebuildPending;
+    rebuild_result.failure_reason = RebuildFailureReason::kNone;
+    rebuild_result.failure_reason_detail.clear();
+    MarkRebuildStageBuilding(&rebuild_result.stage_trace);
+    persist_result(rebuild_result, false);
 
     const BaselineStringRef key_ref{
         request.key.c_str(),
@@ -1065,8 +1173,12 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
         return error::OK;
     });
     if (fetch_rc != error::OK) {
-        rebuild_result.candidate_state =
-            fetch_rc == error::BAD_REQUEST ? "replay_failed" : "fetch_failed";
+        SetRebuildFailureOutcome(&rebuild_result,
+                                 fetch_rc == error::BAD_REQUEST
+                                     ? RebuildFailureReason::kReplayFailed
+                                     : RebuildFailureReason::kUnavailable,
+                                 fetch_rc == error::BAD_REQUEST ? "history_fetch_bad_request"
+                                                                : "history_fetch_failed");
         persist_result(rebuild_result, false);
         return fetch_rc;
     }
@@ -1081,7 +1193,7 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
         blocks, fit_count, blocks.size(), request.bucket_start_hint, request.bucket_end);
 
     if (blocks.empty()) {
-        rebuild_result.candidate_state = "empty";
+        SetRebuildFailureOutcome(&rebuild_result, RebuildFailureReason::kInsufficientData, "empty");
         persist_result(rebuild_result, false);
         return error::OK;
     }
@@ -1112,7 +1224,9 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
         if (CandidateBuilder::BuildRelationMetricBases(
                 basis_input, incumbent_basis, spec_, &basis_build_result) !=
             CandidateBuildStatus::kTrained) {
-            rebuild_result.candidate_state = "basis_build_failed";
+            SetRebuildFailureOutcome(&rebuild_result,
+                                     RebuildFailureReason::kBasisBuildFailed,
+                                     "relation_basis_build_failed");
             persist_result(rebuild_result, false);
             return error::OK;
         }
@@ -1131,7 +1245,9 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                 static_cast<uint32_t>(metric_index),
                 basis_build_result.candidate_service_basis,
                 &service_summaries[metric_index]) != error::OK) {
-            rebuild_result.candidate_state = "replay_failed";
+            SetRebuildFailureOutcome(&rebuild_result,
+                                     RebuildFailureReason::kReplayFailed,
+                                     "relation_service_summary_replay_failed");
             persist_result(rebuild_result, false);
             return error::BAD_REQUEST;
         }
@@ -1145,17 +1261,27 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                     static_cast<uint32_t>(metric_index),
                     basis_build_result.candidate_eval_basis.basis,
                     &eval_summaries[metric_index]) != error::OK) {
-                rebuild_result.candidate_state = "replay_failed";
+                SetRebuildFailureOutcome(&rebuild_result,
+                                         RebuildFailureReason::kReplayFailed,
+                                         "relation_eval_summary_replay_failed");
                 persist_result(rebuild_result, false);
                 return error::BAD_REQUEST;
             }
         }
     }
 
+    rebuild_result.candidate_state = RebuildCandidateState::kBuilt;
+    rebuild_result.switch_state = RebuildSwitchState::kRebuildPending;
+    rebuild_result.failure_reason = RebuildFailureReason::kNone;
+    rebuild_result.failure_reason_detail.clear();
+    MarkRebuildStageBuilt(&rebuild_result.stage_trace);
+    persist_result(rebuild_result, false);
+
     double candidate_loss_sum = 0.0;
     double incumbent_loss_sum = 0.0;
     uint64_t comparable_feature_count = 0;
     uint64_t serviceable_feature_count = 0;
+    bool validation_stage_marked = false;
     struct ValidationDigest {
         double candidate_loss = 0.0;
         double incumbent_loss = 0.0;
@@ -1205,6 +1331,15 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
 
         std::unordered_map<std::string, ValidationDigest> validation_by_feature;
         if (comparable_metric[metric_index]) {
+            if (!validation_stage_marked) {
+                rebuild_result.candidate_state = RebuildCandidateState::kValidating;
+                rebuild_result.switch_state = RebuildSwitchState::kValidating;
+                rebuild_result.failure_reason = RebuildFailureReason::kNone;
+                rebuild_result.failure_reason_detail.clear();
+                MarkRebuildStageValidating(&rebuild_result.stage_trace);
+                persist_result(rebuild_result, false);
+                validation_stage_marked = true;
+            }
             for (const auto& eval_feature : eval_metric_runtime.routed_features) {
                 const auto* incumbent_feature = FindRoutedFeatureRuntime(
                     incumbent_metric_runtime, eval_feature.spec.feature);
@@ -1228,7 +1363,9 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                             request.bucket_start_hint,
                             request.bucket_end,
                             &eval_replay) != error::OK) {
-                        rebuild_result.candidate_state = "replay_failed";
+                        SetRebuildFailureOutcome(&rebuild_result,
+                                                 RebuildFailureReason::kReplayFailed,
+                                                 "relation_value_eval_replay_failed");
                         persist_result(rebuild_result, false);
                         return error::BAD_REQUEST;
                     }
@@ -1237,20 +1374,22 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                         incumbent_feature && incumbent_feature->value_core
                             ? incumbent_feature->value_core->profile()
                             : eval_feature.value_core->profile();
+                    BaselineTaskSpec eval_task_spec =
+                        BuildRoutedTaskSpec(eval_feature.spec, request.key);
+                    const std::shared_ptr<const CompiledEventCalendar> eval_calendar =
+                        CompileRoutedEventCalendar(eval_feature.spec, request.key);
                     ValueCandidateBuildResult build_result;
                     CandidateBuilder::BuildValue(profile,
                                                  eval_replay,
                                                  rebuild_context.next_model_version,
-                                                 nullptr,
-                                                 clock_spec_.delta,
-                                                 clock_spec_.tz,
-                                                 nullptr,
-                                                 nullptr,
+                                                 &eval_task_spec,
+                                                 eval_feature.spec.delta,
+                                                 eval_feature.spec.tz,
+                                                 eval_calendar.get(),
                                                  &build_result);
                     if (build_result.status != CandidateBuildStatus::kTrained ||
                         !build_result.candidate_model) {
-                        rebuild_result.candidate_state =
-                            CandidateBuildStatusName(build_result.status);
+                        ApplyBuildFailureOutcome(build_result.status, &rebuild_result);
                         persist_result(rebuild_result, false);
                         return error::OK;
                     }
@@ -1265,12 +1404,13 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                             : rebuild_context.incumbent_formal_model.get(),
                         rebuild_context.incumbent_shadow_state.active
                             ? &rebuild_context.incumbent_shadow_state
-                            : nullptr);
+                            : nullptr,
+                        &eval_task_spec,
+                        eval_calendar.get());
                     if (validation.status != CandidateValidationStatus::kPassed &&
                         validation.status != CandidateValidationStatus::kFailed &&
                         validation.status != CandidateValidationStatus::kBypassNoIncumbent) {
-                        rebuild_result.candidate_state =
-                            CandidateValidationStatusName(validation.status);
+                        ApplyValidationFailureOutcome(validation.status, false, &rebuild_result);
                         persist_result(rebuild_result, false);
                         return error::OK;
                     }
@@ -1303,7 +1443,9 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                         request.bucket_start_hint,
                         request.bucket_end,
                         &eval_replay) != error::OK) {
-                    rebuild_result.candidate_state = "replay_failed";
+                    SetRebuildFailureOutcome(&rebuild_result,
+                                             RebuildFailureReason::kReplayFailed,
+                                             "relation_ratio_eval_replay_failed");
                     persist_result(rebuild_result, false);
                     return error::BAD_REQUEST;
                 }
@@ -1312,20 +1454,22 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                     incumbent_feature && incumbent_feature->ratio_core
                         ? incumbent_feature->ratio_core->profile()
                         : eval_feature.ratio_core->profile();
+                BaselineTaskSpec eval_task_spec =
+                    BuildRoutedTaskSpec(eval_feature.spec, request.key);
+                const std::shared_ptr<const CompiledEventCalendar> eval_calendar =
+                    CompileRoutedEventCalendar(eval_feature.spec, request.key);
                 RatioCandidateBuildResult build_result;
                 CandidateBuilder::BuildRatio(profile,
                                              eval_replay,
                                              rebuild_context.next_model_version,
-                                             nullptr,
-                                             clock_spec_.delta,
-                                             clock_spec_.tz,
-                                             nullptr,
-                                             nullptr,
+                                             &eval_task_spec,
+                                             eval_feature.spec.delta,
+                                             eval_feature.spec.tz,
+                                             eval_calendar.get(),
                                              &build_result);
                 if (build_result.status != CandidateBuildStatus::kTrained ||
                     !build_result.candidate_model) {
-                    rebuild_result.candidate_state =
-                        CandidateBuildStatusName(build_result.status);
+                    ApplyBuildFailureOutcome(build_result.status, &rebuild_result);
                     persist_result(rebuild_result, false);
                     return error::OK;
                 }
@@ -1340,12 +1484,13 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                         : rebuild_context.incumbent_formal_model.get(),
                     rebuild_context.incumbent_shadow_state.active
                         ? &rebuild_context.incumbent_shadow_state
-                        : nullptr);
+                        : nullptr,
+                    &eval_task_spec,
+                    eval_calendar.get());
                 if (validation.status != CandidateValidationStatus::kPassed &&
                     validation.status != CandidateValidationStatus::kFailed &&
                     validation.status != CandidateValidationStatus::kBypassNoIncumbent) {
-                    rebuild_result.candidate_state =
-                        CandidateValidationStatusName(validation.status);
+                    ApplyValidationFailureOutcome(validation.status, false, &rebuild_result);
                     persist_result(rebuild_result, false);
                     return error::OK;
                 }
@@ -1394,7 +1539,9 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                         request.bucket_start_hint,
                         request.bucket_end,
                         &service_replay) != error::OK) {
-                    rebuild_result.candidate_state = "replay_failed";
+                    SetRebuildFailureOutcome(&rebuild_result,
+                                             RebuildFailureReason::kReplayFailed,
+                                             "relation_value_service_replay_failed");
                     persist_result(rebuild_result, false);
                     return error::BAD_REQUEST;
                 }
@@ -1413,13 +1560,19 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                         incumbent_feature && incumbent_feature->value_core
                             ? incumbent_feature->value_core->profile()
                             : service_feature.value_core->profile();
+                    BaselineTaskSpec service_task_spec =
+                        BuildRoutedTaskSpec(service_feature.spec, request.key);
+                    const std::shared_ptr<const CompiledEventCalendar> service_calendar =
+                        CompileRoutedEventCalendar(service_feature.spec, request.key);
                     plan.value_full_model = TrainFullValueModel(profile,
                                                                 service_replay,
                                                                 rebuild_context.next_model_version,
-                                                                clock_spec_.delta,
-                                                                clock_spec_.tz);
+                                                                &service_task_spec,
+                                                                service_calendar.get());
                     if (!plan.value_full_model) {
-                        rebuild_result.candidate_state = "train_failed";
+                        SetRebuildFailureOutcome(&rebuild_result,
+                                                 RebuildFailureReason::kTrainFailed,
+                                                 "relation_value_full_model_train_failed");
                         persist_result(rebuild_result, false);
                         return error::OK;
                     }
@@ -1446,7 +1599,9 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                     request.bucket_start_hint,
                     request.bucket_end,
                     &service_replay) != error::OK) {
-                rebuild_result.candidate_state = "replay_failed";
+                SetRebuildFailureOutcome(&rebuild_result,
+                                         RebuildFailureReason::kReplayFailed,
+                                         "relation_ratio_service_replay_failed");
                 persist_result(rebuild_result, false);
                 return error::BAD_REQUEST;
             }
@@ -1465,13 +1620,19 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
                     incumbent_feature && incumbent_feature->ratio_core
                         ? incumbent_feature->ratio_core->profile()
                         : service_feature.ratio_core->profile();
+                BaselineTaskSpec service_task_spec =
+                    BuildRoutedTaskSpec(service_feature.spec, request.key);
+                const std::shared_ptr<const CompiledEventCalendar> service_calendar =
+                    CompileRoutedEventCalendar(service_feature.spec, request.key);
                 plan.ratio_full_model = TrainFullRatioModel(profile,
                                                             service_replay,
                                                             rebuild_context.next_model_version,
-                                                            clock_spec_.delta,
-                                                            clock_spec_.tz);
+                                                            &service_task_spec,
+                                                            service_calendar.get());
                 if (!plan.ratio_full_model) {
-                    rebuild_result.candidate_state = "train_failed";
+                    SetRebuildFailureOutcome(&rebuild_result,
+                                             RebuildFailureReason::kTrainFailed,
+                                             "relation_ratio_full_model_train_failed");
                     persist_result(rebuild_result, false);
                     return error::OK;
                 }
@@ -1491,24 +1652,55 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
         rebuild_result.incumbent_loss = aggregate_validation.incumbent_loss;
         rebuild_result.validation_feature_count = aggregate_validation.validation_count;
         if (aggregate_validation.status != CandidateValidationStatus::kPassed) {
-            rebuild_result.candidate_state = "validation_failed";
+            SetRebuildRejectedOutcome(&rebuild_result,
+                                      CandidateValidationStatusName(aggregate_validation.status));
             persist_result(rebuild_result, false);
             return error::OK;
         }
-        rebuild_result.switch_state = "formal_apply";
-    } else {
-        rebuild_result.switch_state = "direct_apply";
     }
 
     if (serviceable_feature_count == 0) {
-        rebuild_result.candidate_state = "no_serviceable_feature";
-        rebuild_result.switch_state = "none";
+        SetRebuildFailureOutcome(&rebuild_result,
+                                 RebuildFailureReason::kInsufficientData,
+                                 "no_serviceable_feature");
         persist_result(rebuild_result, false);
         return error::OK;
     }
 
-    rebuild_result.candidate_state = "none";
-    persist_result(rebuild_result, true);
+    std::unordered_map<std::string, RelationMetricRuntimeState> refreshed_metric_runtimes;
+    for (const auto& metric_name : spec_.metrics) {
+        auto basis_it = rebuild_result.service_basis_by_metric.find(metric_name);
+        if (basis_it == rebuild_result.service_basis_by_metric.end()) continue;
+
+        RelationMetricRuntimeState refreshed_metric_runtime;
+        refreshed_metric_runtime.service_basis = basis_it->second;
+        auto eval_it = rebuild_result.eval_basis_by_metric.find(metric_name);
+        if (eval_it != rebuild_result.eval_basis_by_metric.end()) {
+            refreshed_metric_runtime.eval_basis = eval_it->second;
+        }
+        MaterializeMetricRuntime(TaskId(),
+                                 request.key,
+                                 spec_,
+                                 clock_spec_,
+                                 event_calendar_spec_,
+                                 source_resolver_,
+                                 metric_name,
+                                 &refreshed_metric_runtime);
+        for (auto& routed_feature : refreshed_metric_runtime.routed_features) {
+            routed_feature.last_detector_result = StoredRelationDetectorResult{};
+        }
+        refreshed_metric_runtimes.emplace(metric_name, std::move(refreshed_metric_runtime));
+    }
+
+    SetRebuildAcceptedOutcome(&rebuild_result);
+    persist_result(rebuild_result, false);
+    {
+        std::lock_guard<std::mutex> lock(runtime_mutex_);
+        auto& runtime_state = runtime_by_key_[request.key];
+        for (auto& entry : refreshed_metric_runtimes) {
+            runtime_state.metrics_by_name[entry.first] = std::move(entry.second);
+        }
+    }
 
     for (const auto& plan : rebuild_result.apply_plans) {
         std::shared_ptr<ValueDetectorCore> value_core;
@@ -1538,7 +1730,10 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
             apply_result.validation_count = plan.validation_count;
             apply_result.candidate_trained = true;
             apply_result.candidate_generation = plan.model_version;
+            apply_result.candidate_state = rebuild_result.candidate_state;
             apply_result.switch_state = rebuild_result.switch_state;
+            apply_result.failure_reason = rebuild_result.failure_reason;
+            apply_result.failure_reason_detail = rebuild_result.failure_reason_detail;
             apply_result.replace_formal_model = true;
             apply_result.full_model = plan.value_full_model;
             value_core->ApplyFormalModel(request.key, apply_result);
@@ -1556,7 +1751,10 @@ int BaselineRelationTask::ExecuteRebuild(const RebuildRequest& request) {
         apply_result.validation_count = plan.validation_count;
         apply_result.candidate_trained = true;
         apply_result.candidate_generation = plan.model_version;
+        apply_result.candidate_state = rebuild_result.candidate_state;
         apply_result.switch_state = rebuild_result.switch_state;
+        apply_result.failure_reason = rebuild_result.failure_reason;
+        apply_result.failure_reason_detail = rebuild_result.failure_reason_detail;
         apply_result.replace_formal_model = true;
         apply_result.full_model = plan.ratio_full_model;
         ratio_core->ApplyFormalModel(request.key, apply_result);
@@ -1584,8 +1782,27 @@ int BaselineRelationTask::RequestRebuild(const BaselineStringRef& key,
     request.bucket_end = 0;
     request.runtime = rebuild_runtime_;
 
+    {
+        std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
+        auto& runtime_state = runtime_by_key_[request.key];
+        runtime_state.candidate_state = RebuildCandidateState::kNone;
+        runtime_state.switch_state = RebuildSwitchState::kRebuildPending;
+        runtime_state.failure_reason = RebuildFailureReason::kNone;
+        runtime_state.failure_reason_detail.clear();
+        ResetRebuildStageTrace(&runtime_state.stage_trace);
+    }
     const int rc = rebuild_queue_->Push(request);
-    if (rc != error::OK) rebuild_runtime_->OnCanceled(request);
+    if (rc != error::OK) {
+        rebuild_runtime_->OnCanceled(request);
+        std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
+        auto it = runtime_by_key_.find(request.key);
+        if (it != runtime_by_key_.end()) {
+            it->second.switch_state = RebuildSwitchState::kIdle;
+            it->second.failure_reason = RebuildFailureReason::kNone;
+            it->second.failure_reason_detail.clear();
+            ResetRebuildStageTrace(&it->second.stage_trace);
+        }
+    }
     return rc;
 }
 
@@ -1624,10 +1841,17 @@ int BaselineRelationTask::SubmitBlock(const RelationObservationBlock& block, Fus
 
     const std::string key = CopyKey(block.key);
     std::vector<RelationMetricRuntimeState> metric_runtimes(spec_.metrics.size());
+    std::vector<bool> needs_runtime_refresh(spec_.metrics.size(), false);
     {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
         auto& runtime_state = runtime_by_key_[key];
         ++runtime_state.seen_block_count;
+        runtime_state.last_bucket_id = block.bucket_id;
+        MaybePruneRuntimeByKeyLocked(&runtime_by_key_,
+                                     &runtime_prune_cursor_,
+                                     &pruned_key_count_total_,
+                                     &last_runtime_pruned_bucket_,
+                                     block.bucket_id);
 
         for (uint32_t metric_index = 0; metric_index < block.metric_count; ++metric_index) {
             const std::string& metric_name = spec_.metrics[metric_index];
@@ -1651,15 +1875,28 @@ int BaselineRelationTask::SubmitBlock(const RelationObservationBlock& block, Fus
                 metric_runtime.service_basis.k_head = spec_.summary_policy.k_head;
             }
 
-            MaterializeMetricRuntime(TaskId(),
-                                     key,
-                                     spec_,
-                                     clock_spec_,
-                                     event_calendar_spec_,
-                                     source_resolver_,
-                                     metric_name,
-                                     &metric_runtime);
             metric_runtimes[metric_index] = metric_runtime;
+            needs_runtime_refresh[metric_index] = NeedsRoutedRuntimeRefresh(metric_runtime);
+        }
+    }
+
+    for (uint32_t metric_index = 0; metric_index < block.metric_count; ++metric_index) {
+        if (!needs_runtime_refresh[metric_index]) continue;
+        MaterializeMetricRuntime(TaskId(),
+                                 key,
+                                 spec_,
+                                 clock_spec_,
+                                 event_calendar_spec_,
+                                 source_resolver_,
+                                 spec_.metrics[metric_index],
+                                 &metric_runtimes[metric_index]);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(runtime_mutex_);
+        auto& runtime_state = runtime_by_key_[key];
+        for (uint32_t metric_index = 0; metric_index < block.metric_count; ++metric_index) {
+            runtime_state.metrics_by_name[spec_.metrics[metric_index]] = metric_runtimes[metric_index];
         }
     }
 
@@ -1775,7 +2012,6 @@ int BaselineRelationTask::SubmitBlock(const RelationObservationBlock& block, Fus
     }
 
     StoredFusionResult selected_fusion = pattern_output.fusion_result;
-    MaterializeStoredFusionResult(selected_fusion, out);
 
     if (key_risk_fusion_) {
         for (const auto& single : fusion_singles) {
@@ -1798,7 +2034,6 @@ int BaselineRelationTask::SubmitBlock(const RelationObservationBlock& block, Fus
             if (const StoredFusionResult* matched = SelectResultForBucket(snapshot,
                                                                           block.bucket_id)) {
                 selected_fusion = *matched;
-                MaterializeStoredFusionResult(selected_fusion, out);
             }
         }
     }
@@ -1806,7 +2041,8 @@ int BaselineRelationTask::SubmitBlock(const RelationObservationBlock& block, Fus
     {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
         auto& runtime_state = runtime_by_key_[key];
-        runtime_state.last_fusion_result = selected_fusion;
+        runtime_state.last_fusion_result = std::move(selected_fusion);
+        MaterializeStoredFusionResult(runtime_state.last_fusion_result, out);
     }
 
     if (rebuild_required) {
@@ -1820,14 +2056,33 @@ int BaselineRelationTask::SubmitBlock(const RelationObservationBlock& block, Fus
         request.bucket_end = rebuild_end;
         request.runtime = rebuild_runtime_;
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (EnsureOpenLocked() == error::OK && rebuild_queue_ && rebuild_runtime_ &&
-            rebuild_runtime_->PrepareEnqueue()) {
-            const int push_rc = rebuild_queue_->Push(request);
-            if (push_rc == error::OK) {
-                out->risk = std::max(out->risk, 0.0);
-            } else {
-                rebuild_runtime_->OnCanceled(request);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (EnsureOpenLocked() == error::OK && rebuild_queue_ && rebuild_runtime_ &&
+                rebuild_runtime_->PrepareEnqueue()) {
+                {
+                    std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
+                    auto& runtime_state = runtime_by_key_[request.key];
+                    runtime_state.candidate_state = RebuildCandidateState::kNone;
+                    runtime_state.switch_state = RebuildSwitchState::kRebuildPending;
+                    runtime_state.failure_reason = RebuildFailureReason::kNone;
+                    runtime_state.failure_reason_detail.clear();
+                    ResetRebuildStageTrace(&runtime_state.stage_trace);
+                }
+                const int push_rc = rebuild_queue_->Push(request);
+                if (push_rc == error::OK) {
+                    out->risk = std::max(out->risk, 0.0);
+                } else {
+                    rebuild_runtime_->OnCanceled(request);
+                    std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
+                    auto it = runtime_by_key_.find(request.key);
+                    if (it != runtime_by_key_.end()) {
+                        it->second.switch_state = RebuildSwitchState::kIdle;
+                        it->second.failure_reason = RebuildFailureReason::kNone;
+                        it->second.failure_reason_detail.clear();
+                        ResetRebuildStageTrace(&it->second.stage_trace);
+                    }
+                }
             }
         }
     }
@@ -1845,6 +2100,9 @@ void BaselineRelationTask::OnClosingLocked() {
     if (key_risk_fusion_) key_risk_fusion_->RemoveTaskContributions(TaskId());
     std::lock_guard<std::mutex> lock(runtime_mutex_);
     runtime_by_key_.clear();
+    runtime_prune_cursor_ = 0;
+    last_runtime_pruned_bucket_ = -1;
+    pruned_key_count_total_ = 0;
 }
 
 }  // namespace baseline

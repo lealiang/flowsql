@@ -23,6 +23,7 @@
 #include "plugins/baseline/rebuild/formal_model_trainer.h"
 #include "plugins/baseline/rebuild/rebuild_queue.h"
 #include "plugins/baseline/rebuild/rebuild_worker.h"
+#include "plugins/baseline/task/rebuild_outcome_helper.h"
 
 namespace flowsql {
 namespace baseline {
@@ -44,10 +45,6 @@ std::string CopyKey(const BaselineStringRef& key) {
     return std::string(key.data, key.size);
 }
 
-const EventCalendarSpec* TaskEventCalendar(const BaselineTaskSpec& spec) {
-    return spec.event_calendar_spec ? &(*spec.event_calendar_spec) : nullptr;
-}
-
 const char* EventStatusForSnapshot(int predict_rc,
                                    const FormalPrediction& prediction) {
     if (predict_rc != error::OK || !prediction.ready) return "unavailable";
@@ -59,7 +56,6 @@ std::shared_ptr<RatioFormalModel> TrainFullRatioModel(
     const RatioReplaySeries& replay,
     uint64_t model_version,
     const BaselineTaskSpec* task_spec,
-    const EventCalendarSpec* event_calendar_spec,
     const CompiledEventCalendar* compiled_event_calendar) {
     RatioFormalTrainResult train_result;
     const RatioFormalTrainInput input{
@@ -72,7 +68,6 @@ std::shared_ptr<RatioFormalModel> TrainFullRatioModel(
         task_spec,
         task_spec ? task_spec->delta : 0,
         task_spec ? task_spec->tz : "",
-        event_calendar_spec,
         compiled_event_calendar};
     if (FormalModelTrainer::TrainRatio(input, &train_result) !=
         FormalTrainFailureCode::kNone) {
@@ -81,23 +76,13 @@ std::shared_ptr<RatioFormalModel> TrainFullRatioModel(
     return train_result.model;
 }
 
-bool CompileSeriesEventCalendar(const BaselineTaskSpec& spec,
-                                const std::string& series_key,
-                                CompiledEventCalendar* out_calendar) {
-    if (!out_calendar || !spec.event_calendar_spec) return false;
-    BaselineTaskSpec series_spec = spec;
-    series_spec.key = series_key;
-    std::string err;
-    return CompileEventCalendar(*spec.event_calendar_spec, series_spec, out_calendar, &err) ==
-           error::OK;
-}
-
 }  // namespace
 
 BaselineRatioTask::BaselineRatioTask(TaskRegistry* registry,
                                      RebuildQueue* rebuild_queue,
                                      std::string task_id,
                                      const BaselineTaskSpec& spec,
+                                     std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar,
                                      KeyRiskFusion* key_risk_fusion)
     : BaselineTaskBase(registry,
                        rebuild_queue,
@@ -106,6 +91,7 @@ BaselineRatioTask::BaselineRatioTask(TaskRegistry* registry,
                        spec.name,
                        spec.config_json),
       spec_(spec),
+      compiled_event_calendar_(std::move(compiled_event_calendar)),
       history_binding_(std::make_shared<RatioHistoryBinding>()),
       key_risk_fusion_(key_risk_fusion) {
     RatioDetectorCoreSpec core_spec;
@@ -113,7 +99,9 @@ BaselineRatioTask::BaselineRatioTask(TaskRegistry* registry,
     core_spec.routed_feature_id = spec_.feature;
     core_spec.feature_type = spec_.feature_type;
     core_spec.feature_profile = spec_.feature_profile;
-    core_spec.event_calendar_spec = spec_.event_calendar_spec;
+    core_spec.delta = spec_.delta;
+    core_spec.tz = spec_.tz;
+    core_spec.compiled_event_calendar = compiled_event_calendar_;
     core_spec.baseline_source_configs = spec_.baseline_source_configs;
     core_ = std::make_shared<RatioDetectorCore>(core_spec);
 
@@ -154,6 +142,10 @@ int BaselineRatioTask::QueryTaskSnapshotJson(std::string* out_json) const {
     writer.Uint64(spec_.baseline_source_configs.size());
     writer.Key("series_count");
     writer.Uint64(core_ ? core_->Size() : 0);
+    writer.Key("idle_prune_bucket_gap");
+    writer.Int64(core_ ? core_->IdlePruneBucketGap() : 0);
+    writer.Key("pruned_key_count_total");
+    writer.Uint64(core_ ? core_->PrunedKeyCount() : 0);
     writer.Key("event_calendar_present");
     writer.Bool(spec_.event_calendar_spec.has_value());
     writer.Key("event_calendar_id");
@@ -273,9 +265,19 @@ int BaselineRatioTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     writer.Key("candidate_model_version");
     writer.Uint64(snapshot.runtime_state.formal_state.candidate_model_version);
     writer.Key("candidate_state");
-    writer.String(snapshot.runtime_state.formal_state.candidate_state.c_str());
+    writer.String(RebuildCandidateStateName(snapshot.runtime_state.formal_state.candidate_state));
     writer.Key("switch_state");
-    writer.String(snapshot.runtime_state.formal_state.switch_state.c_str());
+    writer.String(RebuildSwitchStateName(snapshot.runtime_state.formal_state.switch_state));
+    writer.Key("stage_seen_building");
+    writer.Bool(snapshot.runtime_state.formal_state.stage_trace.stage_seen_building);
+    writer.Key("stage_seen_built");
+    writer.Bool(snapshot.runtime_state.formal_state.stage_trace.stage_seen_built);
+    writer.Key("stage_seen_validating");
+    writer.Bool(snapshot.runtime_state.formal_state.stage_trace.stage_seen_validating);
+    writer.Key("failure_reason");
+    writer.String(RebuildFailureReasonName(snapshot.runtime_state.formal_state.failure_reason));
+    writer.Key("failure_reason_detail");
+    writer.String(snapshot.runtime_state.formal_state.failure_reason_detail.c_str());
     writer.Key("last_candidate_loss");
     writer.Double(snapshot.runtime_state.formal_state.last_candidate_loss);
     writer.Key("last_incumbent_loss");
@@ -369,8 +371,12 @@ int BaselineRatioTask::RequestRebuild(const BaselineStringRef& key,
     request.bucket_end = (state_rc == error::OK) ? series_state.last_bucket_id : 0;
     request.runtime = rebuild_runtime_;
 
+    core_->MarkRebuildEnqueued(request.key);
     const int rc = rebuild_queue_->Push(request);
-    if (rc != error::OK) rebuild_runtime_->OnCanceled(request);
+    if (rc != error::OK) {
+        rebuild_runtime_->OnCanceled(request);
+        core_->ClearPendingRebuild(request.key);
+    }
     return rc;
 }
 
@@ -396,14 +402,19 @@ int BaselineRatioTask::ExecuteRebuild(const RebuildRequest& request) {
         reader = history_binding_->reader;
     }
     if (!reader) {
-        core_->MarkRebuildFailure(
-            DetectorRebuildFailure{request.key,
-                                   request.bucket_start_hint,
-                                   request.bucket_end,
-                                   "fetch_failed",
-                                   "rebuild_blocked"});
+        DetectorRebuildFailure failure;
+        failure.key = request.key;
+        failure.request_bucket_start = request.bucket_start_hint;
+        failure.request_bucket_end = request.bucket_end;
+        failure.candidate_state = RebuildCandidateState::kFailed;
+        failure.switch_state = RebuildSwitchState::kRebuildBlocked;
+        failure.failure_reason = RebuildFailureReason::kUnavailable;
+        failure.failure_reason_detail = "history_reader_missing";
+        core_->MarkRebuildFailure(failure);
         return error::UNAVAILABLE;
     }
+
+    core_->MarkCandidateBuilding(request.key);
 
     const BaselineStringRef key_ref{
         request.key.c_str(),
@@ -419,11 +430,19 @@ int BaselineRatioTask::ExecuteRebuild(const RebuildRequest& request) {
         return runner.Push(obs);
     });
     if (fetch_rc != error::OK) {
-        core_->MarkRebuildFailure(DetectorRebuildFailure{
-            request.key,
-            request.bucket_start_hint,
-            request.bucket_end,
-            fetch_rc == error::BAD_REQUEST ? "replay_failed" : "fetch_failed"});
+        DetectorRebuildFailure failure;
+        failure.key = request.key;
+        failure.request_bucket_start = request.bucket_start_hint;
+        failure.request_bucket_end = request.bucket_end;
+        failure.candidate_state = RebuildCandidateState::kFailed;
+        failure.switch_state = RebuildSwitchState::kIdle;
+        failure.failure_reason = fetch_rc == error::BAD_REQUEST
+                                     ? RebuildFailureReason::kReplayFailed
+                                     : RebuildFailureReason::kUnavailable;
+        failure.failure_reason_detail =
+            fetch_rc == error::BAD_REQUEST ? "history_fetch_bad_request"
+                                           : "history_fetch_failed";
+        core_->MarkRebuildFailure(failure);
         return fetch_rc;
     }
 
@@ -432,12 +451,6 @@ int BaselineRatioTask::ExecuteRebuild(const RebuildRequest& request) {
 
     RatioRebuildContext rebuild_context;
     core_->BuildRebuildContext(request.key, &rebuild_context);
-
-    CompiledEventCalendar compiled_event_calendar;
-    const CompiledEventCalendar* compiled_event_calendar_ptr =
-        CompileSeriesEventCalendar(spec_, request.key, &compiled_event_calendar)
-            ? &compiled_event_calendar
-            : nullptr;
 
     BaselineTaskSpec series_task_spec = spec_;
     series_task_spec.key = request.key;
@@ -450,13 +463,21 @@ int BaselineRatioTask::ExecuteRebuild(const RebuildRequest& request) {
         &series_task_spec,
         spec_.delta,
         spec_.tz,
-        TaskEventCalendar(spec_),
-        compiled_event_calendar_ptr,
+        compiled_event_calendar_.get(),
         &build_result);
     CandidateValidationResult validation_result;
     std::shared_ptr<RatioFormalModel> full_model;
+    bool full_model_train_failed = false;
     if (build_result.status == CandidateBuildStatus::kTrained &&
         build_result.candidate_model) {
+        core_->MarkCandidateBuilt(request.key,
+                                  build_result.candidate_model_version,
+                                  FormalModelKindName(
+                                      build_result.candidate_model->metadata.kind));
+        core_->MarkCandidateValidating(request.key,
+                                       build_result.candidate_model_version,
+                                       FormalModelKindName(
+                                           build_result.candidate_model->metadata.kind));
         validation_result = CandidateValidator::ValidateRatio(
             core_->profile(),
             replay,
@@ -467,18 +488,20 @@ int BaselineRatioTask::ExecuteRebuild(const RebuildRequest& request) {
                 : rebuild_context.incumbent_formal_model.get(),
             rebuild_context.incumbent_shadow_state.active
                 ? &rebuild_context.incumbent_shadow_state
-                : nullptr);
+                : nullptr,
+            &series_task_spec,
+            compiled_event_calendar_.get());
         if (validation_result.pass) {
             full_model = TrainFullRatioModel(
                 core_->profile(),
                 replay,
                 build_result.candidate_model_version,
                 &series_task_spec,
-                TaskEventCalendar(spec_),
-                compiled_event_calendar_ptr);
+                compiled_event_calendar_.get());
             if (!full_model) {
                 validation_result.pass = false;
                 validation_result.status = CandidateValidationStatus::kFailed;
+                full_model_train_failed = true;
             }
         }
     }
@@ -495,17 +518,15 @@ int BaselineRatioTask::ExecuteRebuild(const RebuildRequest& request) {
         apply_result.candidate_trained = true;
         apply_result.candidate_generation =
             build_result.candidate_model->metadata.model_version;
-        apply_result.switch_state =
-            validation_result.pass && full_model
-                ? (validation_result.status ==
-                           CandidateValidationStatus::kBypassNoIncumbent
-                       ? "direct_apply"
-                       : "formal_apply")
-                : CandidateValidationStatusName(validation_result.status);
-        apply_result.full_model = full_model;
+        if (validation_result.pass && full_model) {
+            SetRebuildAcceptedOutcome(&apply_result);
+            apply_result.full_model = full_model;
+        } else {
+            ApplyValidationFailureOutcome(
+                validation_result.status, full_model_train_failed, &apply_result);
+        }
     } else {
-        apply_result.candidate_state =
-            CandidateBuildStatusName(build_result.status);
+        ApplyBuildFailureOutcome(build_result.status, &apply_result);
     }
 
     core_->ApplyFormalModel(request.key, apply_result);
@@ -551,6 +572,7 @@ int BaselineRatioTask::SubmitObservation(const RatioObservation& obs,
         std::lock_guard<std::mutex> lock(mutex_);
         if (EnsureOpenLocked() == error::OK && rebuild_queue_ && rebuild_runtime_ &&
             rebuild_runtime_->PrepareEnqueue()) {
+            core_->MarkRebuildEnqueued(request.key);
             const int push_rc = rebuild_queue_->Push(request);
             if (push_rc == error::OK) {
                 out->flags |= kBaselineFlagRebuildQueued;

@@ -26,6 +26,9 @@
 #include <plugins/baseline/model/event_calendar_spec.h>
 #include <plugins/baseline/model/formal_predictor.h>
 #include <plugins/baseline/model/series_store.h>
+#include <plugins/baseline/task/relation_task.h>
+
+#include "relation_task_test_access.h"
 
 using namespace flowsql;
 
@@ -439,6 +442,30 @@ struct OwnedRelationReplayBlock {
     std::vector<OwnedRelationMetricReplay> metrics;
 };
 
+OwnedRelationReplayBlock MakeSingleMetricRelationBlock(int64_t bucket_id,
+                                                       double v0,
+                                                       double v1,
+                                                       double v2) {
+    return OwnedRelationReplayBlock{
+        bucket_id,
+        {11, 12, 13},
+        {{100.0, 3, {v0, v1, v2}}}};
+}
+
+OwnedRelationReplayBlock MakeDualMetricRelationBlock(int64_t bucket_id,
+                                                     double conn0,
+                                                     double conn1,
+                                                     double conn2,
+                                                     double bps0,
+                                                     double bps1,
+                                                     double bps2) {
+    return OwnedRelationReplayBlock{
+        bucket_id,
+        {11, 12, 13},
+        {{100.0, 3, {conn0, conn1, conn2}},
+         {1000.0, 3, {bps0, bps1, bps2}}}};
+}
+
 class ScriptedRelationHistoryReader : public IBaselineRelationHistoryReader {
  public:
     void AddFetchScript(std::vector<OwnedRelationReplayBlock> blocks) {
@@ -512,6 +539,32 @@ BaselineStringRef StringRef(const std::string& value) {
 
 void AssertDoubleNear(double actual, double expected, double epsilon = 1e-9) {
     assert(std::fabs(actual - expected) <= epsilon);
+}
+
+bool HasDominantSingleFeature(const rapidjson::Value& window, const char* feature) {
+    if (!feature || !window.IsObject() || !window.HasMember("dominant_single") ||
+        !window["dominant_single"].IsArray()) {
+        return false;
+    }
+    for (const auto& item : window["dominant_single"].GetArray()) {
+        if (!item.IsObject() || !item.HasMember("feature")) continue;
+        if (std::string(item["feature"].GetString()) == feature) return true;
+    }
+    return false;
+}
+
+bool HasDominantSinglePrefix(const rapidjson::Value& window, const char* prefix) {
+    if (!prefix || !window.IsObject() || !window.HasMember("dominant_single") ||
+        !window["dominant_single"].IsArray()) {
+        return false;
+    }
+    const std::string prefix_string = prefix;
+    for (const auto& item : window["dominant_single"].GetArray()) {
+        if (!item.IsObject() || !item.HasMember("feature")) continue;
+        const std::string feature = item["feature"].GetString();
+        if (feature.rfind(prefix_string, 0) == 0) return true;
+    }
+    return false;
 }
 
 double Median(std::vector<double> values) {
@@ -678,7 +731,17 @@ static void TestBaselineSeriesStoreCommonState() {
     std::printf("[TEST] Baseline series store common state...\n");
 
     baseline::SeriesStore store;
+    assert(baseline::SeriesStore::kShardCount > 1);
     const BaselineStringRef key{"service-a", 9};
+    std::string key_a = "service-a";
+    std::string key_b = "service-b";
+    size_t shard_a = store.ShardIndex(key_a);
+    size_t shard_b = store.ShardIndex(key_b);
+    for (int i = 0; shard_a == shard_b && i < 256; ++i) {
+        key_b = "service-b-" + std::to_string(i);
+        shard_b = store.ShardIndex(key_b);
+    }
+    assert(shard_a != shard_b);
 
     baseline::SeriesUpdateResult first;
     assert(store.ApplyObservation(key, 100, true, &first) == error::OK);
@@ -713,6 +776,13 @@ static void TestBaselineSeriesStoreCommonState() {
     assert(state.initialized);
     assert(state.last_bucket_id == 104);
     assert(state.observation_count == 3);
+
+    baseline::SeriesUpdateResult other_key;
+    assert(store.ApplyObservation(BaselineStringRef{key_b.c_str(),
+                                                    static_cast<uint32_t>(key_b.size())},
+                                  200,
+                                  true,
+                                  &other_key) == error::OK);
 
     std::printf("[PASS] Baseline series store common state\n");
 }
@@ -904,6 +974,115 @@ static void TestBaselineRelationTaskHotPath() {
     std::printf("[PASS] Baseline relation task hot path\n");
 }
 
+static void TestBaselineRelationTaskResultLifetime() {
+    std::printf("[TEST] Baseline relation task result lifetime...\n");
+
+    auto env = LoadBaselineService();
+    auto* service = env.service;
+
+    const char* relation_cfg =
+        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
+
+    IBaselineRelationTask* relation_task = nullptr;
+    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
+    assert(relation_task != nullptr);
+
+    const std::string key =
+        "svc-relation-lifetime-" + std::string(224, 'x');
+    const uint32_t group_idx[] = {11, 12, 50};
+    const double conn_values[] = {50.0, 30.0, 20.0};
+    const RelationMetricBlock metrics[] = {
+        {100.0, kRelationMetricHasActiveCount, 3, conn_values},
+    };
+    const RelationObservationBlock block{
+        StringRef(key),
+        10,
+        3,
+        group_idx,
+        1,
+        metrics,
+    };
+
+    FusionResult result{};
+    assert(relation_task->SubmitBlock(block, &result) == error::OK);
+    assert(result.key.data != nullptr);
+    assert(result.key.size == key.size());
+    assert(std::string(result.key.data, result.key.size) == key);
+
+    const char* returned_key_ptr = result.key.data;
+    bool reused = false;
+    std::vector<std::string> heap_clobbers;
+    heap_clobbers.reserve(4096);
+    for (size_t i = 0; i < 4096; ++i) {
+        heap_clobbers.emplace_back(key.size(), static_cast<char>('a' + (i % 26)));
+        if (heap_clobbers.back().data() == returned_key_ptr) {
+            reused = true;
+            break;
+        }
+    }
+
+    assert(reused == false);
+    assert(std::string(result.key.data, result.key.size) == key);
+
+    assert(relation_task->Close() == error::OK);
+
+    std::printf("[PASS] Baseline relation task result lifetime\n");
+}
+
+static void TestBaselineRelationTaskReusesRoutedRuntime() {
+    std::printf("[TEST] Baseline relation task reuses routed runtime...\n");
+
+    auto env = LoadBaselineService();
+    auto* service = env.service;
+
+    const char* relation_cfg =
+        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2},"event_calendar_spec":{"calendar_id":"relation-calendar","calendar_version":"v1","entries":[{"event_code":"global_event","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
+
+    IBaselineRelationTask* relation_task = nullptr;
+    RoutedBaselineSourceResolver resolver;
+    assert(service->CreateRelationTask(relation_cfg, &resolver, &relation_task) == error::OK);
+    assert(relation_task != nullptr);
+
+    const uint32_t group_idx[] = {11, 12, 50};
+    const double conn_values_10[] = {50.0, 30.0, 20.0};
+    const RelationMetricBlock metrics_10[] = {
+        {100.0, kRelationMetricHasActiveCount, 3, conn_values_10},
+    };
+    const RelationObservationBlock block_10{
+        BaselineStringRef{"svc-relation-reuse", 18},
+        10,
+        3,
+        group_idx,
+        1,
+        metrics_10,
+    };
+
+    const double conn_values_11[] = {48.0, 32.0, 20.0};
+    const RelationMetricBlock metrics_11[] = {
+        {100.0, kRelationMetricHasActiveCount, 3, conn_values_11},
+    };
+    const RelationObservationBlock block_11{
+        BaselineStringRef{"svc-relation-reuse", 18},
+        11,
+        3,
+        group_idx,
+        1,
+        metrics_11,
+    };
+
+    FusionResult result{};
+    assert(relation_task->SubmitBlock(block_10, &result) == error::OK);
+    const int resolver_calls_after_first = resolver.call_count();
+    assert(resolver_calls_after_first > 0);
+
+    assert(relation_task->SubmitBlock(block_11, &result) == error::OK);
+    assert(resolver.call_count() == resolver_calls_after_first);
+
+    assert(relation_task->Close() == error::OK);
+
+    std::printf("[PASS] Baseline relation task reuses routed runtime\n");
+}
+
 static void TestBaselineRelationTaskRebuildDirectApply() {
     std::printf("[TEST] Baseline relation task rebuild direct apply...\n");
 
@@ -947,8 +1126,8 @@ static void TestBaselineRelationTaskRebuildDirectApply() {
     assert(relation_task->QuerySeriesSnapshotJson(
                BaselineStringRef{"svc-relation-rebuild", 20}, &series_snapshot) == error::OK);
     auto series_doc = ParseJson(series_snapshot);
-    assert(std::string(series_doc["switch_state"].GetString()) == "direct_apply");
-    assert(std::string(series_doc["candidate_state"].GetString()) == "none");
+    assert(std::string(series_doc["switch_state"].GetString()) == "formal_applied");
+    assert(std::string(series_doc["candidate_state"].GetString()) == "accepted");
     assert(series_doc["basis_metric_count"].GetUint64() == 1);
     assert(series_doc["validation_feature_count"].GetUint64() == 0);
     assert(series_doc["metrics"].IsArray());
@@ -976,18 +1155,14 @@ static void TestBaselineRelationTaskRebuildFormalApply() {
     std::vector<OwnedRelationReplayBlock> first_script;
     std::vector<OwnedRelationReplayBlock> second_script;
     for (int i = 0; i < 40; ++i) {
-        first_script.push_back(OwnedRelationReplayBlock{
-            200 + i,
-            {11, 12, 13},
-            {{100.0, 3, {82.0 - static_cast<double>(i % 5),
-                          13.0 + static_cast<double>(i % 4),
-                          5.0}}}});
-        second_script.push_back(OwnedRelationReplayBlock{
-            300 + i,
-            {11, 12, 13},
-            {{100.0, 3, {42.0 - static_cast<double>(i % 4),
-                          53.0 + static_cast<double>(i % 4),
-                          5.0}}}});
+        const double first_v0 = 82.0 - static_cast<double>(i % 5);
+        const double first_v1 = 13.0 + static_cast<double>(i % 4);
+        first_script.push_back(MakeSingleMetricRelationBlock(
+            200 + i, first_v0, first_v1, 100.0 - first_v0 - first_v1));
+        const double second_v0 = 42.0 - static_cast<double>(i % 4);
+        const double second_v1 = 53.0 + static_cast<double>(i % 4);
+        second_script.push_back(MakeSingleMetricRelationBlock(
+            300 + i, second_v0, second_v1, 100.0 - second_v0 - second_v1));
     }
     reader.AddFetchScript(std::move(first_script));
     reader.AddFetchScript(std::move(second_script));
@@ -996,6 +1171,22 @@ static void TestBaselineRelationTaskRebuildFormalApply() {
     const BaselineStringRef key{"svc-relation-formal", 19};
     assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
     assert(WaitUntil([&reader]() { return reader.call_count() == 1; }));
+    std::string first_rebuild_snapshot;
+    const bool first_rebuild_ready = WaitUntil([&]() {
+        if (relation_task->QuerySeriesSnapshotJson(key, &first_rebuild_snapshot) != error::OK) {
+            return false;
+        }
+        auto doc = ParseJson(first_rebuild_snapshot);
+        return std::string(doc["candidate_state"].GetString()) == "accepted" &&
+               std::string(doc["switch_state"].GetString()) == "formal_applied" &&
+               doc["metrics"].IsArray() && doc["metrics"].Size() == 1 &&
+               doc["metrics"][0]["basis_version"].GetUint64() == 1;
+    });
+    if (!first_rebuild_ready) {
+        std::fprintf(stderr, "[DEBUG] relation first rebuild snapshot: %s\n",
+                     first_rebuild_snapshot.c_str());
+    }
+    assert(first_rebuild_ready);
 
     assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
     assert(WaitUntil([&reader]() { return reader.call_count() == 2; }));
@@ -1007,17 +1198,195 @@ static void TestBaselineRelationTaskRebuildFormalApply() {
     }));
 
     std::string series_snapshot;
-    assert(relation_task->QuerySeriesSnapshotJson(key, &series_snapshot) == error::OK);
+    const bool formal_applied = WaitUntil([&]() {
+        if (relation_task->QuerySeriesSnapshotJson(key, &series_snapshot) != error::OK) {
+            return false;
+        }
+        auto doc = ParseJson(series_snapshot);
+        return std::string(doc["candidate_state"].GetString()) == "accepted" &&
+               std::string(doc["switch_state"].GetString()) == "formal_applied" &&
+               doc["validation_feature_count"].GetUint64() > 0;
+    });
+    if (!formal_applied) {
+        std::fprintf(stderr, "[DEBUG] relation formal apply snapshot: %s\n",
+                     series_snapshot.c_str());
+    }
+    assert(formal_applied);
+
     auto series_doc = ParseJson(series_snapshot);
-    assert(std::string(series_doc["switch_state"].GetString()) != "");
+    assert(std::string(series_doc["candidate_state"].GetString()) == "accepted");
+    assert(std::string(series_doc["switch_state"].GetString()) == "formal_applied");
+    assert(std::string(series_doc["failure_reason"].GetString()) == "none");
+    assert(series_doc["stage_seen_building"].GetBool() == true);
+    assert(series_doc["stage_seen_built"].GetBool() == true);
+    assert(series_doc["stage_seen_validating"].GetBool() == true);
     assert(series_doc["last_candidate_loss"].GetDouble() >= 0.0);
     assert(series_doc["last_incumbent_loss"].GetDouble() >= 0.0);
+    assert(series_doc["validation_feature_count"].GetUint64() > 0);
     assert(series_doc["metrics"].IsArray());
     assert(series_doc["metrics"].Size() == 1);
-    assert(series_doc["metrics"][0]["basis_version"].GetUint64() >= 1);
+    assert(series_doc["metrics"][0]["basis_version"].GetUint64() >= 2);
 
     assert(relation_task->Close() == error::OK);
     std::printf("[PASS] Baseline relation task rebuild formal apply\n");
+}
+
+static void TestBaselineRelationTaskRebuildCandidateFail() {
+    std::printf("[TEST] Baseline relation task rebuild candidate fail...\n");
+
+    auto env = LoadBaselineService();
+    auto* service = env.service;
+
+    const char* relation_cfg =
+        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
+
+    IBaselineRelationTask* relation_task = nullptr;
+    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
+    assert(relation_task != nullptr);
+
+    ScriptedRelationHistoryReader reader;
+    std::vector<OwnedRelationReplayBlock> first_script;
+    std::vector<OwnedRelationReplayBlock> second_script;
+    for (int i = 0; i < 40; ++i) {
+        const double first_v0 = 82.0 - static_cast<double>(i % 5);
+        const double first_v1 = 13.0 + static_cast<double>(i % 4);
+        first_script.push_back(MakeSingleMetricRelationBlock(
+            400 + i, first_v0, first_v1, 100.0 - first_v0 - first_v1));
+        if (i < 24) {
+            const double second_v0 = 42.0 - static_cast<double>(i % 4);
+            const double second_v1 = 53.0 + static_cast<double>(i % 4);
+            second_script.push_back(MakeSingleMetricRelationBlock(
+                500 + i, second_v0, second_v1, 100.0 - second_v0 - second_v1));
+        } else {
+            const double tail_v0 = 82.0 - static_cast<double>(i % 5);
+            const double tail_v1 = 13.0 + static_cast<double>(i % 4);
+            second_script.push_back(MakeSingleMetricRelationBlock(
+                500 + i, tail_v0, tail_v1, 100.0 - tail_v0 - tail_v1));
+        }
+    }
+    reader.AddFetchScript(std::move(first_script));
+    reader.AddFetchScript(std::move(second_script));
+    assert(relation_task->SetHistoryReader(&reader) == error::OK);
+
+    const BaselineStringRef key{"svc-relation-reject", 19};
+    assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
+    assert(WaitUntil([&reader]() { return reader.call_count() == 1; }));
+    assert(WaitUntil([&]() {
+        std::string snapshot;
+        if (relation_task->QuerySeriesSnapshotJson(key, &snapshot) != error::OK) return false;
+        auto doc = ParseJson(snapshot);
+        return std::string(doc["switch_state"].GetString()) == "formal_applied";
+    }));
+
+    assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
+    assert(WaitUntil([&reader]() { return reader.call_count() == 2; }));
+
+    std::string series_snapshot;
+    const bool candidate_rejected = WaitUntil([&]() {
+        if (relation_task->QuerySeriesSnapshotJson(key, &series_snapshot) != error::OK) {
+            return false;
+        }
+        auto doc = ParseJson(series_snapshot);
+        return std::string(doc["candidate_state"].GetString()) == "rejected";
+    });
+    if (!candidate_rejected) {
+        std::fprintf(stderr, "[DEBUG] relation candidate fail snapshot: %s\n",
+                     series_snapshot.c_str());
+    }
+    assert(candidate_rejected);
+
+    auto series_doc = ParseJson(series_snapshot);
+    assert(std::string(series_doc["candidate_state"].GetString()) == "rejected");
+    assert(std::string(series_doc["failure_reason"].GetString()) == "validation_failed");
+    assert(std::string(series_doc["switch_state"].GetString()) == "idle");
+    assert(series_doc["stage_seen_building"].GetBool() == true);
+    assert(series_doc["stage_seen_built"].GetBool() == true);
+    assert(series_doc["stage_seen_validating"].GetBool() == true);
+    assert(std::string(series_doc["lineage_compatibility"].GetString()) == "identical");
+    assert(series_doc["validation_feature_count"].GetUint64() > 0);
+    assert(series_doc["metrics"].IsArray());
+    assert(series_doc["metrics"].Size() == 1);
+    assert(series_doc["metrics"][0]["basis_version"].GetUint64() == 1);
+
+    assert(relation_task->Close() == error::OK);
+    std::printf("[PASS] Baseline relation task rebuild candidate fail\n");
+}
+
+static void TestBaselineRelationTaskRebuildNewLineage() {
+    std::printf("[TEST] Baseline relation task rebuild new lineage...\n");
+
+    auto env = LoadBaselineService();
+    auto* service = env.service;
+
+    const char* relation_cfg =
+        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v2","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
+
+    IBaselineRelationTask* relation_task = nullptr;
+    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
+    assert(relation_task != nullptr);
+
+    auto* relation_impl =
+        static_cast<flowsql::baseline::BaselineRelationTask*>(relation_task);
+    flowsql::baseline::RelationServiceBasis incumbent_basis;
+    incumbent_basis.basis_version = 7;
+    incumbent_basis.feature_base = "client_group_mix";
+    incumbent_basis.metric_name = "conn_count";
+    incumbent_basis.group_space_id = "client_group";
+    incumbent_basis.group_space_version = "v1";
+    incumbent_basis.k_head = 2;
+    incumbent_basis.support_explicit = {11, 12, 13};
+    incumbent_basis.stable_head = {11, 12};
+    incumbent_basis.head_proto_q = {0.8, 0.2};
+    flowsql::baseline::RelationTaskTestAccess::SeedMetricBasis(relation_impl,
+                                                               "svc-relation-new-lineage",
+                                                               "conn_count",
+                                                               incumbent_basis);
+
+    ScriptedRelationHistoryReader reader;
+    reader.AddFetchScript({
+        MakeSingleMetricRelationBlock(600, 76.0, 19.0, 5.0),
+        MakeSingleMetricRelationBlock(601, 77.0, 18.0, 5.0),
+        MakeSingleMetricRelationBlock(602, 75.0, 20.0, 5.0),
+        MakeSingleMetricRelationBlock(603, 78.0, 17.0, 5.0),
+        MakeSingleMetricRelationBlock(604, 76.0, 19.0, 5.0),
+        MakeSingleMetricRelationBlock(605, 77.0, 18.0, 5.0),
+    });
+    assert(relation_task->SetHistoryReader(&reader) == error::OK);
+
+    const BaselineStringRef key{"svc-relation-new-lineage", 24};
+    assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
+    assert(WaitUntil([&reader]() { return reader.call_count() == 1; }));
+
+    std::string series_snapshot;
+    const bool lineage_switched = WaitUntil([&]() {
+        if (relation_task->QuerySeriesSnapshotJson(key, &series_snapshot) != error::OK) {
+            return false;
+        }
+        auto doc = ParseJson(series_snapshot);
+        return std::string(doc["lineage_compatibility"].GetString()) == "new_lineage" &&
+               std::string(doc["candidate_state"].GetString()) == "accepted" &&
+               std::string(doc["switch_state"].GetString()) == "formal_applied";
+    });
+    if (!lineage_switched) {
+        std::fprintf(stderr, "[DEBUG] relation new lineage snapshot: %s\n",
+                     series_snapshot.c_str());
+    }
+    assert(lineage_switched);
+
+    auto series_doc = ParseJson(series_snapshot);
+    assert(std::string(series_doc["lineage_compatibility"].GetString()) == "new_lineage");
+    assert(std::string(series_doc["candidate_state"].GetString()) == "accepted");
+    assert(std::string(series_doc["switch_state"].GetString()) == "formal_applied");
+    assert(std::string(series_doc["failure_reason"].GetString()) == "none");
+    assert(series_doc["stage_seen_building"].GetBool() == true);
+    assert(series_doc["stage_seen_built"].GetBool() == true);
+    assert(series_doc["validation_feature_count"].GetUint64() == 0);
+    assert(series_doc["metrics"].IsArray());
+    assert(series_doc["metrics"].Size() == 1);
+    assert(series_doc["metrics"][0]["basis_version"].GetUint64() == 8);
+
+    assert(relation_task->Close() == error::OK);
+    std::printf("[PASS] Baseline relation task rebuild new lineage\n");
 }
 
 static void TestBaselineRebuildInfrastructure() {
@@ -1092,9 +1461,9 @@ static void TestBaselineRebuildInfrastructure() {
     assert(value_series_snapshot.find("\"formal_model_version\":1") != std::string::npos);
     assert(value_series_snapshot.find("\"formal_model_kind\":\"value_baseline\"") != std::string::npos);
     assert(value_series_snapshot.find("\"candidate_generation\":1") != std::string::npos);
-    assert(value_series_snapshot.find("\"candidate_state\":\"none\"") != std::string::npos);
+    assert(value_series_snapshot.find("\"candidate_state\":\"accepted\"") != std::string::npos);
     assert(value_series_snapshot.find("\"candidate_model_kind\":\"none\"") != std::string::npos);
-    assert(value_series_snapshot.find("\"switch_state\":\"direct_apply\"") != std::string::npos);
+    assert(value_series_snapshot.find("\"switch_state\":\"formal_applied\"") != std::string::npos);
     assert(value_series_snapshot.find("\"last_rebuild_bucket_start\":0") != std::string::npos);
     assert(value_series_snapshot.find("\"last_rebuild_bucket_end\":400") != std::string::npos);
     assert(value_series_snapshot.find("\"last_replay_observation_count\":3") != std::string::npos);
@@ -1118,7 +1487,8 @@ static void TestBaselineRebuildInfrastructure() {
     assert(ratio_series_snapshot.find("\"formal_ready\":false") != std::string::npos);
     assert(ratio_series_snapshot.find("\"formal_model_version\":0") != std::string::npos);
     assert(ratio_series_snapshot.find("\"candidate_generation\":0") != std::string::npos);
-    assert(ratio_series_snapshot.find("\"candidate_state\":\"fetch_failed\"") != std::string::npos);
+    assert(ratio_series_snapshot.find("\"candidate_state\":\"failed\"") != std::string::npos);
+    assert(ratio_series_snapshot.find("\"failure_reason\":\"unavailable\"") != std::string::npos);
     assert(ratio_series_snapshot.find("\"last_rebuild_bucket_start\":0") != std::string::npos);
     assert(ratio_series_snapshot.find("\"last_rebuild_bucket_end\":500") != std::string::npos);
     assert(ratio_series_snapshot.find("\"last_replay_observation_count\":0") != std::string::npos);
@@ -1207,8 +1577,8 @@ static void TestBaselineFormalPredictorSkeleton() {
     assert(value_doc["candidate_generation"].GetUint64() == 1);
     assert(value_doc["candidate_model_version"].GetUint64() == 0);
     assert(std::string(value_doc["candidate_model_kind"].GetString()) == "none");
-    assert(std::string(value_doc["candidate_state"].GetString()) == "none");
-    assert(std::string(value_doc["switch_state"].GetString()) == "direct_apply");
+    assert(std::string(value_doc["candidate_state"].GetString()) == "accepted");
+    assert(std::string(value_doc["switch_state"].GetString()) == "formal_applied");
     assert(value_doc["candidate_predict_ready"].GetBool() == false);
     AssertDoubleNear(value_doc["candidate_predict_sigma_ref"].GetDouble(), 0.0);
     assert(value_doc["last_train_observation_count"].GetUint64() == 3);
@@ -1228,8 +1598,8 @@ static void TestBaselineFormalPredictorSkeleton() {
     assert(ratio_doc["candidate_generation"].GetUint64() == 1);
     assert(ratio_doc["candidate_model_version"].GetUint64() == 0);
     assert(std::string(ratio_doc["candidate_model_kind"].GetString()) == "none");
-    assert(std::string(ratio_doc["candidate_state"].GetString()) == "none");
-    assert(std::string(ratio_doc["switch_state"].GetString()) == "direct_apply");
+    assert(std::string(ratio_doc["candidate_state"].GetString()) == "accepted");
+    assert(std::string(ratio_doc["switch_state"].GetString()) == "formal_applied");
     assert(ratio_doc["candidate_predict_ready"].GetBool() == false);
     assert(ratio_doc["last_train_observation_count"].GetUint64() == 3);
     assert(ratio_doc["last_holdout_observation_count"].GetUint64() == 0);
@@ -1271,7 +1641,9 @@ static void TestBaselineFormalTrainerFailureReason() {
             return false;
         }
         auto doc = ParseJson(snapshot);
-        return std::string(doc["candidate_state"].GetString()) == "insufficient_train_data";
+        return std::string(doc["candidate_state"].GetString()) == "failed" &&
+               doc.HasMember("failure_reason") &&
+               std::string(doc["failure_reason"].GetString()) == "insufficient_data";
     }));
 
     std::string series_snapshot;
@@ -1281,7 +1653,9 @@ static void TestBaselineFormalTrainerFailureReason() {
     assert(doc["candidate_generation"].GetUint64() == 0);
     assert(doc["candidate_model_version"].GetUint64() == 0);
     assert(std::string(doc["candidate_model_kind"].GetString()) == "none");
-    assert(std::string(doc["candidate_state"].GetString()) == "insufficient_train_data");
+    assert(std::string(doc["candidate_state"].GetString()) == "failed");
+    assert(doc.HasMember("failure_reason"));
+    assert(std::string(doc["failure_reason"].GetString()) == "insufficient_data");
     assert(doc["candidate_predict_ready"].GetBool() == false);
     assert(doc["last_replay_observation_count"].GetUint64() == 1);
     assert(doc["last_train_observation_count"].GetUint64() == 0);
@@ -1554,6 +1928,8 @@ static void TestBaselineShadowBaselineAndFormalSwitch() {
     assert(std::string(value_shadow_doc["model_state"].GetString()) == "shadow_self");
     assert(std::string(value_shadow_doc["shadow_ref_kind"].GetString()) == "self_formal");
     assert(value_shadow_doc["shadow_ref_model_version"].GetUint64() == 1);
+    assert(std::string(value_shadow_doc["candidate_state"].GetString()) == "building");
+    assert(std::string(value_shadow_doc["switch_state"].GetString()) == "rebuild_pending");
 
     std::string ratio_shadow_snapshot;
     assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
@@ -1564,6 +1940,8 @@ static void TestBaselineShadowBaselineAndFormalSwitch() {
     assert(std::string(ratio_shadow_doc["model_state"].GetString()) == "shadow_self");
     assert(std::string(ratio_shadow_doc["shadow_ref_kind"].GetString()) == "self_formal");
     assert(ratio_shadow_doc["shadow_ref_model_version"].GetUint64() == 1);
+    assert(std::string(ratio_shadow_doc["candidate_state"].GetString()) == "building");
+    assert(std::string(ratio_shadow_doc["switch_state"].GetString()) == "rebuild_pending");
 
     value_reader.AllowSecondFetch();
     assert(WaitUntil([&ratio_reader]() { return ratio_reader.second_fetch_started(); }));
@@ -1615,13 +1993,17 @@ static void TestBaselineShadowBaselineAndFormalSwitch() {
         return doc["formal_ready"].GetBool() &&
                doc["formal_model_version"].GetUint64() >= 2 &&
                doc["shadow_active"].GetBool() == false &&
-               std::string(doc["switch_state"].GetString()) == "formal_apply";
+               std::string(doc["switch_state"].GetString()) == "formal_applied";
     });
     if (!value_switched) {
         std::fprintf(stderr, "[DEBUG] value switch snapshot: %s\n",
                      value_final_snapshot.c_str());
     }
     assert(value_switched);
+    auto value_final_doc = ParseJson(value_final_snapshot);
+    assert(value_final_doc["stage_seen_building"].GetBool() == true);
+    assert(value_final_doc["stage_seen_built"].GetBool() == true);
+    assert(value_final_doc["stage_seen_validating"].GetBool() == true);
 
     std::string ratio_final_snapshot;
     const bool ratio_switched = WaitUntil([&]() {
@@ -1633,13 +2015,17 @@ static void TestBaselineShadowBaselineAndFormalSwitch() {
         return doc["formal_ready"].GetBool() &&
                doc["formal_model_version"].GetUint64() >= 2 &&
                doc["shadow_active"].GetBool() == false &&
-               std::string(doc["switch_state"].GetString()) == "formal_apply";
+               std::string(doc["switch_state"].GetString()) == "formal_applied";
     });
     if (!ratio_switched) {
         std::fprintf(stderr, "[DEBUG] ratio switch snapshot: %s\n",
                      ratio_final_snapshot.c_str());
     }
     assert(ratio_switched);
+    auto ratio_final_doc = ParseJson(ratio_final_snapshot);
+    assert(ratio_final_doc["stage_seen_building"].GetBool() == true);
+    assert(ratio_final_doc["stage_seen_built"].GetBool() == true);
+    assert(ratio_final_doc["stage_seen_validating"].GetBool() == true);
 
     DetectorResult value_after_switch{};
     assert(value_task->SubmitObservation(
@@ -1796,7 +2182,7 @@ static void TestBaselineMainScoringChain() {
     assert(value_task->SubmitObservation(
                ValueObservation{BaselineStringRef{"svc-none", 8}, 1101, 64.0, 0},
                &none_value_result) == error::OK);
-    assert(none_value_result.provider == BaselineProvider::kFormal);
+    assert(none_value_result.provider == BaselineProvider::kNone);
     assert(none_value_result.raw_score == 0.0);
     assert(none_value_result.normalized_score == 0.0);
     assert(none_value_result.confidence == 0.0);
@@ -1886,7 +2272,7 @@ static void TestBaselineEventCalendarConfigAndSnapshot() {
             return false;
         }
         auto doc = ParseJson(snapshot);
-        return std::string(doc["switch_state"].GetString()) == "direct_apply";
+        return std::string(doc["switch_state"].GetString()) == "formal_applied";
     }));
     assert(WaitUntil([&ratio_task]() {
         std::string snapshot;
@@ -1895,7 +2281,7 @@ static void TestBaselineEventCalendarConfigAndSnapshot() {
             return false;
         }
         auto doc = ParseJson(snapshot);
-        return std::string(doc["switch_state"].GetString()) == "direct_apply";
+        return std::string(doc["switch_state"].GetString()) == "formal_applied";
     }));
 
     std::string value_series_snapshot;
@@ -1906,7 +2292,7 @@ static void TestBaselineEventCalendarConfigAndSnapshot() {
     assert(std::string(value_doc["formal_calendar_version"].GetString()) == "2026.04");
     assert(value_doc["formal_event_enabled"].GetBool() == true);
     assert(std::string(value_doc["formal_event_status"].GetString()) == "enabled");
-    assert(std::string(value_doc["switch_state"].GetString()) == "direct_apply");
+    assert(std::string(value_doc["switch_state"].GetString()) == "formal_applied");
 
     std::string ratio_series_snapshot;
     assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-calendar", 12},
@@ -1916,7 +2302,7 @@ static void TestBaselineEventCalendarConfigAndSnapshot() {
     assert(std::string(ratio_doc["formal_calendar_version"].GetString()) == "2026.04");
     assert(ratio_doc["formal_event_enabled"].GetBool() == true);
     assert(std::string(ratio_doc["formal_event_status"].GetString()) == "enabled");
-    assert(std::string(ratio_doc["switch_state"].GetString()) == "direct_apply");
+    assert(std::string(ratio_doc["switch_state"].GetString()) == "formal_applied");
 
     assert(value_task->Close() == error::OK);
     assert(ratio_task->Close() == error::OK);
@@ -1927,7 +2313,7 @@ static void TestBaselineEventCalendarConfigAndSnapshot() {
 static void TestBaselineFormalPredictorEventCalendarContract() {
     std::printf("[TEST] Baseline formal predictor event calendar contract...\n");
 
-    baseline::EventCalendarSpec task_calendar;
+    baseline::CompiledEventCalendar task_calendar;
     task_calendar.calendar_id = "ops-calendar";
     task_calendar.calendar_version = "2026.04";
 
@@ -1942,7 +2328,7 @@ static void TestBaselineFormalPredictorEventCalendarContract() {
            baseline::EventCalendarStatus::kDisabledCalendarMismatch);
 
     assert(baseline::EvaluateEventCalendarStatus(
-               metadata, static_cast<const baseline::EventCalendarSpec*>(nullptr)) ==
+               metadata, static_cast<const baseline::CompiledEventCalendar*>(nullptr)) ==
            baseline::EventCalendarStatus::kDisabledNoTaskCalendar);
 
     metadata.calendar_version = "";
@@ -2061,6 +2447,71 @@ static void TestBaselineKeyFusionSnapshotForRelationTask() {
     std::printf("[PASS] Baseline key fusion snapshot for relation task\n");
 }
 
+static void TestBaselineRelationAndKeyFusionPruneIdleKeys() {
+    std::printf("[TEST] Baseline relation and key fusion prune idle keys...\n");
+
+    auto env = LoadBaselineService();
+    auto* service = env.service;
+
+    const char* relation_cfg =
+        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
+
+    IBaselineRelationTask* relation_task = nullptr;
+    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
+    assert(relation_task != nullptr);
+
+    const uint32_t group_idx[] = {11, 12, 13};
+    auto submit_block = [&](const std::string& key,
+                            int64_t bucket_id,
+                            double v0,
+                            double v1,
+                            double v2) {
+        const double values[] = {v0, v1, v2};
+        const RelationMetricBlock metrics[] = {
+            {100.0, kRelationMetricHasActiveCount, 3, values},
+        };
+        FusionResult result{};
+        const RelationObservationBlock block{
+            StringRef(key),
+            bucket_id,
+            3,
+            group_idx,
+            1,
+            metrics,
+        };
+        assert(relation_task->SubmitBlock(block, &result) == error::OK);
+    };
+
+    submit_block("svc-stale-a", 1, 50.0, 30.0, 20.0);
+    submit_block("svc-stale-b", 1, 48.0, 32.0, 20.0);
+    for (int64_t bucket = 5000; bucket < 5070; ++bucket) {
+        submit_block("svc-hot", bucket, 60.0, 25.0, 15.0);
+    }
+
+    std::string task_snapshot;
+    assert(relation_task->QueryTaskSnapshotJson(&task_snapshot) == error::OK);
+    auto task_doc = ParseJson(task_snapshot);
+    assert(task_doc["idle_prune_bucket_gap"].GetInt64() > 0);
+    assert(task_doc["pruned_key_count_total"].GetUint64() >= 2);
+    assert(task_doc["key_runtime_count"].GetUint64() == 1);
+
+    std::string service_stats;
+    assert(service->QueryServiceStatsJson(&service_stats) == error::OK);
+    auto stats_doc = ParseJson(service_stats);
+    assert(stats_doc["key_fusion_idle_prune_bucket_gap"].GetInt64() > 0);
+    assert(stats_doc["key_fusion_pruned_key_count_total"].GetUint64() >= 2);
+    assert(stats_doc["key_fusion_key_count"].GetUint64() == 1);
+
+    std::string stale_snapshot;
+    assert(service->QueryKeyFusionSnapshotJson(StringRef("svc-stale-a"), &stale_snapshot) ==
+           error::OK);
+    auto stale_doc = ParseJson(stale_snapshot);
+    assert(stale_doc["available"].GetBool() == false);
+
+    assert(relation_task->Close() == error::OK);
+    std::printf("[PASS] Baseline relation and key fusion prune idle keys\n");
+}
+
 int main() {
     TestBaselineServiceHeaderAndIid();
     TestBaselinePluginLoadAndQuery();
@@ -2069,8 +2520,12 @@ int main() {
     TestBaselineValueTaskHotPath();
     TestBaselineRatioTaskHotPath();
     TestBaselineRelationTaskHotPath();
+    TestBaselineRelationTaskResultLifetime();
+    TestBaselineRelationTaskReusesRoutedRuntime();
     TestBaselineRelationTaskRebuildDirectApply();
     TestBaselineRelationTaskRebuildFormalApply();
+    TestBaselineRelationTaskRebuildCandidateFail();
+    TestBaselineRelationTaskRebuildNewLineage();
     TestBaselineRebuildInfrastructure();
     TestBaselineFormalPredictorSkeleton();
     TestBaselineFormalTrainerFailureReason();
@@ -2081,6 +2536,7 @@ int main() {
     TestBaselineShadowBaselineAndFormalSwitch();
     TestBaselineKeyFusionSnapshotForValueTask();
     TestBaselineKeyFusionSnapshotForRelationTask();
+    TestBaselineRelationAndKeyFusionPruneIdleKeys();
     std::printf("[DONE] test_baseline\n");
     return 0;
 }

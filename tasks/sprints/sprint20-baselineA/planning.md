@@ -29,11 +29,11 @@
 
 ### 1.2 本轮成功标准
 
-- [ ] 统一输出协议、任务规格、`HistoryReader / BaselineSourceResolver / EventCalendarSpec` 接口全部与设计对齐
-- [ ] `T1` 的 `Core / monthpos / event` 训练、在线评分、漂移证据、`shadow baseline`、正式重建闭环全部落地
-- [ ] `T2` 的 `m0 / alpha0 / beta0 / p_smooth / logit / variance layer / rebuild` 全部落地
-- [ ] `T3` 的 `ServiceBasis / EvalBasis / summary features / routed detector / pattern fusion / key risk` 全部落地
-- [ ] 旧的 `intercept-only`、常数预测、只保留壳层不保留算法的占位路径全部移除
+- [x] 统一输出协议、任务规格、`HistoryReader / BaselineSourceResolver / EventCalendarSpec` 接口全部与设计对齐
+- [x] `T1` 的 `Core / monthpos / event` 训练、在线评分、漂移证据、`shadow baseline`、正式重建闭环全部落地
+- [x] `T2` 的 `m0 / alpha0 / beta0 / p_smooth / logit / variance layer / rebuild` 全部落地
+- [x] `T3` 的 `ServiceBasis / EvalBasis / summary features / routed detector / pattern fusion / key risk` 全部落地
+- [x] 旧的 `intercept-only`、常数预测、只保留壳层不保留算法的占位路径全部移除
 
 ### 1.3 实施门禁
 
@@ -715,9 +715,25 @@
 
 **验收标准**：
 
-- [ ] 测试矩阵覆盖 `code-design.md` 第 `14` 章要求
-- [ ] 无旧正式模型占位路径残留
-- [ ] 最终代码审查能够说明“实现与设计一致”
+- [x] 测试矩阵覆盖 `code-design.md` 第 `14` 章要求
+- [x] 无旧正式模型占位路径残留
+- [x] 最终代码审查能够说明“实现与设计一致”
+
+**完成结论**：
+
+- 已重新编译并执行 `test_baseline`、`test_baseline_value_task`、`test_baseline_ratio_task`、`test_baseline_relation_task`、`test_baseline_model_helpers`、`test_baseline_task_headers`、`test_baseline_rebuild`、`test_baseline_concurrency`
+- 已收口 direct task 与 routed detector 的 `CompiledEventCalendar + runtime key` 正式预测链，并移除旧 `PredictFormalModel(... EventCalendarSpec ...)` 兼容入口及残余 helper
+- 已完成 `review-fix-plan.md` 中的 `P0 / P1 / P2` 收口：
+  - `P0-1`：`RelationTask::SubmitBlock()` 返回结果生命周期修复
+  - `P0-2`：`KeyRiskFusion / FusionResult` 固定上限、低分配收口
+  - `P0-3`：业务时区语义与 ICU 依赖落地，`TimezoneMutex` 移除
+  - `P1-1`：relation routed runtime 改为锁外物化、锁内回写
+  - `P1-2`：`ValueDetectorCore / RatioDetectorCore` 收口为固定 shard 锁
+  - `P1-3`：高基数 runtime 与 key fusion 已补 idle prune 与可观测性
+  - `P2-1`：`14.4` 所需 `building / built / validating` 中间态已真实写入，`candidate` 在线服务死分支已删除
+  - `P2-2`：`SeedMetricBasisForTesting` 已下沉为 test-only seam，不再污染生产 ABI
+- 最终边界、一致性与测试矩阵结论见 `review.md`
+- `14.4` 残余缺口已按 `review-fix-plan.md` 收口：重建状态机词汇、`failure_reason` 语义、relation `candidate_fail / new lineage`、`RemoveTaskContributions(task_id)` 精确清理、状态机中间态观测与 candidate 在线死分支清理均已有实现与测试证据
 
 ---
 

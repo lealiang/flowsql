@@ -41,20 +41,32 @@ std::size_t ValidationStartIndex(std::size_t total_count,
 }
 
 bool PredictValueReady(const ValueFormalModel* model,
+                       const BaselineTaskSpec* task_spec,
+                       const CompiledEventCalendar* compiled_event_calendar,
                        int64_t bucket_id,
                        double* out_value) {
+    FormalPredictContext context;
+    context.task_spec = task_spec;
+    context.event_calendar = compiled_event_calendar;
+    context.bucket_id = bucket_id;
     FormalPrediction prediction;
-    const int rc = PredictFormalModel(model, nullptr, bucket_id, &prediction);
+    const int rc = PredictFormalModel(model, context, &prediction);
     if (rc != error::OK || !prediction.ready) return false;
     if (out_value) *out_value = prediction.value;
     return true;
 }
 
 bool PredictRatioReady(const RatioFormalModel* model,
+                       const BaselineTaskSpec* task_spec,
+                       const CompiledEventCalendar* compiled_event_calendar,
                        int64_t bucket_id,
                        double* out_value) {
+    FormalPredictContext context;
+    context.task_spec = task_spec;
+    context.event_calendar = compiled_event_calendar;
+    context.bucket_id = bucket_id;
     FormalPrediction prediction;
-    const int rc = PredictFormalModel(model, nullptr, bucket_id, &prediction);
+    const int rc = PredictFormalModel(model, context, &prediction);
     if (rc != error::OK || !prediction.ready) return false;
     if (out_value) *out_value = prediction.value;
     return true;
@@ -106,7 +118,9 @@ CandidateValidationResult CandidateValidator::ValidateValue(
     const ReplayWindowSummary& holdout_window,
     const ValueFormalModel* candidate_model,
     const ValueFormalModel* incumbent_formal_model,
-    const ValueShadowState* incumbent_shadow_state) {
+    const ValueShadowState* incumbent_shadow_state,
+    const BaselineTaskSpec* task_spec,
+    const CompiledEventCalendar* compiled_event_calendar) {
     if (!candidate_model) {
         return CandidateValidationResult{CandidateValidationStatus::kFailed, false};
     }
@@ -136,7 +150,11 @@ CandidateValidationResult CandidateValidator::ValidateValue(
             if (profile.is_t1b && point.sample_count < profile.n_score_min) continue;
 
             double mu_ref = 0.0;
-            if (!PredictValueReady(incumbent_shadow_state->frozen_ref_model.get(), point.bucket_id, &mu_ref)) {
+            if (!PredictValueReady(incumbent_shadow_state->frozen_ref_model.get(),
+                                   task_spec,
+                                   compiled_event_calendar,
+                                   point.bucket_id,
+                                   &mu_ref)) {
                 return CandidateValidationResult{CandidateValidationStatus::kUnavailableIncumbent, false};
             }
 
@@ -149,7 +167,11 @@ CandidateValidationResult CandidateValidator::ValidateValue(
 
             if (i >= val_begin) {
                 double mu_candidate = 0.0;
-                if (!PredictValueReady(candidate_model, point.bucket_id, &mu_candidate)) {
+                if (!PredictValueReady(candidate_model,
+                                       task_spec,
+                                       compiled_event_calendar,
+                                       point.bucket_id,
+                                       &mu_candidate)) {
                     return CandidateValidationResult{CandidateValidationStatus::kFailed, false};
                 }
 
@@ -173,8 +195,16 @@ CandidateValidationResult CandidateValidator::ValidateValue(
 
         double mu_candidate = 0.0;
         double mu_incumbent = 0.0;
-        if (!PredictValueReady(candidate_model, point.bucket_id, &mu_candidate) ||
-            !PredictValueReady(incumbent_formal_model, point.bucket_id, &mu_incumbent)) {
+        if (!PredictValueReady(candidate_model,
+                               task_spec,
+                               compiled_event_calendar,
+                               point.bucket_id,
+                               &mu_candidate) ||
+            !PredictValueReady(incumbent_formal_model,
+                               task_spec,
+                               compiled_event_calendar,
+                               point.bucket_id,
+                               &mu_incumbent)) {
             return CandidateValidationResult{CandidateValidationStatus::kUnavailableIncumbent, false};
         }
 
@@ -192,7 +222,9 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
     const ReplayWindowSummary& holdout_window,
     const RatioFormalModel* candidate_model,
     const RatioFormalModel* incumbent_formal_model,
-    const RatioShadowState* incumbent_shadow_state) {
+    const RatioShadowState* incumbent_shadow_state,
+    const BaselineTaskSpec* task_spec,
+    const CompiledEventCalendar* compiled_event_calendar) {
     if (!candidate_model) {
         return CandidateValidationResult{CandidateValidationStatus::kFailed, false};
     }
@@ -221,7 +253,11 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
             if (point.denominator < static_cast<double>(profile.d_score_min)) continue;
 
             double mu_ref = 0.0;
-            if (!PredictRatioReady(incumbent_shadow_state->frozen_ref_model.get(), point.bucket_id, &mu_ref)) {
+            if (!PredictRatioReady(incumbent_shadow_state->frozen_ref_model.get(),
+                                   task_spec,
+                                   compiled_event_calendar,
+                                   point.bucket_id,
+                                   &mu_ref)) {
                 return CandidateValidationResult{CandidateValidationStatus::kUnavailableIncumbent, false};
             }
 
@@ -234,7 +270,11 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
 
             if (i >= val_begin) {
                 double mu_candidate = 0.0;
-                if (!PredictRatioReady(candidate_model, point.bucket_id, &mu_candidate)) {
+                if (!PredictRatioReady(candidate_model,
+                                       task_spec,
+                                       compiled_event_calendar,
+                                       point.bucket_id,
+                                       &mu_candidate)) {
                     return CandidateValidationResult{CandidateValidationStatus::kFailed, false};
                 }
 
@@ -271,8 +311,16 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
 
         double mu_candidate = 0.0;
         double mu_incumbent = 0.0;
-        if (!PredictRatioReady(candidate_model, point.bucket_id, &mu_candidate) ||
-            !PredictRatioReady(incumbent_formal_model, point.bucket_id, &mu_incumbent)) {
+        if (!PredictRatioReady(candidate_model,
+                               task_spec,
+                               compiled_event_calendar,
+                               point.bucket_id,
+                               &mu_candidate) ||
+            !PredictRatioReady(incumbent_formal_model,
+                               task_spec,
+                               compiled_event_calendar,
+                               point.bucket_id,
+                               &mu_incumbent)) {
             return CandidateValidationResult{CandidateValidationStatus::kUnavailableIncumbent, false};
         }
 

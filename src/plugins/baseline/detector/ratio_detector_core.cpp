@@ -16,6 +16,7 @@
 
 #include "plugins/baseline/common/result_builder.h"
 #include "plugins/baseline/model/profile_config.h"
+#include "plugins/baseline/model/runtime_state_prune.h"
 
 namespace flowsql {
 namespace baseline {
@@ -36,10 +37,60 @@ std::string CopyKey(const BaselineStringRef& key) {
     return std::string(key.data, key.size);
 }
 
+bool TryAdvancePruneBucket(std::atomic<int64_t>* last_pruned_bucket,
+                           int64_t current_bucket) {
+    if (!last_pruned_bucket || current_bucket < 0) return false;
+
+    int64_t observed = last_pruned_bucket->load(std::memory_order_relaxed);
+    while (current_bucket > observed) {
+        if (last_pruned_bucket->compare_exchange_weak(observed,
+                                                      current_bucket,
+                                                      std::memory_order_relaxed,
+                                                      std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void FillBadRequestResult(DetectorResult* out) {
     if (!out) return;
     *out = DetectorResult{};
     out->status = error::BAD_REQUEST;
+}
+
+void ResetCandidateSnapshot(FormalModelState* state) {
+    if (!state) return;
+    state->candidate_model_version = 0;
+    state->candidate_model_kind = "none";
+}
+
+void BeginRebuildCycle(FormalModelState* state, RebuildSwitchState switch_state) {
+    if (!state) return;
+    ResetRebuildStageTrace(&state->stage_trace);
+    ResetCandidateSnapshot(state);
+    state->candidate_state = RebuildCandidateState::kNone;
+    state->switch_state = switch_state;
+    state->failure_reason = RebuildFailureReason::kNone;
+    state->failure_reason_detail.clear();
+}
+
+void UpdateCandidateSnapshot(FormalModelState* state,
+                             uint64_t candidate_model_version,
+                             const char* candidate_model_kind) {
+    if (!state) return;
+    state->candidate_generation = candidate_model_version;
+    state->candidate_model_version = candidate_model_version;
+    state->candidate_model_kind = candidate_model_kind ? candidate_model_kind : "none";
+}
+
+void ApplyRebuildOutcome(FormalModelState* state,
+                         const RatioApplyFormalModelResult& apply_result) {
+    if (!state) return;
+    state->candidate_state = apply_result.candidate_state;
+    state->switch_state = apply_result.switch_state;
+    state->failure_reason = apply_result.failure_reason;
+    state->failure_reason_detail = apply_result.failure_reason_detail;
 }
 
 struct SelectedRatioBaseline {
@@ -51,8 +102,32 @@ struct SelectedRatioBaseline {
     std::shared_ptr<RatioFormalModel> model;
 };
 
-const EventCalendarSpec* TaskEventCalendar(const RatioDetectorCoreSpec& spec) {
-    return spec.event_calendar_spec ? &(*spec.event_calendar_spec) : nullptr;
+struct RatioSourceRuntimeView {
+    std::string key;
+    RatioSeriesRuntimeState runtime_state;
+};
+
+BaselineTaskSpec BuildPredictTaskSpec(const RatioDetectorCoreSpec& spec,
+                                      const std::string& series_key) {
+    BaselineTaskSpec task_spec;
+    task_spec.key = series_key;
+    task_spec.feature = spec.routed_feature_id;
+    task_spec.delta = spec.delta;
+    task_spec.tz = spec.tz;
+    return task_spec;
+}
+
+int PredictRatioModel(const RatioDetectorCoreSpec& spec,
+                      const std::string& series_key,
+                      const RatioFormalModel* model,
+                      int64_t bucket_id,
+                      FormalPrediction* out_prediction) {
+    BaselineTaskSpec task_spec = BuildPredictTaskSpec(spec, series_key);
+    FormalPredictContext context;
+    context.task_spec = &task_spec;
+    context.event_calendar = spec.compiled_event_calendar.get();
+    context.bucket_id = bucket_id;
+    return PredictFormalModel(model, context, out_prediction);
 }
 
 bool BuildProfile(const RatioDetectorCoreSpec& spec,
@@ -114,8 +189,9 @@ double ComputeRho(const RatioFeatureProfile& profile, double denominator) {
     return std::sqrt(1.0 + profile.kappa_den / denominator);
 }
 
-bool PredictServiceableModel(const RatioSeriesRuntimeState& state,
-                             const EventCalendarSpec* task_calendar,
+bool PredictServiceableModel(const RatioDetectorCoreSpec& spec,
+                             const std::string& series_key,
+                             const RatioSeriesRuntimeState& state,
                              int64_t bucket_id,
                              FormalPrediction* out_prediction,
                              std::shared_ptr<RatioFormalModel>* out_model,
@@ -123,7 +199,7 @@ bool PredictServiceableModel(const RatioSeriesRuntimeState& state,
                              bool source_kind) {
     FormalPrediction prediction;
     if (state.formal_state.formal_ready &&
-        PredictFormalModel(state.formal_model.get(), task_calendar, bucket_id, &prediction) ==
+        PredictRatioModel(spec, series_key, state.formal_model.get(), bucket_id, &prediction) ==
             error::OK &&
         prediction.ready) {
         if (out_prediction) *out_prediction = prediction;
@@ -138,20 +214,20 @@ bool PredictServiceableModel(const RatioSeriesRuntimeState& state,
 }
 
 SelectedRatioBaseline ResolveServiceableBaseline(
+    const RatioDetectorCoreSpec& spec,
     const std::string& key,
     int64_t bucket_id,
-    const EventCalendarSpec* task_calendar,
-    const std::unordered_map<std::string, RatioSeriesRuntimeState>& runtime_by_key,
+    const RatioSeriesRuntimeState& self_runtime_state,
+    const std::vector<RatioSourceRuntimeView>& source_runtime_states,
     const BaselineSourceConfig* baseline_source_config) {
     SelectedRatioBaseline selected;
 
     // Sprint 20 BaselineA 对 T2 明确收口为 formal-only 来源：
     // 先尝试 self formal，再按静态配置依次尝试 configured source formal。
     // candidate model 仍可保留给慢路径状态观测，但不参与正式来源决策。
-    auto self_it = runtime_by_key.find(key);
-    if (self_it != runtime_by_key.end() &&
-        PredictServiceableModel(self_it->second,
-                                task_calendar,
+    if (PredictServiceableModel(spec,
+                                key,
+                                self_runtime_state,
                                 bucket_id,
                                 &selected.prediction,
                                 &selected.model,
@@ -167,10 +243,15 @@ SelectedRatioBaseline ResolveServiceableBaseline(
     if (!baseline_source_config) return selected;
 
     for (const auto& source_ref : baseline_source_config->sources) {
-        auto source_it = runtime_by_key.find(source_ref.source_key);
-        if (source_it == runtime_by_key.end()) continue;
-        if (!PredictServiceableModel(source_it->second,
-                                     task_calendar,
+        auto source_it = std::find_if(source_runtime_states.begin(),
+                                      source_runtime_states.end(),
+                                      [&source_ref](const RatioSourceRuntimeView& view) {
+                                          return view.key == source_ref.source_key;
+                                      });
+        if (source_it == source_runtime_states.end()) continue;
+        if (!PredictServiceableModel(spec,
+                                     source_it->key,
+                                     source_it->runtime_state,
                                      bucket_id,
                                      &selected.prediction,
                                      &selected.model,
@@ -240,9 +321,6 @@ BaselineModelState EvidenceModelState(const std::string& model_state) {
     }
     if (model_state == "serviceable_source") {
         return BaselineModelState::kConfiguredSource;
-    }
-    if (model_state == "candidate_self" || model_state == "candidate_source") {
-        return BaselineModelState::kCandidate;
     }
     if (model_state == "serviceable_self") {
         return BaselineModelState::kFormal;
@@ -366,35 +444,53 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
     const bool gate_score = obs.denominator >= static_cast<double>(profile_.d_score_min);
     const bool gate_shift = obs.denominator >= static_cast<double>(profile_.d_shift_min);
     const std::string key = CopyKey(obs.key);
-
-    SeriesUpdateResult update;
-    rc = series_store_.ApplyObservation(
-        obs.key,
-        obs.bucket_id,
-        SeriesPersistenceMode::kFreeze,
-        false,
-        &update);
-    if (rc != error::OK) {
-        FillBaseResult(update, &out_submit->detector_result);
-        out_submit->detector_result.status = rc;
-        return rc;
+    const BaselineSourceConfig* baseline_source_config = nullptr;
+    auto source_config_it = baseline_source_config_by_key_.find(key);
+    if (source_config_it != baseline_source_config_by_key_.end()) {
+        baseline_source_config = &source_config_it->second;
     }
-
-    FillBaseResult(update, &out_submit->detector_result);
-    out_submit->detector_result.status = error::OK;
-    out_submit->detector_result.raw_score = 0.0;
-    out_submit->detector_result.normalized_score = 0.0;
-    out_submit->detector_result.confidence = 0.0;
-    out_submit->detector_result.direction = BaselineDirection::kUnknown;
-    out_submit->detector_result.severity = BaselineSeverity::kInfo;
-    out_submit->detector_result.provider = BaselineProvider::kNone;
-    out_submit->detector_result.reason = BaselineReasonCode::kUnknown;
 
     bool enqueue_rebuild = false;
     int64_t rebuild_start_hint = 0;
     {
-        std::lock_guard<std::mutex> lock(runtime_mutex_);
-        auto& runtime_state = runtime_by_key_[key];
+        std::vector<size_t> shard_ids;
+        shard_ids.reserve(1 + (baseline_source_config ? baseline_source_config->sources.size() : 0));
+        shard_ids.push_back(RuntimeShardIndex(key));
+        if (baseline_source_config) {
+            for (const auto& source_ref : baseline_source_config->sources) {
+                shard_ids.push_back(RuntimeShardIndex(source_ref.source_key));
+            }
+        }
+        std::sort(shard_ids.begin(), shard_ids.end());
+        shard_ids.erase(std::unique(shard_ids.begin(), shard_ids.end()), shard_ids.end());
+
+        std::vector<std::unique_lock<std::mutex>> shard_locks;
+        shard_locks.reserve(shard_ids.size());
+        for (size_t shard_id : shard_ids) {
+            shard_locks.emplace_back(runtime_shards_[shard_id].mutex);
+        }
+
+        RuntimeShardState& self_shard = runtime_shards_[RuntimeShardIndex(key)];
+        auto& entry = self_shard.states[key];
+        SeriesUpdateResult update =
+            entry.series_state.ApplyObservation(obs.bucket_id, SeriesPersistenceMode::kFreeze, false);
+        if (update.status != error::OK) {
+            FillBaseResult(update, &out_submit->detector_result);
+            out_submit->detector_result.status = update.status;
+            return update.status;
+        }
+
+        FillBaseResult(update, &out_submit->detector_result);
+        out_submit->detector_result.status = error::OK;
+        out_submit->detector_result.raw_score = 0.0;
+        out_submit->detector_result.normalized_score = 0.0;
+        out_submit->detector_result.confidence = 0.0;
+        out_submit->detector_result.direction = BaselineDirection::kUnknown;
+        out_submit->detector_result.severity = BaselineSeverity::kInfo;
+        out_submit->detector_result.provider = BaselineProvider::kNone;
+        out_submit->detector_result.reason = BaselineReasonCode::kUnknown;
+
+        auto& runtime_state = entry.runtime_state;
         UpdateCoverageStats(&runtime_state.readiness_state, obs.bucket_id, gate_train);
         double p_smooth = 0.0;
         double x_t = 0.0;
@@ -420,10 +516,16 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
         if (runtime_state.shadow_state.active &&
             runtime_state.shadow_state.frozen_ref_model) {
             FormalPrediction shadow_prediction;
-            if (PredictFormalModel(runtime_state.shadow_state.frozen_ref_model.get(),
-                                   TaskEventCalendar(spec_),
-                                   obs.bucket_id,
-                                   &shadow_prediction) == error::OK &&
+            const std::string shadow_key =
+                ShadowRefUsesSource(runtime_state.shadow_state.ref_kind) &&
+                        !runtime_state.shadow_state.ref_source_key.empty()
+                    ? runtime_state.shadow_state.ref_source_key
+                    : key;
+            if (PredictRatioModel(spec_,
+                                  shadow_key,
+                                  runtime_state.shadow_state.frozen_ref_model.get(),
+                                  obs.bucket_id,
+                                  &shadow_prediction) == error::OK &&
                 shadow_prediction.ready) {
                 serviceable = true;
                 shadow_active = true;
@@ -472,16 +574,24 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
         if (!serviceable) {
             // 常态路径先决出“当前 bucket 用谁来解释”，然后才进入残差 / 漂移评分。
             // 如果 self 与 source 都不可服务，热路径只推进公共时序状态，不制造伪异常。
-            const BaselineSourceConfig* baseline_source_config = nullptr;
-            auto source_config_it = baseline_source_config_by_key_.find(key);
-            if (source_config_it != baseline_source_config_by_key_.end()) {
-                baseline_source_config = &source_config_it->second;
+            std::vector<RatioSourceRuntimeView> source_runtime_states;
+            if (baseline_source_config) {
+                source_runtime_states.reserve(baseline_source_config->sources.size());
+                for (const auto& source_ref : baseline_source_config->sources) {
+                    const RuntimeShardState& source_shard =
+                        runtime_shards_[RuntimeShardIndex(source_ref.source_key)];
+                    auto source_it = source_shard.states.find(source_ref.source_key);
+                    if (source_it == source_shard.states.end()) continue;
+                    source_runtime_states.push_back(
+                        RatioSourceRuntimeView{source_ref.source_key, source_it->second.runtime_state});
+                }
             }
             const SelectedRatioBaseline selected = ResolveServiceableBaseline(
+                spec_,
                 key,
                 obs.bucket_id,
-                TaskEventCalendar(spec_),
-                runtime_by_key_,
+                runtime_state,
+                source_runtime_states,
                 baseline_source_config);
             runtime_state.baseline_source = selected.decision;
             if (selected.ready) {
@@ -545,6 +655,11 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
                         ShadowRefUsesSource(selected.shadow_ref_kind)
                             ? "shadow_source"
                             : "shadow_self";
+                    runtime_state.formal_state.switch_state =
+                        RebuildSwitchState::kShadowActive;
+                    runtime_state.formal_state.failure_reason =
+                        RebuildFailureReason::kNone;
+                    runtime_state.formal_state.failure_reason_detail.clear();
                     runtime_state.shift_rebuild_pending = true;
                     enqueue_rebuild = true;
                     rebuild_start_hint = std::max<int64_t>(
@@ -618,6 +733,21 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
         runtime_state.last_gate_shift = gate_shift;
     }
 
+    if (TryAdvancePruneBucket(&last_pruned_bucket_, obs.bucket_id)) {
+        RuntimeShardState& prune_shard =
+            runtime_shards_[prune_cursor_.fetch_add(1, std::memory_order_relaxed) % kShardCount];
+        std::lock_guard<std::mutex> prune_lock(prune_shard.mutex);
+        pruned_key_count_total_.fetch_add(
+            PruneBoundedStateMap(&prune_shard.states,
+                                 &prune_shard.prune_cursor,
+                                 kRuntimeIdlePruneScanLimit,
+                                 [bucket_id = obs.bucket_id](const RatioSeriesShardEntry& entry) {
+                                     return RuntimeStateIdleBeyondGap(
+                                         entry.series_state.last_bucket_id, bucket_id);
+                                 }),
+            std::memory_order_relaxed);
+    }
+
     if (enqueue_rebuild) {
         out_submit->rebuild_intent.required = true;
         out_submit->rebuild_intent.reason = BaselineRebuildReason::kShiftConfirmed;
@@ -632,29 +762,36 @@ int RatioDetectorCore::BuildSeriesSnapshot(const BaselineStringRef& key,
                                            RatioSeriesSnapshot* out_snapshot) const {
     if (!out_snapshot) return error::BAD_REQUEST;
 
-    SeriesState series_state;
-    int rc = series_store_.GetState(key, &series_state);
-    if (rc != error::OK) return rc;
+    const std::string key_copy = CopyKey(key);
+    if (key_copy.empty()) return error::BAD_REQUEST;
 
-    RatioSeriesRuntimeState runtime_state;
+    RatioSeriesShardEntry entry;
+    const RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key_copy)];
     {
-        std::lock_guard<std::mutex> lock(runtime_mutex_);
-        auto it = runtime_by_key_.find(CopyKey(key));
-        if (it != runtime_by_key_.end()) runtime_state = it->second;
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.states.find(key_copy);
+        if (it == shard.states.end() || !it->second.series_state.initialized) {
+            return error::NOT_FOUND;
+        }
+        entry = it->second;
     }
 
     RatioSeriesSnapshot snapshot;
-    snapshot.series_state = series_state;
-    snapshot.runtime_state = runtime_state;
-    snapshot.formal_predict_status = PredictFormalModel(
+    snapshot.series_state = entry.series_state;
+    snapshot.runtime_state = entry.runtime_state;
+    const RatioSeriesRuntimeState& runtime_state = snapshot.runtime_state;
+    const std::string& series_key = key_copy;
+    snapshot.formal_predict_status = PredictRatioModel(
+        spec_,
+        series_key,
         runtime_state.formal_model.get(),
-        TaskEventCalendar(spec_),
-        series_state.last_bucket_id,
+        snapshot.series_state.last_bucket_id,
         &snapshot.formal_prediction);
-    snapshot.candidate_predict_status = PredictFormalModel(
+    snapshot.candidate_predict_status = PredictRatioModel(
+        spec_,
+        series_key,
         runtime_state.candidate_model.get(),
-        TaskEventCalendar(spec_),
-        series_state.last_bucket_id,
+        snapshot.series_state.last_bucket_id,
         &snapshot.candidate_prediction);
     snapshot.formal_calendar_present =
         runtime_state.formal_model &&
@@ -671,7 +808,19 @@ int RatioDetectorCore::BuildSeriesSnapshot(const BaselineStringRef& key,
 
 int RatioDetectorCore::GetSeriesState(const BaselineStringRef& key,
                                       SeriesState* out_state) const {
-    return series_store_.GetState(key, out_state);
+    if (!out_state) return error::BAD_REQUEST;
+
+    const std::string key_copy = CopyKey(key);
+    if (key_copy.empty()) return error::BAD_REQUEST;
+
+    const RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key_copy)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto it = shard.states.find(key_copy);
+    if (it == shard.states.end() || !it->second.series_state.initialized) {
+        return error::NOT_FOUND;
+    }
+    *out_state = it->second.series_state;
+    return error::OK;
 }
 
 int RatioDetectorCore::BuildRebuildContext(const std::string& key,
@@ -680,12 +829,14 @@ int RatioDetectorCore::BuildRebuildContext(const std::string& key,
 
     RatioRebuildContext context;
     {
-        std::lock_guard<std::mutex> lock(runtime_mutex_);
-        auto it = runtime_by_key_.find(key);
-        if (it != runtime_by_key_.end()) {
-            context.next_model_version = it->second.formal_state.candidate_generation + 1;
-            context.incumbent_formal_model = it->second.formal_model;
-            context.incumbent_shadow_state = it->second.shadow_state;
+        const RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.states.find(key);
+        if (it != shard.states.end()) {
+            context.next_model_version =
+                it->second.runtime_state.formal_state.candidate_generation + 1;
+            context.incumbent_formal_model = it->second.runtime_state.formal_model;
+            context.incumbent_shadow_state = it->second.runtime_state.shadow_state;
         }
     }
 
@@ -693,11 +844,67 @@ int RatioDetectorCore::BuildRebuildContext(const std::string& key,
     return error::OK;
 }
 
+void RatioDetectorCore::MarkRebuildEnqueued(const std::string& key) {
+    RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto& runtime_state = shard.states[key].runtime_state;
+    runtime_state.shift_rebuild_pending = true;
+    BeginRebuildCycle(&runtime_state.formal_state, RebuildSwitchState::kRebuildPending);
+    runtime_state.formal_state.candidate_state = RebuildCandidateState::kBuilding;
+    MarkRebuildStageBuilding(&runtime_state.formal_state.stage_trace);
+}
+
+void RatioDetectorCore::MarkCandidateBuilding(const std::string& key) {
+    RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto& runtime_state = shard.states[key].runtime_state;
+    runtime_state.shift_rebuild_pending = true;
+    runtime_state.formal_state.candidate_state = RebuildCandidateState::kBuilding;
+    runtime_state.formal_state.switch_state = RebuildSwitchState::kRebuildPending;
+    runtime_state.formal_state.failure_reason = RebuildFailureReason::kNone;
+    runtime_state.formal_state.failure_reason_detail.clear();
+    ResetCandidateSnapshot(&runtime_state.formal_state);
+    MarkRebuildStageBuilding(&runtime_state.formal_state.stage_trace);
+}
+
+void RatioDetectorCore::MarkCandidateBuilt(const std::string& key,
+                                           uint64_t candidate_model_version,
+                                           const char* candidate_model_kind) {
+    RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto& runtime_state = shard.states[key].runtime_state;
+    runtime_state.formal_state.candidate_state = RebuildCandidateState::kBuilt;
+    runtime_state.formal_state.switch_state = RebuildSwitchState::kRebuildPending;
+    runtime_state.formal_state.failure_reason = RebuildFailureReason::kNone;
+    runtime_state.formal_state.failure_reason_detail.clear();
+    UpdateCandidateSnapshot(&runtime_state.formal_state,
+                            candidate_model_version,
+                            candidate_model_kind);
+    MarkRebuildStageBuilt(&runtime_state.formal_state.stage_trace);
+}
+
+void RatioDetectorCore::MarkCandidateValidating(const std::string& key,
+                                                uint64_t candidate_model_version,
+                                                const char* candidate_model_kind) {
+    RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto& runtime_state = shard.states[key].runtime_state;
+    runtime_state.formal_state.candidate_state = RebuildCandidateState::kValidating;
+    runtime_state.formal_state.switch_state = RebuildSwitchState::kValidating;
+    runtime_state.formal_state.failure_reason = RebuildFailureReason::kNone;
+    runtime_state.formal_state.failure_reason_detail.clear();
+    UpdateCandidateSnapshot(&runtime_state.formal_state,
+                            candidate_model_version,
+                            candidate_model_kind);
+    MarkRebuildStageValidating(&runtime_state.formal_state.stage_trace);
+}
+
 void RatioDetectorCore::ApplyFormalModel(
     const std::string& key,
     const RatioApplyFormalModelResult& apply_result) {
-    std::lock_guard<std::mutex> lock(runtime_mutex_);
-    auto& runtime_state = runtime_by_key_[key];
+    RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto& runtime_state = shard.states[key].runtime_state;
     runtime_state.formal_state.last_replay_window = apply_result.replay_window;
     runtime_state.formal_state.last_train_window = apply_result.train_window;
     runtime_state.formal_state.last_holdout_window = apply_result.holdout_window;
@@ -705,6 +912,8 @@ void RatioDetectorCore::ApplyFormalModel(
     runtime_state.formal_state.last_incumbent_loss = apply_result.incumbent_loss;
     runtime_state.formal_state.last_validation_count = apply_result.validation_count;
     runtime_state.shift_rebuild_pending = false;
+    ApplyRebuildOutcome(&runtime_state.formal_state, apply_result);
+    ResetCandidateSnapshot(&runtime_state.formal_state);
 
     if (apply_result.candidate_trained) {
         runtime_state.formal_state.candidate_generation =
@@ -720,10 +929,6 @@ void RatioDetectorCore::ApplyFormalModel(
                 apply_result.full_model
                     ? FormalModelKindName(apply_result.full_model->metadata.kind)
                     : "none";
-            runtime_state.formal_state.candidate_state = "none";
-            runtime_state.formal_state.candidate_model_version = 0;
-            runtime_state.formal_state.candidate_model_kind = "none";
-            runtime_state.formal_state.switch_state = apply_result.switch_state;
             runtime_state.candidate_replay.reset();
             runtime_state.candidate_model.reset();
             runtime_state.shadow_state.Reset();
@@ -737,10 +942,6 @@ void RatioDetectorCore::ApplyFormalModel(
                 apply_result.full_model->metadata.model_version;
             runtime_state.formal_state.formal_model_kind =
                 FormalModelKindName(apply_result.full_model->metadata.kind);
-            runtime_state.formal_state.candidate_state = "none";
-            runtime_state.formal_state.candidate_model_version = 0;
-            runtime_state.formal_state.candidate_model_kind = "none";
-            runtime_state.formal_state.switch_state = apply_result.switch_state;
             runtime_state.candidate_replay.reset();
             runtime_state.candidate_model.reset();
             runtime_state.shadow_state.Reset();
@@ -748,32 +949,24 @@ void RatioDetectorCore::ApplyFormalModel(
             runtime_state.last_p_shift = 0.0;
             runtime_state.last_shift_confirmed = false;
         } else {
-            runtime_state.formal_state.candidate_state = "none";
-            runtime_state.formal_state.candidate_model_version = 0;
-            runtime_state.formal_state.candidate_model_kind = "none";
-            runtime_state.formal_state.switch_state = apply_result.switch_state;
             runtime_state.candidate_replay.reset();
             runtime_state.candidate_model.reset();
         }
     } else {
-        runtime_state.formal_state.candidate_state = apply_result.candidate_state;
-        runtime_state.formal_state.candidate_model_version = 0;
-        runtime_state.formal_state.candidate_model_kind = "none";
-        runtime_state.formal_state.switch_state = "none";
         runtime_state.candidate_replay.reset();
         runtime_state.candidate_model.reset();
     }
 }
 
 void RatioDetectorCore::MarkRebuildFailure(const DetectorRebuildFailure& failure) {
-    std::lock_guard<std::mutex> lock(runtime_mutex_);
-    auto& runtime_state = runtime_by_key_[failure.key];
-    runtime_state.formal_state.candidate_state =
-        failure.candidate_state.empty() ? "fetch_failed" : failure.candidate_state;
-    runtime_state.formal_state.candidate_model_version = 0;
-    runtime_state.formal_state.candidate_model_kind = "none";
-    runtime_state.formal_state.switch_state =
-        failure.switch_state.empty() ? "none" : failure.switch_state;
+    RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(failure.key)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto& runtime_state = shard.states[failure.key].runtime_state;
+    runtime_state.formal_state.candidate_state = failure.candidate_state;
+    runtime_state.formal_state.switch_state = failure.switch_state;
+    runtime_state.formal_state.failure_reason = failure.failure_reason;
+    runtime_state.formal_state.failure_reason_detail = failure.failure_reason_detail;
+    ResetCandidateSnapshot(&runtime_state.formal_state);
     runtime_state.formal_state.last_candidate_loss = 0.0;
     runtime_state.formal_state.last_incumbent_loss = 0.0;
     runtime_state.formal_state.last_validation_count = 0;
@@ -790,19 +983,51 @@ void RatioDetectorCore::MarkRebuildFailure(const DetectorRebuildFailure& failure
 }
 
 void RatioDetectorCore::ClearPendingRebuild(const std::string& key) {
-    std::lock_guard<std::mutex> lock(runtime_mutex_);
-    auto it = runtime_by_key_.find(key);
-    if (it == runtime_by_key_.end()) return;
-    it->second.shift_rebuild_pending = false;
+    RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto it = shard.states.find(key);
+    if (it == shard.states.end()) return;
+    it->second.runtime_state.shift_rebuild_pending = false;
+    FormalModelState& formal_state = it->second.runtime_state.formal_state;
+    formal_state.candidate_state = RebuildCandidateState::kNone;
+    formal_state.failure_reason = RebuildFailureReason::kNone;
+    formal_state.failure_reason_detail.clear();
+    formal_state.switch_state =
+        it->second.runtime_state.shadow_state.active
+            ? RebuildSwitchState::kShadowActive
+            : RebuildSwitchState::kIdle;
+    ResetRebuildStageTrace(&formal_state.stage_trace);
+    ResetCandidateSnapshot(&formal_state);
 }
 
 void RatioDetectorCore::Clear() {
-    std::lock_guard<std::mutex> lock(runtime_mutex_);
-    runtime_by_key_.clear();
+    for (auto& shard : runtime_shards_) {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        shard.states.clear();
+        shard.prune_cursor = 0;
+    }
+    prune_cursor_.store(0, std::memory_order_relaxed);
+    last_pruned_bucket_.store(-1, std::memory_order_relaxed);
+    pruned_key_count_total_.store(0, std::memory_order_relaxed);
 }
 
 size_t RatioDetectorCore::Size() const {
-    return series_store_.Size();
+    size_t total = 0;
+    for (const auto& shard : runtime_shards_) {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        for (const auto& entry : shard.states) {
+            if (entry.second.series_state.initialized) ++total;
+        }
+    }
+    return total;
+}
+
+uint64_t RatioDetectorCore::PrunedKeyCount() const {
+    return pruned_key_count_total_.load(std::memory_order_relaxed);
+}
+
+int64_t RatioDetectorCore::IdlePruneBucketGap() const {
+    return kRuntimeIdlePruneBucketGap;
 }
 
 }  // namespace baseline
