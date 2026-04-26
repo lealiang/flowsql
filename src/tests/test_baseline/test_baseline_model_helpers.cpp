@@ -174,8 +174,8 @@ void TestRuntimeConfigYamlLoad() {
     const std::string file_path = "/tmp/flowsql-baseline-runtime-config.yaml";
     std::ofstream out(file_path);
     out << R"(
-builtin_defaults:
-  parser_level_defaults:
+baseline:
+  parser:
     tz_default: "UTC"
   shared_profile_config:
     k_day: 3
@@ -319,7 +319,7 @@ void TestRuntimeConfigYamlValidation() {
     const std::string invalid_score_path = "/tmp/flowsql-baseline-runtime-config-invalid.yaml";
     std::ofstream invalid_score(invalid_score_path);
     invalid_score << R"(
-builtin_defaults:
+baseline:
   scoring_and_confidence_constants:
     score_warn: 5.0
     score_crit: 4.0
@@ -333,7 +333,7 @@ builtin_defaults:
     const std::string unknown_field_path = "/tmp/flowsql-baseline-runtime-config-unknown.yaml";
     std::ofstream unknown_field(unknown_field_path);
     unknown_field << R"(
-builtin_defaults:
+baseline:
   scoring_and_confidence_constants:
     score_warn: 3.0
     score_crit: 5.0
@@ -346,7 +346,7 @@ builtin_defaults:
     const std::string invalid_relation_path = "/tmp/flowsql-baseline-runtime-config-relation.yaml";
     std::ofstream invalid_relation(invalid_relation_path);
     invalid_relation << R"(
-builtin_defaults:
+baseline:
   runtime_and_rebuild_constants:
     relation_rebuild:
       min_replay_for_holdout: 0

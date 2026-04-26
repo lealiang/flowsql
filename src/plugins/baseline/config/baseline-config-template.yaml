@@ -8,85 +8,86 @@
 # 1) task payload templates (configurable by Create*Task JSON)
 # 2) built-in defaults/constants (loaded by BaselinePlugin runtime config)
 
-task_templates:
-  value_task_basic:
-    name: "bytes_total"
-    key: "service"
-    feature: "bytes_total"
-    feature_type: "value_basic"
-    feature_profile: "default"
-    delta: 60
-    tz: "Asia/Shanghai"
-    baseline_source_configs: []
-    event_calendar_spec: null
+examples:
+  tasks:
+    value_task_basic:
+      name: "bytes_total"
+      key: "service"
+      feature: "bytes_total"
+      feature_type: "value_basic"
+      feature_profile: "default"
+      delta: 60
+      tz: "Asia/Shanghai"
+      baseline_source_configs: []
+      event_calendar_spec: null
 
-  value_task_sampled:
-    name: "avg_rtt"
-    key: "service"
-    feature: "avg_rtt"
-    feature_type: "value_sampled"
-    feature_profile: "cont_core"   # cont_core | cont_tail
-    delta: 60
-    tz: "Asia/Shanghai"
-    baseline_source_configs: []
-    event_calendar_spec: null
+    value_task_sampled:
+      name: "avg_rtt"
+      key: "service"
+      feature: "avg_rtt"
+      feature_type: "value_sampled"
+      feature_profile: "cont_core"   # cont_core | cont_tail
+      delta: 60
+      tz: "Asia/Shanghai"
+      baseline_source_configs: []
+      event_calendar_spec: null
 
-  ratio_task:
-    name: "success_rate"
-    key: "service"
-    feature: "success_rate"
-    feature_type: "ratio"
-    feature_profile: "rate_core"   # rate_core | ratio_bursty
-    delta: 60
-    tz: "Asia/Shanghai"
-    baseline_source_configs: []
-    event_calendar_spec: null
+    ratio_task:
+      name: "success_rate"
+      key: "service"
+      feature: "success_rate"
+      feature_type: "ratio"
+      feature_profile: "rate_core"   # rate_core | ratio_bursty
+      delta: 60
+      tz: "Asia/Shanghai"
+      baseline_source_configs: []
+      event_calendar_spec: null
 
-  relation_task:
-    name: "client_group_mix"
-    feature_base: "client_group_mix"
-    group_space_id: "client_group"
-    group_space_version: "v1"
-    metric_set_id: "net_metrics"
-    metrics:
-      - "conn_count"
-      - "bps"
-    encode_type: "exact_sparse"    # exact_sparse | topk_other
-    other_group_idxs: []           # optional; only valid for topk_other
-    support_policy:
-      k_support: 16                # requested default
-      min_hist_share: 0.005        # requested default (0.5%)
-      min_active_ratio: 0.2        # requested default (20%)
-    summary_policy:
-      k_head: 5                    # requested default
-      k_stable: 5                  # requested default
-    delta: 60
-    tz: "Asia/Shanghai"
-    event_calendar_spec: null
+    relation_task:
+      name: "client_group_mix"
+      feature_base: "client_group_mix"
+      group_space_id: "client_group"
+      group_space_version: "v1"
+      metric_set_id: "net_metrics"
+      metrics:
+        - "conn_count"
+        - "bps"
+      encode_type: "exact_sparse"    # exact_sparse | topk_other
+      other_group_idxs: []           # optional; only valid for topk_other
+      support_policy:
+        k_support: 16                # requested default
+        min_hist_share: 0.005        # requested default (0.5%)
+        min_active_ratio: 0.2        # requested default (20%)
+      summary_policy:
+        k_head: 5                    # requested default
+        k_stable: 5                  # requested default
+      delta: 60
+      tz: "Asia/Shanghai"
+      event_calendar_spec: null
 
-common_optional_blocks:
-  baseline_source_configs_example:
-    - key: "svc-target"
-      baseline_sources:
-        - source_key: "svc-source-a"
-        - source_key: "svc-source-b"
+  optional_blocks:
+    baseline_source_configs_example:
+      - key: "svc-target"
+        baseline_sources:
+          - source_key: "svc-source-a"
+          - source_key: "svc-source-b"
 
-  event_calendar_spec_example:
-    calendar_id: "ops-calendar"
-    calendar_version: "v1"
-    entries:
-      - event_code: "month_close"
-        scope_type: "global"         # global | feature | key | key_feature
-        alignment_mode: "local_wall_clock"  # local_wall_clock | absolute_utc
-        start_ts: 1711900800
-        end_ts: 1711987199
-        enabled: true
-        feature: ""
-        key: ""
-        tz: "Asia/Shanghai"
+    event_calendar_spec_example:
+      calendar_id: "ops-calendar"
+      calendar_version: "v1"
+      entries:
+        - event_code: "month_close"
+          scope_type: "global"         # global | feature | key | key_feature
+          alignment_mode: "local_wall_clock"  # local_wall_clock | absolute_utc
+          start_ts: 1711900800
+          end_ts: 1711987199
+          enabled: true
+          feature: ""
+          key: ""
+          tz: "Asia/Shanghai"
 
-builtin_defaults:
-  parser_level_defaults:
+baseline:
+  parser:
     tz_default: "Asia/Shanghai"
 
   shared_profile_config:
@@ -185,11 +186,12 @@ builtin_defaults:
       lambda_opp: 0.5
       fuse_persistence_window: 3.0
 
-validation_notes:
-  - "support_policy and summary_policy are required for relation task."
-  - "k_support must be >= k_stable."
-  - "min_hist_share and min_active_ratio must be in (0, 1]."
-  - "k_support/k_head/k_stable and delta must be > 0."
-  - "baseline_source_configs must not be empty if provided; source_key must not equal self key."
-  - "relation encode_type must be exact_sparse or topk_other."
-  - "other_group_idx/other_group_idxs are accepted only when encode_type=topk_other."
+notes:
+  validation:
+    - "support_policy and summary_policy are required for relation task."
+    - "k_support must be >= k_stable."
+    - "min_hist_share and min_active_ratio must be in (0, 1]."
+    - "k_support/k_head/k_stable and delta must be > 0."
+    - "baseline_source_configs must not be empty if provided; source_key must not equal self key."
+    - "relation encode_type must be exact_sparse or topk_other."
+    - "other_group_idx/other_group_idxs are accepted only when encode_type=topk_other."

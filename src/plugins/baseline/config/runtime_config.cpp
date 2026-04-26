@@ -409,13 +409,13 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                               "runtime_and_rebuild_constants",
                               "scoring_and_confidence_constants",
                               "fusion_constants",
-                              "parser_level_defaults"},
-                             "builtin_defaults",
+                              "parser"},
+                             "baseline",
                              err)) {
         return false;
     }
 
-    if (!ValidateAllowedKeys(defaults["parser_level_defaults"], {"tz_default"}, "parser_level_defaults", err)) {
+    if (!ValidateAllowedKeys(defaults["parser"], {"tz_default"}, "baseline.parser", err)) {
         return false;
     }
     if (!ValidateAllowedKeys(defaults["shared_profile_config"],
@@ -573,7 +573,7 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
 
 bool ValidateRuntimeConfig(const RuntimeConfigState& cfg, std::string* err) {
     if (cfg.tz_default.empty()) {
-        if (err) *err = "parser_level_defaults.tz_default must not be empty";
+        if (err) *err = "baseline.parser.tz_default must not be empty";
         return false;
     }
     if (cfg.shared_profile.k_day < 0 || cfg.shared_profile.k_week < 0 ||
@@ -679,32 +679,29 @@ bool ApplyYamlConfig(const YAML::Node& root,
 
     if (strict) {
         if (!ValidateAllowedKeys(root,
-                                 {"builtin_defaults",
-                                  "task_templates",
-                                  "common_optional_blocks",
-                                  "validation_notes"},
+                                 {"baseline", "examples", "notes"},
                                  "root",
                                  err)) {
             return false;
         }
     }
 
-    YAML::Node defaults = root["builtin_defaults"];
+    YAML::Node defaults = root["baseline"];
     if (!defaults) {
         if (strict) {
-            if (err) *err = "missing object field: builtin_defaults";
+            if (err) *err = "missing object field: baseline";
             return false;
         }
         defaults = root;
     }
     if (!defaults || !defaults.IsMap()) {
-        if (err) *err = "builtin_defaults must be an object";
+        if (err) *err = "baseline must be an object";
         return false;
     }
     if (strict && !ValidateStrictDefaultsSchema(defaults, err)) return false;
 
-    if (defaults["parser_level_defaults"]) {
-        ParseOptionalScalar(defaults["parser_level_defaults"], "tz_default", &out->tz_default);
+    if (defaults["parser"]) {
+        ParseOptionalScalar(defaults["parser"], "tz_default", &out->tz_default);
     }
     ParseSharedProfileConfig(defaults["shared_profile_config"], &out->shared_profile);
     ParseValueSampledProfiles(defaults["value_sampled_profiles"], out);
