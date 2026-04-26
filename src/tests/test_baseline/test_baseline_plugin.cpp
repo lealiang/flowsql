@@ -645,9 +645,9 @@ static void TestBaselineTaskLifecycleAndConfigValidation() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"t1b","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"value_sampled","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai"})";
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
     const char* relation_cfg =
         R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count","bps"],"encode_type":"exact_sparse","support_policy":{"k_support":16,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":5,"k_stable":5},"event_calendar_spec":{"calendar_id":"relation-calendar","calendar_version":"v1","entries":[{"event_code":"month_close","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
 
@@ -720,7 +720,7 @@ static void TestBaselineTaskLifecycleAndConfigValidation() {
     assert(bad_relation_task == nullptr);
 
     const char* bad_source_cfg =
-        R"({"name":"avg_rtt","key":"svc-a","feature":"avg_rtt","feature_type":"t1b","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-a","baseline_sources":[{"source_key":"svc-a"}]}]})";
+        R"({"name":"avg_rtt","key":"svc-a","feature":"avg_rtt","feature_type":"value_sampled","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-a","baseline_sources":[{"source_key":"svc-a"}]}]})";
     assert(service->CreateValueTask(bad_source_cfg, &bad_value_task) == error::BAD_REQUEST);
     assert(bad_value_task == nullptr);
 
@@ -793,63 +793,68 @@ static void TestBaselineValueTaskHotPath() {
     auto env = LoadBaselineService();
     auto* service = env.service;
 
-    const char* t1a_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
-    const char* t1b_cfg =
-        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"t1b","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai"})";
+    const char* value_basic_cfg =
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+    const char* value_sampled_cfg =
+        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"value_sampled","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai"})";
 
-    IBaselineValueTask* t1a_task = nullptr;
-    IBaselineValueTask* t1b_task = nullptr;
-    assert(service->CreateValueTask(t1a_cfg, &t1a_task) == error::OK);
-    assert(service->CreateValueTask(t1b_cfg, &t1b_task) == error::OK);
-    assert(t1a_task != nullptr);
-    assert(t1b_task != nullptr);
+    IBaselineValueTask* value_basic_task = nullptr;
+    IBaselineValueTask* value_sampled_task = nullptr;
+    assert(service->CreateValueTask(value_basic_cfg, &value_basic_task) == error::OK);
+    assert(service->CreateValueTask(value_sampled_cfg, &value_sampled_task) == error::OK);
+    assert(value_basic_task != nullptr);
+    assert(value_sampled_task != nullptr);
 
-    DetectorResult t1a_result{};
-    const ValueObservation t1a_obs{BaselineStringRef{"svc-a", 5}, 100, 2048.0, 0};
-    assert(t1a_task->SubmitObservation(t1a_obs, &t1a_result) == error::OK);
-    assert(t1a_result.status == error::OK);
-    assert((t1a_result.flags & kBaselineFlagColdStart) != 0);
-    assert(t1a_result.raw_score == 0.0);
-    assert(t1a_result.normalized_score == 0.0);
+    DetectorResult value_basic_result{};
+    const ValueObservation value_basic_obs{BaselineStringRef{"svc-a", 5}, 100, 2048.0, 0};
+    assert(value_basic_task->SubmitObservation(value_basic_obs, &value_basic_result) == error::OK);
+    assert(value_basic_result.status == error::OK);
+    assert((value_basic_result.flags & kBaselineFlagColdStart) != 0);
+    assert(value_basic_result.raw_score == 0.0);
+    assert(value_basic_result.normalized_score == 0.0);
 
-    std::string t1a_series_snapshot;
-    assert(t1a_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-a", 5}, &t1a_series_snapshot) == error::OK);
-    assert(t1a_series_snapshot.find("\"last_bucket_id\":100") != std::string::npos);
-    assert(t1a_series_snapshot.find("\"observation_count\":1") != std::string::npos);
+    std::string value_basic_series_snapshot;
+    assert(value_basic_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-a", 5},
+                                                     &value_basic_series_snapshot) == error::OK);
+    assert(value_basic_series_snapshot.find("\"last_bucket_id\":100") != std::string::npos);
+    assert(value_basic_series_snapshot.find("\"observation_count\":1") != std::string::npos);
 
     DetectorResult low_sample_result{};
     const ValueObservation low_sample_obs{BaselineStringRef{"svc-b", 5}, 200, 12.5, 10};
-    assert(t1b_task->SubmitObservation(low_sample_obs, &low_sample_result) == error::OK);
+    assert(value_sampled_task->SubmitObservation(low_sample_obs, &low_sample_result) == error::OK);
     assert(low_sample_result.status == error::OK);
     assert(low_sample_result.raw_score == 0.0);
     assert(low_sample_result.normalized_score == 0.0);
 
     std::string low_sample_snapshot;
-    assert(t1b_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-b", 5}, &low_sample_snapshot) == error::OK);
+    assert(value_sampled_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-b", 5},
+                                                       &low_sample_snapshot) == error::OK);
     assert(low_sample_snapshot.find("\"last_gate_score\":false") != std::string::npos);
     assert(low_sample_snapshot.find("\"last_gate_shift\":false") != std::string::npos);
     assert(low_sample_snapshot.find("\"last_sample_count\":10") != std::string::npos);
 
     DetectorResult enough_sample_result{};
     const ValueObservation enough_sample_obs{BaselineStringRef{"svc-b", 5}, 201, 13.5, 50};
-    assert(t1b_task->SubmitObservation(enough_sample_obs, &enough_sample_result) == error::OK);
+    assert(value_sampled_task->SubmitObservation(enough_sample_obs, &enough_sample_result) ==
+           error::OK);
     assert(enough_sample_result.status == error::OK);
 
     std::string enough_sample_snapshot;
-    assert(t1b_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-b", 5}, &enough_sample_snapshot) == error::OK);
+    assert(value_sampled_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-b", 5},
+                                                        &enough_sample_snapshot) == error::OK);
     assert(enough_sample_snapshot.find("\"last_gate_score\":true") != std::string::npos);
     assert(enough_sample_snapshot.find("\"last_gate_shift\":false") != std::string::npos);
     assert(enough_sample_snapshot.find("\"last_sample_count\":50") != std::string::npos);
 
     DetectorResult out_of_order_result{};
     const ValueObservation out_of_order_obs{BaselineStringRef{"svc-b", 5}, 199, 11.5, 50};
-    assert(t1b_task->SubmitObservation(out_of_order_obs, &out_of_order_result) == error::BAD_REQUEST);
+    assert(value_sampled_task->SubmitObservation(out_of_order_obs, &out_of_order_result) ==
+           error::BAD_REQUEST);
     assert(out_of_order_result.status == error::BAD_REQUEST);
     assert((out_of_order_result.flags & kBaselineFlagOutOfOrder) != 0);
 
-    assert(t1a_task->Close() == error::OK);
-    assert(t1b_task->Close() == error::OK);
+    assert(value_basic_task->Close() == error::OK);
+    assert(value_sampled_task->Close() == error::OK);
 
     std::printf("[PASS] Baseline value task hot path\n");
 }
@@ -861,7 +866,7 @@ static void TestBaselineRatioTaskHotPath() {
     auto* service = env.service;
 
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineRatioTask* ratio_task = nullptr;
     assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
@@ -1396,9 +1401,9 @@ static void TestBaselineRebuildInfrastructure() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineValueTask* value_task = nullptr;
     IBaselineRatioTask* ratio_task = nullptr;
@@ -1512,9 +1517,9 @@ static void TestBaselineFormalPredictorSkeleton() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineValueTask* value_task = nullptr;
     IBaselineRatioTask* ratio_task = nullptr;
@@ -1617,7 +1622,7 @@ static void TestBaselineFormalTrainerFailureReason() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineValueTask* value_task = nullptr;
     assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
@@ -1673,9 +1678,9 @@ static void TestBaselineSourceSelectionWithFormalModel() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
 
     IBaselineValueTask* value_task = nullptr;
     IBaselineRatioTask* ratio_task = nullptr;
@@ -1813,9 +1818,9 @@ static void TestBaselineShadowBaselineAndFormalSwitch() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineValueTask* value_task = nullptr;
     IBaselineRatioTask* ratio_task = nullptr;
@@ -2056,9 +2061,9 @@ static void TestBaselineMainScoringChain() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-source-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-source-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-source-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-source-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
 
     IBaselineValueTask* value_task = nullptr;
     IBaselineRatioTask* ratio_task = nullptr;
@@ -2211,11 +2216,11 @@ static void TestBaselineEventCalendarConfigAndSnapshot() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"month_close","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"month_close","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"month_close","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"month_close","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
     const char* bad_value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"broken","scope_type":"global","alignment_mode":"absolute_utc","start_ts":1711987199,"end_ts":1711900800,"enabled":true}]}})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"broken","scope_type":"global","alignment_mode":"absolute_utc","start_ts":1711987199,"end_ts":1711900800,"enabled":true}]}})";
 
     IBaselineValueTask* bad_value_task = reinterpret_cast<IBaselineValueTask*>(0x1);
     assert(service->CreateValueTask(bad_value_cfg, &bad_value_task) == error::BAD_REQUEST);
@@ -2350,7 +2355,7 @@ static void TestBaselineKeyFusionSnapshotForValueTask() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"svc-fusion-value","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"svc-fusion-value","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineValueTask* value_task = nullptr;
     assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);

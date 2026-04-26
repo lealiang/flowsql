@@ -1,44 +1,48 @@
 # Baseline unified config template
 # Source snapshot date: 2026-04-26
+#
+# Plugin load options:
+#   --option "config_file=/abs/path/to/baseline-config-template.yaml;strict=true"
+#
 # This file separates:
 # 1) task payload templates (configurable by Create*Task JSON)
-# 2) built-in defaults/constants (not configurable by task JSON today)
+# 2) built-in defaults/constants (loaded by BaselinePlugin runtime config)
 
 task_templates:
-  value_task_t1a:
+  value_task_basic:
     name: "bytes_total"
     key: "service"
     feature: "bytes_total"
-    feature_type: "t1a"
+    feature_type: "value_basic"
     feature_profile: "default"
     delta: 60
     tz: "Asia/Shanghai"
     baseline_source_configs: []
     event_calendar_spec: null
 
-  value_task_t1b:
+  value_task_sampled:
     name: "avg_rtt"
     key: "service"
     feature: "avg_rtt"
-    feature_type: "t1b"
+    feature_type: "value_sampled"
     feature_profile: "cont_core"   # cont_core | cont_tail
     delta: 60
     tz: "Asia/Shanghai"
     baseline_source_configs: []
     event_calendar_spec: null
 
-  ratio_task_t2:
+  ratio_task:
     name: "success_rate"
     key: "service"
     feature: "success_rate"
-    feature_type: "t2"             # t2 | ratio
+    feature_type: "ratio"
     feature_profile: "rate_core"   # rate_core | ratio_bursty
     delta: 60
     tz: "Asia/Shanghai"
     baseline_source_configs: []
     event_calendar_spec: null
 
-  relation_task_t3:
+  relation_task:
     name: "client_group_mix"
     feature_base: "client_group_mix"
     group_space_id: "client_group"
@@ -82,8 +86,6 @@ common_optional_blocks:
         tz: "Asia/Shanghai"
 
 builtin_defaults:
-  configurable_via_task_json: false
-
   parser_level_defaults:
     tz_default: "Asia/Shanghai"
 
@@ -117,39 +119,36 @@ builtin_defaults:
       g_skip: 3
       g_reset: 12
 
-  t1b_profiles:
+  value_sampled_profiles:
     cont_core:
       n_train_min: 50
-      n_score_min: 25
-      n_shift_min: 100
-      kappa_sample: 50
       transform_name_override: "log1p"
     cont_tail:
       n_train_min: 100
-      n_score_min: 50
-      n_shift_min: 200
-      kappa_sample: 100
       transform_name_override: "log1p"
 
-  t2_profiles:
+  ratio_profiles:
     global:
       eps_logit: 1.0e-4
       m_floor: 1.0e-4
       v_floor: 0.25
     rate_core:
       d_min_train: 50
-      d_score_min: 25
-      d_shift_min: 100
-      kappa_den: 50
       s_prior: 2.0
       phi_over: 1.5
     ratio_bursty:
       d_min_train: 100
-      d_score_min: 50
-      d_shift_min: 200
-      kappa_den: 100
       s_prior: 4.0
       phi_over: 2.0
+
+  solver_constants:
+    solver_name: "weighted_huber_ridge_irls"
+    c_huber: 1.5
+    s_min_fit: 1.0e-3
+    max_iter_fit: 15
+    tol_obj_rel: 1.0e-4
+    tol_beta_inf: 1.0e-5
+    cond_max: 1.0e8
 
   runtime_and_rebuild_constants:
     runtime_state_prune:

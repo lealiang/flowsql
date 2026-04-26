@@ -13,6 +13,7 @@
 
 #include <cmath>
 
+#include "plugins/baseline/config/runtime_config.h"
 #include "plugins/baseline/model/formal_predictor.h"
 #include "plugins/baseline/model/profile_config.h"
 
@@ -21,16 +22,19 @@ namespace baseline {
 
 namespace {
 
-constexpr double kHuberDelta = 1.5;
-constexpr double kShadowAlpha = 0.2;
-constexpr double kRatioVarianceFloor = 0.25;
-constexpr double kSwitchLossAbsTol = 1e-12;
 double HuberLoss(double residual) {
+    const double huber_delta = CandidateHuberDelta();
     const double abs_residual = std::fabs(residual);
-    if (abs_residual <= kHuberDelta) {
+    if (abs_residual <= huber_delta) {
         return 0.5 * abs_residual * abs_residual;
     }
-    return kHuberDelta * (abs_residual - 0.5 * kHuberDelta);
+    return huber_delta * (abs_residual - 0.5 * huber_delta);
+}
+
+double RatioClipEps() {
+    double eps = kRatioEpsLogit;
+    (void)TryGetRatioGlobalNumericalOverride(&eps, nullptr, nullptr);
+    return eps;
 }
 
 std::size_t ValidationStartIndex(std::size_t total_count,
@@ -85,7 +89,7 @@ CandidateValidationResult FinalizeValidationResult(CandidateValidationResult res
     // 使“数值上等价”的候选模型被误拒绝。这里补一个极小的绝对容忍带，
     // 仅用于 near-zero 区间稳定 formal switch，不改变正常量级下的相对判定语义。
     const double tolerance =
-        std::max(kSwitchLossAbsTol, shared_config.eps_switch * result.incumbent_loss);
+        std::max(CandidateSwitchLossAbsTol(), shared_config.eps_switch * result.incumbent_loss);
     result.pass = result.candidate_loss <= (result.incumbent_loss + tolerance);
     result.status = result.pass ? CandidateValidationStatus::kPassed
                                 : CandidateValidationStatus::kFailed;
@@ -147,7 +151,7 @@ CandidateValidationResult CandidateValidator::ValidateValue(
         bool delta_initialized = false;
         for (std::size_t i = 0; i < replay.points.size(); ++i) {
             const auto& point = replay.points[i];
-            if (profile.is_t1b && point.sample_count < profile.n_score_min) continue;
+            if (profile.is_sampled && point.sample_count < profile.n_score_min) continue;
 
             double mu_ref = 0.0;
             if (!PredictValueReady(incumbent_shadow_state->frozen_ref_model.get(),
@@ -180,7 +184,8 @@ CandidateValidationResult CandidateValidator::ValidateValue(
                 ++result.validation_count;
             }
 
-            delta = (1.0 - kShadowAlpha) * delta + kShadowAlpha * (x_t - mu_ref);
+            const double shadow_alpha = CandidateShadowAlpha();
+            delta = (1.0 - shadow_alpha) * delta + shadow_alpha * (x_t - mu_ref);
         }
         return FinalizeValidationResult(result);
     }
@@ -191,7 +196,7 @@ CandidateValidationResult CandidateValidator::ValidateValue(
 
     for (std::size_t i = val_begin; i < replay.points.size(); ++i) {
         const auto& point = replay.points[i];
-        if (profile.is_t1b && point.sample_count < profile.n_score_min) continue;
+        if (profile.is_sampled && point.sample_count < profile.n_score_min) continue;
 
         double mu_candidate = 0.0;
         double mu_incumbent = 0.0;
@@ -244,7 +249,7 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
             return CandidateValidationResult{CandidateValidationStatus::kUnavailableIncumbent, false};
         }
 
-        // T2 的 shadow replay 与 T1 相同，也是单遍 prequential 复现。
+        // 比例特征的 shadow replay 与数值特征相同，也是单遍 prequential 复现。
         // 不同点仅在于 delta 作用于比例空间，计损时继续保留低分母方差层。
         double delta = 0.0;
         bool delta_initialized = false;
@@ -266,8 +271,9 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
                 delta = observed_ratio - mu_ref;
                 delta_initialized = true;
             }
+            const double ratio_eps = RatioClipEps();
             const double mu_shadow =
-                std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, mu_ref + delta));
+                std::min(1.0 - ratio_eps, std::max(ratio_eps, mu_ref + delta));
 
             if (i >= val_begin) {
                 double mu_candidate = 0.0;
@@ -280,15 +286,15 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
                 }
 
                 const double candidate_p =
-                    std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, mu_candidate));
+                    std::min(1.0 - ratio_eps, std::max(ratio_eps, mu_candidate));
                 const double weight =
                     point.denominator /
                     (point.denominator + static_cast<double>(profile.d_min_train));
                 const double var_candidate = std::max(
-                    kRatioVarianceFloor,
+                    CandidateRatioVarianceFloor(),
                     profile.phi_over * point.denominator * candidate_p * (1.0 - candidate_p));
                 const double var_incumbent = std::max(
-                    kRatioVarianceFloor,
+                    CandidateRatioVarianceFloor(),
                     profile.phi_over * point.denominator * mu_shadow * (1.0 - mu_shadow));
 
                 result.candidate_loss += weight * HuberLoss(
@@ -298,7 +304,8 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
                 ++result.validation_count;
             }
 
-            delta = (1.0 - kShadowAlpha) * delta + kShadowAlpha * (observed_ratio - mu_ref);
+            const double shadow_alpha = CandidateShadowAlpha();
+            delta = (1.0 - shadow_alpha) * delta + shadow_alpha * (observed_ratio - mu_ref);
         }
         return FinalizeValidationResult(result);
     }
@@ -326,18 +333,17 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
             return CandidateValidationResult{CandidateValidationStatus::kUnavailableIncumbent, false};
         }
 
-        const double candidate_p =
-            std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, mu_candidate));
-        const double incumbent_p =
-            std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, mu_incumbent));
+        const double ratio_eps = RatioClipEps();
+        const double candidate_p = std::min(1.0 - ratio_eps, std::max(ratio_eps, mu_candidate));
+        const double incumbent_p = std::min(1.0 - ratio_eps, std::max(ratio_eps, mu_incumbent));
         const double weight =
             point.denominator /
             (point.denominator + static_cast<double>(profile.d_min_train));
         const double var_candidate = std::max(
-            kRatioVarianceFloor,
+            CandidateRatioVarianceFloor(),
             profile.phi_over * point.denominator * candidate_p * (1.0 - candidate_p));
         const double var_incumbent = std::max(
-            kRatioVarianceFloor,
+            CandidateRatioVarianceFloor(),
             profile.phi_over * point.denominator * incumbent_p * (1.0 - incumbent_p));
 
         result.candidate_loss += weight * HuberLoss(

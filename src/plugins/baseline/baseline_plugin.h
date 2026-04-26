@@ -52,6 +52,8 @@ class __attribute__((visibility("default"))) BaselinePlugin : public IPlugin, pu
  private:
     IQuerier* querier_ = nullptr;
     std::string option_;
+    std::string config_file_;
+    bool config_strict_ = true;
     std::unique_ptr<TaskRegistry> task_registry_;
     std::unique_ptr<RebuildQueue> rebuild_queue_;
     std::unique_ptr<RebuildWorker> rebuild_worker_;

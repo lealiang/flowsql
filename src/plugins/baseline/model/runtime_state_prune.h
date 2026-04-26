@@ -12,15 +12,14 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "plugins/baseline/config/runtime_config.h"
+
 namespace flowsql {
 namespace baseline {
 
-constexpr int64_t kRuntimeIdlePruneBucketGap = 4096;
-constexpr size_t kRuntimeIdlePruneScanLimit = 32;
-
 inline bool RuntimeStateIdleBeyondGap(int64_t last_bucket_id, int64_t current_bucket_id) {
     return last_bucket_id > 0 && current_bucket_id > last_bucket_id &&
-           (current_bucket_id - last_bucket_id) > kRuntimeIdlePruneBucketGap;
+           (current_bucket_id - last_bucket_id) > RuntimeIdlePruneBucketGap();
 }
 
 // 热路径只做有界 opportunistic prune：每次最多扫描固定数量条目，避免把提交路径拖成全量清理。

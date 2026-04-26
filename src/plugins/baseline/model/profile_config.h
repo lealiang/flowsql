@@ -19,9 +19,11 @@
 namespace flowsql {
 namespace baseline {
 
-constexpr double kT2EpsLogit = 1e-4;
+constexpr double kRatioEpsLogit = 1e-4;
+constexpr double kRatioMFloor = 1e-4;
+constexpr double kRatioVFloor = 0.25;
 
-// SharedProfileConfig 承载 design.md 第 12 章定义的 T1/T2 公共主参数。
+// SharedProfileConfig 承载 design.md 第 12 章定义的数值/比例公共主参数。
 // detector / trainer 不应各自硬编码这些值，后续参数标定也应从这里收口。
 struct SharedProfileConfig {
     int32_t k_day = 4;
@@ -42,6 +44,14 @@ struct SharedProfileConfig {
     DriftConfig drift;
 };
 
+struct ValueSampledProfileConfig;
+struct RatioProfileConfig;
+bool TryGetSharedProfileConfigOverride(SharedProfileConfig* out);
+bool TryGetValueSampledProfileConfigOverride(const std::string& profile_name,
+                                             ValueSampledProfileConfig* out);
+bool TryGetRatioProfileConfigOverride(const std::string& profile_name, RatioProfileConfig* out);
+bool TryGetRatioGlobalNumericalOverride(double* eps_logit, double* m_floor, double* v_floor);
+
 inline SharedProfileConfig DefaultSharedProfileConfig() {
     SharedProfileConfig config;
     config.drift.alpha = 0.2;
@@ -55,10 +65,12 @@ inline SharedProfileConfig DefaultSharedProfileConfig() {
     config.drift.m_shift = 3;
     config.drift.g_skip = 3;
     config.drift.g_reset = 12;
+    SharedProfileConfig override;
+    if (TryGetSharedProfileConfigOverride(&override)) return override;
     return config;
 }
 
-struct T1bProfileConfig {
+struct ValueSampledProfileConfig {
     std::string name;
     uint32_t n_train_min = 0;
     std::string transform_name_override = "log1p";
@@ -68,9 +80,11 @@ struct T1bProfileConfig {
     double kappa_sample() const { return static_cast<double>(n_train_min); }
 };
 
-inline bool GetT1bProfileConfig(const std::string& profile_name, T1bProfileConfig* out) {
+inline bool GetValueSampledProfileConfig(const std::string& profile_name,
+                                         ValueSampledProfileConfig* out) {
     if (!out) return false;
-    T1bProfileConfig profile;
+    if (TryGetValueSampledProfileConfigOverride(profile_name, out)) return true;
+    ValueSampledProfileConfig profile;
     profile.name = profile_name;
     if (profile_name == "cont_core") {
         profile.n_train_min = 50;
@@ -83,24 +97,32 @@ inline bool GetT1bProfileConfig(const std::string& profile_name, T1bProfileConfi
     return true;
 }
 
-struct T2ProfileConfig {
+struct RatioProfileConfig {
     std::string name;
     double s_prior = 0.0;
     uint32_t d_min_train = 0;
     double phi_over = 1.0;
-    double m_floor = 1e-4;
-    double eps_logit = kT2EpsLogit;
-    double v_floor = 0.25;
+    double m_floor = kRatioMFloor;
+    double eps_logit = kRatioEpsLogit;
+    double v_floor = kRatioVFloor;
 
     uint32_t d_score_min() const { return (d_min_train + 1) / 2; }
     uint32_t d_shift_min() const { return d_min_train * 2; }
     double kappa_den() const { return static_cast<double>(d_min_train); }
 };
 
-inline bool GetT2ProfileConfig(const std::string& profile_name, T2ProfileConfig* out) {
+inline bool GetRatioProfileConfig(const std::string& profile_name, RatioProfileConfig* out) {
     if (!out) return false;
-    T2ProfileConfig profile;
+    if (TryGetRatioProfileConfigOverride(profile_name, out)) return true;
+    RatioProfileConfig profile;
     profile.name = profile_name;
+    double eps_logit = profile.eps_logit;
+    double m_floor = profile.m_floor;
+    double v_floor = profile.v_floor;
+    (void)TryGetRatioGlobalNumericalOverride(&eps_logit, &m_floor, &v_floor);
+    profile.eps_logit = eps_logit;
+    profile.m_floor = m_floor;
+    profile.v_floor = v_floor;
     if (profile_name == "rate_core") {
         profile.d_min_train = 50;
         profile.s_prior = 2.0;
@@ -122,7 +144,7 @@ struct RatioPriorConfig {
     double beta0 = 0.0;
 };
 
-inline RatioPriorConfig ComputeRatioPrior(const T2ProfileConfig& profile,
+inline RatioPriorConfig ComputeRatioPrior(const RatioProfileConfig& profile,
                                           double numerator_sum,
                                           double denominator_sum) {
     RatioPriorConfig prior;

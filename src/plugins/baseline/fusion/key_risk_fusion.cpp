@@ -22,16 +22,13 @@ namespace baseline {
 
 namespace {
 
-constexpr double kFusePersistenceWindow = 3.0;
-constexpr size_t kWindowLimit = 2;
-
 double ClipUnit(double value) {
     return std::max(0.0, std::min(1.0, value));
 }
 
 double ComputeEvidenceStrength(const DetectorResult& result) {
     const double persistence_ratio =
-        std::min(1.0, static_cast<double>(result.persistence) / kFusePersistenceWindow);
+        std::min(1.0, static_cast<double>(result.persistence) / KeyFusionPersistenceWindow());
     return ClipUnit(result.normalized_score) * ClipUnit(result.confidence) * persistence_ratio;
 }
 
@@ -218,7 +215,7 @@ KeyRiskFusion::KeyRiskWindowState* FindOrCreateWindow(
         newest.finalized = true;
         state->windows.push_back(KeyRiskFusion::KeyRiskWindowState{});
         state->windows.back().bucket_id = ts;
-        if (state->windows.size() > kWindowLimit) {
+        if (state->windows.size() > KeyFusionWindowLimit()) {
             state->windows.erase(state->windows.begin());
         }
         return &state->windows.back();
@@ -263,12 +260,12 @@ void RecomputeWindowRisk(const std::string& key,
         InsertTopPattern(entry.second, &recomputed);
     }
 
-    const double risk_t1t2 = SaturatedNoisyOr(direct_scores);
-    const double risk_single_t3 = SaturatedNoisyOr(routed_scores);
+    const double risk_direct = SaturatedNoisyOr(direct_scores);
+    const double risk_routed_single = SaturatedNoisyOr(routed_scores);
     const double risk_pattern = SaturatedNoisyOr(pattern_scores);
-    const double risk_t3 = 1.0 - (1.0 - risk_single_t3) * (1.0 - risk_pattern);
+    const double risk_routed = 1.0 - (1.0 - risk_routed_single) * (1.0 - risk_pattern);
 
-    recomputed.risk = 1.0 - (1.0 - risk_t1t2) * (1.0 - risk_t3);
+    recomputed.risk = 1.0 - (1.0 - risk_direct) * (1.0 - risk_routed);
     window->key_risk = std::move(recomputed);
 }
 
@@ -284,10 +281,11 @@ void PruneEmptyWindows(KeyRiskFusion::KeyRiskFusionState* state) {
                        state->windows.end(),
                        [](const auto& window) { return WindowEmpty(window); }),
         state->windows.end());
-    if (state->windows.size() > kWindowLimit) {
+    if (state->windows.size() > KeyFusionWindowLimit()) {
         state->windows.erase(state->windows.begin(),
                              state->windows.begin() +
-                                 static_cast<std::ptrdiff_t>(state->windows.size() - kWindowLimit));
+                                 static_cast<std::ptrdiff_t>(state->windows.size() -
+                                                             KeyFusionWindowLimit()));
     }
 }
 
@@ -342,7 +340,7 @@ void KeyRiskFusion::UpdateSingleDetectorResult(int64_t ts,
         pruned_key_count_total_.fetch_add(
             PruneBoundedStateMap(&prune_shard.states,
                                  &prune_shard.prune_cursor,
-                                 kRuntimeIdlePruneScanLimit,
+                                 RuntimeIdlePruneScanLimit(),
                                  [ts](const KeyRiskFusionState& state) {
                                      if (state.windows.empty()) return false;
                                      return RuntimeStateIdleBeyondGap(
@@ -392,7 +390,7 @@ void KeyRiskFusion::UpdateRelationFusionResult(int64_t ts,
         pruned_key_count_total_.fetch_add(
             PruneBoundedStateMap(&prune_shard.states,
                                  &prune_shard.prune_cursor,
-                                 kRuntimeIdlePruneScanLimit,
+                                 RuntimeIdlePruneScanLimit(),
                                  [ts](const KeyRiskFusionState& state) {
                                      if (state.windows.empty()) return false;
                                      return RuntimeStateIdleBeyondGap(
@@ -509,7 +507,7 @@ uint64_t KeyRiskFusion::PrunedKeyCount() const {
 }
 
 int64_t KeyRiskFusion::IdlePruneBucketGap() const {
-    return kRuntimeIdlePruneBucketGap;
+    return RuntimeIdlePruneBucketGap();
 }
 
 }  // namespace baseline

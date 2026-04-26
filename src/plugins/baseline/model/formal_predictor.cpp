@@ -24,7 +24,12 @@ namespace baseline {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kRatioEps = kT2EpsLogit;
+
+double RatioClipEps() {
+    double eps = kRatioEpsLogit;
+    (void)TryGetRatioGlobalNumericalOverride(&eps, nullptr, nullptr);
+    return eps;
+}
 
 double Sigmoid(double value) {
     if (value >= 0.0) {
@@ -36,7 +41,8 @@ double Sigmoid(double value) {
 }
 
 double ClipRatio(double value) {
-    return std::max(kRatioEps, std::min(1.0 - kRatioEps, value));
+    const double eps = RatioClipEps();
+    return std::max(eps, std::min(1.0 - eps, value));
 }
 
 int64_t ResolveDelta(const ValueFormalModel& model, const FormalPredictContext& context) {

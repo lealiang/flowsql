@@ -36,7 +36,7 @@ struct SeriesState {
     uint64_t observation_count = 0;
 
     // 公共状态层只负责时序完整性、gap 惰性计算和持续性计数。
-    // 具体的分数、方向和残差解释由 T1/T2/T3 各自算法层补充。
+    // 具体的分数、方向和残差解释由各特征算法层补充。
     SeriesUpdateResult ApplyObservation(int64_t bucket_id,
                                         SeriesPersistenceMode mode,
                                         bool is_anomalous) {

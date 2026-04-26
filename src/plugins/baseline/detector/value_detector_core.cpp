@@ -24,9 +24,7 @@ namespace baseline {
 
 namespace {
 
-constexpr double kShadowConfidenceCap = 0.8;
-constexpr double kT1SigmaRefFloor = 1e-3;
-constexpr double kShadowSigmaScale = 1.5;
+constexpr double kValueSigmaRefFloor = 1e-3;
 
 const SharedProfileConfig& SharedConfig() {
     static const SharedProfileConfig config = DefaultSharedProfileConfig();
@@ -143,22 +141,22 @@ bool BuildProfile(const ValueDetectorCoreSpec& spec,
     profile.feature_type = spec.feature_type;
     profile.feature_profile = spec.feature_profile;
 
-    if (spec.feature_type == "t1a") {
-        profile.is_t1b = false;
+    if (spec.feature_type == "value_basic") {
+        profile.is_sampled = false;
         if (spec.transform_kind.has_value()) {
             if (*spec.transform_kind != "identity" && *spec.transform_kind != "log1p") {
-                if (err) *err = "unsupported t1a transform_kind";
+                if (err) *err = "unsupported value_basic transform_kind";
                 return false;
             }
             profile.transform_name = *spec.transform_kind;
         }
-    } else if (spec.feature_type == "t1b") {
-        T1bProfileConfig profile_config;
-        if (!GetT1bProfileConfig(spec.feature_profile, &profile_config)) {
-            if (err) *err = "unsupported t1b feature_profile";
+    } else if (spec.feature_type == "value_sampled") {
+        ValueSampledProfileConfig profile_config;
+        if (!GetValueSampledProfileConfig(spec.feature_profile, &profile_config)) {
+            if (err) *err = "unsupported value_sampled feature_profile";
             return false;
         }
-        profile.is_t1b = true;
+        profile.is_sampled = true;
         profile.transform_name = profile_config.transform_name_override;
         profile.n_train_min = profile_config.n_train_min;
         profile.n_score_min = profile_config.n_score_min();
@@ -188,15 +186,15 @@ int ValidateObservation(const ValueFeatureProfile& profile,
         if (err) *err = "value must be >= 0";
         return error::BAD_REQUEST;
     }
-    if (profile.is_t1b && obs.sample_count == 0) {
-        if (err) *err = "sample_count must be >= 1 for t1b";
+    if (profile.is_sampled && obs.sample_count == 0) {
+        if (err) *err = "sample_count must be >= 1 for value_sampled";
         return error::BAD_REQUEST;
     }
     return error::OK;
 }
 
 double ComputeRho(const ValueFeatureProfile& profile, uint64_t sample_count) {
-    if (!profile.is_t1b) return 1.0;
+    if (!profile.is_sampled) return 1.0;
     if (sample_count == 0) return std::numeric_limits<double>::infinity();
     return std::sqrt(1.0 + profile.kappa_sample / static_cast<double>(sample_count));
 }
@@ -234,7 +232,7 @@ SelectedValueBaseline ResolveServiceableBaseline(
     const BaselineSourceConfig* baseline_source_config) {
     SelectedValueBaseline selected;
 
-    // T1 热路径只允许 formal source 提供在线解释：
+    // 数值特征热路径只允许 formal source 提供在线解释：
     // 先尝试 self formal，再按静态配置回退到 configured source formal。
     // candidate model 仅保留给慢路径验证与快照观测，不参与正式在线服务。
     if (PredictServiceableModel(spec,
@@ -296,7 +294,7 @@ double ComputeNormalizedScore(double score_point, double score_shift) {
 double EffectiveValueSigma(double sigma_ref,
                            double rho_t,
                            double extra_scale = 1.0) {
-    return std::max(kT1SigmaRefFloor, sigma_ref) * std::max(rho_t, 1.0) * extra_scale;
+    return std::max(kValueSigmaRefFloor, sigma_ref) * std::max(rho_t, 1.0) * extra_scale;
 }
 
 BaselineStringRef StringRefOf(const std::string& value) {
@@ -378,7 +376,7 @@ void FillValueEvidence(DetectorResult* out,
     evidence.model_state = EvidenceModelState(runtime_state.model_state);
     evidence.shadow_active = shadow_active;
 
-    if (profile.is_t1b) {
+    if (profile.is_sampled) {
         evidence.field_flags |= kBaselineEvidenceHasSampleCount;
         evidence.field_flags |= kBaselineEvidenceHasSigmaEff;
         evidence.sample_count = sample_count;
@@ -439,8 +437,8 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
 
     const double x_t = TransformValueObservation(profile_, obs.value);
     const double rho_t = ComputeRho(profile_, obs.sample_count);
-    const bool gate_score = !profile_.is_t1b || obs.sample_count >= profile_.n_score_min;
-    const bool gate_shift = !profile_.is_t1b || obs.sample_count >= profile_.n_shift_min;
+    const bool gate_score = !profile_.is_sampled || obs.sample_count >= profile_.n_score_min;
+    const bool gate_shift = !profile_.is_sampled || obs.sample_count >= profile_.n_shift_min;
     const std::string key = CopyKey(obs.key);
     const BaselineSourceConfig* baseline_source_config = nullptr;
     auto source_config_it = baseline_source_config_by_key_.find(key);
@@ -554,7 +552,7 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                     const double sigma_shadow =
                         EffectiveValueSigma(shadow_prediction.sigma_ref,
                                             rho_t,
-                                            kShadowSigmaScale);
+                                            ValueShadowSigmaScale());
                     sigma_eff_t = sigma_shadow;
                     z_t = residual / sigma_shadow;
                     out_submit->detector_result.raw_score = std::fabs(z_t);
@@ -703,7 +701,7 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
 
             double confidence_base = runtime_state.readiness_state.confidence_base;
             if (shadow_active) {
-                confidence_base = std::min(confidence_base, kShadowConfidenceCap);
+                confidence_base = std::min(confidence_base, ValueShadowConfidenceCap());
             }
             out_submit->detector_result.confidence =
                 confidence_base / std::max(rho_t, 1.0);
@@ -738,7 +736,7 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
         pruned_key_count_total_.fetch_add(
             PruneBoundedStateMap(&prune_shard.states,
                                  &prune_shard.prune_cursor,
-                                 kRuntimeIdlePruneScanLimit,
+                                 RuntimeIdlePruneScanLimit(),
                                  [bucket_id = obs.bucket_id](const ValueSeriesShardEntry& entry) {
                                      return RuntimeStateIdleBeyondGap(
                                          entry.series_state.last_bucket_id, bucket_id);
@@ -1027,7 +1025,7 @@ uint64_t ValueDetectorCore::PrunedKeyCount() const {
 }
 
 int64_t ValueDetectorCore::IdlePruneBucketGap() const {
-    return kRuntimeIdlePruneBucketGap;
+    return RuntimeIdlePruneBucketGap();
 }
 
 }  // namespace baseline

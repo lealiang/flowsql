@@ -104,7 +104,7 @@ static void TestRatioDetectorCoreSubmitAndSnapshot() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-1";
     spec.routed_feature_id = "svc_success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
 
     RatioDetectorCore core(spec);
@@ -137,7 +137,7 @@ static void TestRatioDetectorCoreMarkRebuildFailure() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-2";
     spec.routed_feature_id = "svc_success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
 
     RatioDetectorCore core(spec);
@@ -174,7 +174,7 @@ static void TestRatioDetectorCoreRatioEvidenceAndIdentity() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-3";
     spec.routed_feature_id = "svc_success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
 
     RatioDetectorCore core(spec);
@@ -199,7 +199,7 @@ static void TestRatioDetectorCoreRatioEvidenceAndIdentity() {
                        submit.detector_result.feature.size) == "svc_success_rate");
     assert(submit.detector_result.feature_type.data != nullptr);
     assert(std::string(submit.detector_result.feature_type.data,
-                       submit.detector_result.feature_type.size) == "t2");
+                       submit.detector_result.feature_type.size) == "ratio");
     assert(submit.detector_result.ts == 20);
     assert(submit.detector_result.provider == BaselineProvider::kFormal);
     assert(NearlyEqual(submit.detector_result.confidence, 1.0 / rho_t));
@@ -227,7 +227,7 @@ static void TestRatioDetectorCoreConfiguredSourceConfidence() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-4";
     spec.routed_feature_id = "svc_success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
     SeriesBaselineSourceConfig source_config;
     source_config.key = "svc-target";
@@ -265,7 +265,7 @@ static void TestRatioDetectorCoreUsesShardedRuntimeStorage() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-shards";
     spec.routed_feature_id = "success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
 
     RatioDetectorCore core(spec);
@@ -309,7 +309,7 @@ static void TestRatioDetectorCoreKeyFeatureEventCalendar() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-5";
     spec.routed_feature_id = "svc_success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
     spec.delta = 60;
     spec.tz = "UTC";
@@ -351,7 +351,7 @@ static void TestRatioDetectorCoreProfileDifferenceIsEffective() {
     RatioDetectorCoreSpec rate_spec;
     rate_spec.owner_task_id = "ratio-task-4a";
     rate_spec.routed_feature_id = "svc_success_rate";
-    rate_spec.feature_type = "t2";
+    rate_spec.feature_type = "ratio";
     rate_spec.feature_profile = "rate_core";
 
     RatioDetectorCoreSpec bursty_spec = rate_spec;
@@ -386,7 +386,7 @@ static void TestRatioDetectorCoreColdStartUsesNoneProvider() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-5";
     spec.routed_feature_id = "svc_success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
 
     RatioDetectorCore core(spec);
@@ -411,7 +411,7 @@ static void TestRatioDetectorCoreShadowConfidenceAndReason() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-6";
     spec.routed_feature_id = "svc_success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
 
     RatioDetectorCore core(spec);
@@ -444,7 +444,7 @@ static void TestRatioDetectorCorePrunesIdleKeys() {
     RatioDetectorCoreSpec spec;
     spec.owner_task_id = "ratio-task-prune";
     spec.routed_feature_id = "svc_success_rate";
-    spec.feature_type = "t2";
+    spec.feature_type = "ratio";
     spec.feature_profile = "rate_core";
 
     RatioDetectorCore core(spec);

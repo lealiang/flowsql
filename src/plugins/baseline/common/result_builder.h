@@ -13,16 +13,11 @@
 
 #include <algorithm>
 
+#include "plugins/baseline/config/runtime_config.h"
 #include "plugins/baseline/model/series_state.h"
 
 namespace flowsql {
 namespace baseline {
-
-constexpr double kScoreWarn = 3.0;
-constexpr double kScoreCrit = 5.0;
-constexpr double kConfidenceFormalBase = 0.8;
-constexpr double kConfidenceSourceBase = 0.6;
-constexpr double kConfidenceShadowBase = 0.5;
 
 inline void FillBaseResult(const SeriesUpdateResult& update,
                            DetectorResult* out) {
@@ -37,8 +32,10 @@ inline double ClipUnit(double value) {
 }
 
 inline double ComputePointScore(double raw_score) {
-    if (raw_score <= kScoreWarn) return 0.0;
-    return ClipUnit((raw_score - kScoreWarn) / (kScoreCrit - kScoreWarn));
+    const double score_warn = ScoreWarn();
+    const double score_crit = ScoreCrit();
+    if (raw_score <= score_warn) return 0.0;
+    return ClipUnit((raw_score - score_warn) / (score_crit - score_warn));
 }
 
 inline BaselineDirection DirectionFromResidual(double residual) {
@@ -64,11 +61,11 @@ inline BaselineSeverity SeverityFromNormalizedScore(double normalized_score) {
 inline double ConfidenceBaseForProvider(BaselineProvider provider) {
     switch (provider) {
         case BaselineProvider::kFormal:
-            return kConfidenceFormalBase;
+            return ConfidenceFormalBase();
         case BaselineProvider::kSource:
-            return kConfidenceSourceBase;
+            return ConfidenceSourceBase();
         case BaselineProvider::kShadow:
-            return kConfidenceShadowBase;
+            return ConfidenceShadowBase();
     }
     return 0.0;
 }

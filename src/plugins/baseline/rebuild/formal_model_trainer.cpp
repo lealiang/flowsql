@@ -30,6 +30,12 @@ namespace {
 constexpr double kSigmaFloor = 1e-3;
 constexpr double kPi = 3.14159265358979323846;
 
+double RatioClipEps() {
+    double eps = kRatioEpsLogit;
+    (void)TryGetRatioGlobalNumericalOverride(&eps, nullptr, nullptr);
+    return eps;
+}
+
 struct ValueTrainRow {
     int64_t bucket_id = 0;
     double x = 0.0;
@@ -481,12 +487,12 @@ void CollectValueTrainRows(const ValueFormalTrainInput& input,
 
     for (std::size_t i = 0; i < input.train_count; ++i) {
         const auto& point = input.replay->points[i];
-        if (input.profile->is_t1b && point.sample_count < input.profile->n_train_min) continue;
+        if (input.profile->is_sampled && point.sample_count < input.profile->n_train_min) continue;
 
         ValueTrainRow row;
         row.bucket_id = point.bucket_id;
         row.x = TransformValueObservation(*input.profile, point.value);
-        if (input.profile->is_t1b) {
+        if (input.profile->is_sampled) {
             const double rho = std::sqrt(
                 1.0 + input.profile->kappa_sample / static_cast<double>(point.sample_count));
             row.weight = 1.0 / (rho * rho);
@@ -510,9 +516,10 @@ void CollectRatioTrainRows(const RatioFormalTrainInput& input,
 
         RatioTrainRow row;
         row.bucket_id = point.bucket_id;
+        const double ratio_eps = RatioClipEps();
         const double smoothed =
-            std::min(1.0 - kT2EpsLogit,
-                     std::max(kT2EpsLogit,
+            std::min(1.0 - ratio_eps,
+                     std::max(ratio_eps,
                               (point.numerator + prior.alpha0) /
                                   (point.denominator + prior.alpha0 + prior.beta0)));
         row.eta = std::log(smoothed / (1.0 - smoothed));
@@ -925,8 +932,8 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
         numerator_sum += point.numerator;
         denominator_sum += point.denominator;
     }
-    T2ProfileConfig profile_config;
-    if (!GetT2ProfileConfig(input.profile->feature_profile, &profile_config)) {
+    RatioProfileConfig profile_config;
+    if (!GetRatioProfileConfig(input.profile->feature_profile, &profile_config)) {
         return out->failure = FormalTrainFailureCode::kTrainFailed;
     }
     const RatioPriorConfig prior = ComputeRatioPrior(profile_config, numerator_sum, denominator_sum);

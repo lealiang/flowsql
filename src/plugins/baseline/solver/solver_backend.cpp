@@ -20,6 +20,8 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/QR>
 
+#include "plugins/baseline/config/runtime_config.h"
+
 namespace flowsql {
 namespace baseline {
 
@@ -145,7 +147,9 @@ const char* BlockFitStatusName(BlockFitStatus status) {
 }
 
 BlockSolverConfig DefaultBlockSolverConfig() {
-    return BlockSolverConfig{};
+    BlockSolverConfig config;
+    (void)TryGetBlockSolverConfigOverride(&config);
+    return config;
 }
 
 bool SolverBackend::IsAvailable() {

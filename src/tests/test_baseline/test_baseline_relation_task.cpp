@@ -117,7 +117,7 @@ void TestProtocolContract() {
     DetectorResult detector_result;
     detector_result.key = BaselineStringRef{"svc-a", 5};
     detector_result.feature = BaselineStringRef{"bytes_total", 11};
-    detector_result.feature_type = BaselineStringRef{"t1a", 3};
+    detector_result.feature_type = BaselineStringRef{"value_basic", 3};
     detector_result.ts = 123;
     detector_result.reason_code = BaselineReasonCode::kSpike;
     detector_result.evidence.kind = BaselineEvidenceKind::kValue;
@@ -148,7 +148,7 @@ void TestParseValueTaskBaselineSourceConfig() {
   "name": "bytes_total",
   "key": "service",
   "feature": "bytes_total",
-  "feature_type": "t1a",
+  "feature_type": "value_basic",
   "feature_profile": "traffic",
   "delta": 60,
   "tz": "Asia/Shanghai",
@@ -174,7 +174,7 @@ void TestParseValueTaskBaselineSourceConfig() {
   "name": "bytes_total",
   "key": "svc-self",
   "feature": "bytes_total",
-  "feature_type": "t1a",
+  "feature_type": "value_basic",
   "feature_profile": "traffic",
   "delta": 60,
   "tz": "Asia/Shanghai",
@@ -195,7 +195,7 @@ void TestParseValueTaskBaselineSourceConfig() {
   "name": "bytes_total",
   "key": "service",
   "feature": "bytes_total",
-  "feature_type": "t1a",
+  "feature_type": "value_basic",
   "feature_profile": "traffic",
   "delta": 60,
   "tz": "Asia/Shanghai",
@@ -220,7 +220,7 @@ void TestParseValueTaskBaselineSourceConfig() {
   "name": "bytes_total",
   "key": "service",
   "feature": "bytes_total",
-  "feature_type": "t1a",
+  "feature_type": "value_basic",
   "feature_profile": "traffic",
   "delta": 60,
   "tz": "Asia/Shanghai",
@@ -244,7 +244,7 @@ void TestParseValueTaskBaselineSourceConfig() {
   "name": "bytes_total",
   "key": "service",
   "feature": "bytes_total",
-  "feature_type": "t1a",
+  "feature_type": "value_basic",
   "feature_profile": "traffic",
   "delta": 60,
   "tz": "Asia/Shanghai",
@@ -262,7 +262,7 @@ void TestParseValueTaskBaselineSourceConfig() {
   "name": "bytes_total",
   "key": "service",
   "feature": "bytes_total",
-  "feature_type": "t1a",
+  "feature_type": "value_basic",
   "feature_profile": "traffic",
   "delta": 60,
   "tz": "Asia/Shanghai",

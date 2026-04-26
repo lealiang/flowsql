@@ -12,14 +12,13 @@
 
 #include <algorithm>
 
+#include "plugins/baseline/config/runtime_config.h"
 #include "plugins/baseline/model/profile_config.h"
 
 namespace flowsql {
 namespace baseline {
 
 namespace {
-
-constexpr std::size_t kMinTrainPointCount = 2;
 
 CandidateBuildStatus MapTrainFailure(FormalTrainFailureCode code) {
     switch (code) {
@@ -56,7 +55,7 @@ std::vector<std::size_t> CollectValueValidIndices(const ValueFeatureProfile& pro
     std::vector<std::size_t> indices;
     indices.reserve(replay.points.size());
     for (std::size_t i = 0; i < replay.points.size(); ++i) {
-        if (profile.is_t1b && replay.points[i].sample_count < profile.n_train_min) continue;
+        if (profile.is_sampled && replay.points[i].sample_count < profile.n_train_min) continue;
         indices.push_back(i);
     }
     return indices;
@@ -125,7 +124,7 @@ CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& pro
         HoldoutStartIndex(replay, valid_indices, holdout_valid_count);
     const std::size_t train_count = holdout_begin;
 
-    if (train_count < kMinTrainPointCount) {
+    if (train_count < CandidateMinTrainPointCount()) {
         return out->status = CandidateBuildStatus::kInsufficientTrainData;
     }
 
@@ -181,7 +180,7 @@ CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& pro
         HoldoutStartIndex(replay, valid_indices, holdout_valid_count);
     const std::size_t train_count = holdout_begin;
 
-    if (train_count < kMinTrainPointCount) {
+    if (train_count < CandidateMinTrainPointCount()) {
         return out->status = CandidateBuildStatus::kInsufficientTrainData;
     }
 

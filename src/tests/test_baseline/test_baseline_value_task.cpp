@@ -98,7 +98,7 @@ static void TestValueDetectorCoreSubmitAndSnapshot() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-1";
     spec.routed_feature_id = "svc_latency";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "default";
 
     ValueDetectorCore core(spec);
@@ -130,7 +130,7 @@ static void TestValueDetectorCoreMarkRebuildFailure() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-2";
     spec.routed_feature_id = "svc_latency";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "default";
 
     ValueDetectorCore core(spec);
@@ -167,7 +167,7 @@ static void TestValueDetectorCoreValueEvidenceAndIdentity() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-3";
     spec.routed_feature_id = "bytes_total";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "traffic";
 
     ValueDetectorCore core(spec);
@@ -186,7 +186,7 @@ static void TestValueDetectorCoreValueEvidenceAndIdentity() {
                        submit.detector_result.feature.size) == "bytes_total");
     assert(submit.detector_result.feature_type.data != nullptr);
     assert(std::string(submit.detector_result.feature_type.data,
-                       submit.detector_result.feature_type.size) == "t1a");
+                       submit.detector_result.feature_type.size) == "value_basic");
     assert(submit.detector_result.ts == 20);
     assert(submit.detector_result.provider == BaselineProvider::kFormal);
     assert(NearlyEqual(submit.detector_result.confidence, 1.0));
@@ -208,12 +208,12 @@ static void TestValueDetectorCoreValueEvidenceAndIdentity() {
 }
 
 static void TestValueDetectorCoreT1bSampleCountAndConfidence() {
-    std::printf("[TEST] ValueDetectorCore t1b sample count and confidence...\n");
+    std::printf("[TEST] ValueDetectorCore sampled profile count and confidence...\n");
 
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-4";
     spec.routed_feature_id = "avg_rtt";
-    spec.feature_type = "t1b";
+    spec.feature_type = "value_sampled";
     spec.feature_profile = "cont_core";
 
     ValueDetectorCore core(spec);
@@ -235,7 +235,7 @@ static void TestValueDetectorCoreT1bSampleCountAndConfidence() {
     assert(NearlyEqual(submit.detector_result.evidence.value.sigma_eff_t, 2.0 * rho));
     assert(submit.detector_result.evidence.value.model_state == BaselineModelState::kFormal);
 
-    std::printf("[PASS] ValueDetectorCore t1b sample count and confidence\n");
+    std::printf("[PASS] ValueDetectorCore sampled profile count and confidence\n");
 }
 
 static void TestValueDetectorCoreConfiguredSourceConfidence() {
@@ -244,7 +244,7 @@ static void TestValueDetectorCoreConfiguredSourceConfidence() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-5";
     spec.routed_feature_id = "bytes_total";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "traffic";
     SeriesBaselineSourceConfig source_config;
     source_config.key = "svc-target";
@@ -281,7 +281,7 @@ static void TestValueDetectorCoreDoesNotServeCandidateModel() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-candidate";
     spec.routed_feature_id = "bytes_total";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "traffic";
 
     ValueDetectorCore core(spec);
@@ -316,7 +316,7 @@ static void TestValueDetectorCoreUsesShardedRuntimeStorage() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-shards";
     spec.routed_feature_id = "bytes_total";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "traffic";
 
     ValueDetectorCore core(spec);
@@ -360,7 +360,7 @@ static void TestValueDetectorCoreKeyFeatureEventCalendar() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-6";
     spec.routed_feature_id = "bytes_total";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "traffic";
     spec.delta = 60;
     spec.tz = "UTC";
@@ -405,7 +405,7 @@ static void TestValueDetectorCoreShadowConfidenceAndReason() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-6";
     spec.routed_feature_id = "bytes_total";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "traffic";
 
     ValueDetectorCore core(spec);
@@ -437,7 +437,7 @@ static void TestValueDetectorCorePrunesIdleKeys() {
     ValueDetectorCoreSpec spec;
     spec.owner_task_id = "value-task-prune";
     spec.routed_feature_id = "bytes_total";
-    spec.feature_type = "t1a";
+    spec.feature_type = "value_basic";
     spec.feature_profile = "traffic";
 
     ValueDetectorCore core(spec);

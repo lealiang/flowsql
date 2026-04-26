@@ -41,7 +41,7 @@ struct ValueFeatureProfile {
     std::string feature_type;
     std::string feature_profile;
     std::string transform_name = "log1p";
-    bool is_t1b = false;
+    bool is_sampled = false;
     uint32_t n_train_min = 0;
     uint32_t n_score_min = 0;
     uint32_t n_shift_min = 0;

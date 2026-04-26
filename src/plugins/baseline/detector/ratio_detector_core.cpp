@@ -23,9 +23,6 @@ namespace baseline {
 
 namespace {
 
-constexpr double kShadowConfidenceCap = 0.8;
-constexpr double kShadowScoreScale = 1.5;
-
 const SharedProfileConfig& SharedConfig() {
     static const SharedProfileConfig config = DefaultSharedProfileConfig();
     return config;
@@ -141,9 +138,9 @@ bool BuildProfile(const RatioDetectorCoreSpec& spec,
     profile.feature_type = spec.feature_type;
     profile.feature_profile = spec.feature_profile;
 
-    T2ProfileConfig profile_config;
-    if (!GetT2ProfileConfig(spec.feature_profile, &profile_config)) {
-        if (err) *err = "unsupported t2 feature_profile";
+    RatioProfileConfig profile_config;
+    if (!GetRatioProfileConfig(spec.feature_profile, &profile_config)) {
+        if (err) *err = "unsupported ratio feature_profile";
         return false;
     }
 
@@ -221,7 +218,7 @@ SelectedRatioBaseline ResolveServiceableBaseline(
     const BaselineSourceConfig* baseline_source_config) {
     SelectedRatioBaseline selected;
 
-    // Sprint 20 BaselineA 对 T2 明确收口为 formal-only 来源：
+    // Sprint 20 BaselineA 对比例特征明确收口为 formal-only 来源：
     // 先尝试 self formal，再按静态配置依次尝试 configured source formal。
     // candidate model 仍可保留给慢路径状态观测，但不参与正式来源决策。
     if (PredictServiceableModel(spec,
@@ -339,23 +336,25 @@ double DriftDirectionSign(DriftDirection direction) {
     return 0.0;
 }
 
-double ClipProbability(double value) {
-    return std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, value));
+double ClipProbability(double value, double eps_logit) {
+    return std::min(1.0 - eps_logit, std::max(eps_logit, value));
 }
 
-double Logit(double value) {
-    const double clipped = ClipProbability(value);
+double Logit(double value, double eps_logit) {
+    const double clipped = ClipProbability(value, eps_logit);
     return std::log(clipped / (1.0 - clipped));
 }
 
 double ComputeSmoothedRatio(const RatioObservation& obs,
-                            const RatioFormalModel& model) {
+                            const RatioFormalModel& model,
+                            double eps_logit) {
     return ClipProbability((obs.numerator + model.alpha0) /
-                           (obs.denominator + model.alpha0 + model.beta0));
+                               (obs.denominator + model.alpha0 + model.beta0),
+                           eps_logit);
 }
 
 double ComputeEffectiveVariance(const RatioFeatureProfile& profile,
-                                const T2ProfileConfig& profile_config,
+                                const RatioProfileConfig& profile_config,
                                 double denominator,
                                 double p_hat_t) {
     const double var_ideal = denominator * p_hat_t * (1.0 - p_hat_t);
@@ -501,8 +500,8 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
         DriftDirection drift_direction = runtime_state.drift_state.direction;
         bool serviceable = false;
         bool shadow_active = false;
-        T2ProfileConfig profile_config;
-        (void)GetT2ProfileConfig(profile_.feature_profile, &profile_config);
+        RatioProfileConfig profile_config;
+        (void)GetRatioProfileConfig(profile_.feature_profile, &profile_config);
         const SharedProfileConfig& shared_config = SharedConfig();
         const DriftConfig& drift_config = shared_config.drift;
 
@@ -511,7 +510,7 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
         }
 
         // shadow 分支直接沿用冻结参考模型的概率预测，再叠加在线 delta。
-        // 对 T2 来说，delta 作用在概率空间，最终仍然按低分母放大的方差层做标准化。
+        // 对比例特征来说，delta 作用在概率空间，最终仍然按低分母放大的方差层做标准化。
         if (runtime_state.shadow_state.active &&
             runtime_state.shadow_state.frozen_ref_model) {
             FormalPrediction shadow_prediction;
@@ -530,10 +529,11 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
                 shadow_active = true;
                 const RatioFormalModel& shadow_model =
                     *runtime_state.shadow_state.frozen_ref_model;
-                p_smooth = ComputeSmoothedRatio(obs, shadow_model);
-                x_t = Logit(p_smooth);
+                p_smooth = ComputeSmoothedRatio(obs, shadow_model, profile_config.eps_logit);
+                x_t = Logit(p_smooth, profile_config.eps_logit);
                 p_hat_t = ClipProbability(
-                    shadow_prediction.value + runtime_state.shadow_state.delta);
+                    shadow_prediction.value + runtime_state.shadow_state.delta,
+                    profile_config.eps_logit);
                 var_eff_t = ComputeEffectiveVariance(
                     profile_, profile_config, obs.denominator, p_hat_t);
                 residual =
@@ -557,7 +557,7 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
 
                 if (gate_score) {
                     out_submit->detector_result.raw_score =
-                        std::fabs(residual) / kShadowScoreScale;
+                        std::fabs(residual) / RatioShadowScoreScale();
                     score_point = ComputePointScoreFromAbsResidual(
                         out_submit->detector_result.raw_score);
                 }
@@ -600,9 +600,10 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
                         ? "serviceable_self"
                         : "serviceable_source";
                 out_submit->detector_result.provider = selected.provider;
-                p_smooth = ComputeSmoothedRatio(obs, *selected.model);
-                x_t = Logit(p_smooth);
-                p_hat_t = ClipProbability(selected.prediction.value);
+                p_smooth =
+                    ComputeSmoothedRatio(obs, *selected.model, profile_config.eps_logit);
+                x_t = Logit(p_smooth, profile_config.eps_logit);
+                p_hat_t = ClipProbability(selected.prediction.value, profile_config.eps_logit);
                 var_eff_t = ComputeEffectiveVariance(
                     profile_, profile_config, obs.denominator, p_hat_t);
                 residual =
@@ -705,7 +706,7 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
 
             double confidence_base = runtime_state.readiness_state.confidence_base;
             if (shadow_active) {
-                confidence_base = std::min(confidence_base, kShadowConfidenceCap);
+                confidence_base = std::min(confidence_base, RatioShadowConfidenceCap());
             }
             out_submit->detector_result.confidence =
                 confidence_base / std::max(rho_t, 1.0);
@@ -739,7 +740,7 @@ int RatioDetectorCore::Submit(const RatioObservation& obs,
         pruned_key_count_total_.fetch_add(
             PruneBoundedStateMap(&prune_shard.states,
                                  &prune_shard.prune_cursor,
-                                 kRuntimeIdlePruneScanLimit,
+                                 RuntimeIdlePruneScanLimit(),
                                  [bucket_id = obs.bucket_id](const RatioSeriesShardEntry& entry) {
                                      return RuntimeStateIdleBeyondGap(
                                          entry.series_state.last_bucket_id, bucket_id);
@@ -917,7 +918,7 @@ void RatioDetectorCore::ApplyFormalModel(
     if (apply_result.candidate_trained) {
         runtime_state.formal_state.candidate_generation =
             apply_result.candidate_generation;
-        // `replace_formal_model` 的语义与 T1 相同：新 formal 一旦切换成功，
+        // `replace_formal_model` 的语义与数值特征一致：新 formal 一旦切换成功，
         // 就把旧 shadow / drift / candidate 状态整体丢弃，避免旧概率语义继续生效。
         if (apply_result.replace_formal_model) {
             runtime_state.formal_model = apply_result.full_model;
@@ -1026,7 +1027,7 @@ uint64_t RatioDetectorCore::PrunedKeyCount() const {
 }
 
 int64_t RatioDetectorCore::IdlePruneBucketGap() const {
-    return kRuntimeIdlePruneBucketGap;
+    return RuntimeIdlePruneBucketGap();
 }
 
 }  // namespace baseline

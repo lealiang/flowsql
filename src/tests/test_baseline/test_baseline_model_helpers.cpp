@@ -11,11 +11,13 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <framework/interfaces/ibaseline_types.h>
+#include <plugins/baseline/config/runtime_config.h>
 #include <plugins/baseline/config_parser.h>
 #include <plugins/baseline/fusion/relation_pattern_fusion.h>
 #include <plugins/baseline/model/calendar_feature_helper.h>
@@ -59,7 +61,7 @@ BaselineTaskSpec BuildEventTask() {
     task.name = "bytes_total";
     task.key = "svc-a";
     task.feature = "bytes_total";
-    task.feature_type = "t1a";
+    task.feature_type = "value_basic";
     task.feature_profile = "traffic";
     task.delta = 60;
     task.tz = "Asia/Shanghai";
@@ -68,7 +70,7 @@ BaselineTaskSpec BuildEventTask() {
 
 ValueFeatureProfile BuildValueT1aProfile() {
     ValueFeatureProfile profile;
-    profile.feature_type = "t1a";
+    profile.feature_type = "value_basic";
     profile.feature_profile = "traffic";
     profile.transform_name = "log1p";
     return profile;
@@ -95,7 +97,7 @@ std::shared_ptr<ValueFormalModel> BuildConstantValueFormalModel(double beta0,
 
 RatioFeatureProfile BuildRatioProfile() {
     RatioFeatureProfile profile;
-    profile.feature_type = "t2";
+    profile.feature_type = "ratio";
     profile.feature_profile = "rate_core";
     profile.d_min_train = 50;
     profile.d_score_min = 25;
@@ -141,16 +143,16 @@ void TestProfileConfigDefaultsAndDerivedValues() {
     assert(NearlyEqual(shared.drift.lambda_mem, 0.9));
     assert(shared.drift.m_shift == 3);
 
-    T1bProfileConfig cont_tail;
-    assert(GetT1bProfileConfig("cont_tail", &cont_tail));
+    ValueSampledProfileConfig cont_tail;
+    assert(GetValueSampledProfileConfig("cont_tail", &cont_tail));
     assert(cont_tail.n_train_min == 100);
     assert(cont_tail.n_score_min() == 50);
     assert(cont_tail.n_shift_min() == 200);
     assert(NearlyEqual(cont_tail.kappa_sample(), 100.0));
     assert(cont_tail.transform_name_override == "log1p");
 
-    T2ProfileConfig ratio_bursty;
-    assert(GetT2ProfileConfig("ratio_bursty", &ratio_bursty));
+    RatioProfileConfig ratio_bursty;
+    assert(GetRatioProfileConfig("ratio_bursty", &ratio_bursty));
     assert(ratio_bursty.d_min_train == 100);
     assert(ratio_bursty.d_score_min() == 50);
     assert(ratio_bursty.d_shift_min() == 200);
@@ -164,6 +166,200 @@ void TestProfileConfigDefaultsAndDerivedValues() {
     assert(NearlyEqual(prior.beta0, 3.6));
 
     std::printf("[PASS] Profile config defaults and derived values\n");
+}
+
+void TestRuntimeConfigYamlLoad() {
+    std::printf("[TEST] Runtime config YAML load...\n");
+
+    const std::string file_path = "/tmp/flowsql-baseline-runtime-config.yaml";
+    std::ofstream out(file_path);
+    out << R"(
+builtin_defaults:
+  parser_level_defaults:
+    tz_default: "UTC"
+  shared_profile_config:
+    k_day: 3
+    z_warn: 2.8
+    z_crit: 4.8
+  value_sampled_profiles:
+    cont_core:
+      n_train_min: 60
+      transform_name_override: "log1p"
+    cont_tail:
+      n_train_min: 120
+      transform_name_override: "log1p"
+  ratio_profiles:
+    global:
+      eps_logit: 1.0e-3
+      m_floor: 1.0e-3
+      v_floor: 0.3
+    rate_core:
+      d_min_train: 70
+      s_prior: 2.5
+      phi_over: 1.6
+    ratio_bursty:
+      d_min_train: 140
+      s_prior: 4.5
+      phi_over: 2.2
+  solver_constants:
+    solver_name: "weighted_huber_ridge_irls"
+    c_huber: 1.8
+    s_min_fit: 1.0e-3
+    max_iter_fit: 20
+    tol_obj_rel: 1.0e-4
+    tol_beta_inf: 1.0e-5
+    cond_max: 1.0e8
+  runtime_and_rebuild_constants:
+    runtime_state_prune:
+      idle_bucket_gap: 2048
+      prune_scan_limit: 16
+    candidate_builder:
+      min_train_point_count: 3
+    candidate_validator:
+      huber_delta: 2.0
+      shadow_alpha: 0.3
+      ratio_variance_floor: 0.4
+      switch_loss_abs_tol: 1.0e-10
+    relation_rebuild:
+      min_replay_for_holdout: 5
+      switch_validation_tail: 10
+  scoring_and_confidence_constants:
+    score_warn: 2.5
+    score_crit: 4.5
+    confidence_formal_base: 0.9
+    confidence_source_base: 0.7
+    confidence_shadow_base: 0.55
+    value_shadow_confidence_cap: 0.75
+    ratio_shadow_confidence_cap: 0.70
+    value_shadow_sigma_scale: 1.7
+    ratio_shadow_score_scale: 1.8
+  fusion_constants:
+    key_risk_fusion:
+      fuse_persistence_window: 4.0
+      window_limit: 3
+    relation_pattern_fusion:
+      lambda_sup: 0.6
+      lambda_opp: 0.4
+      fuse_persistence_window: 4.5
+)";
+    out.close();
+
+    std::string err;
+    assert(LoadBaselineRuntimeConfigFromYaml(file_path, true, &err) == 0);
+    assert(BaselineDefaultTimezone() == "UTC");
+
+    const SharedProfileConfig shared = DefaultSharedProfileConfig();
+    assert(shared.k_day == 3);
+    assert(NearlyEqual(shared.z_warn, 2.8));
+    assert(NearlyEqual(shared.z_crit, 4.8));
+
+    ValueSampledProfileConfig sampled_profile;
+    assert(GetValueSampledProfileConfig("cont_core", &sampled_profile));
+    assert(sampled_profile.n_train_min == 60);
+
+    RatioProfileConfig ratio_profile;
+    assert(GetRatioProfileConfig("rate_core", &ratio_profile));
+    assert(ratio_profile.d_min_train == 70);
+    assert(NearlyEqual(ratio_profile.s_prior, 2.5));
+    assert(NearlyEqual(ratio_profile.phi_over, 1.6));
+    assert(NearlyEqual(ratio_profile.eps_logit, 1.0e-3));
+    assert(NearlyEqual(ratio_profile.m_floor, 1.0e-3));
+    assert(NearlyEqual(ratio_profile.v_floor, 0.3));
+
+    assert(RuntimeIdlePruneBucketGap() == 2048);
+    assert(RuntimeIdlePruneScanLimit() == 16);
+    assert(CandidateMinTrainPointCount() == 3);
+    assert(NearlyEqual(CandidateHuberDelta(), 2.0));
+    assert(NearlyEqual(CandidateShadowAlpha(), 0.3));
+    assert(NearlyEqual(CandidateRatioVarianceFloor(), 0.4));
+    assert(NearlyEqual(CandidateSwitchLossAbsTol(), 1.0e-10));
+    assert(RelationMinReplayForHoldout() == 5);
+    assert(RelationSwitchValidationTail() == 10);
+
+    assert(NearlyEqual(ScoreWarn(), 2.5));
+    assert(NearlyEqual(ScoreCrit(), 4.5));
+    assert(NearlyEqual(ConfidenceFormalBase(), 0.9));
+    assert(NearlyEqual(ConfidenceSourceBase(), 0.7));
+    assert(NearlyEqual(ConfidenceShadowBase(), 0.55));
+    assert(NearlyEqual(ValueShadowConfidenceCap(), 0.75));
+    assert(NearlyEqual(RatioShadowConfidenceCap(), 0.70));
+    assert(NearlyEqual(ValueShadowSigmaScale(), 1.7));
+    assert(NearlyEqual(RatioShadowScoreScale(), 1.8));
+
+    assert(NearlyEqual(KeyFusionPersistenceWindow(), 4.0));
+    assert(KeyFusionWindowLimit() == 3);
+    assert(NearlyEqual(RelationPatternLambdaSup(), 0.6));
+    assert(NearlyEqual(RelationPatternLambdaOpp(), 0.4));
+    assert(NearlyEqual(RelationPatternPersistenceWindow(), 4.5));
+
+    const BlockSolverConfig solver = DefaultBlockSolverConfig();
+    assert(solver.max_iter_fit == 20);
+    assert(NearlyEqual(solver.c_huber, 1.8));
+
+    ResetBaselineRuntimeConfig();
+
+    assert(BaselineDefaultTimezone() == "Asia/Shanghai");
+    assert(RuntimeIdlePruneBucketGap() == 4096);
+    assert(RuntimeIdlePruneScanLimit() == 32);
+    assert(CandidateMinTrainPointCount() == 2);
+    assert(NearlyEqual(ScoreWarn(), 3.0));
+    assert(NearlyEqual(ScoreCrit(), 5.0));
+    assert(NearlyEqual(KeyFusionPersistenceWindow(), 3.0));
+    assert(KeyFusionWindowLimit() == 2);
+    assert(RelationMinReplayForHoldout() == 3);
+    assert(RelationSwitchValidationTail() == 16);
+
+    std::remove(file_path.c_str());
+    std::printf("[PASS] Runtime config YAML load\n");
+}
+
+void TestRuntimeConfigYamlValidation() {
+    std::printf("[TEST] Runtime config YAML validation...\n");
+
+    const std::string invalid_score_path = "/tmp/flowsql-baseline-runtime-config-invalid.yaml";
+    std::ofstream invalid_score(invalid_score_path);
+    invalid_score << R"(
+builtin_defaults:
+  scoring_and_confidence_constants:
+    score_warn: 5.0
+    score_crit: 4.0
+)";
+    invalid_score.close();
+
+    std::string err;
+    assert(LoadBaselineRuntimeConfigFromYaml(invalid_score_path, true, &err) != 0);
+    std::remove(invalid_score_path.c_str());
+
+    const std::string unknown_field_path = "/tmp/flowsql-baseline-runtime-config-unknown.yaml";
+    std::ofstream unknown_field(unknown_field_path);
+    unknown_field << R"(
+builtin_defaults:
+  scoring_and_confidence_constants:
+    score_warn: 3.0
+    score_crit: 5.0
+    unknown_field: 1
+)";
+    unknown_field.close();
+    err.clear();
+    assert(LoadBaselineRuntimeConfigFromYaml(unknown_field_path, true, &err) != 0);
+
+    const std::string invalid_relation_path = "/tmp/flowsql-baseline-runtime-config-relation.yaml";
+    std::ofstream invalid_relation(invalid_relation_path);
+    invalid_relation << R"(
+builtin_defaults:
+  runtime_and_rebuild_constants:
+    relation_rebuild:
+      min_replay_for_holdout: 0
+      switch_validation_tail: 16
+)";
+    invalid_relation.close();
+    err.clear();
+    assert(LoadBaselineRuntimeConfigFromYaml(invalid_relation_path, true, &err) != 0);
+
+    ResetBaselineRuntimeConfig();
+    std::remove(unknown_field_path.c_str());
+    std::remove(invalid_relation_path.c_str());
+    std::printf("[PASS] Runtime config YAML validation\n");
 }
 
 void TestCalendarFeatureHelper() {
@@ -268,7 +464,7 @@ void TestConfigParserTimezoneDefault() {
     BaselineTaskSpec value_spec;
     std::string err;
     const int value_rc = ConfigParser::ParseValueTask(
-        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"t1b","feature_profile":"cont_core","delta":60})",
+        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"value_sampled","feature_profile":"cont_core","delta":60})",
         &value_spec,
         &err);
     assert(value_rc == error::OK);
@@ -800,7 +996,7 @@ void TestWeightedHuberRidgeBlockSolver() {
 }
 
 void TestFormalModelTrainerStagesForValue() {
-    std::printf("[TEST] Formal model trainer staged T1 fit...\n");
+    std::printf("[TEST] Formal model trainer staged value fit...\n");
 
     constexpr int64_t delta = 86400;
     const int64_t start_bucket = UtcBucket(2026, 1, 1, 0, 0, 0, delta);
@@ -909,11 +1105,11 @@ void TestFormalModelTrainerStagesForValue() {
     assert(prediction.value > 1.0);
     assert(prediction.sigma_ref > 0.0);
 
-    std::printf("[PASS] Formal model trainer staged T1 fit\n");
+    std::printf("[PASS] Formal model trainer staged value fit\n");
 }
 
 void TestFormalModelTrainerStagesForRatio() {
-    std::printf("[TEST] Formal model trainer staged T2 fit...\n");
+    std::printf("[TEST] Formal model trainer staged ratio fit...\n");
 
     constexpr int64_t delta = 86400;
     const int64_t start_bucket = UtcBucket(2026, 1, 1, 0, 0, 0, delta);
@@ -922,7 +1118,7 @@ void TestFormalModelTrainerStagesForRatio() {
     task.name = "success_rate";
     task.key = "svc-ratio";
     task.feature = "success_rate";
-    task.feature_type = "t2";
+    task.feature_type = "ratio";
     task.feature_profile = "rate_core";
     task.delta = delta;
     task.tz = "UTC";
@@ -1035,7 +1231,7 @@ void TestFormalModelTrainerStagesForRatio() {
     assert(prediction.value > 0.0);
     assert(prediction.value < 1.0);
 
-    std::printf("[PASS] Formal model trainer staged T2 fit\n");
+    std::printf("[PASS] Formal model trainer staged ratio fit\n");
 }
 
 void TestCandidateBuilderHoldoutTailSplit() {
@@ -1223,6 +1419,8 @@ void TestRebuildOutcomeHelpers() {
 
 int main() {
     TestProfileConfigDefaultsAndDerivedValues();
+    TestRuntimeConfigYamlLoad();
+    TestRuntimeConfigYamlValidation();
     TestCalendarFeatureHelper();
     TestEventCalendarMatcherScopeAndOverlap();
     TestConfigParserTimezoneDefault();

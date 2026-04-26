@@ -98,9 +98,9 @@ void TestRebuildWithoutHistoryReader() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
     const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"t2","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
     const char* relation_cfg =
         R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
 

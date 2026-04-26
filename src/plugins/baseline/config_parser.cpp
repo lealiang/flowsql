@@ -16,6 +16,9 @@
 
 #include <rapidjson/document.h>
 
+#include "plugins/baseline/config/runtime_config.h"
+#include "plugins/baseline/model/profile_config.h"
+
 namespace flowsql {
 namespace baseline {
 
@@ -171,7 +174,7 @@ bool IsAllowedValue(const std::string& value,
 
 void ApplyDefaultTimezone(std::string* tz) {
     if (!tz || !tz->empty()) return;
-    *tz = "Asia/Shanghai";
+    *tz = BaselineDefaultTimezone();
 }
 
 int ParseEventCalendarSpec(const rapidjson::Value& obj,
@@ -509,15 +512,16 @@ int ConfigParser::ParseValueTask(const char* config_json,
     int rc = ParseScalarTaskInternal(config_json, out, err);
     if (rc != error::OK) return rc;
 
-    if (out->feature_type != "t1a" && out->feature_type != "t1b") {
-        if (err) *err = "feature_type for value task must be t1a or t1b";
+    if (out->feature_type != "value_basic" && out->feature_type != "value_sampled") {
+        if (err) *err = "feature_type for value task must be value_basic or value_sampled";
         return error::BAD_REQUEST;
     }
-    if (out->feature_type == "t1b" &&
-        out->feature_profile != "cont_core" &&
-        out->feature_profile != "cont_tail") {
-        if (err) *err = "t1b feature_profile must be cont_core or cont_tail";
-        return error::BAD_REQUEST;
+    if (out->feature_type == "value_sampled") {
+        ValueSampledProfileConfig sampled_profile;
+        if (!GetValueSampledProfileConfig(out->feature_profile, &sampled_profile)) {
+            if (err) *err = "unsupported value_sampled feature_profile";
+            return error::BAD_REQUEST;
+        }
     }
     return error::OK;
 }
@@ -528,13 +532,13 @@ int ConfigParser::ParseRatioTask(const char* config_json,
     int rc = ParseScalarTaskInternal(config_json, out, err);
     if (rc != error::OK) return rc;
 
-    if (out->feature_type != "t2" && out->feature_type != "ratio") {
-        if (err) *err = "feature_type for ratio task must be t2 or ratio";
+    if (out->feature_type != "ratio") {
+        if (err) *err = "feature_type for ratio task must be ratio";
         return error::BAD_REQUEST;
     }
-    if (out->feature_profile != "rate_core" &&
-        out->feature_profile != "ratio_bursty") {
-        if (err) *err = "t2 feature_profile must be rate_core or ratio_bursty";
+    RatioProfileConfig ratio_profile;
+    if (!GetRatioProfileConfig(out->feature_profile, &ratio_profile)) {
+        if (err) *err = "unsupported ratio feature_profile";
         return error::BAD_REQUEST;
     }
     return error::OK;

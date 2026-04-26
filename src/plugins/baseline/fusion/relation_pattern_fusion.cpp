@@ -18,14 +18,12 @@
 #include <utility>
 #include <vector>
 
+#include "plugins/baseline/config/runtime_config.h"
+
 namespace flowsql {
 namespace baseline {
 
 namespace {
-
-constexpr double kLambdaSup = 0.5;
-constexpr double kLambdaOpp = 0.5;
-constexpr double kFusePersistenceWindow = 3.0;
 
 struct EvidenceSignal {
     bool present = false;
@@ -53,7 +51,7 @@ double ClipUnit(double value) {
 
 double ComputeEvidenceStrength(const DetectorResult& result) {
     const double persistence_ratio =
-        std::min(1.0, static_cast<double>(result.persistence) / kFusePersistenceWindow);
+        std::min(1.0, static_cast<double>(result.persistence) / RelationPatternPersistenceWindow());
     return ClipUnit(result.normalized_score) * ClipUnit(result.confidence) * persistence_ratio;
 }
 
@@ -178,7 +176,8 @@ MetricPatternSignal ComputeSupportEscape(const MetricEvidenceBundle& bundle) {
         entropy ? entropy->a_down : 0.0,
     });
 
-    signal.score = ClipUnit(core + kLambdaSup * support - kLambdaOpp * oppose);
+    signal.score =
+        ClipUnit(core + RelationPatternLambdaSup() * support - RelationPatternLambdaOpp() * oppose);
     if (signal.score <= 0.0) return signal;
 
     AppendSupportingFeature(out_support->feature, &signal.supporting_features);
@@ -211,7 +210,8 @@ MetricPatternSignal ComputeHeadConcentration(const MetricEvidenceBundle& bundle)
         entropy ? entropy->a_up : 0.0,
     });
 
-    signal.score = ClipUnit(core + kLambdaSup * support - kLambdaOpp * oppose);
+    signal.score =
+        ClipUnit(core + RelationPatternLambdaSup() * support - RelationPatternLambdaOpp() * oppose);
     if (signal.score <= 0.0) return signal;
 
     AppendSupportingFeature(top1->feature, &signal.supporting_features);
@@ -239,7 +239,8 @@ MetricPatternSignal ComputeLegacyHeadDilution(const MetricEvidenceBundle& bundle
     });
     const double oppose = coverage->a_up;
 
-    signal.score = ClipUnit(core + kLambdaSup * support - kLambdaOpp * oppose);
+    signal.score =
+        ClipUnit(core + RelationPatternLambdaSup() * support - RelationPatternLambdaOpp() * oppose);
     if (signal.score <= 0.0) return signal;
 
     AppendSupportingFeature(coverage->feature, &signal.supporting_features);
@@ -267,7 +268,7 @@ MetricPatternSignal ComputeStableHeadMixShift(const MetricEvidenceBundle& bundle
         out_support ? out_support->a_up : 0.0,
     });
 
-    signal.score = ClipUnit(core - kLambdaOpp * oppose);
+    signal.score = ClipUnit(core - RelationPatternLambdaOpp() * oppose);
     if (signal.score <= 0.0) return signal;
 
     AppendSupportingFeature(mix_drift->feature, &signal.supporting_features);
@@ -385,11 +386,11 @@ int RelationPatternFusion::Compute(const RelationPatternFusionInput& input,
     std::vector<double> single_evidence;
     single_evidence.reserve(ranked_singles.size());
     for (const auto& item : ranked_singles) single_evidence.push_back(item.first);
-    double risk_single_t3 = 0.0;
+    double risk_single = 0.0;
     if (!single_evidence.empty()) {
         double product = 1.0;
         for (double value : single_evidence) product *= (1.0 - value);
-        risk_single_t3 = 1.0 - product;
+        risk_single = 1.0 - product;
     }
 
     std::vector<std::pair<double, StoredDominantPatternProjection>> ranked_patterns;
@@ -464,7 +465,7 @@ int RelationPatternFusion::Compute(const RelationPatternFusionInput& input,
     }
 
     out->fusion_result.risk =
-        1.0 - (1.0 - risk_single_t3) * (1.0 - risk_pattern);
+        1.0 - (1.0 - risk_single) * (1.0 - risk_pattern);
     return error::OK;
 }
 

@@ -3,6 +3,7 @@ find_package(ICU REQUIRED COMPONENTS uc i18n)
 
 add_library(${PROJECT_NAME} SHARED
     baseline_plugin.cpp
+    config/runtime_config.cpp
     config_parser.cpp
     detector/ratio_detector_core.cpp
     detector/value_detector_core.cpp
@@ -35,7 +36,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
     ${ICU_INCLUDE_DIRS}
 )
 
-add_thirddepen(${PROJECT_NAME} eigen rapidjson)
+add_thirddepen(${PROJECT_NAME} eigen rapidjson yaml-cpp)
 target_link_libraries(${PROJECT_NAME} ${ICU_LIBRARIES})
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

@@ -4,6 +4,7 @@ find_package(ICU REQUIRED COMPONENTS uc i18n)
 add_executable(${PROJECT_NAME} test_baseline_plugin.cpp)
 add_executable(test_baseline_value_task
     test_baseline_value_task.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/config/runtime_config.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/detector/value_detector_core.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/event_calendar_matcher.cpp
@@ -13,6 +14,7 @@ add_executable(test_baseline_value_task
 )
 add_executable(test_baseline_ratio_task
     test_baseline_ratio_task.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/config/runtime_config.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/detector/ratio_detector_core.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/event_calendar_matcher.cpp
@@ -22,6 +24,7 @@ add_executable(test_baseline_ratio_task
 )
 add_executable(test_baseline_relation_task
     test_baseline_relation_task.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/config/runtime_config.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/config_parser.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/fusion/key_risk_fusion.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/fusion/relation_pattern_fusion.cpp
@@ -48,6 +51,7 @@ add_executable(test_baseline_relation_task
 )
 add_executable(test_baseline_model_helpers
     test_baseline_model_helpers.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/config/runtime_config.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/config_parser.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/fusion/relation_pattern_fusion.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
@@ -101,7 +105,10 @@ target_compile_options(test_baseline_relation_task PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_model_helpers PRIVATE -UNDEBUG)
 
 add_thirddepen(test_baseline_model_helpers eigen rapidjson)
-add_thirddepen(test_baseline_relation_task eigen rapidjson)
+add_thirddepen(test_baseline_relation_task eigen rapidjson yaml-cpp)
+add_thirddepen(test_baseline_model_helpers yaml-cpp)
+add_thirddepen(test_baseline_value_task yaml-cpp)
+add_thirddepen(test_baseline_ratio_task yaml-cpp)
 target_compile_options(test_baseline_task_headers PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rebuild PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_concurrency PRIVATE -UNDEBUG)

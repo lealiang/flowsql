@@ -66,7 +66,7 @@ void MaybePruneRuntimeByKeyLocked(
     *pruned_key_count_total +=
         PruneBoundedStateMap(runtime_by_key,
                             prune_cursor,
-                            kRuntimeIdlePruneScanLimit,
+                            RuntimeIdlePruneScanLimit(),
                             [current_bucket](const RelationTaskKeyRuntimeState& runtime_state) {
                                 return RuntimeStateIdleBeyondGap(runtime_state.last_bucket_id,
                                                                  current_bucket);
@@ -514,12 +514,10 @@ const RelationRoutedFeatureRuntime* FindRoutedFeatureRuntime(
     return nullptr;
 }
 
-constexpr std::size_t kRelationMinReplayForHoldout = 3;
-constexpr std::size_t kRelationSwitchValidationTail = 16;
-
 std::size_t DecideRelationHoldoutCount(std::size_t total_count) {
-    if (total_count < kRelationMinReplayForHoldout) return 0;
-    return std::min(kRelationSwitchValidationTail, total_count / 2);
+    const std::size_t min_replay_for_holdout = RelationMinReplayForHoldout();
+    if (total_count < min_replay_for_holdout) return 0;
+    return std::min(RelationSwitchValidationTail(), total_count / 2);
 }
 
 ReplayWindowSummary BuildRelationWindowSummary(
@@ -862,7 +860,7 @@ int BaselineRelationTask::QueryTaskSnapshotJson(std::string* out_json) const {
     writer.Key("key_runtime_count");
     writer.Uint64(key_runtime_count);
     writer.Key("idle_prune_bucket_gap");
-    writer.Int64(kRuntimeIdlePruneBucketGap);
+    writer.Int64(RuntimeIdlePruneBucketGap());
     writer.Key("pruned_key_count_total");
     writer.Uint64(pruned_key_count_total);
     writer.Key("reader_bound");

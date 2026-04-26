@@ -12,6 +12,11 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+
+#include "config/runtime_config.h"
 #include "config_parser.h"
 #include "fusion/key_risk_fusion.h"
 #include "model/event_calendar_matcher.h"
@@ -67,10 +72,51 @@ BaselinePlugin::~BaselinePlugin() = default;
 
 int BaselinePlugin::Option(const char* arg) {
     option_ = arg ? arg : "";
+    config_file_.clear();
+    config_strict_ = true;
+
+    if (option_.empty()) return error::OK;
+    std::size_t pos = 0;
+    while (pos < option_.size()) {
+        const std::size_t eq = option_.find('=', pos);
+        if (eq == std::string::npos) break;
+        std::size_t end = option_.find(';', eq);
+        if (end == std::string::npos) end = option_.size();
+
+        const std::string key = option_.substr(pos, eq - pos);
+        const std::string value = option_.substr(eq + 1, end - eq - 1);
+        if (key == "config_file") {
+            config_file_ = value;
+        } else if (key == "strict") {
+            std::string lowered = value;
+            std::transform(lowered.begin(),
+                           lowered.end(),
+                           lowered.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lowered == "1" || lowered == "true" || lowered == "yes") {
+                config_strict_ = true;
+            } else if (lowered == "0" || lowered == "false" || lowered == "no") {
+                config_strict_ = false;
+            } else {
+                return error::BAD_REQUEST;
+            }
+        }
+        pos = end < option_.size() ? end + 1 : option_.size();
+    }
     return error::OK;
 }
 
 int BaselinePlugin::Load(IQuerier* querier) {
+    std::string err;
+    const int rc =
+        LoadBaselineRuntimeConfigFromYaml(config_file_, config_strict_, &err);
+    if (rc != error::OK) {
+        if (!err.empty()) {
+            std::fprintf(stderr, "[baseline] load runtime config failed: %s\n", err.c_str());
+        }
+        return rc;
+    }
+
     querier_ = querier;
     (void)SolverBackend::IsAvailable();
     return error::OK;
@@ -83,6 +129,7 @@ int BaselinePlugin::Unload() {
     rebuild_worker_ = std::make_unique<RebuildWorker>(rebuild_queue_.get());
     key_risk_fusion_ = std::make_unique<KeyRiskFusion>();
     querier_ = nullptr;
+    ResetBaselineRuntimeConfig();
     return error::OK;
 }
 

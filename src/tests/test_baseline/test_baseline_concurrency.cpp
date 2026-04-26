@@ -81,7 +81,7 @@ void TestConcurrentSubmitAndSnapshotQueries() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineValueTask* value_task = nullptr;
     assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
@@ -176,7 +176,7 @@ void TestCloseWaitsForInflightRebuild() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineValueTask* value_task = nullptr;
     assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
@@ -217,7 +217,7 @@ void TestPerformanceSmoke() {
     auto* service = env.service;
 
     const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"t1a","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
+        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
 
     IBaselineValueTask* value_task = nullptr;
     assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
