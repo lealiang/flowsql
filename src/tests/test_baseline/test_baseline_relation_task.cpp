@@ -7,12 +7,14 @@
  */
 
 #include <cassert>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <rapidjson/document.h>
 #include <string>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 
 #include <common/error_code.h>
 #include <framework/interfaces/ibaseline_service.h>
@@ -44,16 +46,17 @@ rapidjson::Document ParseJson(const std::string& json) {
 
 class TestRelationSourceResolver : public IBaselineSourceResolver {
  public:
+    explicit TestRelationSourceResolver(
+        std::string config_json = R"({"baseline_sources":[{"source_key":"svc-source"}]})")
+        : config_json_(std::move(config_json)) {}
+
     int ResolveBaselineSource(const BaselineStringRef& key,
                               const BaselineStringRef& feature,
                               std::string* out_config_json) override {
         last_key_ = key.data ? std::string(key.data, key.size) : "";
         last_feature_ = feature.data ? std::string(feature.data, feature.size) : "";
         ++call_count_;
-        if (out_config_json) {
-            *out_config_json =
-                R"({"baseline_sources":[{"source_key":"svc-source"}]})";
-        }
+        if (out_config_json) *out_config_json = config_json_;
         return error::OK;
     }
 
@@ -65,7 +68,27 @@ class TestRelationSourceResolver : public IBaselineSourceResolver {
     int call_count_ = 0;
     std::string last_key_;
     std::string last_feature_;
+    std::string config_json_;
 };
+
+RelationTaskSpec BuildRelationTaskSpecForEncodeValidation(const std::string& task_id,
+                                                          const std::string& encode_type) {
+    RelationTaskSpec spec;
+    spec.task_id = task_id;
+    spec.name = "client_group_mix";
+    spec.feature_base = "client_group_mix";
+    spec.group_space_id = "client_group";
+    spec.group_space_version = "v1";
+    spec.metric_set_id = "net_metrics";
+    spec.metrics = {"conn_count"};
+    spec.encode_type = encode_type;
+    spec.support_policy.k_support = 8;
+    spec.support_policy.min_hist_share = 0.005;
+    spec.support_policy.min_active_ratio = 0.2;
+    spec.summary_policy.k_head = 2;
+    spec.summary_policy.k_stable = 2;
+    return spec;
+}
 
 void TestProtocolContract() {
     std::printf("[TEST] Baseline protocol contract...\n");
@@ -272,6 +295,8 @@ void TestParseRelationTaskSpec() {
   "metric_set_id": "traffic",
   "metrics": ["conn_count", "bps", "pps"],
   "encode_type": "topk_other",
+  "other_group_idx": 7,
+  "other_group_idxs": [9, 8],
   "support_policy": {
     "k_support": 8,
     "min_hist_share": 0.005,
@@ -300,6 +325,10 @@ void TestParseRelationTaskSpec() {
     assert(spec.metrics[1] == "bps");
     assert(spec.metrics[2] == "pps");
     assert(spec.encode_type == "topk_other");
+    assert(spec.other_group_idxs.size() == 3);
+    assert(spec.other_group_idxs[0] == 7);
+    assert(spec.other_group_idxs[1] == 8);
+    assert(spec.other_group_idxs[2] == 9);
     assert(spec.support_policy.k_support == 8);
     assert(NearlyEqual(spec.support_policy.min_hist_share, 0.005));
     assert(NearlyEqual(spec.support_policy.min_active_ratio, 0.2));
@@ -377,7 +406,109 @@ void TestParseRelationTaskSpec() {
                                            &create_spec,
                                            &err) == error::BAD_REQUEST);
 
+    const char* invalid_other_for_exact_sparse_json = R"JSON(
+{
+  "name": "client_group_mix",
+  "feature_base": "client_group_mix",
+  "group_space_id": "client_group",
+  "delta": 60,
+  "tz": "Asia/Shanghai",
+  "metric_set_id": "traffic",
+  "metrics": ["conn_count"],
+  "encode_type": "exact_sparse",
+  "other_group_idxs": [9],
+  "support_policy": {
+    "k_support": 8,
+    "min_hist_share": 0.005,
+    "min_active_ratio": 0.2
+  },
+  "summary_policy": {
+    "k_head": 5,
+    "k_stable": 3
+  }
+}
+)JSON";
+    assert(ConfigParser::ParseRelationTask(invalid_other_for_exact_sparse_json,
+                                           &create_spec,
+                                           &err) == error::BAD_REQUEST);
+
     std::printf("[PASS] Relation task spec parsing\n");
+}
+
+void TestRelationEncodeTypeValidationOnSubmit() {
+    std::printf("[TEST] Relation block encode_type validation...\n");
+
+    const uint32_t group_idx[] = {11, 12};
+    const double values[] = {40.0, 30.0};
+    const RelationMetricBlock metrics[] = {
+        {100.0, 0, 0, values},
+    };
+    const RelationObservationBlock block{
+        BaselineStringRef{"svc-a", 5},
+        100,
+        2,
+        group_idx,
+        1,
+        metrics};
+
+    RelationTaskClockSpec clock_spec;
+    clock_spec.delta = 60;
+    clock_spec.tz = "UTC";
+    KeyRiskFusion fusion;
+
+    const RelationTaskSpec exact_spec =
+        BuildRelationTaskSpecForEncodeValidation("relation-encode-exact", "exact_sparse");
+    BaselineRelationTask exact_task(
+        nullptr, nullptr, exact_spec.task_id, exact_spec, clock_spec, std::nullopt, nullptr, &fusion);
+    FusionResult result{};
+    assert(exact_task.SubmitBlock(block, &result) == error::BAD_REQUEST);
+
+    const RelationTaskSpec topk_spec =
+        BuildRelationTaskSpecForEncodeValidation("relation-encode-topk", "topk_other");
+    BaselineRelationTask topk_task(
+        nullptr, nullptr, topk_spec.task_id, topk_spec, clock_spec, std::nullopt, nullptr, &fusion);
+    assert(topk_task.SubmitBlock(block, &result) == error::OK);
+
+    std::printf("[PASS] Relation block encode_type validation\n");
+}
+
+void TestRelationOtherGroupIdxValidationOnSubmit() {
+    std::printf("[TEST] Relation other_group_idxs validation on submit...\n");
+
+    const uint32_t group_idx[] = {11, 77};
+    const double values[] = {60.0, 40.0};
+    const RelationMetricBlock metrics[] = {
+        {100.0, 0, 0, values},
+    };
+    const RelationObservationBlock block{
+        BaselineStringRef{"svc-a", 5},
+        101,
+        2,
+        group_idx,
+        1,
+        metrics};
+
+    RelationTaskClockSpec clock_spec;
+    clock_spec.delta = 60;
+    clock_spec.tz = "UTC";
+    KeyRiskFusion fusion;
+    FusionResult result{};
+
+    RelationTaskSpec exact_spec =
+        BuildRelationTaskSpecForEncodeValidation("relation-other-exact", "exact_sparse");
+    exact_spec.other_group_idxs = {77};
+    BaselineRelationTask exact_task(
+        nullptr, nullptr, exact_spec.task_id, exact_spec, clock_spec, std::nullopt, nullptr, &fusion);
+    assert(exact_task.SubmitBlock(block, &result) == error::BAD_REQUEST);
+
+    RelationTaskSpec topk_spec =
+        BuildRelationTaskSpecForEncodeValidation("relation-other-topk", "topk_other");
+    topk_spec.other_group_idxs = {77};
+    BaselineRelationTask topk_task(
+        nullptr, nullptr, topk_spec.task_id, topk_spec, clock_spec, std::nullopt, nullptr, &fusion);
+    assert(topk_task.SubmitBlock(block, &result) == error::OK);
+
+    std::printf("[PASS] Relation other_group_idxs validation on submit\n");
 }
 
 void TestBuildRelationBasisAndEvalBasis() {
@@ -433,6 +564,42 @@ void TestBuildRelationBasisAndEvalBasis() {
            RelationLineageCompatibility::kNewLineage);
 
     std::printf("[PASS] Relation basis build and eval basis\n");
+}
+
+void TestBuildRelationBasisExcludeOtherGroupIdxs() {
+    std::printf("[TEST] Relation basis excludes other_group_idxs...\n");
+
+    RelationBasisBuildInput input;
+    input.basis_version = 4;
+    input.feature_base = "client_group_mix";
+    input.metric_name = "bps";
+    input.group_space_id = "client_group";
+    input.group_space_version = "v1";
+    input.other_group_idxs = {77};
+    input.support_policy.k_support = 3;
+    input.support_policy.min_hist_share = 0.05;
+    input.support_policy.min_active_ratio = 0.20;
+    input.summary_policy.k_head = 2;
+    input.summary_policy.k_stable = 2;
+    input.valid_bucket_count = 10;
+    input.group_stats = {
+        {77, 70.0, 10},
+        {11, 20.0, 10},
+        {12, 10.0, 6},
+    };
+
+    RelationServiceBasis basis;
+    assert(RelationBasisBuilder::BuildServiceBasis(input, &basis) == error::OK);
+    assert(basis.other_group_idxs.size() == 1);
+    assert(basis.other_group_idxs[0] == 77);
+    assert(std::find(basis.support_explicit.begin(),
+                     basis.support_explicit.end(),
+                     77) == basis.support_explicit.end());
+    assert(basis.support_explicit.size() == 2);
+    assert(basis.support_explicit[0] == 11);
+    assert(basis.support_explicit[1] == 12);
+
+    std::printf("[PASS] Relation basis excludes other_group_idxs\n");
 }
 
 void TestRelationTaskSeedMetricBasisViaTestAccess() {
@@ -645,6 +812,48 @@ void TestExtractRelationSummaries() {
     std::printf("[PASS] Relation summary extraction\n");
 }
 
+void TestExtractRelationSummariesExcludeOtherGroupIdxs() {
+    std::printf("[TEST] Relation summary excludes other_group_idxs from top/support...\n");
+
+    RelationServiceBasis basis;
+    basis.basis_version = 1;
+    basis.feature_base = "client_group_mix";
+    basis.metric_name = "bps";
+    basis.group_space_id = "client_group";
+    basis.group_space_version = "v1";
+    basis.k_head = 2;
+    basis.other_group_idxs = {77};
+    // 故意把 77 放进 support_explicit，验证提取阶段仍会排除该聚合槽位。
+    basis.support_explicit = {11, 12, 77};
+    basis.stable_head = {11, 12};
+    basis.head_proto_q = {0.5, 0.5};
+
+    const uint32_t group_idx[] = {11, 50, 77};
+    const double values[] = {30.0, 10.0, 60.0};
+    const RelationMetricBlock metrics[] = {
+        {100.0, 0, 0, values},
+    };
+    const RelationObservationBlock block{
+        BaselineStringRef{"svc-a", 5},
+        21,
+        3,
+        group_idx,
+        1,
+        metrics};
+
+    RelationMetricSummary summary;
+    assert(RelationSummaryExtractor::ExtractMetricSummary(block, 0, basis, &summary) == error::OK);
+    assert(summary.valid == true);
+    assert(NearlyEqual(summary.top1_share, 0.3));
+    assert(NearlyEqual(summary.headk_share, 0.4));
+    assert(NearlyEqual(summary.out_of_support_share, 0.7));
+    assert(summary.stable_g_shares.size() == 2);
+    assert(NearlyEqual(summary.stable_g_shares[0], 0.3));
+    assert(NearlyEqual(summary.stable_g_shares[1], 0.0));
+
+    std::printf("[PASS] Relation summary excludes other_group_idxs from top/support\n");
+}
+
 void TestRelationRouter() {
     std::printf("[TEST] Relation routed feature mapping...\n");
 
@@ -782,6 +991,21 @@ void TestRelationRouter() {
     }
     assert(found_ratio == true);
 
+    TestRelationSourceResolver self_source_resolver(
+        R"({"baseline_sources":[{"source_key":"svc-a"}]})");
+    std::vector<RelationRoutedFeatureSpec> self_source_specs;
+    RelationRouter::BuildRoutedFeatureSpecs(spec,
+                                           basis,
+                                           clock_spec,
+                                           BaselineStringRef{"svc-a", 5},
+                                           &calendar_spec,
+                                           &self_source_resolver,
+                                           &self_source_specs);
+    assert(!self_source_specs.empty());
+    for (const auto& routed_spec : self_source_specs) {
+        assert(!routed_spec.baseline_source_config.has_value());
+    }
+
     std::printf("[PASS] Relation routed feature mapping\n");
 }
 
@@ -791,10 +1015,14 @@ int main() {
     TestProtocolContract();
     TestParseValueTaskBaselineSourceConfig();
     TestParseRelationTaskSpec();
+    TestRelationEncodeTypeValidationOnSubmit();
+    TestRelationOtherGroupIdxValidationOnSubmit();
     TestBuildRelationBasisAndEvalBasis();
+    TestBuildRelationBasisExcludeOtherGroupIdxs();
     TestRelationTaskSeedMetricBasisViaTestAccess();
     TestKeyRiskFusionRemoveTaskContributionsByTaskId();
     TestExtractRelationSummaries();
+    TestExtractRelationSummariesExcludeOtherGroupIdxs();
     TestRelationRouter();
     std::printf("[DONE] test_baseline_relation_task\n");
     return 0;

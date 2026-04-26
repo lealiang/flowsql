@@ -19,6 +19,8 @@
 namespace flowsql {
 namespace baseline {
 
+constexpr double kT2EpsLogit = 1e-4;
+
 // SharedProfileConfig 承载 design.md 第 12 章定义的 T1/T2 公共主参数。
 // detector / trainer 不应各自硬编码这些值，后续参数标定也应从这里收口。
 struct SharedProfileConfig {
@@ -87,7 +89,7 @@ struct T2ProfileConfig {
     uint32_t d_min_train = 0;
     double phi_over = 1.0;
     double m_floor = 1e-4;
-    double eps_logit = 1e-4;
+    double eps_logit = kT2EpsLogit;
     double v_floor = 0.25;
 
     uint32_t d_score_min() const { return (d_min_train + 1) / 2; }

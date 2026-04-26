@@ -38,6 +38,7 @@ struct RelationBasisBuildInput {
     std::string metric_name;
     std::string group_space_id;
     std::string group_space_version;
+    std::vector<uint32_t> other_group_idxs;
     RelationSupportPolicySpec support_policy;
     RelationSummaryPolicySpec summary_policy;
     uint64_t valid_bucket_count = 0;
@@ -51,6 +52,7 @@ struct RelationServiceBasis {
     std::string group_space_id;
     std::string group_space_version;
     int32_t k_head = 0;
+    std::vector<uint32_t> other_group_idxs;
     std::vector<uint32_t> support_explicit;
     std::vector<uint32_t> stable_head;
     std::vector<double> head_proto_q;

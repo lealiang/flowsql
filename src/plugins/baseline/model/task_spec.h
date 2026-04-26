@@ -53,6 +53,7 @@ struct RelationTaskSpec {
     std::string metric_set_id;
     std::vector<std::string> metrics;
     std::string encode_type;
+    std::vector<uint32_t> other_group_idxs;
     RelationSupportPolicySpec support_policy;
     RelationSummaryPolicySpec summary_policy;
     std::string config_json;

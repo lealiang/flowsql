@@ -11,9 +11,10 @@
 #include <common/error_code.h>
 
 #include <algorithm>
-#include <optional>
 #include <memory>
+#include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <rapidjson/stringbuffer.h>
@@ -79,6 +80,8 @@ int ValidateRelationBlock(const RelationTaskSpec& spec,
     if (block.metric_count != spec.metrics.size()) return error::BAD_REQUEST;
     if (block.nnz > 0 && !block.group_idx) return error::BAD_REQUEST;
     if (block.metric_count > 0 && !block.metrics) return error::BAD_REQUEST;
+    const std::unordered_set<uint32_t> other_group_set(
+        spec.other_group_idxs.begin(), spec.other_group_idxs.end());
 
     for (uint32_t i = 0; i < block.metric_count; ++i) {
         const auto& metric = block.metrics[i];
@@ -89,10 +92,26 @@ int ValidateRelationBlock(const RelationTaskSpec& spec,
             if (j > 0 && block.group_idx[j - 1] >= block.group_idx[j]) {
                 return error::BAD_REQUEST;
             }
+            if (spec.encode_type == "exact_sparse" &&
+                other_group_set.find(block.group_idx[j]) != other_group_set.end()) {
+                return error::BAD_REQUEST;
+            }
             if (metric.values[j] < 0.0) return error::BAD_REQUEST;
             value_sum += metric.values[j];
         }
-        if (value_sum > metric.total + 1e-9) return error::BAD_REQUEST;
+
+        const double tol = 1e-9 * std::max(1.0, metric.total);
+        if (spec.encode_type == "exact_sparse") {
+            if (value_sum < metric.total - tol || value_sum > metric.total + tol) {
+                return error::BAD_REQUEST;
+            }
+            continue;
+        }
+        if (spec.encode_type == "topk_other") {
+            if (value_sum > metric.total + tol) return error::BAD_REQUEST;
+            continue;
+        }
+        return error::BAD_REQUEST;
     }
     return error::OK;
 }
@@ -106,14 +125,18 @@ RelationBasisBuildInput MakeBootstrapBasisInput(const RelationTaskSpec& spec,
     input.metric_name = spec.metrics[metric_index];
     input.group_space_id = spec.group_space_id;
     input.group_space_version = spec.group_space_version.value_or("");
+    input.other_group_idxs = spec.other_group_idxs;
     input.support_policy = spec.support_policy;
     input.summary_policy = spec.summary_policy;
     input.valid_bucket_count = 1;
     input.group_stats.reserve(block.nnz);
     const RelationMetricBlock& metric = block.metrics[metric_index];
+    const std::unordered_set<uint32_t> other_group_set(
+        spec.other_group_idxs.begin(), spec.other_group_idxs.end());
     for (uint32_t i = 0; i < block.nnz; ++i) {
         const double mass = metric.values[i];
         if (mass <= 0.0) continue;
+        if (other_group_set.find(block.group_idx[i]) != other_group_set.end()) continue;
         input.group_stats.push_back(RelationGroupHistoryStat{block.group_idx[i], mass, 1});
     }
     return input;
@@ -263,6 +286,7 @@ bool SameRelationServiceBasis(const RelationServiceBasis& lhs,
            lhs.group_space_id == rhs.group_space_id &&
            lhs.group_space_version == rhs.group_space_version &&
            lhs.k_head == rhs.k_head &&
+           lhs.other_group_idxs == rhs.other_group_idxs &&
            lhs.support_explicit == rhs.support_explicit &&
            lhs.stable_head == rhs.stable_head &&
            lhs.head_proto_q == rhs.head_proto_q;
@@ -644,9 +668,12 @@ RelationBasisBuildInput BuildRelationBasisInput(const RelationTaskSpec& spec,
     input.metric_name = spec.metrics[metric_index];
     input.group_space_id = spec.group_space_id;
     input.group_space_version = spec.group_space_version.value_or("");
+    input.other_group_idxs = spec.other_group_idxs;
     input.support_policy = spec.support_policy;
     input.summary_policy = spec.summary_policy;
 
+    const std::unordered_set<uint32_t> other_group_set(
+        spec.other_group_idxs.begin(), spec.other_group_idxs.end());
     std::unordered_map<uint32_t, RelationGroupHistoryStat> stats_by_group;
     const std::size_t limit = std::min(block_limit, blocks.size());
     for (std::size_t block_index = 0; block_index < limit; ++block_index) {
@@ -657,6 +684,10 @@ RelationBasisBuildInput BuildRelationBasisInput(const RelationTaskSpec& spec,
         ++input.valid_bucket_count;
         for (std::size_t i = 0; i < blocks[block_index].group_idx.size(); ++i) {
             if (i >= metric.values.size() || metric.values[i] <= 0.0) continue;
+            if (other_group_set.find(blocks[block_index].group_idx[i]) !=
+                other_group_set.end()) {
+                continue;
+            }
             auto& stat = stats_by_group[blocks[block_index].group_idx[i]];
             stat.group_idx = blocks[block_index].group_idx[i];
             stat.hist_mass += metric.values[i];
@@ -989,6 +1020,14 @@ int BaselineRelationTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
         writer.String(has_basis ? metric_runtime->service_basis.group_space_id.c_str() : "");
         writer.Key("group_space_version");
         writer.String(has_basis ? metric_runtime->service_basis.group_space_version.c_str() : "");
+        writer.Key("other_group_idxs");
+        writer.StartArray();
+        if (has_basis) {
+            for (uint32_t group_idx : metric_runtime->service_basis.other_group_idxs) {
+                writer.Uint(group_idx);
+            }
+        }
+        writer.EndArray();
         writer.Key("support_explicit");
         writer.StartArray();
         if (has_basis) {
@@ -1873,6 +1912,7 @@ int BaselineRelationTask::SubmitBlock(const RelationObservationBlock& block, Fus
                 metric_runtime.service_basis.group_space_version =
                     spec_.group_space_version.value_or("");
                 metric_runtime.service_basis.k_head = spec_.summary_policy.k_head;
+                metric_runtime.service_basis.other_group_idxs = spec_.other_group_idxs;
             }
 
             metric_runtimes[metric_index] = metric_runtime;

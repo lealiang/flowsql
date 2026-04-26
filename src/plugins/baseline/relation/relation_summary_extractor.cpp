@@ -56,8 +56,13 @@ int RelationSummaryExtractor::ExtractMetricSummary(
     out_summary->total = metric.total;
     if (metric.total <= 0.0) return error::OK;
 
+    const std::unordered_set<uint32_t> other_group_set(
+        basis.other_group_idxs.begin(), basis.other_group_idxs.end());
     std::unordered_set<uint32_t> support_set(
         basis.support_explicit.begin(), basis.support_explicit.end());
+    for (uint32_t group_idx : basis.other_group_idxs) {
+        support_set.erase(group_idx);
+    }
     std::unordered_map<uint32_t, std::size_t> stable_index_by_group;
     stable_index_by_group.reserve(basis.stable_head.size());
     out_summary->stable_g_shares.assign(basis.stable_head.size(), 0.0);
@@ -77,20 +82,25 @@ int RelationSummaryExtractor::ExtractMetricSummary(
     for (uint32_t i = 0; i < block.nnz; ++i) {
         const double mass = metric.values[i];
         if (mass <= 0.0) continue;
+        const uint32_t group_idx = block.group_idx[i];
+        const bool is_other = other_group_set.find(group_idx) != other_group_set.end();
 
         const double share = mass / metric.total;
         out_summary->entropy_shannon -= share * std::log(share);
-        if (mass > top1_mass) top1_mass = mass;
-        InsertTopMass(mass, static_cast<std::size_t>(std::max(0, basis.k_head)), &top_masses);
+        if (!is_other) {
+            if (mass > top1_mass) top1_mass = mass;
+            InsertTopMass(mass, static_cast<std::size_t>(std::max(0, basis.k_head)), &top_masses);
+        }
 
-        const uint32_t group_idx = block.group_idx[i];
-        if (support_set.find(group_idx) != support_set.end()) {
+        if (!is_other && support_set.find(group_idx) != support_set.end()) {
             support_mass += mass;
         }
 
-        auto stable_it = stable_index_by_group.find(group_idx);
-        if (stable_it != stable_index_by_group.end()) {
-            out_summary->stable_g_shares[stable_it->second] = share;
+        if (!is_other) {
+            auto stable_it = stable_index_by_group.find(group_idx);
+            if (stable_it != stable_index_by_group.end()) {
+                out_summary->stable_g_shares[stable_it->second] = share;
+            }
         }
     }
 

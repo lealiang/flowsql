@@ -33,7 +33,8 @@ std::string CopyStringRef(const BaselineStringRef& key) {
 }
 
 bool ParseResolvedSourceConfig(const std::string& config_json,
-                              std::optional<BaselineSourceConfig>* out_config) {
+                               const std::string& self_key,
+                               std::optional<BaselineSourceConfig>* out_config) {
     if (!out_config) return false;
     out_config->reset();
     if (config_json.empty()) return true;
@@ -65,7 +66,8 @@ bool ParseResolvedSourceConfig(const std::string& config_json,
 
         BaselineSourceRef ref;
         ref.source_key = (*source_array)[i]["source_key"].GetString();
-        if (ref.source_key.empty() || !seen_sources.insert(ref.source_key).second) {
+        if (ref.source_key.empty() || ref.source_key == self_key ||
+            !seen_sources.insert(ref.source_key).second) {
             return false;
         }
         config.sources.push_back(std::move(ref));
@@ -122,7 +124,7 @@ std::optional<BaselineSourceConfig> ResolveRoutedSourceConfig(
     }
 
     std::optional<BaselineSourceConfig> parsed_config;
-    if (!ParseResolvedSourceConfig(config_json, &parsed_config)) {
+    if (!ParseResolvedSourceConfig(config_json, CopyStringRef(key), &parsed_config)) {
         return std::nullopt;
     }
     return parsed_config;

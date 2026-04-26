@@ -10,6 +10,7 @@
 
 #include <common/error_code.h>
 
+#include <algorithm>
 #include <optional>
 #include <unordered_set>
 
@@ -423,6 +424,50 @@ int ParseMetricList(const rapidjson::Value& obj,
     return error::OK;
 }
 
+int ParseOtherGroupIdxs(const rapidjson::Value& obj,
+                        std::vector<uint32_t>* out,
+                        std::string* err) {
+    if (!out) return error::BAD_REQUEST;
+    out->clear();
+    std::unordered_set<uint32_t> uniq_group_idxs;
+
+    if (obj.HasMember("other_group_idx")) {
+        if (!obj["other_group_idx"].IsUint()) {
+            if (err) *err = "other_group_idx must be an uint";
+            return error::BAD_REQUEST;
+        }
+        const uint32_t group_idx = obj["other_group_idx"].GetUint();
+        if (!uniq_group_idxs.insert(group_idx).second) {
+            if (err) *err = "other_group_idx must not duplicate with other_group_idxs";
+            return error::BAD_REQUEST;
+        }
+        out->push_back(group_idx);
+    }
+
+    if (obj.HasMember("other_group_idxs")) {
+        if (!obj["other_group_idxs"].IsArray()) {
+            if (err) *err = "other_group_idxs must be an array";
+            return error::BAD_REQUEST;
+        }
+        const auto& other_group_idxs = obj["other_group_idxs"];
+        for (rapidjson::SizeType i = 0; i < other_group_idxs.Size(); ++i) {
+            if (!other_group_idxs[i].IsUint()) {
+                if (err) *err = "other_group_idxs must contain uint only";
+                return error::BAD_REQUEST;
+            }
+            const uint32_t group_idx = other_group_idxs[i].GetUint();
+            if (!uniq_group_idxs.insert(group_idx).second) {
+                if (err) *err = "other_group_idxs must not contain duplicate item";
+                return error::BAD_REQUEST;
+            }
+            out->push_back(group_idx);
+        }
+    }
+
+    std::sort(out->begin(), out->end());
+    return error::OK;
+}
+
 int ParseSupportPolicy(const rapidjson::Value& obj,
                        RelationSupportPolicySpec* out,
                        std::string* err) {
@@ -511,6 +556,7 @@ int ConfigParser::ParseRelationTask(const char* config_json,
     if ((rc = RequireString(doc, "metric_set_id", &spec.metric_set_id, err)) != error::OK) return rc;
     if ((rc = RequireString(doc, "encode_type", &spec.encode_type, err)) != error::OK) return rc;
     if ((rc = ParseMetricList(doc, &spec.metrics, err)) != error::OK) return rc;
+    if ((rc = ParseOtherGroupIdxs(doc, &spec.other_group_idxs, err)) != error::OK) return rc;
     if ((rc = ParseSupportPolicy(doc, &spec.support_policy, err)) != error::OK) return rc;
     if ((rc = ParseSummaryPolicy(doc, &spec.summary_policy, err)) != error::OK) return rc;
     if ((rc = RequirePositiveInt64(doc, "delta", &create_spec.clock_spec.delta, err)) != error::OK) return rc;
@@ -528,6 +574,10 @@ int ConfigParser::ParseRelationTask(const char* config_json,
     }
     if (!IsAllowedValue(spec.encode_type, {"exact_sparse", "topk_other"})) {
         if (err) *err = "relation encode_type must be exact_sparse or topk_other";
+        return error::BAD_REQUEST;
+    }
+    if (!spec.other_group_idxs.empty() && spec.encode_type != "topk_other") {
+        if (err) *err = "other_group_idx(s) requires relation encode_type=topk_other";
         return error::BAD_REQUEST;
     }
     if (spec.support_policy.k_support < spec.summary_policy.k_stable) {

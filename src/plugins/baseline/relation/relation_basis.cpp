@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -57,6 +58,13 @@ int RelationBasisBuilder::BuildServiceBasis(const RelationBasisBuildInput& input
     }
     if (input.valid_bucket_count == 0) return error::BAD_REQUEST;
 
+    std::vector<uint32_t> other_group_idxs = input.other_group_idxs;
+    std::sort(other_group_idxs.begin(), other_group_idxs.end());
+    other_group_idxs.erase(std::unique(other_group_idxs.begin(), other_group_idxs.end()),
+                           other_group_idxs.end());
+    const std::unordered_set<uint32_t> other_group_set(other_group_idxs.begin(),
+                                                       other_group_idxs.end());
+
     double total_hist_mass = 0.0;
     for (const auto& stat : input.group_stats) {
         if (stat.hist_mass > 0.0) total_hist_mass += stat.hist_mass;
@@ -70,6 +78,7 @@ int RelationBasisBuilder::BuildServiceBasis(const RelationBasisBuildInput& input
     support_candidates.reserve(input.group_stats.size());
     for (const auto& stat : input.group_stats) {
         if (stat.hist_mass <= 0.0) continue;
+        if (other_group_set.find(stat.group_idx) != other_group_set.end()) continue;
 
         CandidateGroup candidate;
         candidate.group_idx = stat.group_idx;
@@ -96,6 +105,7 @@ int RelationBasisBuilder::BuildServiceBasis(const RelationBasisBuildInput& input
     basis.group_space_id = input.group_space_id;
     basis.group_space_version = input.group_space_version;
     basis.k_head = input.summary_policy.k_head;
+    basis.other_group_idxs = std::move(other_group_idxs);
     basis.support_explicit.reserve(support_candidates.size());
     for (const auto& candidate : support_candidates) {
         basis.support_explicit.push_back(candidate.group_idx);
@@ -135,6 +145,14 @@ RelationLineageCompatibility RelationBasisBuilder::DetermineCompatibility(
         return RelationLineageCompatibility::kNewLineage;
     }
     if (incumbent_basis->group_space_id != task_spec.group_space_id) {
+        return RelationLineageCompatibility::kNewLineage;
+    }
+    std::vector<uint32_t> task_other_group_idxs = task_spec.other_group_idxs;
+    std::sort(task_other_group_idxs.begin(), task_other_group_idxs.end());
+    task_other_group_idxs.erase(
+        std::unique(task_other_group_idxs.begin(), task_other_group_idxs.end()),
+        task_other_group_idxs.end());
+    if (incumbent_basis->other_group_idxs != task_other_group_idxs) {
         return RelationLineageCompatibility::kNewLineage;
     }
 

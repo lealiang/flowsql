@@ -28,7 +28,6 @@ namespace baseline {
 namespace {
 
 constexpr double kSigmaFloor = 1e-3;
-constexpr double kRatioEps = 1e-6;
 constexpr double kPi = 3.14159265358979323846;
 
 struct ValueTrainRow {
@@ -512,8 +511,8 @@ void CollectRatioTrainRows(const RatioFormalTrainInput& input,
         RatioTrainRow row;
         row.bucket_id = point.bucket_id;
         const double smoothed =
-            std::min(1.0 - kRatioEps,
-                     std::max(kRatioEps,
+            std::min(1.0 - kT2EpsLogit,
+                     std::max(kT2EpsLogit,
                               (point.numerator + prior.alpha0) /
                                   (point.denominator + prior.alpha0 + prior.beta0)));
         row.eta = std::log(smoothed / (1.0 - smoothed));

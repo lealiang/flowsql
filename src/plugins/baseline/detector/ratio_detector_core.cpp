@@ -25,7 +25,6 @@ namespace {
 
 constexpr double kShadowConfidenceCap = 0.8;
 constexpr double kShadowScoreScale = 1.5;
-constexpr double kRatioClipEps = 1e-6;
 
 const SharedProfileConfig& SharedConfig() {
     static const SharedProfileConfig config = DefaultSharedProfileConfig();
@@ -341,7 +340,7 @@ double DriftDirectionSign(DriftDirection direction) {
 }
 
 double ClipProbability(double value) {
-    return std::min(1.0 - kRatioClipEps, std::max(kRatioClipEps, value));
+    return std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, value));
 }
 
 double Logit(double value) {

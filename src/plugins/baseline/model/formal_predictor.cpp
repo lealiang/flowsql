@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "plugins/baseline/model/calendar_feature_helper.h"
+#include "plugins/baseline/model/profile_config.h"
 
 namespace flowsql {
 namespace baseline {
@@ -23,7 +24,7 @@ namespace baseline {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kRatioEps = 1e-6;
+constexpr double kRatioEps = kT2EpsLogit;
 
 double Sigmoid(double value) {
     if (value >= 0.0) {

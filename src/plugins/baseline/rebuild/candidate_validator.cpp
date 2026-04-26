@@ -266,7 +266,8 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
                 delta = observed_ratio - mu_ref;
                 delta_initialized = true;
             }
-            const double mu_shadow = std::min(1.0 - 1e-6, std::max(1e-6, mu_ref + delta));
+            const double mu_shadow =
+                std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, mu_ref + delta));
 
             if (i >= val_begin) {
                 double mu_candidate = 0.0;
@@ -278,7 +279,8 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
                     return CandidateValidationResult{CandidateValidationStatus::kFailed, false};
                 }
 
-                const double candidate_p = std::min(1.0 - 1e-6, std::max(1e-6, mu_candidate));
+                const double candidate_p =
+                    std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, mu_candidate));
                 const double weight =
                     point.denominator /
                     (point.denominator + static_cast<double>(profile.d_min_train));
@@ -324,8 +326,10 @@ CandidateValidationResult CandidateValidator::ValidateRatio(
             return CandidateValidationResult{CandidateValidationStatus::kUnavailableIncumbent, false};
         }
 
-        const double candidate_p = std::min(1.0 - 1e-6, std::max(1e-6, mu_candidate));
-        const double incumbent_p = std::min(1.0 - 1e-6, std::max(1e-6, mu_incumbent));
+        const double candidate_p =
+            std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, mu_candidate));
+        const double incumbent_p =
+            std::min(1.0 - kT2EpsLogit, std::max(kT2EpsLogit, mu_incumbent));
         const double weight =
             point.denominator /
             (point.denominator + static_cast<double>(profile.d_min_train));
