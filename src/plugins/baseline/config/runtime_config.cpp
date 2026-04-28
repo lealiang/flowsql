@@ -35,6 +35,16 @@ struct RatioGlobalNumericalConfig {
     double v_floor = kRatioVFloor;
 };
 
+struct ShadowPolicyConfig {
+    double z_shift_confirm_min = 1.44;
+    uint32_t c_rebuild_min = 5;
+    double z_win_shift_threshold = 2.2;
+    std::size_t min_shadow_points_for_candidate = 1440;
+    std::size_t min_shadow_holdout_points = 180;
+    std::size_t retry_cooldown_points = 180;
+    std::size_t shadow_stuck_alert_points = 4320;
+};
+
 struct RuntimeConfigState {
     std::string tz_default = "Asia/Shanghai";
 
@@ -64,6 +74,7 @@ struct RuntimeConfigState {
     double candidate_ratio_variance_floor = 0.25;
     double candidate_switch_loss_abs_tol = 1e-12;
     std::size_t candidate_min_train_point_count = 2;
+    ShadowPolicyConfig shadow_policy;
     std::size_t relation_min_replay_for_holdout = 3;
     std::size_t relation_switch_validation_tail = 16;
 
@@ -280,6 +291,26 @@ void ParseRuntimeAndRebuild(const YAML::Node& node, RuntimeConfigState* out) {
         ParseOptionalScalar(node["candidate_builder"],
                             "min_train_point_count",
                             &out->candidate_min_train_point_count);
+    }
+    if (node["shadow_policy"]) {
+        const YAML::Node shadow_policy = node["shadow_policy"];
+        ParseOptionalScalar(
+            shadow_policy, "z_shift_confirm_min", &out->shadow_policy.z_shift_confirm_min);
+        ParseOptionalScalar(shadow_policy, "c_rebuild_min", &out->shadow_policy.c_rebuild_min);
+        ParseOptionalScalar(shadow_policy,
+                            "z_win_shift_threshold",
+                            &out->shadow_policy.z_win_shift_threshold);
+        ParseOptionalScalar(shadow_policy,
+                            "min_shadow_points_for_candidate",
+                            &out->shadow_policy.min_shadow_points_for_candidate);
+        ParseOptionalScalar(shadow_policy,
+                            "min_shadow_holdout_points",
+                            &out->shadow_policy.min_shadow_holdout_points);
+        ParseOptionalScalar(
+            shadow_policy, "retry_cooldown_points", &out->shadow_policy.retry_cooldown_points);
+        ParseOptionalScalar(shadow_policy,
+                            "shadow_stuck_alert_points",
+                            &out->shadow_policy.shadow_stuck_alert_points);
     }
     if (node["candidate_validator"]) {
         const YAML::Node validator = node["candidate_validator"];
@@ -503,6 +534,7 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
     if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"],
                              {"runtime_state_prune",
                               "candidate_builder",
+                              "shadow_policy",
                               "candidate_validator",
                               "relation_rebuild"},
                              "runtime_and_rebuild_constants",
@@ -518,6 +550,18 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
     if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"]["candidate_builder"],
                              {"min_train_point_count"},
                              "runtime_and_rebuild_constants.candidate_builder",
+                             err)) {
+        return false;
+    }
+    if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"]["shadow_policy"],
+                             {"z_shift_confirm_min",
+                              "c_rebuild_min",
+                              "z_win_shift_threshold",
+                              "min_shadow_points_for_candidate",
+                              "min_shadow_holdout_points",
+                              "retry_cooldown_points",
+                              "shadow_stuck_alert_points"},
+                             "runtime_and_rebuild_constants.shadow_policy",
                              err)) {
         return false;
     }
@@ -647,6 +691,15 @@ bool ValidateRuntimeConfig(const RuntimeConfigState& cfg, std::string* err) {
           cfg.candidate_shadow_alpha <= 1.0 && cfg.candidate_ratio_variance_floor > 0.0 &&
           cfg.candidate_switch_loss_abs_tol >= 0.0 && cfg.candidate_min_train_point_count > 0)) {
         if (err) *err = "candidate validator constants are invalid";
+        return false;
+    }
+    if (!(cfg.shadow_policy.z_shift_confirm_min > 0.0 && cfg.shadow_policy.c_rebuild_min > 0 &&
+          cfg.shadow_policy.z_win_shift_threshold > 0.0 &&
+          cfg.shadow_policy.min_shadow_points_for_candidate > 0 &&
+          cfg.shadow_policy.min_shadow_holdout_points > 0 &&
+          cfg.shadow_policy.retry_cooldown_points > 0 &&
+          cfg.shadow_policy.shadow_stuck_alert_points > 0)) {
+        if (err) *err = "shadow_policy constants are invalid";
         return false;
     }
     if (cfg.relation_min_replay_for_holdout == 0 || cfg.relation_switch_validation_tail == 0) {
@@ -877,6 +930,41 @@ double CandidateSwitchLossAbsTol() {
 std::size_t CandidateMinTrainPointCount() {
     const auto snapshot = Snapshot();
     return snapshot->candidate_min_train_point_count;
+}
+
+double ShadowZShiftConfirmMin() {
+    const auto snapshot = Snapshot();
+    return snapshot->shadow_policy.z_shift_confirm_min;
+}
+
+uint32_t ShadowCRebuildMin() {
+    const auto snapshot = Snapshot();
+    return snapshot->shadow_policy.c_rebuild_min;
+}
+
+double ShadowZWinShiftThreshold() {
+    const auto snapshot = Snapshot();
+    return snapshot->shadow_policy.z_win_shift_threshold;
+}
+
+std::size_t ShadowMinPointsForCandidate() {
+    const auto snapshot = Snapshot();
+    return snapshot->shadow_policy.min_shadow_points_for_candidate;
+}
+
+std::size_t ShadowMinHoldoutPoints() {
+    const auto snapshot = Snapshot();
+    return snapshot->shadow_policy.min_shadow_holdout_points;
+}
+
+std::size_t ShadowRetryCooldownPoints() {
+    const auto snapshot = Snapshot();
+    return snapshot->shadow_policy.retry_cooldown_points;
+}
+
+std::size_t ShadowStuckAlertPoints() {
+    const auto snapshot = Snapshot();
+    return snapshot->shadow_policy.shadow_stuck_alert_points;
 }
 
 double KeyFusionPersistenceWindow() {

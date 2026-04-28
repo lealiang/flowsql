@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "plugins/baseline/common/result_builder.h"
+#include "plugins/baseline/config/runtime_config.h"
 #include "plugins/baseline/model/profile_config.h"
 #include "plugins/baseline/model/runtime_state_prune.h"
 namespace flowsql {
@@ -25,10 +26,93 @@ namespace baseline {
 namespace {
 
 constexpr double kValueSigmaRefFloor = 1e-3;
+constexpr double kSlowDriftVarFloor = 1e-12;
 
-const SharedProfileConfig& SharedConfig() {
-    static const SharedProfileConfig config = DefaultSharedProfileConfig();
-    return config;
+SharedProfileConfig SharedConfig() {
+    return DefaultSharedProfileConfig();
+}
+
+void ResetSlowDriftTracking(ValueShadowState* shadow_state) {
+    if (!shadow_state) return;
+    shadow_state->slow_err_ring.clear();
+    shadow_state->slow_var_ring.clear();
+    shadow_state->slow_ring_pos = 0;
+    shadow_state->slow_ring_size = 0;
+    shadow_state->slow_err_sum = 0.0;
+    shadow_state->slow_var_sum = 0.0;
+    shadow_state->z_win = 0.0;
+    shadow_state->slow_drift_triggered = false;
+}
+
+void EnsureSlowDriftWindow(ValueShadowState* shadow_state, std::size_t window_size) {
+    if (!shadow_state) return;
+    if (window_size == 0) {
+        ResetSlowDriftTracking(shadow_state);
+        return;
+    }
+    if (shadow_state->slow_err_ring.size() == window_size &&
+        shadow_state->slow_var_ring.size() == window_size) {
+        return;
+    }
+    ResetSlowDriftTracking(shadow_state);
+    shadow_state->slow_err_ring.assign(window_size, 0.0);
+    shadow_state->slow_var_ring.assign(window_size, 0.0);
+}
+
+void UpdateSlowDriftTracking(ValueShadowState* shadow_state,
+                             std::size_t window_size,
+                             double residual,
+                             double sigma) {
+    if (!shadow_state) return;
+    EnsureSlowDriftWindow(shadow_state, window_size);
+    if (window_size == 0 || shadow_state->slow_err_ring.empty() ||
+        shadow_state->slow_var_ring.empty()) {
+        return;
+    }
+    const std::size_t idx = shadow_state->slow_ring_pos;
+    const bool buffer_full = shadow_state->slow_ring_size >= window_size;
+    if (buffer_full) {
+        shadow_state->slow_err_sum -= shadow_state->slow_err_ring[idx];
+        shadow_state->slow_var_sum -= shadow_state->slow_var_ring[idx];
+    } else {
+        ++shadow_state->slow_ring_size;
+    }
+
+    const double sigma_sq = sigma * sigma;
+    shadow_state->slow_err_ring[idx] = residual;
+    shadow_state->slow_var_ring[idx] = sigma_sq;
+    shadow_state->slow_err_sum += residual;
+    shadow_state->slow_var_sum += sigma_sq;
+    shadow_state->slow_ring_pos = (idx + 1) % window_size;
+
+    if (shadow_state->slow_ring_size >= window_size) {
+        const double denom = std::sqrt(std::max(shadow_state->slow_var_sum, kSlowDriftVarFloor));
+        shadow_state->z_win = shadow_state->slow_err_sum / denom;
+        shadow_state->slow_drift_triggered =
+            std::fabs(shadow_state->z_win) >= ShadowZWinShiftThreshold();
+    } else {
+        shadow_state->z_win = 0.0;
+        shadow_state->slow_drift_triggered = false;
+    }
+}
+
+bool IsCandidateRunning(RebuildCandidateState state) {
+    return state == RebuildCandidateState::kBuilding ||
+           state == RebuildCandidateState::kBuilt ||
+           state == RebuildCandidateState::kValidating;
+}
+
+void NormalizeSwitchState(FormalModelState* state, bool shadow_active) {
+    if (!state) return;
+    if (state->switch_state == RebuildSwitchState::kFormalApplied) return;
+    if (IsCandidateRunning(state->candidate_state)) {
+        state->switch_state = state->candidate_state == RebuildCandidateState::kValidating
+                                  ? RebuildSwitchState::kValidating
+                                  : RebuildSwitchState::kRebuildPending;
+        return;
+    }
+    state->switch_state =
+        shadow_active ? RebuildSwitchState::kShadowActive : RebuildSwitchState::kIdle;
 }
 
 std::string CopyKey(const BaselineStringRef& key) {
@@ -72,6 +156,10 @@ void BeginRebuildCycle(FormalModelState* state, RebuildSwitchState switch_state)
     state->switch_state = switch_state;
     state->failure_reason = RebuildFailureReason::kNone;
     state->failure_reason_detail.clear();
+    state->candidate_passed = false;
+    state->full_waiting = false;
+    state->t_switch_gate = -1;
+    state->t_full_start = -1;
 }
 
 void UpdateCandidateSnapshot(FormalModelState* state,
@@ -90,6 +178,10 @@ void ApplyRebuildOutcome(FormalModelState* state,
     state->switch_state = apply_result.switch_state;
     state->failure_reason = apply_result.failure_reason;
     state->failure_reason_detail = apply_result.failure_reason_detail;
+    state->candidate_passed = apply_result.candidate_passed;
+    state->full_waiting = apply_result.full_waiting;
+    state->t_switch_gate = apply_result.t_switch_gate;
+    state->t_full_start = apply_result.t_full_start;
 }
 
 struct SelectedValueBaseline {
@@ -282,7 +374,7 @@ SelectedValueBaseline ResolveServiceableBaseline(
 }
 
 double ComputePointScoreFromAbsResidual(double abs_residual) {
-    const SharedProfileConfig& config = SharedConfig();
+    const SharedProfileConfig config = SharedConfig();
     if (abs_residual <= config.z_warn) return 0.0;
     return ClipUnit((abs_residual - config.z_warn) / (config.z_crit - config.z_warn));
 }
@@ -448,6 +540,9 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
 
     bool enqueue_rebuild = false;
     int64_t rebuild_start_hint = 0;
+    const std::size_t shadow_fit_points = ShadowMinPointsForCandidate();
+    const std::size_t shadow_holdout_points = ShadowMinHoldoutPoints();
+    const std::size_t shadow_window_points = shadow_fit_points + shadow_holdout_points;
     {
         std::vector<size_t> shard_ids;
         shard_ids.reserve(1 + (baseline_source_config ? baseline_source_config->sources.size() : 0));
@@ -498,11 +593,19 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
         bool serviceable = false;
         bool shadow_active = false;
 
-        const SharedProfileConfig& shared_config = SharedConfig();
+        const SharedProfileConfig shared_config = SharedConfig();
         const DriftConfig& drift_config = shared_config.drift;
 
-        if (runtime_state.shadow_state.active && update.gap > drift_config.g_reset) {
-            runtime_state.shadow_state.Reset();
+        if (update.gap > drift_config.g_reset) {
+            if (runtime_state.shadow_state.active) {
+                runtime_state.shadow_state.Reset();
+                runtime_state.formal_state.full_waiting = false;
+                runtime_state.formal_state.candidate_passed = false;
+                runtime_state.formal_state.t_switch_gate = -1;
+                runtime_state.formal_state.t_full_start = -1;
+            } else {
+                ResetSlowDriftTracking(&runtime_state.shadow_state);
+            }
         }
 
         // `shadow baseline` 一旦激活，就优先复用冻结参考模型 + 单偏移量 delta。
@@ -548,11 +651,13 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                                        shadow_prediction.readiness,
                                        shadow_source_kind);
 
+                const double sigma_shadow =
+                    EffectiveValueSigma(
+                        shadow_prediction.sigma_ref, rho_t, ValueShadowSigmaScale());
+                UpdateSlowDriftTracking(
+                    &runtime_state.shadow_state, shadow_holdout_points, residual, sigma_shadow);
+
                 if (gate_score) {
-                    const double sigma_shadow =
-                        EffectiveValueSigma(shadow_prediction.sigma_ref,
-                                            rho_t,
-                                            ValueShadowSigmaScale());
                     sigma_eff_t = sigma_shadow;
                     z_t = residual / sigma_shadow;
                     out_submit->detector_result.raw_score = std::fabs(z_t);
@@ -606,8 +711,12 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                                        shared_config,
                                        selected.prediction.readiness,
                                        selected.decision.selected_kind);
+                const double sigma_formal =
+                    EffectiveValueSigma(selected.prediction.sigma_ref, rho_t);
+                UpdateSlowDriftTracking(
+                    &runtime_state.shadow_state, shadow_holdout_points, residual, sigma_formal);
                 if (gate_score) {
-                    sigma_eff_t = EffectiveValueSigma(selected.prediction.sigma_ref, rho_t);
+                    sigma_eff_t = sigma_formal;
                     z_t = residual / sigma_eff_t;
                     out_submit->detector_result.raw_score = std::fabs(z_t);
                     score_point =
@@ -627,13 +736,20 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                     ClipUnit((drift_result.p_shift - drift_config.p_shift_low) /
                              (drift_config.p_shift_high - drift_config.p_shift_low));
 
-                // 漂移确认后，不直接继续用旧 formal 硬扛，而是激活 shadow 并异步排队重建。
-                // `rebuild_start_hint` 近似取连续确认段的起点，让慢路径优先回放新阶段数据。
-                if (drift_result.shift_confirmed &&
-                    runtime_state.drift_state.confirm_count >= drift_config.m_shift &&
+                const bool gate_fast =
+                    gate_shift && std::fabs(z_t) >= ShadowZShiftConfirmMin() &&
+                    runtime_state.drift_state.confirm_count >= ShadowCRebuildMin();
+                const bool gate_slow = runtime_state.shadow_state.slow_drift_triggered;
+                const bool existing_drift_evidence =
+                    drift_result.shift_confirmed &&
+                    runtime_state.drift_state.confirm_count >= drift_config.m_shift;
+
+                // formal -> shadow 仅负责保护，不直接触发 candidate 重建。
+                if (existing_drift_evidence && (gate_fast || gate_slow) &&
                     !runtime_state.shadow_state.active &&
                     !runtime_state.shift_rebuild_pending &&
                     selected.model) {
+                    runtime_state.shadow_state.Reset();
                     runtime_state.shadow_state.active = true;
                     runtime_state.shadow_state.ref_kind = selected.shadow_ref_kind;
                     runtime_state.shadow_state.ref_source_key =
@@ -646,6 +762,7 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                     runtime_state.shadow_state.frozen_ref_model = selected.model;
                     runtime_state.shadow_state.delta = residual;
                     runtime_state.shadow_state.last_bucket_id = obs.bucket_id;
+                    runtime_state.shadow_state.enter_bucket_id = obs.bucket_id;
                     runtime_state.model_state =
                         ShadowRefUsesSource(selected.shadow_ref_kind)
                             ? "shadow_source"
@@ -655,13 +772,10 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                     runtime_state.formal_state.failure_reason =
                         RebuildFailureReason::kNone;
                     runtime_state.formal_state.failure_reason_detail.clear();
-                    runtime_state.shift_rebuild_pending = true;
-                    enqueue_rebuild = true;
-                    rebuild_start_hint = std::max<int64_t>(
-                        0,
-                        obs.bucket_id -
-                            static_cast<int64_t>(runtime_state.drift_state.confirm_count) +
-                            1);
+                    runtime_state.formal_state.candidate_passed = false;
+                    runtime_state.formal_state.full_waiting = false;
+                    runtime_state.formal_state.t_switch_gate = -1;
+                    runtime_state.formal_state.t_full_start = -1;
 
                     out_submit->detector_result.provider = BaselineProvider::kShadow;
                     out_submit->detector_result.flags |= kBaselineFlagShadowActive;
@@ -720,6 +834,47 @@ int ValueDetectorCore::Submit(const ValueObservation& obs,
                               sigma_eff_t,
                               shadow_active);
         }
+
+        if (serviceable && runtime_state.shadow_state.active) {
+            if (runtime_state.shadow_state.enter_bucket_id < 0) {
+                runtime_state.shadow_state.enter_bucket_id = obs.bucket_id;
+            }
+            ++runtime_state.shadow_state.shadow_point_count;
+            runtime_state.shadow_state.shadow_effective_holdout_count =
+                runtime_state.shadow_state.shadow_point_count > shadow_fit_points
+                    ? runtime_state.shadow_state.shadow_point_count - shadow_fit_points
+                    : 0;
+            runtime_state.shadow_state.shadow_stuck =
+                runtime_state.shadow_state.shadow_point_count > ShadowStuckAlertPoints();
+
+            const bool gate_data_fit =
+                runtime_state.shadow_state.shadow_point_count >= shadow_fit_points;
+            const bool gate_data_val =
+                runtime_state.shadow_state.shadow_effective_holdout_count >=
+                shadow_holdout_points;
+            const bool gate_data = gate_data_fit && gate_data_val;
+            const bool gate_fast =
+                gate_shift && std::fabs(z_t) >= ShadowZShiftConfirmMin() &&
+                runtime_state.drift_state.confirm_count >= ShadowCRebuildMin();
+            const bool gate_drift = gate_fast || runtime_state.shadow_state.slow_drift_triggered;
+            const int64_t last_attempt = runtime_state.shadow_state.last_candidate_attempt_bucket;
+            const bool gate_cooldown =
+                last_attempt < 0 ||
+                obs.bucket_id - last_attempt >=
+                    static_cast<int64_t>(ShadowRetryCooldownPoints());
+            const bool gate_no_pending = !runtime_state.shift_rebuild_pending;
+            const bool gate_not_waiting = !runtime_state.formal_state.full_waiting;
+            if (!enqueue_rebuild && gate_no_pending && gate_not_waiting &&
+                gate_data && gate_drift && gate_cooldown) {
+                enqueue_rebuild = true;
+                rebuild_start_hint = std::max<int64_t>(
+                    0,
+                    obs.bucket_id - static_cast<int64_t>(shadow_window_points) + 1);
+            }
+        }
+
+        NormalizeSwitchState(
+            &runtime_state.formal_state, runtime_state.shadow_state.active);
 
         runtime_state.last_sample_count = obs.sample_count;
         runtime_state.last_value = obs.value;
@@ -850,6 +1005,15 @@ void ValueDetectorCore::MarkRebuildEnqueued(const std::string& key) {
     MarkRebuildStageBuilding(&runtime_state.formal_state.stage_trace);
 }
 
+void ValueDetectorCore::MarkCandidateAttemptEnqueued(const std::string& key, int64_t bucket_id) {
+    RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto it = shard.states.find(key);
+    if (it == shard.states.end()) return;
+    if (!it->second.runtime_state.shadow_state.active) return;
+    it->second.runtime_state.shadow_state.last_candidate_attempt_bucket = bucket_id;
+}
+
 void ValueDetectorCore::MarkCandidateBuilding(const std::string& key) {
     RuntimeShardState& shard = runtime_shards_[RuntimeShardIndex(key)];
     std::lock_guard<std::mutex> lock(shard.mutex);
@@ -859,6 +1023,10 @@ void ValueDetectorCore::MarkCandidateBuilding(const std::string& key) {
     runtime_state.formal_state.switch_state = RebuildSwitchState::kRebuildPending;
     runtime_state.formal_state.failure_reason = RebuildFailureReason::kNone;
     runtime_state.formal_state.failure_reason_detail.clear();
+    runtime_state.formal_state.candidate_passed = false;
+    runtime_state.formal_state.full_waiting = false;
+    runtime_state.formal_state.t_switch_gate = -1;
+    runtime_state.formal_state.t_full_start = -1;
     ResetCandidateSnapshot(&runtime_state.formal_state);
     MarkRebuildStageBuilding(&runtime_state.formal_state.stage_trace);
 }
@@ -914,11 +1082,15 @@ void ValueDetectorCore::ApplyFormalModel(
     if (apply_result.candidate_trained) {
         runtime_state.formal_state.candidate_generation =
             apply_result.candidate_generation;
+        if (apply_result.full_waiting) {
+            runtime_state.candidate_replay.reset();
+            runtime_state.candidate_model.reset();
+        }
         // `replace_formal_model` 用于“新模型语义整体替换旧模型”的场景，
         // 尤其是 relation routed detector 在 basis 切换后，旧 formal 已经不再可比较。
         // 一旦正式切换成功，必须同步清空 shadow / drift / candidate 状态，
         // 防止旧阶段残留证据继续污染新 formal。
-        if (apply_result.replace_formal_model) {
+        if (!apply_result.full_waiting && apply_result.replace_formal_model) {
             runtime_state.formal_model = apply_result.full_model;
             runtime_state.formal_state.formal_ready = (apply_result.full_model != nullptr);
             runtime_state.formal_state.formal_model_version =
@@ -933,7 +1105,11 @@ void ValueDetectorCore::ApplyFormalModel(
             runtime_state.drift_state.Reset();
             runtime_state.last_p_shift = 0.0;
             runtime_state.last_shift_confirmed = false;
-        } else if (apply_result.full_model) {
+            runtime_state.formal_state.candidate_passed = false;
+            runtime_state.formal_state.full_waiting = false;
+            runtime_state.formal_state.t_switch_gate = -1;
+            runtime_state.formal_state.t_full_start = -1;
+        } else if (!apply_result.full_waiting && apply_result.full_model) {
             runtime_state.formal_model = apply_result.full_model;
             runtime_state.formal_state.formal_ready = true;
             runtime_state.formal_state.formal_model_version =
@@ -946,7 +1122,11 @@ void ValueDetectorCore::ApplyFormalModel(
             runtime_state.drift_state.Reset();
             runtime_state.last_p_shift = 0.0;
             runtime_state.last_shift_confirmed = false;
-        } else {
+            runtime_state.formal_state.candidate_passed = false;
+            runtime_state.formal_state.full_waiting = false;
+            runtime_state.formal_state.t_switch_gate = -1;
+            runtime_state.formal_state.t_full_start = -1;
+        } else if (!apply_result.full_waiting) {
             runtime_state.candidate_replay.reset();
             runtime_state.candidate_model.reset();
         }
@@ -954,6 +1134,9 @@ void ValueDetectorCore::ApplyFormalModel(
         runtime_state.candidate_replay.reset();
         runtime_state.candidate_model.reset();
     }
+
+    NormalizeSwitchState(
+        &runtime_state.formal_state, runtime_state.shadow_state.active);
 }
 
 void ValueDetectorCore::MarkRebuildFailure(const DetectorRebuildFailure& failure) {
@@ -978,6 +1161,8 @@ void ValueDetectorCore::MarkRebuildFailure(const DetectorRebuildFailure& failure
     runtime_state.shift_rebuild_pending = false;
     runtime_state.candidate_replay.reset();
     runtime_state.candidate_model.reset();
+    NormalizeSwitchState(
+        &runtime_state.formal_state, runtime_state.shadow_state.active);
 }
 
 void ValueDetectorCore::ClearPendingRebuild(const std::string& key) {
@@ -990,10 +1175,12 @@ void ValueDetectorCore::ClearPendingRebuild(const std::string& key) {
     formal_state.candidate_state = RebuildCandidateState::kNone;
     formal_state.failure_reason = RebuildFailureReason::kNone;
     formal_state.failure_reason_detail.clear();
-    formal_state.switch_state =
-        it->second.runtime_state.shadow_state.active
-            ? RebuildSwitchState::kShadowActive
-            : RebuildSwitchState::kIdle;
+    formal_state.full_waiting = false;
+    formal_state.candidate_passed = false;
+    formal_state.t_switch_gate = -1;
+    formal_state.t_full_start = -1;
+    NormalizeSwitchState(
+        &formal_state, it->second.runtime_state.shadow_state.active);
     ResetRebuildStageTrace(&formal_state.stage_trace);
     ResetCandidateSnapshot(&formal_state);
 }

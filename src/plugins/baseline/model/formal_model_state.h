@@ -139,6 +139,27 @@ inline const char* RebuildFailureReasonName(RebuildFailureReason reason) {
     return "none";
 }
 
+enum class RebuildPhase : uint8_t {
+    kIdle = 0,
+    kShadowObserve = 1,
+    kCandidateRunning = 2,
+    kFormalApplied = 3,
+};
+
+inline const char* RebuildPhaseName(RebuildPhase phase) {
+    switch (phase) {
+        case RebuildPhase::kShadowObserve:
+            return "shadow_observe";
+        case RebuildPhase::kCandidateRunning:
+            return "candidate_running";
+        case RebuildPhase::kFormalApplied:
+            return "formal_applied";
+        case RebuildPhase::kIdle:
+            break;
+    }
+    return "idle";
+}
+
 struct FormalModelState {
     bool formal_ready = false;
     uint64_t formal_model_version = 0;
@@ -157,7 +178,24 @@ struct FormalModelState {
     ReplayWindowSummary last_train_window;
     ReplayWindowSummary last_holdout_window;
     RebuildStageTrace stage_trace;
+    bool candidate_passed = false;
+    bool full_waiting = false;
+    int64_t t_switch_gate = -1;
+    int64_t t_full_start = -1;
 };
+
+inline RebuildPhase ResolveRebuildPhase(const FormalModelState& state, bool shadow_active) {
+    if (state.switch_state == RebuildSwitchState::kFormalApplied) {
+        return RebuildPhase::kFormalApplied;
+    }
+    if (state.candidate_state == RebuildCandidateState::kBuilding ||
+        state.candidate_state == RebuildCandidateState::kBuilt ||
+        state.candidate_state == RebuildCandidateState::kValidating) {
+        return RebuildPhase::kCandidateRunning;
+    }
+    if (shadow_active) return RebuildPhase::kShadowObserve;
+    return RebuildPhase::kIdle;
+}
 
 }  // namespace baseline
 }  // namespace flowsql

@@ -168,7 +168,7 @@ void TestRebuildWithoutHistoryReader() {
                                                &value_series_snapshot) == error::OK);
     auto value_series_doc = ParseJson(value_series_snapshot);
     assert(std::string(value_series_doc["candidate_state"].GetString()) == "failed");
-    assert(std::string(value_series_doc["switch_state"].GetString()) == "rebuild_blocked");
+    assert(std::string(value_series_doc["switch_state"].GetString()) == "idle");
     assert(value_series_doc.HasMember("failure_reason"));
     assert(std::string(value_series_doc["failure_reason"].GetString()) == "unavailable");
 
@@ -177,7 +177,7 @@ void TestRebuildWithoutHistoryReader() {
                                                &ratio_series_snapshot) == error::OK);
     auto ratio_series_doc = ParseJson(ratio_series_snapshot);
     assert(std::string(ratio_series_doc["candidate_state"].GetString()) == "failed");
-    assert(std::string(ratio_series_doc["switch_state"].GetString()) == "rebuild_blocked");
+    assert(std::string(ratio_series_doc["switch_state"].GetString()) == "idle");
     assert(ratio_series_doc.HasMember("failure_reason"));
     assert(std::string(ratio_series_doc["failure_reason"].GetString()) == "unavailable");
 

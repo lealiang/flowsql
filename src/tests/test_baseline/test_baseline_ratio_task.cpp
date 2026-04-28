@@ -158,7 +158,7 @@ static void TestRatioDetectorCoreMarkRebuildFailure() {
     assert(snapshot.runtime_state.formal_state.candidate_state ==
            RebuildCandidateState::kFailed);
     assert(snapshot.runtime_state.formal_state.switch_state ==
-           RebuildSwitchState::kRebuildBlocked);
+           RebuildSwitchState::kIdle);
     assert(snapshot.runtime_state.formal_state.failure_reason ==
            RebuildFailureReason::kUnavailable);
     assert(snapshot.runtime_state.formal_state.last_replay_window.request_bucket_start == 7);
@@ -420,20 +420,26 @@ static void TestRatioDetectorCoreShadowConfidenceAndReason() {
     DetectorSubmitOutput first;
     DetectorSubmitOutput second;
     DetectorSubmitOutput third;
+    DetectorSubmitOutput fourth;
+    DetectorSubmitOutput fifth;
     assert(core.Submit(RatioObservation{Ref("svc-shadow"), 201, 90.0, 100.0}, &first) == error::OK);
     assert(core.Submit(RatioObservation{Ref("svc-shadow"), 202, 90.0, 100.0}, &second) == error::OK);
     assert(core.Submit(RatioObservation{Ref("svc-shadow"), 203, 90.0, 100.0}, &third) == error::OK);
+    assert(core.Submit(RatioObservation{Ref("svc-shadow"), 204, 90.0, 100.0}, &fourth) == error::OK);
+    assert(core.Submit(RatioObservation{Ref("svc-shadow"), 205, 90.0, 100.0}, &fifth) == error::OK);
 
     const double rho_t = std::sqrt(1.0 + 50.0 / 100.0);
     assert((first.detector_result.flags & kBaselineFlagShadowActive) == 0);
     assert((second.detector_result.flags & kBaselineFlagShadowActive) == 0);
-    assert((third.detector_result.flags & kBaselineFlagShadowActive) != 0);
-    assert(third.detector_result.provider == BaselineProvider::kShadow);
-    assert(NearlyEqual(third.detector_result.confidence, 0.8 / rho_t));
-    assert(third.detector_result.reason == BaselineReasonCode::kBaselineShiftUp);
-    assert(third.detector_result.evidence.kind == BaselineEvidenceKind::kRatio);
-    assert(third.detector_result.evidence.ratio.shadow_active);
-    assert(third.detector_result.evidence.ratio.model_state == BaselineModelState::kShadow);
+    assert((third.detector_result.flags & kBaselineFlagShadowActive) == 0);
+    assert((fourth.detector_result.flags & kBaselineFlagShadowActive) == 0);
+    assert((fifth.detector_result.flags & kBaselineFlagShadowActive) != 0);
+    assert(fifth.detector_result.provider == BaselineProvider::kShadow);
+    assert(NearlyEqual(fifth.detector_result.confidence, 0.8 / rho_t));
+    assert(fifth.detector_result.reason == BaselineReasonCode::kBaselineShiftUp);
+    assert(fifth.detector_result.evidence.kind == BaselineEvidenceKind::kRatio);
+    assert(fifth.detector_result.evidence.ratio.shadow_active);
+    assert(fifth.detector_result.evidence.ratio.model_state == BaselineModelState::kShadow);
 
     std::printf("[PASS] RatioDetectorCore shadow confidence and reason\n");
 }

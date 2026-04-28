@@ -151,7 +151,7 @@ static void TestValueDetectorCoreMarkRebuildFailure() {
     assert(snapshot.runtime_state.formal_state.candidate_state ==
            RebuildCandidateState::kFailed);
     assert(snapshot.runtime_state.formal_state.switch_state ==
-           RebuildSwitchState::kRebuildBlocked);
+           RebuildSwitchState::kIdle);
     assert(snapshot.runtime_state.formal_state.failure_reason ==
            RebuildFailureReason::kUnavailable);
     assert(snapshot.runtime_state.formal_state.last_replay_window.request_bucket_start == 7);
@@ -414,19 +414,25 @@ static void TestValueDetectorCoreShadowConfidenceAndReason() {
     DetectorSubmitOutput first;
     DetectorSubmitOutput second;
     DetectorSubmitOutput third;
+    DetectorSubmitOutput fourth;
+    DetectorSubmitOutput fifth;
     assert(core.Submit(ValueObservation{Ref("svc-shadow"), 201, 64.0, 0}, &first) == error::OK);
     assert(core.Submit(ValueObservation{Ref("svc-shadow"), 202, 64.0, 0}, &second) == error::OK);
     assert(core.Submit(ValueObservation{Ref("svc-shadow"), 203, 64.0, 0}, &third) == error::OK);
+    assert(core.Submit(ValueObservation{Ref("svc-shadow"), 204, 64.0, 0}, &fourth) == error::OK);
+    assert(core.Submit(ValueObservation{Ref("svc-shadow"), 205, 64.0, 0}, &fifth) == error::OK);
 
     assert((first.detector_result.flags & kBaselineFlagShadowActive) == 0);
     assert((second.detector_result.flags & kBaselineFlagShadowActive) == 0);
-    assert((third.detector_result.flags & kBaselineFlagShadowActive) != 0);
-    assert(third.detector_result.provider == BaselineProvider::kShadow);
-    assert(NearlyEqual(third.detector_result.confidence, 0.8));
-    assert(third.detector_result.reason == BaselineReasonCode::kBaselineShiftUp);
-    assert(third.detector_result.evidence.kind == BaselineEvidenceKind::kValue);
-    assert(third.detector_result.evidence.value.shadow_active);
-    assert(third.detector_result.evidence.value.model_state == BaselineModelState::kShadow);
+    assert((third.detector_result.flags & kBaselineFlagShadowActive) == 0);
+    assert((fourth.detector_result.flags & kBaselineFlagShadowActive) == 0);
+    assert((fifth.detector_result.flags & kBaselineFlagShadowActive) != 0);
+    assert(fifth.detector_result.provider == BaselineProvider::kShadow);
+    assert(NearlyEqual(fifth.detector_result.confidence, 0.8));
+    assert(fifth.detector_result.reason == BaselineReasonCode::kBaselineShiftUp);
+    assert(fifth.detector_result.evidence.kind == BaselineEvidenceKind::kValue);
+    assert(fifth.detector_result.evidence.value.shadow_active);
+    assert(fifth.detector_result.evidence.value.model_state == BaselineModelState::kShadow);
 
     std::printf("[PASS] ValueDetectorCore shadow confidence and reason\n");
 }

@@ -117,11 +117,18 @@ CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& pro
     }
 
     const SharedProfileConfig shared_config = DefaultSharedProfileConfig();
-    const std::vector<std::size_t> valid_indices = CollectValueValidIndices(profile, replay);
-    const std::size_t holdout_valid_count =
-        valid_indices.size() >= 2 * shared_config.n_val_switch ? shared_config.n_val_switch : 0;
-    const std::size_t holdout_begin =
-        HoldoutStartIndex(replay, valid_indices, holdout_valid_count);
+    std::size_t holdout_begin = replay.points.size();
+    std::size_t holdout_valid_count = 0;
+    const std::size_t shadow_holdout = ShadowMinHoldoutPoints();
+    if (shadow_holdout > 0 && replay.points.size() >= 2 * shadow_holdout) {
+        holdout_valid_count = shadow_holdout;
+        holdout_begin = replay.points.size() - holdout_valid_count;
+    } else {
+        const std::vector<std::size_t> valid_indices = CollectValueValidIndices(profile, replay);
+        holdout_valid_count =
+            valid_indices.size() >= 2 * shared_config.n_val_switch ? shared_config.n_val_switch : 0;
+        holdout_begin = HoldoutStartIndex(replay, valid_indices, holdout_valid_count);
+    }
     const std::size_t train_count = holdout_begin;
 
     if (train_count < CandidateMinTrainPointCount()) {
@@ -137,7 +144,7 @@ CandidateBuildStatus CandidateBuilder::BuildValue(const ValueFeatureProfile& pro
         &replay,
         train_count,
         candidate_model_version,
-        static_cast<uint64_t>(holdout_valid_count),
+        static_cast<uint64_t>(out->holdout_window.observation_count),
         out->train_window,
         task_spec,
         delta,
@@ -173,11 +180,18 @@ CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& pro
     }
 
     const SharedProfileConfig shared_config = DefaultSharedProfileConfig();
-    const std::vector<std::size_t> valid_indices = CollectRatioValidIndices(profile, replay);
-    const std::size_t holdout_valid_count =
-        valid_indices.size() >= 2 * shared_config.n_val_switch ? shared_config.n_val_switch : 0;
-    const std::size_t holdout_begin =
-        HoldoutStartIndex(replay, valid_indices, holdout_valid_count);
+    std::size_t holdout_begin = replay.points.size();
+    std::size_t holdout_valid_count = 0;
+    const std::size_t shadow_holdout = ShadowMinHoldoutPoints();
+    if (shadow_holdout > 0 && replay.points.size() >= 2 * shadow_holdout) {
+        holdout_valid_count = shadow_holdout;
+        holdout_begin = replay.points.size() - holdout_valid_count;
+    } else {
+        const std::vector<std::size_t> valid_indices = CollectRatioValidIndices(profile, replay);
+        holdout_valid_count =
+            valid_indices.size() >= 2 * shared_config.n_val_switch ? shared_config.n_val_switch : 0;
+        holdout_begin = HoldoutStartIndex(replay, valid_indices, holdout_valid_count);
+    }
     const std::size_t train_count = holdout_begin;
 
     if (train_count < CandidateMinTrainPointCount()) {
@@ -193,7 +207,7 @@ CandidateBuildStatus CandidateBuilder::BuildRatio(const RatioFeatureProfile& pro
         &replay,
         train_count,
         candidate_model_version,
-        static_cast<uint64_t>(holdout_valid_count),
+        static_cast<uint64_t>(out->holdout_window.observation_count),
         out->train_window,
         task_spec,
         delta,

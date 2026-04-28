@@ -56,6 +56,13 @@ double CandidateShadowAlpha();
 double CandidateRatioVarianceFloor();
 double CandidateSwitchLossAbsTol();
 std::size_t CandidateMinTrainPointCount();
+double ShadowZShiftConfirmMin();
+uint32_t ShadowCRebuildMin();
+double ShadowZWinShiftThreshold();
+std::size_t ShadowMinPointsForCandidate();
+std::size_t ShadowMinHoldoutPoints();
+std::size_t ShadowRetryCooldownPoints();
+std::size_t ShadowStuckAlertPoints();
 
 double KeyFusionPersistenceWindow();
 std::size_t KeyFusionWindowLimit();

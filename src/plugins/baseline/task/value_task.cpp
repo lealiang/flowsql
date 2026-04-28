@@ -16,6 +16,7 @@
 
 #include "baseline_task_base.h"
 #include "plugins/baseline/fusion/key_risk_fusion.h"
+#include "plugins/baseline/config/runtime_config.h"
 #include "plugins/baseline/model/event_calendar_matcher.h"
 #include "plugins/baseline/model/formal_predictor.h"
 #include "plugins/baseline/rebuild/candidate_builder.h"
@@ -244,6 +245,20 @@ int BaselineValueTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     writer.Uint64(snapshot.runtime_state.shadow_state.ref_model_version);
     writer.Key("shadow_delta");
     writer.Double(snapshot.runtime_state.shadow_state.delta);
+    writer.Key("shadow_enter_bucket_id");
+    writer.Int64(snapshot.runtime_state.shadow_state.enter_bucket_id);
+    writer.Key("shadow_point_count");
+    writer.Uint64(snapshot.runtime_state.shadow_state.shadow_point_count);
+    writer.Key("shadow_effective_holdout_count");
+    writer.Uint64(snapshot.runtime_state.shadow_state.shadow_effective_holdout_count);
+    writer.Key("last_candidate_attempt_bucket");
+    writer.Int64(snapshot.runtime_state.shadow_state.last_candidate_attempt_bucket);
+    writer.Key("shadow_stuck");
+    writer.Bool(snapshot.runtime_state.shadow_state.shadow_stuck);
+    writer.Key("z_win");
+    writer.Double(snapshot.runtime_state.shadow_state.z_win);
+    writer.Key("slow_drift_triggered");
+    writer.Bool(snapshot.runtime_state.shadow_state.slow_drift_triggered);
     writer.Key("formal_ready");
     writer.Bool(snapshot.runtime_state.formal_state.formal_ready);
     writer.Key("formal_model_kind");
@@ -270,6 +285,9 @@ int BaselineValueTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     writer.String(RebuildCandidateStateName(snapshot.runtime_state.formal_state.candidate_state));
     writer.Key("switch_state");
     writer.String(RebuildSwitchStateName(snapshot.runtime_state.formal_state.switch_state));
+    writer.Key("rebuild_phase");
+    writer.String(RebuildPhaseName(ResolveRebuildPhase(snapshot.runtime_state.formal_state,
+                                                       snapshot.runtime_state.shadow_state.active)));
     writer.Key("stage_seen_building");
     writer.Bool(snapshot.runtime_state.formal_state.stage_trace.stage_seen_building);
     writer.Key("stage_seen_built");
@@ -286,6 +304,14 @@ int BaselineValueTask::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     writer.Double(snapshot.runtime_state.formal_state.last_incumbent_loss);
     writer.Key("last_validation_count");
     writer.Uint64(snapshot.runtime_state.formal_state.last_validation_count);
+    writer.Key("candidate_passed");
+    writer.Bool(snapshot.runtime_state.formal_state.candidate_passed);
+    writer.Key("full_waiting");
+    writer.Bool(snapshot.runtime_state.formal_state.full_waiting);
+    writer.Key("t_switch_gate");
+    writer.Int64(snapshot.runtime_state.formal_state.t_switch_gate);
+    writer.Key("t_full_start");
+    writer.Int64(snapshot.runtime_state.formal_state.t_full_start);
     writer.Key("candidate_calendar_present");
     writer.Bool(snapshot.candidate_calendar_present);
     writer.Key("candidate_calendar_id");
@@ -402,6 +428,17 @@ int BaselineValueTask::SetHistoryReader(IBaselineValueHistoryReader* reader) {
 }
 
 int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
+    int64_t rebuild_start_hint = request.bucket_start_hint;
+    if (request.rebuild_reason == BaselineRebuildReason::kShiftConfirmed) {
+        const std::size_t replay_points_required =
+            ShadowMinPointsForCandidate() + ShadowMinHoldoutPoints();
+        const int64_t min_start = std::max<int64_t>(
+            0, request.bucket_end - static_cast<int64_t>(replay_points_required) + 1);
+        if (rebuild_start_hint <= 0 || rebuild_start_hint > min_start) {
+            rebuild_start_hint = min_start;
+        }
+    }
+
     IBaselineValueHistoryReader* reader = nullptr;
     {
         std::lock_guard<std::mutex> lock(history_binding_->mutex);
@@ -410,7 +447,7 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
     if (!reader) {
         DetectorRebuildFailure failure;
         failure.key = request.key;
-        failure.request_bucket_start = request.bucket_start_hint;
+        failure.request_bucket_start = rebuild_start_hint;
         failure.request_bucket_end = request.bucket_end;
         failure.candidate_state = RebuildCandidateState::kFailed;
         failure.switch_state = RebuildSwitchState::kRebuildBlocked;
@@ -428,7 +465,7 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
     const HistoryFetchRequest fetch_req{
         key_ref,
         BaselineStringRef{spec_.feature.c_str(), static_cast<uint32_t>(spec_.feature.size())},
-        request.bucket_start_hint,
+        rebuild_start_hint,
         request.bucket_end};
 
     ValueReplayRunner runner(request.key);
@@ -438,7 +475,7 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
     if (fetch_rc != error::OK) {
         DetectorRebuildFailure failure;
         failure.key = request.key;
-        failure.request_bucket_start = request.bucket_start_hint;
+        failure.request_bucket_start = rebuild_start_hint;
         failure.request_bucket_end = request.bucket_end;
         failure.candidate_state = RebuildCandidateState::kFailed;
         failure.switch_state = RebuildSwitchState::kIdle;
@@ -453,7 +490,7 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
     }
 
     ValueReplaySeries replay;
-    runner.Finalize(request.bucket_start_hint, request.bucket_end, &replay);
+    runner.Finalize(rebuild_start_hint, request.bucket_end, &replay);
 
     ValueRebuildContext rebuild_context;
     core_->BuildRebuildContext(request.key, &rebuild_context);
@@ -474,6 +511,7 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
     CandidateValidationResult validation_result;
     std::shared_ptr<ValueFormalModel> full_model;
     bool full_model_train_failed = false;
+    const bool shift_rebuild = request.rebuild_reason == BaselineRebuildReason::kShiftConfirmed;
     if (build_result.status == CandidateBuildStatus::kTrained &&
         build_result.candidate_model) {
         core_->MarkCandidateBuilt(request.key,
@@ -497,7 +535,7 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
                 : nullptr,
             &series_task_spec,
             compiled_event_calendar_.get());
-        if (validation_result.pass) {
+        if (validation_result.pass && !shift_rebuild) {
             full_model = TrainFullValueModel(
                 core_->profile(),
                 replay,
@@ -524,7 +562,19 @@ int BaselineValueTask::ExecuteRebuild(const RebuildRequest& request) {
         apply_result.candidate_trained = true;
         apply_result.candidate_generation =
             build_result.candidate_model->metadata.model_version;
-        if (validation_result.pass && full_model) {
+        if (validation_result.pass && shift_rebuild) {
+            apply_result.candidate_state = RebuildCandidateState::kAccepted;
+            apply_result.switch_state = RebuildSwitchState::kShadowActive;
+            apply_result.failure_reason = RebuildFailureReason::kNone;
+            apply_result.failure_reason_detail.clear();
+            apply_result.candidate_passed = true;
+            apply_result.full_waiting = true;
+            apply_result.t_switch_gate = request.bucket_end;
+            const std::size_t required_points =
+                ShadowMinPointsForCandidate() + ShadowMinHoldoutPoints();
+            apply_result.t_full_start = std::max<int64_t>(
+                0, request.bucket_end - static_cast<int64_t>(required_points) + 1);
+        } else if (validation_result.pass && full_model) {
             SetRebuildAcceptedOutcome(&apply_result);
             apply_result.full_model = full_model;
         } else {
@@ -582,6 +632,9 @@ int BaselineValueTask::SubmitObservation(const ValueObservation& obs,
             const int push_rc = rebuild_queue_->Push(request);
             if (push_rc == error::OK) {
                 out->flags |= kBaselineFlagRebuildQueued;
+                if (request.rebuild_reason == BaselineRebuildReason::kShiftConfirmed) {
+                    core_->MarkCandidateAttemptEnqueued(request.key, request.bucket_end);
+                }
             } else {
                 rebuild_runtime_->OnCanceled(request);
                 core_->ClearPendingRebuild(request.key);

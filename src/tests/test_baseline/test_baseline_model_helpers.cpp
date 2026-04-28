@@ -215,6 +215,14 @@ baseline:
       prune_scan_limit: 16
     candidate_builder:
       min_train_point_count: 3
+    shadow_policy:
+      z_shift_confirm_min: 1.33
+      c_rebuild_min: 6
+      z_win_shift_threshold: 2.4
+      min_shadow_points_for_candidate: 1200
+      min_shadow_holdout_points: 200
+      retry_cooldown_points: 240
+      shadow_stuck_alert_points: 3600
     candidate_validator:
       huber_delta: 2.0
       shadow_alpha: 0.3
@@ -269,6 +277,13 @@ baseline:
     assert(RuntimeIdlePruneBucketGap() == 2048);
     assert(RuntimeIdlePruneScanLimit() == 16);
     assert(CandidateMinTrainPointCount() == 3);
+    assert(NearlyEqual(ShadowZShiftConfirmMin(), 1.33));
+    assert(ShadowCRebuildMin() == 6);
+    assert(NearlyEqual(ShadowZWinShiftThreshold(), 2.4));
+    assert(ShadowMinPointsForCandidate() == 1200);
+    assert(ShadowMinHoldoutPoints() == 200);
+    assert(ShadowRetryCooldownPoints() == 240);
+    assert(ShadowStuckAlertPoints() == 3600);
     assert(NearlyEqual(CandidateHuberDelta(), 2.0));
     assert(NearlyEqual(CandidateShadowAlpha(), 0.3));
     assert(NearlyEqual(CandidateRatioVarianceFloor(), 0.4));
@@ -302,6 +317,13 @@ baseline:
     assert(RuntimeIdlePruneBucketGap() == 4096);
     assert(RuntimeIdlePruneScanLimit() == 32);
     assert(CandidateMinTrainPointCount() == 2);
+    assert(NearlyEqual(ShadowZShiftConfirmMin(), 1.44));
+    assert(ShadowCRebuildMin() == 5);
+    assert(NearlyEqual(ShadowZWinShiftThreshold(), 2.2));
+    assert(ShadowMinPointsForCandidate() == 1440);
+    assert(ShadowMinHoldoutPoints() == 180);
+    assert(ShadowRetryCooldownPoints() == 180);
+    assert(ShadowStuckAlertPoints() == 4320);
     assert(NearlyEqual(ScoreWarn(), 3.0));
     assert(NearlyEqual(ScoreCrit(), 5.0));
     assert(NearlyEqual(KeyFusionPersistenceWindow(), 3.0));

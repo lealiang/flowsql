@@ -11,7 +11,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <cstddef>
 #include <string>
+#include <vector>
 
 #include "formal_model.h"
 
@@ -55,6 +57,19 @@ struct ShadowStateT {
     std::shared_ptr<TFormalModel> frozen_ref_model;
     double delta = 0.0;
     int64_t last_bucket_id = 0;
+    int64_t enter_bucket_id = -1;
+    uint64_t shadow_point_count = 0;
+    uint64_t shadow_effective_holdout_count = 0;
+    int64_t last_candidate_attempt_bucket = -1;
+    bool shadow_stuck = false;
+    std::vector<double> slow_err_ring;
+    std::vector<double> slow_var_ring;
+    std::size_t slow_ring_pos = 0;
+    std::size_t slow_ring_size = 0;
+    double slow_err_sum = 0.0;
+    double slow_var_sum = 0.0;
+    double z_win = 0.0;
+    bool slow_drift_triggered = false;
 
     void Reset() {
         active = false;
@@ -64,6 +79,19 @@ struct ShadowStateT {
         frozen_ref_model.reset();
         delta = 0.0;
         last_bucket_id = 0;
+        enter_bucket_id = -1;
+        shadow_point_count = 0;
+        shadow_effective_holdout_count = 0;
+        last_candidate_attempt_bucket = -1;
+        shadow_stuck = false;
+        slow_err_ring.clear();
+        slow_var_ring.clear();
+        slow_ring_pos = 0;
+        slow_ring_size = 0;
+        slow_err_sum = 0.0;
+        slow_var_sum = 0.0;
+        z_win = 0.0;
+        slow_drift_triggered = false;
     }
 };
 

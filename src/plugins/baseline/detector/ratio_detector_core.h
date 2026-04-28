@@ -109,6 +109,10 @@ struct RatioApplyFormalModelResult {
     RebuildSwitchState switch_state = RebuildSwitchState::kIdle;
     RebuildFailureReason failure_reason = RebuildFailureReason::kNone;
     std::string failure_reason_detail;
+    bool candidate_passed = false;
+    bool full_waiting = false;
+    int64_t t_switch_gate = -1;
+    int64_t t_full_start = -1;
     bool replace_formal_model = false;
     std::shared_ptr<RatioFormalModel> full_model;
 };
@@ -123,6 +127,7 @@ class RatioDetectorCore {
     int GetSeriesState(const BaselineStringRef& key, SeriesState* out_state) const;
     int BuildRebuildContext(const std::string& key, RatioRebuildContext* out_context) const;
     void MarkRebuildEnqueued(const std::string& key);
+    void MarkCandidateAttemptEnqueued(const std::string& key, int64_t bucket_id);
     void MarkCandidateBuilding(const std::string& key);
     void MarkCandidateBuilt(const std::string& key,
                             uint64_t candidate_model_version,

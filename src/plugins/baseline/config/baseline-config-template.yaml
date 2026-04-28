@@ -102,7 +102,7 @@ baseline:
     lambda_dme: 2.0
     lambda_lwd: 1.0
     lambda_event: 2.0
-    n_val_switch: 16
+    n_val_switch: 16              # legacy for non-shadow-refactor path
     eps_switch: 0.05
     z_warn: 3.0
     z_crit: 5.0
@@ -157,6 +157,14 @@ baseline:
       prune_scan_limit: 32
     candidate_builder:
       min_train_point_count: 2
+    shadow_policy:
+      z_shift_confirm_min: 1.44
+      c_rebuild_min: 5
+      z_win_shift_threshold: 2.2
+      min_shadow_points_for_candidate: 1440
+      min_shadow_holdout_points: 180
+      retry_cooldown_points: 180
+      shadow_stuck_alert_points: 4320
     candidate_validator:
       huber_delta: 1.5
       shadow_alpha: 0.2

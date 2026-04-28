@@ -1898,9 +1898,21 @@ static void TestBaselineShadowBaselineAndFormalSwitch() {
     assert(value_task->SubmitObservation(
                ValueObservation{BaselineStringRef{"svc-switch", 10}, 203, 64.0, 0},
                &value_shift_3) == error::OK);
-    assert(value_shift_3.provider == BaselineProvider::kShadow);
-    assert((value_shift_3.flags & kBaselineFlagShadowActive) != 0);
-    assert((value_shift_3.flags & kBaselineFlagRebuildQueued) != 0);
+    assert((value_shift_3.flags & kBaselineFlagShadowActive) == 0);
+
+    DetectorResult value_shift_4{};
+    assert(value_task->SubmitObservation(
+               ValueObservation{BaselineStringRef{"svc-switch", 10}, 204, 64.0, 0},
+               &value_shift_4) == error::OK);
+    assert((value_shift_4.flags & kBaselineFlagShadowActive) == 0);
+
+    DetectorResult value_shift_5{};
+    assert(value_task->SubmitObservation(
+               ValueObservation{BaselineStringRef{"svc-switch", 10}, 205, 64.0, 0},
+               &value_shift_5) == error::OK);
+    assert(value_shift_5.provider == BaselineProvider::kShadow);
+    assert((value_shift_5.flags & kBaselineFlagShadowActive) != 0);
+    assert((value_shift_5.flags & kBaselineFlagRebuildQueued) == 0);
 
     DetectorResult ratio_shift_1{};
     assert(ratio_task->SubmitObservation(
@@ -1918,9 +1930,26 @@ static void TestBaselineShadowBaselineAndFormalSwitch() {
     assert(ratio_task->SubmitObservation(
                RatioObservation{BaselineStringRef{"svc-switch", 10}, 203, 23.0, 100.0},
                &ratio_shift_3) == error::OK);
-    assert(ratio_shift_3.provider == BaselineProvider::kShadow);
-    assert((ratio_shift_3.flags & kBaselineFlagShadowActive) != 0);
-    assert((ratio_shift_3.flags & kBaselineFlagRebuildQueued) != 0);
+    assert((ratio_shift_3.flags & kBaselineFlagShadowActive) == 0);
+
+    DetectorResult ratio_shift_4{};
+    assert(ratio_task->SubmitObservation(
+               RatioObservation{BaselineStringRef{"svc-switch", 10}, 204, 23.0, 100.0},
+               &ratio_shift_4) == error::OK);
+    assert((ratio_shift_4.flags & kBaselineFlagShadowActive) == 0);
+
+    DetectorResult ratio_shift_5{};
+    assert(ratio_task->SubmitObservation(
+               RatioObservation{BaselineStringRef{"svc-switch", 10}, 205, 23.0, 100.0},
+               &ratio_shift_5) == error::OK);
+    assert(ratio_shift_5.provider == BaselineProvider::kShadow);
+    assert((ratio_shift_5.flags & kBaselineFlagShadowActive) != 0);
+    assert((ratio_shift_5.flags & kBaselineFlagRebuildQueued) == 0);
+
+    assert(value_task->RequestRebuild(BaselineStringRef{"svc-switch", 10},
+                                      BaselineRebuildReason::kManual) == error::OK);
+    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-switch", 10},
+                                      BaselineRebuildReason::kManual) == error::OK);
 
     assert(WaitUntil([&value_reader]() { return value_reader.second_fetch_started(); }));
 
@@ -1952,25 +1981,7 @@ static void TestBaselineShadowBaselineAndFormalSwitch() {
     assert(WaitUntil([&ratio_reader]() { return ratio_reader.second_fetch_started(); }));
     ratio_reader.AllowSecondFetch();
 
-    assert(WaitUntil([&]() {
-        std::string snapshot;
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10}, &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["shadow_active"].GetBool() == true;
-    }));
-
-    assert(WaitUntil([&]() {
-        std::string snapshot;
-        if (ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10}, &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["shadow_active"].GetBool() == true;
-    }));
-
-    for (int64_t bucket = 204; bucket <= 240; ++bucket) {
+    for (int64_t bucket = 206; bucket <= 240; ++bucket) {
         DetectorResult value_bridge{};
         assert(value_task->SubmitObservation(
                    ValueObservation{BaselineStringRef{"svc-switch", 10}, bucket, 64.0, 0},
