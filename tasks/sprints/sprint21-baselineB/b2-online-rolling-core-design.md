@@ -10,8 +10,7 @@ stream observation -> rolling prediction band -> residual score -> gated update
 
 必须完成：
 
-- `T1/T2` 支持 `InitRollingFromEmpty(series_key, options)`，无历史数据也能按 key 启动。
-- `T1/T2` 支持 `InitRollingFromBootstrap(series_key, options)`，从同一 task 内部的 `BootstrapSeed[series_key]` 初始化。
+- `T1/T2` 以 `SubmitObservation(...)` 作为唯一对外滚动入口，首次提交时根据同一 task 内部的 `BootstrapSeed[series_key]` 或空启动语义内部懒初始化。
 - 每个有效 bucket 输出 baseline band，而不是只输出中心点。
 - 强异常点可跳过或降权更新，避免污染 baseline。
 - `level/trend/day/week`、残差尺度、漂移证据在线滚动更新。
@@ -40,7 +39,7 @@ ready_hint
 `B2` 沿用 `B1` 的统一任务模型，不新增独立 rolling service。
 
 - `IBaselineService` 继续负责创建任务。
-- `IBaselineValueTask` 和 `IBaselineRatioTask` 增加 rolling 能力。
+- `IBaselineValueTask` 和 `IBaselineRatioTask` 只对外暴露 rolling 提交能力，初始化由 task 内部 lazy 触发。
 - `IBaselineRelationTask` 不增加 rolling 提交接口，只能继续查询 `B1` bootstrap basis / seed。
 - `BootstrapSeed` 仍是 baseline plugin 内部结构，不进入 `framework/interfaces` public ABI。
 
@@ -48,10 +47,6 @@ ready_hint
 
 ```cpp
 namespace flowsql {
-
-struct RollingInitOptions {
-    bool force_reset_existing_state = false;
-};
 
 struct RollingSubmitOptions {
     bool allow_auto_init_from_bootstrap = true;
@@ -117,44 +112,47 @@ struct RollingBaselineResult {
     std::string diagnostics;
 };
 
+struct RollingPrediction {
+    BaselineStatus status = BaselineStatus::kOk;
+    double baseline_mu = 0.0;
+    double baseline_lower = 0.0;
+    double baseline_upper = 0.0;
+    double band_z = 0.0;
+
+    bool ok() const { return status == BaselineStatus::kOk; }
+};
+
 }  // namespace flowsql
 ```
 
 Value task 接口扩展示意：
 
 ```cpp
-virtual BaselineStatus InitRollingFromEmpty(
-    std::string_view series_key,
-    const RollingInitOptions& options) = 0;
-
-virtual BaselineStatus InitRollingFromBootstrap(
-    std::string_view series_key,
-    const RollingInitOptions& options) = 0;
-
 virtual RollingBaselineResult SubmitObservation(
     const ValueRollingObservation& obs,
     const RollingSubmitOptions& options) = 0;
+
+virtual RollingPrediction PredictRolling(
+    std::string_view series_key,
+    int64_t bucket_id) const = 0;
 ```
 
 Ratio task 接口扩展示意：
 
 ```cpp
-virtual BaselineStatus InitRollingFromEmpty(
-    std::string_view series_key,
-    const RollingInitOptions& options) = 0;
-
-virtual BaselineStatus InitRollingFromBootstrap(
-    std::string_view series_key,
-    const RollingInitOptions& options) = 0;
-
 virtual RollingBaselineResult SubmitObservation(
     const RatioRollingObservation& obs,
     const RollingSubmitOptions& options) = 0;
+
+virtual RollingPrediction PredictRolling(
+    std::string_view series_key,
+    int64_t bucket_id) const = 0;
 ```
 
 输出边界：
 
 - B2 core 输出 `RollingBaselineResult`。
+- `PredictRolling()` 是测试与验收用的只读预测接口，只消费已有 rolling state，不更新状态、不触发 bootstrap / empty lazy init，不携带 `options` 或 `diagnostics`。`band_z` 用于评估程序根据实际观测值计算 directional z-score，并统计 `|Z| > 3` / `|Z| > 5`。
 - 旧 `DetectorResult` 映射只允许放在 task 层或兼容层，core 不直接依赖旧异常检测结果结构。
 - snapshot 可输出 band、state_status、update_weight、drift_evidence 和状态规模。
 
@@ -162,12 +160,11 @@ Seed 交接约定：
 
 - `BootstrapSeed` 归属 task，但模型参数粒度是 `series_key`。
 - task 内部形态可以理解为 `BootstrapSeedStore[series_key]`。
-- `InitRollingFromBootstrap(series_key, options)` 不接收外部 seed 参数，只消费同一 task 内部同 key seed。
 - B2 在 task 内部应优先对 `BootstrapSeedStore` 做批量 warm-up：一次性遍历全部 seed，批量初始化对应的 `RollingState`。
-- `InitRollingFromBootstrap(series_key, options)` 是批量 warm-up 中的单系列原子动作，不是对外逐个查询 seed 的热接口。
+- warm-up 只是一条内部优化路径，不是对外 API；`SubmitObservation()` 在未命中预热状态时必须仍然能按 seed / 空启动语义完成懒初始化。
 - B2 核心初始化只校验 rolling-critical 字段：`task_identity`、`series_key`、`feature_type`、`profile`、`clock_spec`、`calendar_ref`、`theta_init`、`sigma_init`、`uncertainty_init`、`maturity_init` 和 `coverage_report`。`monthpos_hint`、`event_hint`、`relation_basis_by_metric`、`relation_routed_summary_seeds` 这类扩展项不参与 B2 核心初始化，仅保留诊断或原样存储，不作为兼容性判定条件。
 - `ExportBootstrapSeed(format)` 是 task 级全量序列化接口，导出全部 series seed；这不等于 task 级模型参数。
-- `B1 -> B2` 主路径不得走 `ExportBootstrapSeed(JSON) -> parse/load -> InitRollingFromBootstrap`。
+- `B1 -> B2` 主路径不得走 `ExportBootstrapSeed(JSON) -> parse/load -> 内部 bootstrap 懒初始化`。
 
 ### Snapshot JSON 契约
 
@@ -229,8 +226,11 @@ Seed 交接约定：
 
 ```text
 已有 RollingState
-  -> 同 key BootstrapSeed
-  -> InitRollingFromEmpty(obs.series_key, options)
+  -> 直接使用已有状态
+无 RollingState 且同 key BootstrapSeed 可用
+  -> 内部 bootstrap 懒初始化
+无 RollingState 且无可用 seed
+  -> 内部空启动懒初始化
 ```
 
 后两步分别由 `allow_auto_init_from_bootstrap` 和 `allow_auto_init_from_empty` 控制。
@@ -362,6 +362,8 @@ relation group 级动态状态
 配置归属：
 
 - 所有 rolling 参数归 `BaselineRollingConfig` 或等价内部配置结构。
+- 默认值必须同时落在 C++ 默认构造和 `plugins/baseline/config/baseline-config-template.yaml`；新增 / 修改 rolling 参数时必须同步更新 strict YAML schema、配置模板和测试。
+- B2 rolling 的 day/week 阶数以 `rolling_config.daily_harmonic_order` / `rolling_config.weekly_harmonic_order` 为准，不再隐式读取 B1 bootstrap 的 `shared_profile_config` 覆盖值。
 - 观测适配器、状态估计器、gate、drift、residual scale 只能读取已解析配置。
 - 新增 `rolling/*.cpp` 必须加入 `plugins/baseline/CMakeLists.txt`。
 
@@ -423,6 +425,12 @@ MVP 默认值：
 | `confidence_ready_hint_cap` | `0.8` | B2 ready hint confidence 上限 |
 | `min_warming_updates` | `3` | 进入 warming 的最少有效更新数 |
 | `min_ready_hint_updates` | `day_buckets` | 进入 ready hint 的最少有效更新数 |
+
+`alpha_short` / `alpha_long` 是可配置的 EWMA 系数，不是固定窗口长度。默认值在分钟级 bucket 下的近似含义：
+
+- `alpha_short = 0.05`：有效观察长度约 `1 / alpha = 20` 个点，半衰期约 `13.5` 个点，约 14 分钟。
+- `alpha_long = 0.005`：有效观察长度约 `1 / alpha = 200` 个点，半衰期约 `138` 个点，约 2 小时 18 分钟。
+- 非分钟级 bucket 时，时间长度随 `bucket_seconds` 等比例缩放。
 
 派生时间参数：
 
@@ -676,9 +684,9 @@ sigma_t >= sigma_floor
 
 ## 6. 启动与自动初始化
 
-### 6.1 InitRollingFromEmpty(series_key)
+### 6.1 空启动的内部懒初始化
 
-空启动只作用于指定 `series_key`。该接口创建 key 级 pending empty state；如果由 `SubmitObservation()` 自动触发，首个 update-eligible 点会在同一次提交中完成 level 初始化。
+空启动不再作为 public ABI 暴露；它是 `SubmitObservation()` 在未命中 bootstrap seed、且允许空启动时的内部懒初始化分支。其作用域仍然只针对指定 `series_key`。
 
 `series_key` 为空时返回 `kInvalidArgument`，不创建 state。
 
@@ -719,9 +727,9 @@ pending empty state 遇到非 update-eligible 点时，返回对应错误或低�
 | `false` | 返回 `kInvalidArgument`，不清空该 key 状态 |
 | `true` | 先验证 seed 是否存在且兼容，再用 seed 原子性重建该 `series_key` 的 rolling state；校验失败时保留旧 state，不产生中间态 |
 
-### 6.2 InitRollingFromBootstrap
+### 6.2 Bootstrap Seed 的内部初始化
 
-从 `BootstrapSeed[series_key]` 初始化：
+从 `BootstrapSeed[series_key]` 内部初始化：
 
 ```text
 anchor_bucket =
@@ -811,6 +819,7 @@ P_component =
 | 无 state，允许 bootstrap，但无同 key seed，且禁止空启动 | `kNotTrained` | 不创建 state |
 | 无 state，同 key seed 不兼容 | `kIncompatibleArtifact` | 不回退空启动 |
 | 无 state，首点支撑不足 | `kInsufficientData` | 不创建 state |
+| 已有 state，观测支撑不足 | `kOk` | 输出低置信预测，按 adapter 规则禁用评分或更新 |
 
 ### 6.4 批量 warm-up
 
@@ -830,7 +839,6 @@ WarmupRollingFromBootstrapStore(task)
 - 已存在的 `RollingState[series_key]` 不应被无条件覆盖，除非显式 reset。
 - 新到达、但不在 seed store 中的 `series_key`，仍按 `SubmitObservation()` 的空启动或自动初始化语义处理。
 - 批量 warm-up 的实现必须可观测：至少记录 warm-up 成功数、失败数、跳过数和耗时。
-| 已有 state，观测支撑不足 | `kOk` | 输出低置信预测，按 adapter 规则禁用评分或更新 |
 
 ## 7. 状态边界与阶段边界
 
@@ -883,6 +891,8 @@ accepted_update_count >= min_ready_hint_updates:
 B3 负责：
 
 ```text
+score_trust / z-score trust
+detection band calibration
 level_ready
 daily_warming / daily_ready
 weekly_warming / weekly_ready
@@ -890,6 +900,8 @@ monthly_warming / monthly_ready
 component_readiness
 maturity/confidence 绑定
 ```
+
+B3 需要把 learning confidence 与 score trust 分开处理：B2 可以输出预测 band 和粗粒度 `can_score`，但冷启动、warming、level shift 学习和 band 重新校准期间，`Z-score` 是否能用于异常判定由 B3 负责。
 
 Relation 边界：
 
@@ -905,12 +917,12 @@ Relation 边界：
 
 | 顺序 | 任务 | 参考章节 | 主要文件 | 完成标志 |
 |---|---|---|---|---|
-| `B2-T01` | 补齐 rolling public 类型与接口 | 第 2 节 | `framework/interfaces/ibaseline_types.h`、`ibaseline_service.h`、`task/value_task.*`、`task/ratio_task.*` | Value / Ratio 暴露 rolling 接口；Relation 不新增 rolling 提交接口；concrete task stub 可独立编译 |
-| `B2-T02` | 解析 rolling 配置与默认值 | 第 4 节 | `plugins/baseline/config/*`、`plugins/baseline/rolling/rolling_config.*`、`plugins/baseline/CMakeLists.txt` | `BaselineRollingConfig` 覆盖默认值、派生时间参数、profile override 和合法性校验 |
+| `B2-T01` | 补齐 rolling public 类型与提交 / 预测接口 | 第 2 节 | `framework/interfaces/ibaseline_types.h`、`ibaseline_service.h`、`task/value_task.*`、`task/ratio_task.*` | Value / Ratio 暴露 rolling 提交接口和只读预测接口；初始化仅作为 task 内部 lazy 行为；Relation 不新增 rolling 提交 / 预测接口；concrete task stub 可独立编译 |
+| `B2-T02` | 解析 rolling 配置与默认值 | 第 4 节 | `plugins/baseline/config/*`、`plugins/baseline/rolling/rolling_config.*`、`plugins/baseline/CMakeLists.txt` | `BaselineRollingConfig` 覆盖默认值、配置模板、strict schema、派生时间参数和合法性校验 |
 | `B2-T03` | 实现观测适配器 | 第 3 节 | `plugins/baseline/rolling/observation_adapter.*` | `value_basic/value_sampled/ratio` 转成 `ObservedModelPoint` |
 | `B2-T04` | 建立 `RollingState` 与初始化 | 第 4 节、第 6 节 | `plugins/baseline/rolling/rolling_state.*` | 支持空启动、bootstrap 启动、自动初始化失败语义、`force_reset_existing_state` 和 seed uncertainty 映射 |
-| `B2-T05` | 实现 `RollingStateEstimator` | 第 5.1 至 5.3 节、第 5.5 节 | `plugins/baseline/rolling/rolling_estimator.*` | 完成 predict、band、residual、Kalman/RLS update、gap 和协方差夹紧 |
-| `B2-T06` | 实现 gate、scale、drift | 第 5.4 节、第 5.6 节 | `plugins/baseline/rolling/update_gate.*`、`residual_scale.*`、`drift_adapt.*` | 强异常跳过或降权；sigma 不被异常收窄；level shift 能被逐步追踪 |
+| `B2-T05` | 实现 `RollingStateEstimator` | 第 5.1 至 5.3 节、第 5.5 节 | `plugins/baseline/rolling/rolling_estimator.*` | 完成 predict、band、residual、Kalman/RLS update、gap、协方差夹紧，以及 `adapt_boost` 对 `Q_level` / level 更新权重的接入 |
+| `B2-T06` | 实现 gate、scale、drift | 第 5.4 节、第 5.6 节 | `plugins/baseline/rolling/update_gate.*`、`residual_scale.*`、`drift_adapt.*` | 强异常跳过或降权；sigma 不被异常收窄；level shift 通过 drift evidence 触发 level 加速学习，不触发 shadow/rebuild |
 | `B2-T07` | 接入 Value / Ratio task | 第 2 节、第 6.3 节 | `task/value_task.*`、`task/ratio_task.*` | `SubmitObservation()` 返回 `RollingBaselineResult`；不触发 shadow / rebuild |
 | `B2-T08` | 实现状态管理与批量 warm-up | 第 7 节、第 6.4 节、第 2 节 snapshot 契约 | `rolling/rolling_state_store.*`、`task/*snapshot*` | 支持状态上限、TTL、LRU、批量 warm-up、snapshot schema、指标和 snapshot |
 | `B2-T09` | 补齐自动化测试 | 第 8.2 节 | `tests/test_baseline/*` | 覆盖下方测试矩阵 |
@@ -932,13 +944,15 @@ Relation 边界：
 | 批量 warm-up | 多个 `series_key` 的 rolling state 一次性初始化，且不走 JSON 解析 |
 | bootstrap 已有 state 且不强制 reset | 返回 `kInvalidArgument`，不覆盖 state |
 | bootstrap 已有 state 且强制 reset | 只重置该 `series_key` 的 state |
-| bootstrap 无 seed | 显式 `InitRollingFromBootstrap(series_key)` 返回 `kNotTrained` |
+| bootstrap 无 seed | `SubmitObservation()` 在 bootstrap 分支找不到 seed 时返回 `kNotTrained` |
 | bootstrap 不兼容 | 返回 `kIncompatibleArtifact`，已有 state 不变 |
 | 自动初始化关闭 | `SubmitObservation()` 返回 `kNotTrained`，不创建 state |
 | 自动初始化不兼容 seed | `SubmitObservation()` 不回退空启动 |
 | 自动初始化低支撑首点 | 返回 `kInsufficientData`，不创建 state |
 | series snapshot schema | `schema_version`、`document_kind`、`task_identity`、`series_identity`、`state_status`、`band`、`control` 必填 |
 | task snapshot schema | `schema_version`、`document_kind`、`task_identity`、`rolling_series_count`、`state_status_counts` 必填 |
+| rolling 只读预测 | 已有 state 可预测未来 bucket，预测不更新 state；无 state 返回 `kNotTrained`；旧 bucket 返回 `kInvalidArgument` |
+| link rolling eval | 复用 `link_data_2_month.csv`，输出第 4 周 Bootstrap/Rolling walk-forward 对比、过渡带学习检查点、最后 7 天 rolling 预测评估，以及 absolute / level-scaled / calibrated level-scaled 三个临时 adaptive forecast prototype；指标包含 `RMSE`、`MAPE`、coverage、`|Z| > 3`、`|Z| > 5` |
 | 同 bucket 重复 | 返回 `kInvalidArgument`，状态不二次更新 |
 | 乱序旧 bucket | 返回 `kInvalidArgument`，状态不回滚 |
 | gap jump | 不补点，band 因过程噪声变宽 |

@@ -10,6 +10,8 @@
 
 #include <utility>
 
+#include "plugins/baseline/rolling/rolling_task_runner.h"
+
 namespace flowsql {
 namespace baseline {
 
@@ -38,16 +40,52 @@ BaselineSerializationResult BaselineRatioTask::ExportConfig(
 
 BaselineSerializationResult BaselineRatioTask::QueryTaskSnapshot(
     BaselineSerializationFormat format) const {
-    return BaselineTaskBase::QueryTaskSnapshot(format);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const BaselineStatus status = EnsureOpenLocked();
+    if (status != BaselineStatus::kOk) return {status, ""};
+    return QueryRollingTaskSnapshot(spec_, rolling_states_, format);
 }
 
 BaselineSerializationResult BaselineRatioTask::QuerySeriesSnapshot(
     std::string_view series_key,
     BaselineSerializationFormat format) const {
-    return BaselineTaskBase::QuerySeriesSnapshot(series_key, format);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const BaselineStatus status = EnsureOpenLocked();
+    if (status != BaselineStatus::kOk) return {status, ""};
+    return QueryRollingSeriesSnapshot(spec_, rolling_states_, series_key, format);
 }
 
 BaselineStatus BaselineRatioTask::Close() { return BaselineTaskBase::Close(); }
+
+RollingBaselineResult BaselineRatioTask::SubmitObservation(
+    const RatioRollingObservation& obs,
+    const RollingSubmitOptions& options) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RollingBaselineResult result;
+    result.series_key = obs.series_key;
+    result.bucket_id = obs.bucket_id;
+    const BaselineStatus status = EnsureOpenLocked();
+    if (status != BaselineStatus::kOk) {
+        result.status = status;
+        result.numerator = obs.numerator;
+        result.denominator = obs.denominator;
+        return result;
+    }
+    return RunRatioRollingSubmit(
+        spec_, seeds_by_series_, &rolling_states_, obs, options);
+}
+
+RollingPrediction BaselineRatioTask::PredictRolling(std::string_view series_key,
+                                                    int64_t bucket_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RollingPrediction result;
+    const BaselineStatus status = EnsureOpenLocked();
+    if (status != BaselineStatus::kOk) {
+        result.status = status;
+        return result;
+    }
+    return PredictRollingForSeries(spec_, rolling_states_, series_key, bucket_id);
+}
 
 BootstrapTrainResult BaselineRatioTask::Bootstrap(const RatioBootstrapInput& input) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -76,6 +114,7 @@ BootstrapTrainResult BaselineRatioTask::Bootstrap(const RatioBootstrapInput& inp
             result.status = seed_status;
             return result;
         }
+        (void)WarmupRollingStatesFromBootstrapSeeds(spec_, seeds_by_series_, &rolling_states_);
     }
     return result;
 }
@@ -121,13 +160,18 @@ BaselineStatus BaselineRatioTask::LoadBootstrapArtifact(
     std::lock_guard<std::mutex> lock(mutex_);
     const BaselineStatus status = EnsureOpenLocked();
     if (status != BaselineStatus::kOk) return status;
-    return LoadBootstrapArtifactStore(content,
-                                      format,
-                                      bootstrap_engine_,
-                                      spec_,
-                                      BootstrapArtifactKind::kRatio,
-                                      &artifacts_by_series_,
-                                      &seeds_by_series_);
+    const BaselineStatus load_status =
+        LoadBootstrapArtifactStore(content,
+                                   format,
+                                   bootstrap_engine_,
+                                   spec_,
+                                   BootstrapArtifactKind::kRatio,
+                                   &artifacts_by_series_,
+                                   &seeds_by_series_);
+    if (load_status == BaselineStatus::kOk) {
+        (void)WarmupRollingStatesFromBootstrapSeeds(spec_, seeds_by_series_, &rolling_states_);
+    }
+    return load_status;
 }
 
 BaselineSerializationResult BaselineRatioTask::ExportBootstrapSeed(

@@ -146,6 +146,69 @@ struct BootstrapPrediction {
     bool ok() const { return status == BaselineStatus::kOk; }
 };
 
+struct RollingSubmitOptions {
+    bool allow_auto_init_from_bootstrap = true;
+    bool allow_auto_init_from_empty = true;
+};
+
+struct ValueRollingObservation {
+    std::string series_key;
+    int64_t bucket_id = 0;
+    double value = 0.0;
+    uint64_t sample_count = 0;
+};
+
+struct RatioRollingObservation {
+    std::string series_key;
+    int64_t bucket_id = 0;
+    double numerator = 0.0;
+    double denominator = 0.0;
+};
+
+struct RollingBaselineResult {
+    BaselineStatus status = BaselineStatus::kOk;
+    std::string series_key;
+    int64_t bucket_id = 0;
+    double observed = 0.0;
+    double observed_model = 0.0;
+    double baseline_mu = 0.0;
+    double baseline_lower = 0.0;
+    double baseline_upper = 0.0;
+    double band_width = 0.0;
+    double model_mu = 0.0;
+    double model_lower = 0.0;
+    double model_upper = 0.0;
+    double residual = 0.0;
+    double band_std = 0.0;
+    double z_score = 0.0;
+    bool is_outside_band = false;
+    bool can_score = false;
+    bool can_update = false;
+    double score_weight = 0.0;
+    double update_weight = 0.0;
+    double confidence = 0.0;
+    std::string state_status;
+    std::vector<std::string> uncertainty_source;
+    double drift_evidence = 0.0;
+    double adapt_boost = 0.0;
+    uint64_t sample_count = 0;
+    bool skipped_low_sample_count = false;
+    double numerator = 0.0;
+    double denominator = 0.0;
+    bool skipped_low_denominator = false;
+    std::string diagnostics;
+};
+
+struct RollingPrediction {
+    BaselineStatus status = BaselineStatus::kOk;
+    double baseline_mu = 0.0;
+    double baseline_lower = 0.0;
+    double baseline_upper = 0.0;
+    double band_z = 0.0;
+
+    bool ok() const { return status == BaselineStatus::kOk; }
+};
+
 }  // namespace flowsql
 
 #endif  // _FLOWSQL_FRAMEWORK_INTERFACES_IBASELINE_TYPES_H_

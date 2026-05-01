@@ -1001,3 +1001,30 @@ pip3 install -e src/python/ --break-system-packages
 2. 任务是否启用事件修正，由 task config / task options 决定，不写回 calendar schema。
 3. 任务只能通过 `calendar_ref = {calendar_id, calendar_version}` 引用全局 calendar registry。
 4. strict 配置校验必须拒绝 task-scoped 字段出现在 calendar entry 中。
+
+---
+
+## L63: 新增运行时配置不能只写在 C++ 默认值里
+
+**来源**：Sprint 21 BaselineB B2 实现纠偏 — 用户指出 `BaselineRolling` 相关配置不能只硬编码在头文件中，也必须记录到 `config/baseline-config-template.yaml`。
+
+**问题**：如果新增配置只存在于 C++ 默认值，使用者无法从模板了解可调参数，strict YAML schema 也无法覆盖这些字段。后续调整默认值时，代码、模板和测试容易漂移，最终导致线上配置不可见或不可验证。
+
+**原则（强制）**：
+1. 新增运行时配置结构时，必须同步更新默认值、YAML 解析、strict schema、配置模板和最小测试。
+2. 配置模板必须列出可运维调节的关键参数，不能只依赖头文件作为事实来源。
+3. 如果某个参数同时被多个阶段使用，必须在阶段文档中写清最终归属，避免从旧配置结构隐式覆盖新配置结构。
+
+---
+
+## L64: 阶段设计必须对齐当前代码的实际计算边界
+
+**来源**：Sprint 21 BaselineB B3 设计纠偏 — 用户指出检测可信度、band 校准和 monthpos 设计必须精确贴合 B2 rolling 热路径。
+
+**问题**：如果阶段设计只写算法意图，不钉死当前代码的实际证据来源，后续实现会出现重复计入方差、用 post-update estimator 填 public result、把未成熟 daily/weekly 当成 ready component，或把 centered monthpos coeff 误当直接 offset 等偏差。这类问题不会表现为编译错误，但会让检测 band、`Z-score` 和 `can_alert` 语义失真。
+
+**原则（强制）**：
+1. 设计文档引用现有实现时，必须写清 pre-update / post-update、public result、update gate、drift evidence 各自使用哪份 evidence。
+2. 基于现有方差公式扩展 detection band 时，必须拆清基础 `sigma^2`、额外观测噪声和 `sigma_floor^2`，禁止直接复用聚合后的 `obs_var - pred_var`。
+3. 组件成熟度与中心线贡献必须分开描述：未 ready 组件若作为 provisional center hint 使用，必须在 evidence 中说明，并用组件缺失不确定性保守扩宽 band。
+4. 从旧 bootstrap / formal model 继承的 monthpos 结构必须保留 centered basis 语义，不能把 coeff 简化为直接 offset。

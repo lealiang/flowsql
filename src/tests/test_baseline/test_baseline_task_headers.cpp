@@ -46,11 +46,57 @@ struct HasValueSubmitObservation<T, std::void_t<decltype(&T::SubmitObservation)>
     : std::true_type {};
 
 template <typename T, typename = void>
+struct HasValuePredictRolling : std::false_type {};
+
+template <typename T>
+struct HasValuePredictRolling<T, std::void_t<decltype(&T::PredictRolling)>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasValueInitRollingFromEmpty : std::false_type {};
+
+template <typename T>
+struct HasValueInitRollingFromEmpty<T,
+                                    std::void_t<decltype(&T::InitRollingFromEmpty)>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasValueInitRollingFromBootstrap : std::false_type {};
+
+template <typename T>
+struct HasValueInitRollingFromBootstrap<
+    T,
+    std::void_t<decltype(&T::InitRollingFromBootstrap)>> : std::true_type {};
+
+template <typename T, typename = void>
 struct HasRatioSubmitObservation : std::false_type {};
 
 template <typename T>
 struct HasRatioSubmitObservation<T, std::void_t<decltype(&T::SubmitObservation)>>
     : std::true_type {};
+
+template <typename T, typename = void>
+struct HasRatioPredictRolling : std::false_type {};
+
+template <typename T>
+struct HasRatioPredictRolling<T, std::void_t<decltype(&T::PredictRolling)>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasRatioInitRollingFromEmpty : std::false_type {};
+
+template <typename T>
+struct HasRatioInitRollingFromEmpty<T,
+                                    std::void_t<decltype(&T::InitRollingFromEmpty)>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasRatioInitRollingFromBootstrap : std::false_type {};
+
+template <typename T>
+struct HasRatioInitRollingFromBootstrap<
+    T,
+    std::void_t<decltype(&T::InitRollingFromBootstrap)>> : std::true_type {};
 
 template <typename T, typename = void>
 struct HasRelationSubmitBlock : std::false_type {};
@@ -88,6 +134,10 @@ void TestTaskHeaderContracts() {
     using ExpectedCreateRelationTask =
         std::pair<BaselineStatus, std::shared_ptr<IBaselineRelationTask>> (
             IBaselineService::*)(std::string_view, BaselineSerializationFormat);
+    using ExpectedValuePredictRolling =
+        RollingPrediction (IBaselineValueTask::*)(std::string_view, int64_t) const;
+    using ExpectedRatioPredictRolling =
+        RollingPrediction (IBaselineRatioTask::*)(std::string_view, int64_t) const;
 
     static_assert(std::is_same_v<decltype(&IBaselineService::CreateValueTask),
                                  ExpectedCreateValueTask>);
@@ -95,13 +145,31 @@ void TestTaskHeaderContracts() {
                                  ExpectedCreateRatioTask>);
     static_assert(std::is_same_v<decltype(&IBaselineService::CreateRelationTask),
                                  ExpectedCreateRelationTask>);
+    static_assert(std::is_same_v<decltype(&IBaselineValueTask::PredictRolling),
+                                 ExpectedValuePredictRolling>);
+    static_assert(std::is_same_v<decltype(&IBaselineRatioTask::PredictRolling),
+                                 ExpectedRatioPredictRolling>);
 
     static_assert(!HasRequestRebuild<IBaselineTask>::value);
     static_assert(!HasSetHistoryReader<IBaselineValueTask>::value);
     static_assert(!HasSetHistoryReader<IBaselineRatioTask>::value);
     static_assert(!HasSetHistoryReader<IBaselineRelationTask>::value);
-    static_assert(!HasValueSubmitObservation<IBaselineValueTask>::value);
-    static_assert(!HasRatioSubmitObservation<IBaselineRatioTask>::value);
+    static_assert(!HasValueInitRollingFromEmpty<IBaselineValueTask>::value);
+    static_assert(!HasValueInitRollingFromBootstrap<IBaselineValueTask>::value);
+    static_assert(HasValueSubmitObservation<IBaselineValueTask>::value);
+    static_assert(HasValuePredictRolling<IBaselineValueTask>::value);
+    static_assert(!HasRatioInitRollingFromEmpty<IBaselineRatioTask>::value);
+    static_assert(!HasRatioInitRollingFromBootstrap<IBaselineRatioTask>::value);
+    static_assert(HasRatioSubmitObservation<IBaselineRatioTask>::value);
+    static_assert(HasRatioPredictRolling<IBaselineRatioTask>::value);
+    static_assert(!HasValueInitRollingFromEmpty<IBaselineRelationTask>::value);
+    static_assert(!HasValueInitRollingFromBootstrap<IBaselineRelationTask>::value);
+    static_assert(!HasValueSubmitObservation<IBaselineRelationTask>::value);
+    static_assert(!HasValuePredictRolling<IBaselineRelationTask>::value);
+    static_assert(!HasRatioInitRollingFromEmpty<IBaselineRelationTask>::value);
+    static_assert(!HasRatioInitRollingFromBootstrap<IBaselineRelationTask>::value);
+    static_assert(!HasRatioSubmitObservation<IBaselineRelationTask>::value);
+    static_assert(!HasRatioPredictRolling<IBaselineRelationTask>::value);
     static_assert(!HasRelationSubmitBlock<IBaselineRelationTask>::value);
     static_assert(!HasQueryBootstrapSeed<IBaselineValueTask>::value);
     static_assert(!HasQueryBootstrapSeed<IBaselineRatioTask>::value);
@@ -109,6 +177,22 @@ void TestTaskHeaderContracts() {
     static_assert(!HasQueryBootstrapSeed<BaselineValueTask>::value);
     static_assert(!HasQueryBootstrapSeed<BaselineRatioTask>::value);
     static_assert(!HasQueryBootstrapSeed<BaselineRelationTask>::value);
+
+    RollingSubmitOptions rolling_submit_options;
+    ValueRollingObservation value_obs;
+    RatioRollingObservation ratio_obs;
+    RollingBaselineResult rolling_result;
+    RollingPrediction rolling_prediction;
+    assert(rolling_submit_options.allow_auto_init_from_bootstrap);
+    assert(rolling_submit_options.allow_auto_init_from_empty);
+    assert(value_obs.sample_count == 0);
+    assert(ratio_obs.denominator == 0.0);
+    assert(rolling_result.status == BaselineStatus::kOk);
+    assert(rolling_prediction.status == BaselineStatus::kOk);
+    AssertNear(rolling_prediction.baseline_mu, 0.0);
+    AssertNear(rolling_prediction.baseline_lower, 0.0);
+    AssertNear(rolling_prediction.baseline_upper, 0.0);
+    AssertNear(rolling_prediction.band_z, 0.0);
 
     std::printf("[PASS] Task header contracts\n");
 }

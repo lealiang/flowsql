@@ -1,4 +1,4 @@
-# Baseline B1 optional bootstrap config template
+# Baseline config template
 # Source snapshot date: 2026-04-29
 #
 # Plugin load options:
@@ -92,6 +92,85 @@ baseline:
     lambda_dme: 2.0
     lambda_lwd: 1.0
     lambda_event: 2.0
+
+  rolling_config:
+    # value_sampled observation reliability
+    n_min_score: 3
+    n_min_update: 10
+    n_ref: 10
+    sample_count_noise: 1.0
+
+    # ratio observation reliability
+    d_min_score: 10
+    d_min_update: 100
+    d_ref: 100
+    ratio_denominator_noise: 1.0
+
+    # anomaly-gated update
+    z_downweight: 3.0
+    z_skip: 5.0
+    small_update_weight: 0.2
+
+    # harmonic model shape
+    daily_harmonic_order: 6
+    weekly_harmonic_order: 3
+
+    # learning rate scales
+    level_learning_scale: 1.0
+    day_learning_scale: 0.2
+    week_learning_scale: 0.05
+    cold_day_learning_scale: 0.05
+    cold_week_learning_scale: 0.01
+    seasonal_drift_min_scale: 0.1
+    day_delta_coeff_max: 0.05
+    week_delta_coeff_max: 0.02
+
+    # process noise scales in model space
+    Q_day: 1.0e-4
+    Q_week: 2.0e-5
+    Q_level: 1.0e-3
+    Q_trend: 1.0e-5
+    process_noise_gap_cap_buckets: 0
+
+    # trend update controls
+    trend_update_scale: 0.05
+    cold_trend_update_scale: 0.0
+    trend_delta_max: 0.01
+    trend_abs_max: 0.1
+
+    # covariance initialization and bounds
+    P_level_init: 9.0
+    P_trend_init: 16.0
+    P_day_init: 4.0
+    P_week_init: 9.0
+    P_floor: 1.0e-6
+    P_cap: 1.0e6
+
+    # drift evidence
+    # alpha_short = 0.05 is about 20 buckets effective length;
+    # alpha_long = 0.005 is about 200 buckets effective length.
+    alpha_short: 0.05
+    alpha_long: 0.005
+    z_cap: 5.0
+    drift_start: 1.0
+    drift_full: 2.0
+    max_level_boost: 4.0
+    max_q_boost: 9.0
+    skip_relax: 2.0
+
+    # residual scale and band
+    alpha_sigma: 0.02
+    c_sigma: 3.0
+    sigma_floor: 0.05
+    cold_start_band_scale: 3.0
+    band_z: 3.0
+
+    # state maturity
+    confidence_cold: 0.2
+    confidence_warming: 0.5
+    confidence_ready_hint_cap: 0.8
+    min_warming_updates: 3
+    min_ready_hint_updates: 0
 
   value_sampled_profiles:
     cont_core:

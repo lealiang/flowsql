@@ -579,7 +579,7 @@ history
 Bootstrap(history)
   -> task owns BootstrapArtifact by series_key
   -> task owns BootstrapSeed by series_key
-  -> InitRollingFromBootstrap(series_key, options)
+  -> B2 SubmitObservation / warm-up consumes BootstrapSeed internally
 ```
 
 不得把 `ExportBootstrapSeed(JSON)` 再 parse / load 作为 B2 初始化主路径。JSON seed 只用于持久化、审计、跨进程导入、调试和重启恢复。即使未来需要从已保存的 seed 启动，也应先在 B2 core 外部反序列化为内部 `BootstrapSeed` 结构体，再进入 rolling 初始化流程。
@@ -658,7 +658,7 @@ BaselineTask
 明确限制：
 
 - 同一进程内，`B2` 初始化 rolling state 必须直接消费 `BootstrapSeed` 结构体。
-- 不允许把 `ExportBootstrapSeed(JSON) -> parse/load -> InitRollingFromBootstrap` 作为主路径。
+- 不允许把 `ExportBootstrapSeed(JSON) -> parse/load -> rolling 初始化` 作为主路径。
 - 重启恢复时优先加载 task 级全量 `BootstrapArtifact`，再在内存中为每个 series 重新生成 `BootstrapSeed`；若只保存了 seed 文档，也必须先在 B2 core 外部反序列化为结构体。
 - `LoadBootstrapArtifact(content, format)` 必须原子替换当前 task 的 bootstrap store：任一 series 条目不兼容或重复，整体失败，不能部分导入。
 

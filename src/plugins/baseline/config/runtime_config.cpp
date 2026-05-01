@@ -25,6 +25,7 @@
 #include "plugins/baseline/model/event_calendar_spec.h"
 #include "plugins/baseline/model/profile_config.h"
 #include "plugins/baseline/model/task_spec.h"
+#include "plugins/baseline/rolling/rolling_config.h"
 #include "plugins/baseline/solver/solver_backend.h"
 
 namespace flowsql {
@@ -45,6 +46,7 @@ struct RuntimeConfigState {
     std::unordered_map<std::string, ValueSampledProfileConfig> value_sampled_profiles;
     RatioGlobalNumericalConfig ratio_global;
     std::unordered_map<std::string, RatioProfileConfig> ratio_profiles;
+    BaselineRollingConfig rolling_config;
     BlockSolverConfig block_solver;
     std::unordered_map<std::string, std::shared_ptr<const CompiledEventCalendar>>
         calendars;
@@ -113,6 +115,7 @@ RuntimeConfigState BuildDefaultRuntimeConfigState() {
     state.shared_profile = BuildDefaultSharedProfileConfigRaw();
     state.value_sampled_profiles = BuildDefaultValueSampledProfiles();
     state.ratio_profiles = BuildDefaultRatioProfiles(state.ratio_global);
+    state.rolling_config = DefaultBaselineRollingConfig();
     return state;
 }
 
@@ -213,6 +216,80 @@ void ParseBlockSolverConfig(const YAML::Node& node, BlockSolverConfig* out) {
     ParseOptionalScalar(node, "tol_obj_rel", &out->tol_obj_rel);
     ParseOptionalScalar(node, "tol_beta_inf", &out->tol_beta_inf);
     ParseOptionalScalar(node, "cond_max", &out->cond_max);
+}
+
+void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
+    if (!node || !out) return;
+    ParseOptionalScalar(node, "n_min_score", &out->n_min_score);
+    ParseOptionalScalar(node, "n_min_update", &out->n_min_update);
+    ParseOptionalScalar(node, "n_ref", &out->n_ref);
+    ParseOptionalScalar(node, "sample_count_noise", &out->sample_count_noise);
+    ParseOptionalScalar(node, "d_min_score", &out->d_min_score);
+    ParseOptionalScalar(node, "d_min_update", &out->d_min_update);
+    ParseOptionalScalar(node, "d_ref", &out->d_ref);
+    ParseOptionalScalar(node, "ratio_denominator_noise", &out->ratio_denominator_noise);
+    ParseOptionalScalar(node, "z_downweight", &out->z_downweight);
+    ParseOptionalScalar(node, "z_skip", &out->z_skip);
+    ParseOptionalScalar(node, "small_update_weight", &out->small_update_weight);
+    ParseOptionalScalar(node, "daily_harmonic_order", &out->daily_harmonic_order);
+    ParseOptionalScalar(node, "weekly_harmonic_order", &out->weekly_harmonic_order);
+    ParseOptionalScalar(node, "level_learning_scale", &out->level_learning_scale);
+    ParseOptionalScalar(node, "day_learning_scale", &out->day_learning_scale);
+    ParseOptionalScalar(node, "week_learning_scale", &out->week_learning_scale);
+    ParseOptionalScalar(node, "cold_day_learning_scale", &out->cold_day_learning_scale);
+    ParseOptionalScalar(node, "cold_week_learning_scale", &out->cold_week_learning_scale);
+    ParseOptionalScalar(node, "seasonal_drift_min_scale", &out->seasonal_drift_min_scale);
+    ParseOptionalScalar(node, "day_delta_coeff_max", &out->day_delta_coeff_max_scale);
+    ParseOptionalScalar(node, "day_delta_coeff_max_scale", &out->day_delta_coeff_max_scale);
+    ParseOptionalScalar(node, "week_delta_coeff_max", &out->week_delta_coeff_max_scale);
+    ParseOptionalScalar(node, "week_delta_coeff_max_scale", &out->week_delta_coeff_max_scale);
+    ParseOptionalScalar(node, "Q_day", &out->q_day_scale);
+    ParseOptionalScalar(node, "q_day_scale", &out->q_day_scale);
+    ParseOptionalScalar(node, "Q_week", &out->q_week_scale);
+    ParseOptionalScalar(node, "q_week_scale", &out->q_week_scale);
+    ParseOptionalScalar(node, "Q_level", &out->q_level_scale);
+    ParseOptionalScalar(node, "q_level_scale", &out->q_level_scale);
+    ParseOptionalScalar(node, "Q_trend", &out->q_trend_scale);
+    ParseOptionalScalar(node, "q_trend_scale", &out->q_trend_scale);
+    ParseOptionalScalar(node, "trend_update_scale", &out->trend_update_scale);
+    ParseOptionalScalar(node, "cold_trend_update_scale", &out->cold_trend_update_scale);
+    ParseOptionalScalar(node, "trend_delta_max", &out->trend_delta_max_scale);
+    ParseOptionalScalar(node, "trend_delta_max_scale", &out->trend_delta_max_scale);
+    ParseOptionalScalar(node, "trend_abs_max", &out->trend_abs_max_scale);
+    ParseOptionalScalar(node, "trend_abs_max_scale", &out->trend_abs_max_scale);
+    ParseOptionalScalar(node, "P_level_init", &out->p_level_init_scale);
+    ParseOptionalScalar(node, "p_level_init_scale", &out->p_level_init_scale);
+    ParseOptionalScalar(node, "P_trend_init", &out->p_trend_init_scale);
+    ParseOptionalScalar(node, "p_trend_init_scale", &out->p_trend_init_scale);
+    ParseOptionalScalar(node, "P_day_init", &out->p_day_init_scale);
+    ParseOptionalScalar(node, "p_day_init_scale", &out->p_day_init_scale);
+    ParseOptionalScalar(node, "P_week_init", &out->p_week_init_scale);
+    ParseOptionalScalar(node, "p_week_init_scale", &out->p_week_init_scale);
+    ParseOptionalScalar(node, "P_floor", &out->p_floor_scale);
+    ParseOptionalScalar(node, "p_floor_scale", &out->p_floor_scale);
+    ParseOptionalScalar(node, "P_cap", &out->p_cap_scale);
+    ParseOptionalScalar(node, "p_cap_scale", &out->p_cap_scale);
+    ParseOptionalScalar(node, "alpha_short", &out->alpha_short);
+    ParseOptionalScalar(node, "alpha_long", &out->alpha_long);
+    ParseOptionalScalar(node, "z_cap", &out->z_cap);
+    ParseOptionalScalar(node, "drift_start", &out->drift_start);
+    ParseOptionalScalar(node, "drift_full", &out->drift_full);
+    ParseOptionalScalar(node, "max_level_boost", &out->max_level_boost);
+    ParseOptionalScalar(node, "max_q_boost", &out->max_q_boost);
+    ParseOptionalScalar(node, "skip_relax", &out->skip_relax);
+    ParseOptionalScalar(node, "process_noise_gap_cap_buckets",
+                        &out->process_noise_gap_cap_buckets);
+    ParseOptionalScalar(node, "alpha_sigma", &out->alpha_sigma);
+    ParseOptionalScalar(node, "c_sigma", &out->c_sigma);
+    ParseOptionalScalar(node, "sigma_floor", &out->sigma_floor);
+    ParseOptionalScalar(node, "cold_start_band_scale", &out->cold_start_band_scale);
+    ParseOptionalScalar(node, "band_z", &out->band_z);
+    ParseOptionalScalar(node, "confidence_cold", &out->confidence_cold);
+    ParseOptionalScalar(node, "confidence_warming", &out->confidence_warming);
+    ParseOptionalScalar(node, "confidence_ready_hint_cap",
+                        &out->confidence_ready_hint_cap);
+    ParseOptionalScalar(node, "min_warming_updates", &out->min_warming_updates);
+    ParseOptionalScalar(node, "min_ready_hint_updates", &out->min_ready_hint_updates);
 }
 
 void ParseCalendars(const YAML::Node& node, RuntimeConfigState* out) {
@@ -318,6 +395,7 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
     if (!ValidateAllowedKeys(defaults,
                              {"parser",
                               "shared_profile_config",
+                              "rolling_config",
                               "value_sampled_profiles",
                               "ratio_profiles",
                               "solver_constants"},
@@ -342,6 +420,79 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                               "lambda_lwd",
                               "lambda_event"},
                              "shared_profile_config",
+                             err)) {
+        return false;
+    }
+    if (!ValidateAllowedKeys(defaults["rolling_config"],
+                             {"n_min_score",
+                              "n_min_update",
+                              "n_ref",
+                              "sample_count_noise",
+                              "d_min_score",
+                              "d_min_update",
+                              "d_ref",
+                              "ratio_denominator_noise",
+                              "z_downweight",
+                              "z_skip",
+                              "small_update_weight",
+                              "daily_harmonic_order",
+                              "weekly_harmonic_order",
+                              "level_learning_scale",
+                              "day_learning_scale",
+                              "week_learning_scale",
+                              "cold_day_learning_scale",
+                              "cold_week_learning_scale",
+                              "seasonal_drift_min_scale",
+                              "day_delta_coeff_max",
+                              "day_delta_coeff_max_scale",
+                              "week_delta_coeff_max",
+                              "week_delta_coeff_max_scale",
+                              "Q_day",
+                              "q_day_scale",
+                              "Q_week",
+                              "q_week_scale",
+                              "Q_level",
+                              "q_level_scale",
+                              "Q_trend",
+                              "q_trend_scale",
+                              "trend_update_scale",
+                              "cold_trend_update_scale",
+                              "trend_delta_max",
+                              "trend_delta_max_scale",
+                              "trend_abs_max",
+                              "trend_abs_max_scale",
+                              "P_level_init",
+                              "p_level_init_scale",
+                              "P_trend_init",
+                              "p_trend_init_scale",
+                              "P_day_init",
+                              "p_day_init_scale",
+                              "P_week_init",
+                              "p_week_init_scale",
+                              "P_floor",
+                              "p_floor_scale",
+                              "P_cap",
+                              "p_cap_scale",
+                              "alpha_short",
+                              "alpha_long",
+                              "z_cap",
+                              "drift_start",
+                              "drift_full",
+                              "max_level_boost",
+                              "max_q_boost",
+                              "skip_relax",
+                              "process_noise_gap_cap_buckets",
+                              "alpha_sigma",
+                              "c_sigma",
+                              "sigma_floor",
+                              "cold_start_band_scale",
+                              "band_z",
+                              "confidence_cold",
+                              "confidence_warming",
+                              "confidence_ready_hint_cap",
+                              "min_warming_updates",
+                              "min_ready_hint_updates"},
+                             "rolling_config",
                              err)) {
         return false;
     }
@@ -494,6 +645,9 @@ bool ValidateRuntimeConfig(const RuntimeConfigState& cfg, std::string* err) {
         if (err) *err = "solver_constants are invalid";
         return false;
     }
+    if (ValidateBaselineRollingConfig(cfg.rolling_config, err) != BaselineStatus::kOk) {
+        return false;
+    }
     for (const auto& entry : cfg.calendars) {
         if (!entry.second ||
             entry.second->calendar_id.empty() ||
@@ -539,6 +693,7 @@ bool ApplyYamlConfig(const YAML::Node& root,
     ParseSharedProfileConfig(defaults["shared_profile_config"], &out->shared_profile);
     ParseValueSampledProfiles(defaults["value_sampled_profiles"], out);
     ParseRatioProfiles(defaults["ratio_profiles"], out);
+    ParseRollingConfig(defaults["rolling_config"], &out->rolling_config);
     ParseBlockSolverConfig(defaults["solver_constants"], &out->block_solver);
     ParseCalendars(root["calendars"], out);
     return true;
@@ -622,6 +777,13 @@ bool TryGetBlockSolverConfigOverride(BlockSolverConfig* out) {
     if (!out) return false;
     const auto snapshot = Snapshot();
     *out = snapshot->block_solver;
+    return true;
+}
+
+bool TryGetBaselineRollingConfigOverride(BaselineRollingConfig* out) {
+    if (!out) return false;
+    const auto snapshot = Snapshot();
+    *out = snapshot->rolling_config;
     return true;
 }
 

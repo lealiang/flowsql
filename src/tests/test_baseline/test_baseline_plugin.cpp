@@ -904,6 +904,285 @@ void TestRuntimeConfigDefaultDailyHarmonicOrder() {
     std::printf("[PASS] B1 runtime config default daily harmonic order\n");
 }
 
+void TestB2ValueRollingEmptyStart() {
+    std::printf("[TEST] B2 value rolling empty start...\n");
+
+    auto env = LoadBaselineService();
+    auto [status, task] =
+        env.service->CreateValueTask(ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+
+    ValueRollingObservation first;
+    first.series_key = "link-a";
+    first.bucket_id = 100;
+    first.value = 99.0;
+    RollingBaselineResult first_result = task->SubmitObservation(first, RollingSubmitOptions{});
+    assert(first_result.status == BaselineStatus::kOk);
+    assert(first_result.series_key == "link-a");
+    assert(first_result.bucket_id == 100);
+    assert(!first_result.can_score);
+    assert(first_result.can_update);
+    assert(first_result.state_status == "cold_learning");
+    assert(first_result.band_width > 0.0);
+    assert(first_result.baseline_lower >= 0.0);
+
+    ValueRollingObservation second = first;
+    second.bucket_id = 101;
+    second.value = 110.0;
+    RollingBaselineResult second_result =
+        task->SubmitObservation(second, RollingSubmitOptions{});
+    assert(second_result.status == BaselineStatus::kOk);
+    assert(second_result.can_score);
+    assert(second_result.can_update);
+    assert(second_result.update_weight > 0.0);
+    assert(second_result.band_width > 0.0);
+
+    std::printf("[PASS] B2 value rolling empty start\n");
+}
+
+void TestB2SampledValueLowSupportStart() {
+    std::printf("[TEST] B2 sampled value low support start...\n");
+
+    auto env = LoadBaselineService();
+    auto [status, task] = env.service->CreateValueTask(SampledValueTaskConfig(),
+                                                       BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+
+    ValueRollingObservation low;
+    low.series_key = "sampled-a";
+    low.bucket_id = 100;
+    low.value = 10.0;
+    low.sample_count = 2;
+    RollingBaselineResult low_result = task->SubmitObservation(low, RollingSubmitOptions{});
+    assert(low_result.status == BaselineStatus::kInsufficientData);
+    assert(low_result.skipped_low_sample_count);
+
+    ValueRollingObservation ok = low;
+    ok.bucket_id = 101;
+    ok.sample_count = 20;
+    RollingBaselineResult ok_result = task->SubmitObservation(ok, RollingSubmitOptions{});
+    assert(ok_result.status == BaselineStatus::kOk);
+    assert(ok_result.can_update);
+    assert(ok_result.state_status == "cold_learning");
+
+    std::printf("[PASS] B2 sampled value low support start\n");
+}
+
+void TestB2RatioRollingInputAndEmptyStart() {
+    std::printf("[TEST] B2 ratio rolling input and empty start...\n");
+
+    auto env = LoadBaselineService();
+    auto [status, task] =
+        env.service->CreateRatioTask(RatioTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+
+    RatioRollingObservation invalid;
+    invalid.series_key = "svc-a";
+    invalid.bucket_id = 100;
+    invalid.numerator = 11.0;
+    invalid.denominator = 10.0;
+    RollingBaselineResult invalid_result =
+        task->SubmitObservation(invalid, RollingSubmitOptions{});
+    assert(invalid_result.status == BaselineStatus::kInvalidArgument);
+
+    RatioRollingObservation first;
+    first.series_key = "svc-a";
+    first.bucket_id = 101;
+    first.numerator = 95.0;
+    first.denominator = 100.0;
+    RollingBaselineResult first_result = task->SubmitObservation(first, RollingSubmitOptions{});
+    assert(first_result.status == BaselineStatus::kOk);
+    assert(!first_result.can_score);
+    assert(first_result.can_update);
+    assert(first_result.baseline_lower >= 0.0);
+    assert(first_result.baseline_upper <= 1.0);
+    assert(first_result.band_width > 0.0);
+
+    std::printf("[PASS] B2 ratio rolling input and empty start\n");
+}
+
+void TestB2RollingSnapshotAndBootstrapWarmup() {
+    std::printf("[TEST] B2 rolling snapshot and bootstrap warm-up...\n");
+
+    auto env = LoadBaselineService();
+    auto [status, task] =
+        env.service->CreateValueTask(ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+
+    const BootstrapTrainResult train = task->Bootstrap(BuildValueHistory());
+    assert(train.status == BaselineStatus::kOk);
+
+    auto [task_snapshot_status, task_snapshot_json] =
+        task->QueryTaskSnapshot(BaselineSerializationFormat::kJson);
+    assert(task_snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document task_doc;
+    task_doc.Parse(task_snapshot_json.c_str());
+    assert(!task_doc.HasParseError());
+    assert(std::string(task_doc["document_kind"].GetString()) == "rolling_task_snapshot");
+    assert(task_doc["rolling_series_count"].GetUint64() == 1);
+    assert(task_doc.HasMember("state_status_counts"));
+    assert(task_doc.HasMember("rolling_state_memory_estimate_bytes"));
+
+    auto [series_snapshot_status, series_snapshot_json] =
+        task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+    assert(series_snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document series_doc;
+    series_doc.Parse(series_snapshot_json.c_str());
+    assert(!series_doc.HasParseError());
+    assert(std::string(series_doc["document_kind"].GetString()) == "rolling_series_snapshot");
+    assert(series_doc["series_identity"]["series_key"] == "svc-a");
+    assert(series_doc.HasMember("band"));
+    assert(series_doc.HasMember("control"));
+
+    ValueRollingObservation stream;
+    stream.series_key = "svc-a";
+    stream.bucket_id = 200;
+    stream.value = 105.0;
+    RollingBaselineResult result = task->SubmitObservation(stream, RollingSubmitOptions{});
+    assert(result.status == BaselineStatus::kOk);
+    assert(result.can_score);
+    assert(result.state_status == "warming");
+
+    std::printf("[PASS] B2 rolling snapshot and bootstrap warm-up\n");
+}
+
+void TestB2RollingPredict() {
+    std::printf("[TEST] B2 rolling predict...\n");
+
+    auto env = LoadBaselineService();
+    auto [status, task] =
+        env.service->CreateValueTask(ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+
+    RollingPrediction missing = task->PredictRolling("link-predict", 101);
+    assert(missing.status == BaselineStatus::kNotTrained);
+
+    ValueRollingObservation first;
+    first.series_key = "link-predict";
+    first.bucket_id = 100;
+    first.value = 100.0;
+    assert(task->SubmitObservation(first, RollingSubmitOptions{}).status ==
+           BaselineStatus::kOk);
+
+    RollingPrediction past = task->PredictRolling("link-predict", 99);
+    assert(past.status == BaselineStatus::kInvalidArgument);
+
+    RollingPrediction prediction = task->PredictRolling("link-predict", 101);
+    assert(prediction.status == BaselineStatus::kOk);
+    assert(prediction.baseline_mu > 0.0);
+    assert(prediction.baseline_lower <= prediction.baseline_mu);
+    assert(prediction.baseline_upper >= prediction.baseline_mu);
+    assert(prediction.baseline_upper > prediction.baseline_lower);
+    assert(prediction.band_z > 0.0);
+
+    ValueRollingObservation second = first;
+    second.bucket_id = 101;
+    second.value = 102.0;
+    RollingBaselineResult update = task->SubmitObservation(second, RollingSubmitOptions{});
+    assert(update.status == BaselineStatus::kOk);
+    assert(update.can_score);
+
+    auto [ratio_status, ratio_task] =
+        env.service->CreateRatioTask(RatioTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(ratio_status == BaselineStatus::kOk);
+    assert(ratio_task != nullptr);
+
+    RatioRollingObservation ratio_first;
+    ratio_first.series_key = "ratio-predict";
+    ratio_first.bucket_id = 100;
+    ratio_first.numerator = 80.0;
+    ratio_first.denominator = 100.0;
+    assert(ratio_task->SubmitObservation(ratio_first, RollingSubmitOptions{}).status ==
+           BaselineStatus::kOk);
+
+    RollingPrediction ratio_prediction = ratio_task->PredictRolling("ratio-predict", 101);
+    assert(ratio_prediction.status == BaselineStatus::kOk);
+    assert(ratio_prediction.baseline_lower >= 0.0);
+    assert(ratio_prediction.baseline_upper <= 1.0);
+    assert(ratio_prediction.baseline_lower <= ratio_prediction.baseline_mu);
+    assert(ratio_prediction.baseline_upper >= ratio_prediction.baseline_mu);
+    assert(ratio_prediction.band_z > 0.0);
+
+    std::printf("[PASS] B2 rolling predict\n");
+}
+
+void TestB2RollingFailureSemantics() {
+    std::printf("[TEST] B2 rolling failure semantics...\n");
+
+    {
+        auto env = LoadBaselineService();
+        auto [status, task] =
+            env.service->CreateValueTask(ValueTaskConfig(), BaselineSerializationFormat::kJson);
+        assert(status == BaselineStatus::kOk);
+        ValueRollingObservation obs;
+        obs.series_key = "link-disabled";
+        obs.bucket_id = 10;
+        obs.value = 1.0;
+        RollingSubmitOptions options;
+        options.allow_auto_init_from_bootstrap = false;
+        options.allow_auto_init_from_empty = false;
+        RollingBaselineResult result = task->SubmitObservation(obs, options);
+        assert(result.status == BaselineStatus::kNotTrained);
+    }
+
+    {
+        auto env = LoadBaselineService();
+        auto [status, task] =
+            env.service->CreateValueTask(ValueTaskConfig(), BaselineSerializationFormat::kJson);
+        assert(status == BaselineStatus::kOk);
+        ValueRollingObservation obs;
+        obs.series_key = "link-dup";
+        obs.bucket_id = 10;
+        obs.value = 10.0;
+        assert(task->SubmitObservation(obs, RollingSubmitOptions{}).status ==
+               BaselineStatus::kOk);
+        assert(task->SubmitObservation(obs, RollingSubmitOptions{}).status ==
+               BaselineStatus::kInvalidArgument);
+    }
+
+    {
+        auto env = LoadBaselineService();
+        auto [status, task] = env.service->CreateValueTask(SampledValueTaskConfig(),
+                                                           BaselineSerializationFormat::kJson);
+        assert(status == BaselineStatus::kOk);
+        ValueRollingObservation obs;
+        obs.series_key = "sampled-existing";
+        obs.bucket_id = 10;
+        obs.value = 10.0;
+        obs.sample_count = 20;
+        assert(task->SubmitObservation(obs, RollingSubmitOptions{}).status ==
+               BaselineStatus::kOk);
+        obs.bucket_id = 11;
+        obs.sample_count = 2;
+        RollingBaselineResult low = task->SubmitObservation(obs, RollingSubmitOptions{});
+        assert(low.status == BaselineStatus::kOk);
+        assert(low.skipped_low_sample_count);
+        assert(!low.can_update);
+    }
+
+    {
+        auto env = LoadBaselineService();
+        auto [status, task] =
+            env.service->CreateRatioTask(RatioTaskConfig(), BaselineSerializationFormat::kJson);
+        assert(status == BaselineStatus::kOk);
+        RatioRollingObservation obs;
+        obs.series_key = "ratio-low-den";
+        obs.bucket_id = 10;
+        obs.numerator = 1.0;
+        obs.denominator = 5.0;
+        RollingBaselineResult result = task->SubmitObservation(obs, RollingSubmitOptions{});
+        assert(result.status == BaselineStatus::kInsufficientData);
+        assert(result.skipped_low_denominator);
+    }
+
+    std::printf("[PASS] B2 rolling failure semantics\n");
+}
+
 }  // namespace
 
 int main() {
@@ -916,5 +1195,11 @@ int main() {
     TestTaskRejectsIncompatibleBootstrapArtifact();
     TestRuntimeConfigDefaultDailyHarmonicOrder();
     TestRuntimeConfigHarmonicOrders();
+    TestB2ValueRollingEmptyStart();
+    TestB2SampledValueLowSupportStart();
+    TestB2RatioRollingInputAndEmptyStart();
+    TestB2RollingSnapshotAndBootstrapWarmup();
+    TestB2RollingPredict();
+    TestB2RollingFailureSemantics();
     return 0;
 }

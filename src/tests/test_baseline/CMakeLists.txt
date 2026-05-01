@@ -1,24 +1,78 @@
 project(test_baseline)
+find_package(ICU REQUIRED COMPONENTS uc i18n)
 
 add_executable(${PROJECT_NAME} test_baseline_plugin.cpp)
 add_executable(test_baseline_task_headers test_baseline_task_headers.cpp)
 add_executable(test_baseline_link_bootstrap_eval test_baseline_link_bootstrap_eval.cpp)
+add_executable(test_baseline_link_rolling_eval test_baseline_link_rolling_eval.cpp)
+add_executable(test_baseline_rolling_config test_baseline_rolling_config.cpp)
+add_executable(test_baseline_observation_adapter
+    test_baseline_observation_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/observation_adapter.cpp
+)
+add_executable(test_baseline_rolling_state
+    test_baseline_rolling_state.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/rolling_state.cpp
+)
+add_executable(test_baseline_rolling_estimator
+    test_baseline_rolling_estimator.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/rolling_estimator.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/rolling_state.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
+)
+add_executable(test_baseline_rolling_gate_scale
+    test_baseline_rolling_gate_scale.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/update_gate.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/drift_adapt.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/residual_scale.cpp
+)
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_task_headers PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_link_bootstrap_eval PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_link_rolling_eval PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_rolling_config PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_observation_adapter PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_rolling_state PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_rolling_estimator PUBLIC
+    ${CMAKE_SOURCE_DIR}
+    ${ICU_INCLUDE_DIRS}
+)
+target_include_directories(test_baseline_rolling_gate_scale PUBLIC ${CMAKE_SOURCE_DIR})
+
+target_compile_definitions(test_baseline_rolling_config
+    PRIVATE FLOWSQL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
 
 add_dependencies(${PROJECT_NAME} flowsql_common flowsql_baseline)
 add_dependencies(test_baseline_task_headers flowsql_common flowsql_baseline)
 add_dependencies(test_baseline_link_bootstrap_eval flowsql_common flowsql_baseline)
+add_dependencies(test_baseline_link_rolling_eval flowsql_common flowsql_baseline)
+add_dependencies(test_baseline_rolling_config flowsql_common flowsql_baseline)
+add_dependencies(test_baseline_observation_adapter flowsql_common)
+add_dependencies(test_baseline_rolling_state flowsql_common)
+add_dependencies(test_baseline_rolling_estimator flowsql_common)
+add_dependencies(test_baseline_rolling_gate_scale flowsql_common)
 
 target_link_libraries(${PROJECT_NAME} flowsql_common flowsql_baseline)
 target_link_libraries(test_baseline_task_headers flowsql_common flowsql_baseline)
 target_link_libraries(test_baseline_link_bootstrap_eval flowsql_common flowsql_baseline)
+target_link_libraries(test_baseline_link_rolling_eval flowsql_common flowsql_baseline)
+target_link_libraries(test_baseline_rolling_config flowsql_common flowsql_baseline)
+target_link_libraries(test_baseline_observation_adapter flowsql_common)
+target_link_libraries(test_baseline_rolling_state flowsql_common)
+target_link_libraries(test_baseline_rolling_estimator flowsql_common ${ICU_LIBRARIES})
+target_link_libraries(test_baseline_rolling_gate_scale flowsql_common)
 
 target_compile_options(${PROJECT_NAME} PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_task_headers PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_link_bootstrap_eval PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_link_rolling_eval PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_rolling_config PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_observation_adapter PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_rolling_state PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_rolling_estimator PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_rolling_gate_scale PRIVATE -UNDEBUG)
 
 add_thirddepen(${PROJECT_NAME} rapidjson)
 add_thirddepen(test_baseline_task_headers rapidjson)
@@ -30,5 +84,23 @@ set_target_properties(test_baseline_task_headers PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 set_target_properties(test_baseline_link_bootstrap_eval PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_link_rolling_eval PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_rolling_config PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_observation_adapter PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_rolling_state PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_rolling_estimator PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_rolling_gate_scale PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )

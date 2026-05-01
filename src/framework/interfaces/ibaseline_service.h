@@ -45,6 +45,13 @@ interface IBaselineTask {
 };
 
 interface IBaselineValueTask : public IBaselineTask {
+    virtual RollingBaselineResult SubmitObservation(
+        const ValueRollingObservation& obs,
+        const RollingSubmitOptions& options) = 0;
+    virtual RollingPrediction PredictRolling(
+        std::string_view series_key,
+        int64_t bucket_id) const = 0;
+
     virtual BootstrapTrainResult Bootstrap(const ValueBootstrapInput& input) = 0;
     virtual BootstrapPrediction PredictBootstrap(
         std::string_view series_key,
@@ -60,6 +67,13 @@ interface IBaselineValueTask : public IBaselineTask {
 };
 
 interface IBaselineRatioTask : public IBaselineTask {
+    virtual RollingBaselineResult SubmitObservation(
+        const RatioRollingObservation& obs,
+        const RollingSubmitOptions& options) = 0;
+    virtual RollingPrediction PredictRolling(
+        std::string_view series_key,
+        int64_t bucket_id) const = 0;
+
     virtual BootstrapTrainResult Bootstrap(const RatioBootstrapInput& input) = 0;
     virtual BootstrapPrediction PredictBootstrap(
         std::string_view series_key,

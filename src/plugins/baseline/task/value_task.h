@@ -12,11 +12,13 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 #include "baseline_task_base.h"
 #include "bootstrap_task_store.h"
 #include "plugins/baseline/model/event_calendar_matcher.h"
 #include "plugins/baseline/model/task_spec.h"
+#include "plugins/baseline/rolling/rolling_state.h"
 
 namespace flowsql {
 namespace baseline {
@@ -45,6 +47,13 @@ class BaselineValueTask final : public IBaselineValueTask, public BaselineTaskBa
         BaselineSerializationFormat format) const override;
     BaselineStatus Close() override;
 
+    RollingBaselineResult SubmitObservation(
+        const ValueRollingObservation& obs,
+        const RollingSubmitOptions& options) override;
+    RollingPrediction PredictRolling(
+        std::string_view series_key,
+        int64_t bucket_id) const override;
+
     BootstrapTrainResult Bootstrap(const ValueBootstrapInput& input) override;
     BootstrapPrediction PredictBootstrap(
         std::string_view series_key,
@@ -63,6 +72,7 @@ class BaselineValueTask final : public IBaselineValueTask, public BaselineTaskBa
     std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar_;
     BootstrapArtifactStore artifacts_by_series_;
     BootstrapSeedStore seeds_by_series_;
+    std::unordered_map<std::string, RollingState> rolling_states_;
     BootstrapEngine bootstrap_engine_;
 };
 
