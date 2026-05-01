@@ -9,22 +9,24 @@
 #ifndef _FLOWSQL_PLUGINS_BASELINE_CONFIG_RUNTIME_CONFIG_H_
 #define _FLOWSQL_PLUGINS_BASELINE_CONFIG_RUNTIME_CONFIG_H_
 
-#include <cstddef>
-#include <cstdint>
+#include <memory>
 #include <string>
 
 namespace flowsql {
 namespace baseline {
 
+struct BaselineCalendarRef;
+struct CompiledEventCalendar;
 struct SharedProfileConfig;
 struct ValueSampledProfileConfig;
 struct RatioProfileConfig;
 struct BlockSolverConfig;
 
-int LoadBaselineRuntimeConfigFromYaml(const std::string& file_path,
-                                      bool strict,
-                                      std::string* err);
-void ResetBaselineRuntimeConfig();
+int __attribute__((visibility("default"))) LoadBaselineRuntimeConfigFromYaml(
+    const std::string& file_path,
+    bool strict,
+    std::string* err);
+void __attribute__((visibility("default"))) ResetBaselineRuntimeConfig();
 
 bool TryGetSharedProfileConfigOverride(SharedProfileConfig* out);
 bool TryGetValueSampledProfileConfigOverride(const std::string& profile_name,
@@ -37,40 +39,8 @@ bool TryGetRatioGlobalNumericalOverride(double* eps_logit,
 bool TryGetBlockSolverConfigOverride(BlockSolverConfig* out);
 
 std::string BaselineDefaultTimezone();
-int64_t RuntimeIdlePruneBucketGap();
-std::size_t RuntimeIdlePruneScanLimit();
-
-double ScoreWarn();
-double ScoreCrit();
-double ConfidenceFormalBase();
-double ConfidenceSourceBase();
-double ConfidenceShadowBase();
-
-double ValueShadowConfidenceCap();
-double ValueShadowSigmaScale();
-double RatioShadowConfidenceCap();
-double RatioShadowScoreScale();
-
-double CandidateHuberDelta();
-double CandidateShadowAlpha();
-double CandidateRatioVarianceFloor();
-double CandidateSwitchLossAbsTol();
-std::size_t CandidateMinTrainPointCount();
-double ShadowZShiftConfirmMin();
-uint32_t ShadowCRebuildMin();
-double ShadowZWinShiftThreshold();
-std::size_t ShadowMinPointsForCandidate();
-std::size_t ShadowMinHoldoutPoints();
-std::size_t ShadowRetryCooldownPoints();
-std::size_t ShadowStuckAlertPoints();
-
-double KeyFusionPersistenceWindow();
-std::size_t KeyFusionWindowLimit();
-double RelationPatternLambdaSup();
-double RelationPatternLambdaOpp();
-double RelationPatternPersistenceWindow();
-std::size_t RelationMinReplayForHoldout();
-std::size_t RelationSwitchValidationTail();
+std::shared_ptr<const CompiledEventCalendar> FindBaselineEventCalendar(
+    const BaselineCalendarRef& calendar_ref);
 
 }  // namespace baseline
 }  // namespace flowsql

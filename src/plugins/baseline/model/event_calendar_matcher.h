@@ -22,12 +22,9 @@ namespace baseline {
 
 struct CompiledEventCalendarEntry {
     std::string event_code;
-    std::string scope_type;
     std::string alignment_mode;
     int64_t start_ts = 0;
     int64_t end_ts = 0;
-    std::string feature;
-    std::string key;
     std::string tz;
     std::size_t event_code_index = 0;
 };

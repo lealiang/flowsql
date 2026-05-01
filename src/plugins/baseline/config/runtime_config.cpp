@@ -21,7 +21,10 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include "plugins/baseline/model/event_calendar_matcher.h"
+#include "plugins/baseline/model/event_calendar_spec.h"
 #include "plugins/baseline/model/profile_config.h"
+#include "plugins/baseline/model/task_spec.h"
 #include "plugins/baseline/solver/solver_backend.h"
 
 namespace flowsql {
@@ -35,16 +38,6 @@ struct RatioGlobalNumericalConfig {
     double v_floor = kRatioVFloor;
 };
 
-struct ShadowPolicyConfig {
-    double z_shift_confirm_min = 1.44;
-    uint32_t c_rebuild_min = 5;
-    double z_win_shift_threshold = 2.2;
-    std::size_t min_shadow_points_for_candidate = 1440;
-    std::size_t min_shadow_holdout_points = 180;
-    std::size_t retry_cooldown_points = 180;
-    std::size_t shadow_stuck_alert_points = 4320;
-};
-
 struct RuntimeConfigState {
     std::string tz_default = "Asia/Shanghai";
 
@@ -52,43 +45,14 @@ struct RuntimeConfigState {
     std::unordered_map<std::string, ValueSampledProfileConfig> value_sampled_profiles;
     RatioGlobalNumericalConfig ratio_global;
     std::unordered_map<std::string, RatioProfileConfig> ratio_profiles;
-
     BlockSolverConfig block_solver;
-
-    int64_t runtime_idle_prune_bucket_gap = 4096;
-    std::size_t runtime_idle_prune_scan_limit = 32;
-
-    double score_warn = 3.0;
-    double score_crit = 5.0;
-    double confidence_formal_base = 0.8;
-    double confidence_source_base = 0.6;
-    double confidence_shadow_base = 0.5;
-
-    double value_shadow_confidence_cap = 0.8;
-    double value_shadow_sigma_scale = 1.5;
-    double ratio_shadow_confidence_cap = 0.8;
-    double ratio_shadow_score_scale = 1.5;
-
-    double candidate_huber_delta = 1.5;
-    double candidate_shadow_alpha = 0.2;
-    double candidate_ratio_variance_floor = 0.25;
-    double candidate_switch_loss_abs_tol = 1e-12;
-    std::size_t candidate_min_train_point_count = 2;
-    ShadowPolicyConfig shadow_policy;
-    std::size_t relation_min_replay_for_holdout = 3;
-    std::size_t relation_switch_validation_tail = 16;
-
-    double key_fusion_persistence_window = 3.0;
-    std::size_t key_fusion_window_limit = 2;
-
-    double relation_pattern_lambda_sup = 0.5;
-    double relation_pattern_lambda_opp = 0.5;
-    double relation_pattern_persistence_window = 3.0;
+    std::unordered_map<std::string, std::shared_ptr<const CompiledEventCalendar>>
+        calendars;
 };
 
 SharedProfileConfig BuildDefaultSharedProfileConfigRaw() {
     SharedProfileConfig config;
-    config.k_day = 4;
+    config.k_day = 6;
     config.k_week = 3;
     config.dme_max = 7;
     config.m_month_enable = 4;
@@ -98,23 +62,6 @@ SharedProfileConfig BuildDefaultSharedProfileConfigRaw() {
     config.lambda_dme = 2.0;
     config.lambda_lwd = 1.0;
     config.lambda_event = 2.0;
-    config.n_val_switch = 16;
-    config.eps_switch = 0.05;
-    config.z_warn = 3.0;
-    config.z_crit = 5.0;
-    config.w_shift = 0.8;
-
-    config.drift.alpha = 0.2;
-    config.drift.shift_clip = 6.0;
-    config.drift.lambda_mem = 0.9;
-    config.drift.kappa_shift = 0.25;
-    config.drift.u_min = 0.5;
-    config.drift.h_shift = 3.0;
-    config.drift.p_shift_low = 0.3;
-    config.drift.p_shift_high = 0.6;
-    config.drift.m_shift = 3;
-    config.drift.g_skip = 3;
-    config.drift.g_reset = 12;
     return config;
 }
 
@@ -169,6 +116,11 @@ RuntimeConfigState BuildDefaultRuntimeConfigState() {
     return state;
 }
 
+std::string CalendarKey(const std::string& calendar_id,
+                        const std::string& calendar_version) {
+    return calendar_id + "\n" + calendar_version;
+}
+
 std::shared_ptr<const RuntimeConfigState>& SnapshotRef() {
     static std::shared_ptr<const RuntimeConfigState> snapshot =
         std::make_shared<const RuntimeConfigState>(BuildDefaultRuntimeConfigState());
@@ -194,6 +146,8 @@ void ParseSharedProfileConfig(const YAML::Node& node, SharedProfileConfig* out) 
     if (!node || !out) return;
     ParseOptionalScalar(node, "k_day", &out->k_day);
     ParseOptionalScalar(node, "k_week", &out->k_week);
+    ParseOptionalScalar(node, "daily_harmonic_order", &out->k_day);
+    ParseOptionalScalar(node, "weekly_harmonic_order", &out->k_week);
     ParseOptionalScalar(node, "dme_max", &out->dme_max);
     ParseOptionalScalar(node, "m_month_enable", &out->m_month_enable);
     ParseOptionalScalar(node, "month_cov_min", &out->month_cov_min);
@@ -202,25 +156,6 @@ void ParseSharedProfileConfig(const YAML::Node& node, SharedProfileConfig* out) 
     ParseOptionalScalar(node, "lambda_dme", &out->lambda_dme);
     ParseOptionalScalar(node, "lambda_lwd", &out->lambda_lwd);
     ParseOptionalScalar(node, "lambda_event", &out->lambda_event);
-    ParseOptionalScalar(node, "n_val_switch", &out->n_val_switch);
-    ParseOptionalScalar(node, "eps_switch", &out->eps_switch);
-    ParseOptionalScalar(node, "z_warn", &out->z_warn);
-    ParseOptionalScalar(node, "z_crit", &out->z_crit);
-    ParseOptionalScalar(node, "w_shift", &out->w_shift);
-    if (node["drift"]) {
-        const YAML::Node drift = node["drift"];
-        ParseOptionalScalar(drift, "alpha", &out->drift.alpha);
-        ParseOptionalScalar(drift, "shift_clip", &out->drift.shift_clip);
-        ParseOptionalScalar(drift, "lambda_mem", &out->drift.lambda_mem);
-        ParseOptionalScalar(drift, "kappa_shift", &out->drift.kappa_shift);
-        ParseOptionalScalar(drift, "u_min", &out->drift.u_min);
-        ParseOptionalScalar(drift, "h_shift", &out->drift.h_shift);
-        ParseOptionalScalar(drift, "p_shift_low", &out->drift.p_shift_low);
-        ParseOptionalScalar(drift, "p_shift_high", &out->drift.p_shift_high);
-        ParseOptionalScalar(drift, "m_shift", &out->drift.m_shift);
-        ParseOptionalScalar(drift, "g_skip", &out->drift.g_skip);
-        ParseOptionalScalar(drift, "g_reset", &out->drift.g_reset);
-    }
 }
 
 void ParseValueSampledProfiles(const YAML::Node& node, RuntimeConfigState* out) {
@@ -280,90 +215,38 @@ void ParseBlockSolverConfig(const YAML::Node& node, BlockSolverConfig* out) {
     ParseOptionalScalar(node, "cond_max", &out->cond_max);
 }
 
-void ParseRuntimeAndRebuild(const YAML::Node& node, RuntimeConfigState* out) {
-    if (!node || !out) return;
-    if (node["runtime_state_prune"]) {
-        const YAML::Node prune = node["runtime_state_prune"];
-        ParseOptionalScalar(prune, "idle_bucket_gap", &out->runtime_idle_prune_bucket_gap);
-        ParseOptionalScalar(prune, "prune_scan_limit", &out->runtime_idle_prune_scan_limit);
-    }
-    if (node["candidate_builder"]) {
-        ParseOptionalScalar(node["candidate_builder"],
-                            "min_train_point_count",
-                            &out->candidate_min_train_point_count);
-    }
-    if (node["shadow_policy"]) {
-        const YAML::Node shadow_policy = node["shadow_policy"];
-        ParseOptionalScalar(
-            shadow_policy, "z_shift_confirm_min", &out->shadow_policy.z_shift_confirm_min);
-        ParseOptionalScalar(shadow_policy, "c_rebuild_min", &out->shadow_policy.c_rebuild_min);
-        ParseOptionalScalar(shadow_policy,
-                            "z_win_shift_threshold",
-                            &out->shadow_policy.z_win_shift_threshold);
-        ParseOptionalScalar(shadow_policy,
-                            "min_shadow_points_for_candidate",
-                            &out->shadow_policy.min_shadow_points_for_candidate);
-        ParseOptionalScalar(shadow_policy,
-                            "min_shadow_holdout_points",
-                            &out->shadow_policy.min_shadow_holdout_points);
-        ParseOptionalScalar(
-            shadow_policy, "retry_cooldown_points", &out->shadow_policy.retry_cooldown_points);
-        ParseOptionalScalar(shadow_policy,
-                            "shadow_stuck_alert_points",
-                            &out->shadow_policy.shadow_stuck_alert_points);
-    }
-    if (node["candidate_validator"]) {
-        const YAML::Node validator = node["candidate_validator"];
-        ParseOptionalScalar(validator, "huber_delta", &out->candidate_huber_delta);
-        ParseOptionalScalar(validator, "shadow_alpha", &out->candidate_shadow_alpha);
-        ParseOptionalScalar(
-            validator, "ratio_variance_floor", &out->candidate_ratio_variance_floor);
-        ParseOptionalScalar(
-            validator, "switch_loss_abs_tol", &out->candidate_switch_loss_abs_tol);
-    }
-    if (node["relation_rebuild"]) {
-        const YAML::Node relation = node["relation_rebuild"];
-        ParseOptionalScalar(
-            relation, "min_replay_for_holdout", &out->relation_min_replay_for_holdout);
-        ParseOptionalScalar(
-            relation, "switch_validation_tail", &out->relation_switch_validation_tail);
-    }
-}
+void ParseCalendars(const YAML::Node& node, RuntimeConfigState* out) {
+    if (!node || !out || !node.IsSequence()) return;
+    out->calendars.clear();
+    for (const auto& calendar_node : node) {
+        if (!calendar_node || !calendar_node.IsMap()) continue;
+        EventCalendarSpec spec;
+        ParseOptionalScalar(calendar_node, "calendar_id", &spec.calendar_id);
+        ParseOptionalScalar(calendar_node, "calendar_version", &spec.calendar_version);
+        const YAML::Node entries_node = calendar_node["entries"];
+        if (entries_node && entries_node.IsSequence()) {
+            for (const auto& entry_node : entries_node) {
+                if (!entry_node || !entry_node.IsMap()) continue;
+                EventCalendarEntry entry;
+                ParseOptionalScalar(entry_node, "event_code", &entry.event_code);
+                ParseOptionalScalar(entry_node, "alignment_mode", &entry.alignment_mode);
+                ParseOptionalScalar(entry_node, "start_ts", &entry.start_ts);
+                ParseOptionalScalar(entry_node, "end_ts", &entry.end_ts);
+                ParseOptionalScalar(entry_node, "enabled", &entry.enabled);
+                ParseOptionalScalar(entry_node, "tz", &entry.tz);
+                spec.entries.push_back(std::move(entry));
+            }
+        }
 
-void ParseScoringAndConfidence(const YAML::Node& node, RuntimeConfigState* out) {
-    if (!node || !out) return;
-    ParseOptionalScalar(node, "score_warn", &out->score_warn);
-    ParseOptionalScalar(node, "score_crit", &out->score_crit);
-    ParseOptionalScalar(node, "confidence_formal_base", &out->confidence_formal_base);
-    ParseOptionalScalar(node, "confidence_source_base", &out->confidence_source_base);
-    ParseOptionalScalar(node, "confidence_shadow_base", &out->confidence_shadow_base);
-    ParseOptionalScalar(
-        node, "value_shadow_confidence_cap", &out->value_shadow_confidence_cap);
-    ParseOptionalScalar(node, "value_shadow_sigma_scale", &out->value_shadow_sigma_scale);
-    ParseOptionalScalar(
-        node, "ratio_shadow_confidence_cap", &out->ratio_shadow_confidence_cap);
-    ParseOptionalScalar(node, "ratio_shadow_score_scale", &out->ratio_shadow_score_scale);
-}
-
-void ParseFusionConfig(const YAML::Node& node, RuntimeConfigState* out) {
-    if (!node || !out) return;
-    if (node["key_risk_fusion"]) {
-        const YAML::Node key = node["key_risk_fusion"];
-        ParseOptionalScalar(
-            key, "fuse_persistence_window", &out->key_fusion_persistence_window);
-        ParseOptionalScalar(key, "window_limit", &out->key_fusion_window_limit);
+        CompiledEventCalendar compiled;
+        std::string compile_err;
+        BaselineTaskSpec empty_task;
+        if (CompileEventCalendar(spec, empty_task, &compiled, &compile_err) == error::OK) {
+            auto calendar = std::make_shared<CompiledEventCalendar>(std::move(compiled));
+            out->calendars[CalendarKey(calendar->calendar_id, calendar->calendar_version)] =
+                std::move(calendar);
+        }
     }
-    if (node["relation_pattern_fusion"]) {
-        const YAML::Node relation = node["relation_pattern_fusion"];
-        ParseOptionalScalar(relation, "lambda_sup", &out->relation_pattern_lambda_sup);
-        ParseOptionalScalar(relation, "lambda_opp", &out->relation_pattern_lambda_opp);
-        ParseOptionalScalar(
-            relation, "fuse_persistence_window", &out->relation_pattern_persistence_window);
-    }
-}
-
-bool IsUnitInterval(double value) {
-    return value >= 0.0 && value <= 1.0;
 }
 
 bool ValidateAllowedKeys(const YAML::Node& node,
@@ -433,25 +316,23 @@ bool ValidateNamedProfileMapKeys(const YAML::Node& node,
 
 bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) {
     if (!ValidateAllowedKeys(defaults,
-                             {"shared_profile_config",
+                             {"parser",
+                              "shared_profile_config",
                               "value_sampled_profiles",
                               "ratio_profiles",
-                              "solver_constants",
-                              "runtime_and_rebuild_constants",
-                              "scoring_and_confidence_constants",
-                              "fusion_constants",
-                              "parser"},
+                              "solver_constants"},
                              "baseline",
                              err)) {
         return false;
     }
-
     if (!ValidateAllowedKeys(defaults["parser"], {"tz_default"}, "baseline.parser", err)) {
         return false;
     }
     if (!ValidateAllowedKeys(defaults["shared_profile_config"],
                              {"k_day",
                               "k_week",
+                              "daily_harmonic_order",
+                              "weekly_harmonic_order",
                               "dme_max",
                               "m_month_enable",
                               "month_cov_min",
@@ -459,35 +340,16 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                               "lambda_dom",
                               "lambda_dme",
                               "lambda_lwd",
-                              "lambda_event",
-                              "n_val_switch",
-                              "eps_switch",
-                              "z_warn",
-                              "z_crit",
-                              "w_shift",
-                              "drift"},
+                              "lambda_event"},
                              "shared_profile_config",
                              err)) {
         return false;
     }
-    if (!ValidateAllowedKeys(defaults["shared_profile_config"]["drift"],
-                             {"alpha",
-                              "shift_clip",
-                              "lambda_mem",
-                              "kappa_shift",
-                              "u_min",
-                              "h_shift",
-                              "p_shift_low",
-                              "p_shift_high",
-                              "m_shift",
-                              "g_skip",
-                              "g_reset"},
-                             "shared_profile_config.drift",
-                             err)) {
-        return false;
-    }
     if (!ValidateNamedProfileMapKeys(
-            defaults["value_sampled_profiles"], {"n_train_min", "transform_name_override"}, "value_sampled_profiles", err)) {
+            defaults["value_sampled_profiles"],
+            {"n_train_min", "transform_name_override"},
+            "value_sampled_profiles",
+            err)) {
         return false;
     }
     if (defaults["ratio_profiles"]) {
@@ -513,104 +375,66 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                 }
                 continue;
             }
-            if (!ValidateAllowedKeys(
-                    it->second, {"d_min_train", "s_prior", "phi_over"}, profile_path.c_str(), err)) {
+            if (!ValidateAllowedKeys(it->second,
+                                     {"d_min_train", "s_prior", "phi_over"},
+                                     profile_path.c_str(),
+                                     err)) {
                 return false;
             }
         }
     }
-    if (!ValidateAllowedKeys(defaults["solver_constants"],
-                             {"solver_name",
-                              "c_huber",
-                              "s_min_fit",
-                              "max_iter_fit",
-                              "tol_obj_rel",
-                              "tol_beta_inf",
-                              "cond_max"},
-                             "solver_constants",
-                             err)) {
+    return ValidateAllowedKeys(defaults["solver_constants"],
+                               {"solver_name",
+                                "c_huber",
+                                "s_min_fit",
+                                "max_iter_fit",
+                                "tol_obj_rel",
+                                "tol_beta_inf",
+                                "cond_max"},
+                               "solver_constants",
+                               err);
+}
+
+bool ValidateCalendarsSchema(const YAML::Node& calendars, std::string* err) {
+    if (!calendars) return true;
+    if (!calendars.IsSequence()) {
+        if (err) *err = "calendars must be an array";
         return false;
     }
-    if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"],
-                             {"runtime_state_prune",
-                              "candidate_builder",
-                              "shadow_policy",
-                              "candidate_validator",
-                              "relation_rebuild"},
-                             "runtime_and_rebuild_constants",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"]["runtime_state_prune"],
-                             {"idle_bucket_gap", "prune_scan_limit"},
-                             "runtime_and_rebuild_constants.runtime_state_prune",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"]["candidate_builder"],
-                             {"min_train_point_count"},
-                             "runtime_and_rebuild_constants.candidate_builder",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"]["shadow_policy"],
-                             {"z_shift_confirm_min",
-                              "c_rebuild_min",
-                              "z_win_shift_threshold",
-                              "min_shadow_points_for_candidate",
-                              "min_shadow_holdout_points",
-                              "retry_cooldown_points",
-                              "shadow_stuck_alert_points"},
-                             "runtime_and_rebuild_constants.shadow_policy",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"]["candidate_validator"],
-                             {"huber_delta",
-                              "shadow_alpha",
-                              "ratio_variance_floor",
-                              "switch_loss_abs_tol"},
-                             "runtime_and_rebuild_constants.candidate_validator",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["runtime_and_rebuild_constants"]["relation_rebuild"],
-                             {"min_replay_for_holdout", "switch_validation_tail"},
-                             "runtime_and_rebuild_constants.relation_rebuild",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["scoring_and_confidence_constants"],
-                             {"score_warn",
-                              "score_crit",
-                              "confidence_formal_base",
-                              "confidence_source_base",
-                              "confidence_shadow_base",
-                              "value_shadow_confidence_cap",
-                              "value_shadow_sigma_scale",
-                              "ratio_shadow_confidence_cap",
-                              "ratio_shadow_score_scale"},
-                             "scoring_and_confidence_constants",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["fusion_constants"],
-                             {"key_risk_fusion", "relation_pattern_fusion"},
-                             "fusion_constants",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["fusion_constants"]["key_risk_fusion"],
-                             {"fuse_persistence_window", "window_limit"},
-                             "fusion_constants.key_risk_fusion",
-                             err)) {
-        return false;
-    }
-    if (!ValidateAllowedKeys(defaults["fusion_constants"]["relation_pattern_fusion"],
-                             {"lambda_sup", "lambda_opp", "fuse_persistence_window"},
-                             "fusion_constants.relation_pattern_fusion",
-                             err)) {
-        return false;
+    for (std::size_t i = 0; i < calendars.size(); ++i) {
+        const YAML::Node calendar = calendars[i];
+        const std::string calendar_path = "calendars[" + std::to_string(i) + "]";
+        if (!ValidateAllowedKeys(calendar,
+                                 {"calendar_id", "calendar_version", "entries"},
+                                 calendar_path.c_str(),
+                                 err)) {
+            return false;
+        }
+        if (!calendar["calendar_id"] || !calendar["calendar_version"]) {
+            if (err) *err = calendar_path + " requires calendar_id and calendar_version";
+            return false;
+        }
+        const YAML::Node entries = calendar["entries"];
+        if (!entries) continue;
+        if (!entries.IsSequence()) {
+            if (err) *err = calendar_path + ".entries must be an array";
+            return false;
+        }
+        for (std::size_t j = 0; j < entries.size(); ++j) {
+            const std::string entry_path =
+                calendar_path + ".entries[" + std::to_string(j) + "]";
+            if (!ValidateAllowedKeys(entries[j],
+                                     {"event_code",
+                                      "alignment_mode",
+                                      "start_ts",
+                                      "end_ts",
+                                      "enabled",
+                                      "tz"},
+                                     entry_path.c_str(),
+                                     err)) {
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -620,25 +444,15 @@ bool ValidateRuntimeConfig(const RuntimeConfigState& cfg, std::string* err) {
         if (err) *err = "baseline.parser.tz_default must not be empty";
         return false;
     }
-    if (cfg.shared_profile.k_day < 0 || cfg.shared_profile.k_week < 0 ||
-        cfg.shared_profile.dme_max < 0 || cfg.shared_profile.n_val_switch == 0) {
+    if (cfg.shared_profile.k_day < 0 ||
+        cfg.shared_profile.k_week < 0 ||
+        cfg.shared_profile.dme_max < 0) {
         if (err) *err = "shared_profile_config integer fields are invalid";
         return false;
     }
-    if (!(cfg.shared_profile.month_cov_min > 0.0 && cfg.shared_profile.month_cov_min <= 1.0)) {
+    if (!(cfg.shared_profile.month_cov_min > 0.0 &&
+          cfg.shared_profile.month_cov_min <= 1.0)) {
         if (err) *err = "shared_profile_config.month_cov_min must be in (0,1]";
-        return false;
-    }
-    if (!(cfg.shared_profile.z_warn > 0.0 && cfg.shared_profile.z_crit > cfg.shared_profile.z_warn)) {
-        if (err) *err = "shared_profile_config z_warn/z_crit are invalid";
-        return false;
-    }
-    if (!IsUnitInterval(cfg.shared_profile.drift.alpha) ||
-        !IsUnitInterval(cfg.shared_profile.drift.lambda_mem) ||
-        !IsUnitInterval(cfg.shared_profile.drift.p_shift_low) ||
-        !IsUnitInterval(cfg.shared_profile.drift.p_shift_high) ||
-        cfg.shared_profile.drift.p_shift_low > cfg.shared_profile.drift.p_shift_high) {
-        if (err) *err = "shared_profile_config.drift probability fields are invalid";
         return false;
     }
     if (cfg.value_sampled_profiles.empty()) {
@@ -662,61 +476,31 @@ bool ValidateRuntimeConfig(const RuntimeConfigState& cfg, std::string* err) {
         return false;
     }
     for (const auto& entry : cfg.ratio_profiles) {
-        if (entry.first.empty() || entry.second.d_min_train == 0 || entry.second.s_prior < 0.0 ||
+        if (entry.first.empty() ||
+            entry.second.d_min_train == 0 ||
+            entry.second.s_prior < 0.0 ||
             entry.second.phi_over < 1.0) {
             if (err) *err = "ratio_profiles contains invalid profile";
             return false;
         }
     }
-    if (cfg.runtime_idle_prune_bucket_gap <= 0 || cfg.runtime_idle_prune_scan_limit == 0) {
-        if (err) *err = "runtime_state_prune values must be > 0";
-        return false;
-    }
-    if (!(cfg.score_warn >= 0.0 && cfg.score_crit > cfg.score_warn)) {
-        if (err) *err = "score_warn/score_crit are invalid";
-        return false;
-    }
-    if (!IsUnitInterval(cfg.confidence_formal_base) || !IsUnitInterval(cfg.confidence_source_base) ||
-        !IsUnitInterval(cfg.confidence_shadow_base) ||
-        !IsUnitInterval(cfg.value_shadow_confidence_cap) ||
-        !IsUnitInterval(cfg.ratio_shadow_confidence_cap)) {
-        if (err) *err = "confidence fields must be in [0,1]";
-        return false;
-    }
-    if (!(cfg.value_shadow_sigma_scale > 0.0 && cfg.ratio_shadow_score_scale > 0.0)) {
-        if (err) *err = "shadow score scale must be > 0";
-        return false;
-    }
-    if (!(cfg.candidate_huber_delta > 0.0 && cfg.candidate_shadow_alpha > 0.0 &&
-          cfg.candidate_shadow_alpha <= 1.0 && cfg.candidate_ratio_variance_floor > 0.0 &&
-          cfg.candidate_switch_loss_abs_tol >= 0.0 && cfg.candidate_min_train_point_count > 0)) {
-        if (err) *err = "candidate validator constants are invalid";
-        return false;
-    }
-    if (!(cfg.shadow_policy.z_shift_confirm_min > 0.0 && cfg.shadow_policy.c_rebuild_min > 0 &&
-          cfg.shadow_policy.z_win_shift_threshold > 0.0 &&
-          cfg.shadow_policy.min_shadow_points_for_candidate > 0 &&
-          cfg.shadow_policy.min_shadow_holdout_points > 0 &&
-          cfg.shadow_policy.retry_cooldown_points > 0 &&
-          cfg.shadow_policy.shadow_stuck_alert_points > 0)) {
-        if (err) *err = "shadow_policy constants are invalid";
-        return false;
-    }
-    if (cfg.relation_min_replay_for_holdout == 0 || cfg.relation_switch_validation_tail == 0) {
-        if (err) *err = "relation_rebuild constants are invalid";
-        return false;
-    }
-    if (!(cfg.key_fusion_persistence_window > 0.0 && cfg.key_fusion_window_limit > 0 &&
-          cfg.relation_pattern_persistence_window > 0.0)) {
-        if (err) *err = "fusion persistence/window values are invalid";
-        return false;
-    }
-    if (cfg.block_solver.solver_name.empty() || cfg.block_solver.c_huber <= 0.0 ||
-        cfg.block_solver.s_min_fit <= 0.0 || cfg.block_solver.max_iter_fit == 0 ||
-        cfg.block_solver.tol_obj_rel <= 0.0 || cfg.block_solver.tol_beta_inf <= 0.0 ||
+    if (cfg.block_solver.solver_name.empty() ||
+        cfg.block_solver.c_huber <= 0.0 ||
+        cfg.block_solver.s_min_fit <= 0.0 ||
+        cfg.block_solver.max_iter_fit == 0 ||
+        cfg.block_solver.tol_obj_rel <= 0.0 ||
+        cfg.block_solver.tol_beta_inf <= 0.0 ||
         cfg.block_solver.cond_max <= 0.0) {
         if (err) *err = "solver_constants are invalid";
         return false;
+    }
+    for (const auto& entry : cfg.calendars) {
+        if (!entry.second ||
+            entry.second->calendar_id.empty() ||
+            entry.second->calendar_version.empty()) {
+            if (err) *err = "calendars contains invalid calendar";
+            return false;
+        }
     }
     return true;
 }
@@ -729,15 +513,11 @@ bool ApplyYamlConfig(const YAML::Node& root,
         if (err) *err = "runtime config output must not be null";
         return false;
     }
-
-    if (strict) {
-        if (!ValidateAllowedKeys(root,
-                                 {"baseline", "examples", "notes"},
-                                 "root",
-                                 err)) {
-            return false;
-        }
+    if (strict &&
+        !ValidateAllowedKeys(root, {"baseline", "calendars", "examples", "notes"}, "root", err)) {
+        return false;
     }
+    if (strict && !ValidateCalendarsSchema(root["calendars"], err)) return false;
 
     YAML::Node defaults = root["baseline"];
     if (!defaults) {
@@ -760,9 +540,7 @@ bool ApplyYamlConfig(const YAML::Node& root,
     ParseValueSampledProfiles(defaults["value_sampled_profiles"], out);
     ParseRatioProfiles(defaults["ratio_profiles"], out);
     ParseBlockSolverConfig(defaults["solver_constants"], &out->block_solver);
-    ParseRuntimeAndRebuild(defaults["runtime_and_rebuild_constants"], out);
-    ParseScoringAndConfidence(defaults["scoring_and_confidence_constants"], out);
-    ParseFusionConfig(defaults["fusion_constants"], out);
+    ParseCalendars(root["calendars"], out);
     return true;
 }
 
@@ -852,154 +630,15 @@ std::string BaselineDefaultTimezone() {
     return snapshot->tz_default;
 }
 
-int64_t RuntimeIdlePruneBucketGap() {
+std::shared_ptr<const CompiledEventCalendar> FindBaselineEventCalendar(
+    const BaselineCalendarRef& calendar_ref) {
+    if (calendar_ref.calendar_id.empty() || calendar_ref.calendar_version.empty()) {
+        return nullptr;
+    }
     const auto snapshot = Snapshot();
-    return snapshot->runtime_idle_prune_bucket_gap;
-}
-
-std::size_t RuntimeIdlePruneScanLimit() {
-    const auto snapshot = Snapshot();
-    return snapshot->runtime_idle_prune_scan_limit;
-}
-
-double ScoreWarn() {
-    const auto snapshot = Snapshot();
-    return snapshot->score_warn;
-}
-
-double ScoreCrit() {
-    const auto snapshot = Snapshot();
-    return snapshot->score_crit;
-}
-
-double ConfidenceFormalBase() {
-    const auto snapshot = Snapshot();
-    return snapshot->confidence_formal_base;
-}
-
-double ConfidenceSourceBase() {
-    const auto snapshot = Snapshot();
-    return snapshot->confidence_source_base;
-}
-
-double ConfidenceShadowBase() {
-    const auto snapshot = Snapshot();
-    return snapshot->confidence_shadow_base;
-}
-
-double ValueShadowConfidenceCap() {
-    const auto snapshot = Snapshot();
-    return snapshot->value_shadow_confidence_cap;
-}
-
-double ValueShadowSigmaScale() {
-    const auto snapshot = Snapshot();
-    return snapshot->value_shadow_sigma_scale;
-}
-
-double RatioShadowConfidenceCap() {
-    const auto snapshot = Snapshot();
-    return snapshot->ratio_shadow_confidence_cap;
-}
-
-double RatioShadowScoreScale() {
-    const auto snapshot = Snapshot();
-    return snapshot->ratio_shadow_score_scale;
-}
-
-double CandidateHuberDelta() {
-    const auto snapshot = Snapshot();
-    return snapshot->candidate_huber_delta;
-}
-
-double CandidateShadowAlpha() {
-    const auto snapshot = Snapshot();
-    return snapshot->candidate_shadow_alpha;
-}
-
-double CandidateRatioVarianceFloor() {
-    const auto snapshot = Snapshot();
-    return snapshot->candidate_ratio_variance_floor;
-}
-
-double CandidateSwitchLossAbsTol() {
-    const auto snapshot = Snapshot();
-    return snapshot->candidate_switch_loss_abs_tol;
-}
-
-std::size_t CandidateMinTrainPointCount() {
-    const auto snapshot = Snapshot();
-    return snapshot->candidate_min_train_point_count;
-}
-
-double ShadowZShiftConfirmMin() {
-    const auto snapshot = Snapshot();
-    return snapshot->shadow_policy.z_shift_confirm_min;
-}
-
-uint32_t ShadowCRebuildMin() {
-    const auto snapshot = Snapshot();
-    return snapshot->shadow_policy.c_rebuild_min;
-}
-
-double ShadowZWinShiftThreshold() {
-    const auto snapshot = Snapshot();
-    return snapshot->shadow_policy.z_win_shift_threshold;
-}
-
-std::size_t ShadowMinPointsForCandidate() {
-    const auto snapshot = Snapshot();
-    return snapshot->shadow_policy.min_shadow_points_for_candidate;
-}
-
-std::size_t ShadowMinHoldoutPoints() {
-    const auto snapshot = Snapshot();
-    return snapshot->shadow_policy.min_shadow_holdout_points;
-}
-
-std::size_t ShadowRetryCooldownPoints() {
-    const auto snapshot = Snapshot();
-    return snapshot->shadow_policy.retry_cooldown_points;
-}
-
-std::size_t ShadowStuckAlertPoints() {
-    const auto snapshot = Snapshot();
-    return snapshot->shadow_policy.shadow_stuck_alert_points;
-}
-
-double KeyFusionPersistenceWindow() {
-    const auto snapshot = Snapshot();
-    return snapshot->key_fusion_persistence_window;
-}
-
-std::size_t KeyFusionWindowLimit() {
-    const auto snapshot = Snapshot();
-    return snapshot->key_fusion_window_limit;
-}
-
-double RelationPatternLambdaSup() {
-    const auto snapshot = Snapshot();
-    return snapshot->relation_pattern_lambda_sup;
-}
-
-double RelationPatternLambdaOpp() {
-    const auto snapshot = Snapshot();
-    return snapshot->relation_pattern_lambda_opp;
-}
-
-double RelationPatternPersistenceWindow() {
-    const auto snapshot = Snapshot();
-    return snapshot->relation_pattern_persistence_window;
-}
-
-std::size_t RelationMinReplayForHoldout() {
-    const auto snapshot = Snapshot();
-    return snapshot->relation_min_replay_for_holdout;
-}
-
-std::size_t RelationSwitchValidationTail() {
-    const auto snapshot = Snapshot();
-    return snapshot->relation_switch_validation_tail;
+    const auto it = snapshot->calendars.find(
+        CalendarKey(calendar_ref.calendar_id, calendar_ref.calendar_version));
+    return it == snapshot->calendars.end() ? nullptr : it->second;
 }
 
 }  // namespace baseline

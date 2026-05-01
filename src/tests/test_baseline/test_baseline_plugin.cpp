@@ -7,28 +7,16 @@
  */
 
 #include <cassert>
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdio>
-#include <mutex>
-#include <cmath>
-#include <rapidjson/document.h>
+#include <fstream>
 #include <string>
-#include <thread>
-#include <vector>
 
 #include <common/loader.hpp>
 #include <common/error_code.h>
 #include <framework/interfaces/ibaseline_service.h>
-#include <plugins/baseline/common/result_builder.h>
-#include <plugins/baseline/model/event_calendar_spec.h>
-#include <plugins/baseline/model/formal_predictor.h>
-#include <plugins/baseline/model/series_store.h>
-#include <plugins/baseline/task/relation_task.h>
+#include <rapidjson/document.h>
 
-#include "relation_task_test_access.h"
+#include "plugins/baseline/config/runtime_config.h"
 
 using namespace flowsql;
 
@@ -45,14 +33,15 @@ struct LoadedBaselineService {
     }
 };
 
-LoadedBaselineService LoadBaselineService() {
+LoadedBaselineService LoadBaselineService(const std::string& option = "") {
     LoadedBaselineService env;
     env.loader = PluginLoader::Single();
 
     std::string plugin_dir = get_absolute_process_path();
     std::string plugin_name = "libflowsql_baseline.so";
     const char* relapath[] = {plugin_name.c_str()};
-    const char* options[] = {nullptr};
+    const char* option_value = option.empty() ? nullptr : option.c_str();
+    const char* options[] = {option_value};
 
     const int ret = env.loader->Load(plugin_dir.c_str(), relapath, options, 1);
     assert(ret == 0);
@@ -63,2496 +52,869 @@ LoadedBaselineService LoadBaselineService() {
     return env;
 }
 
-struct ListedTask {
-    std::string id;
-    std::string name;
-    BaselineTaskKind kind = BaselineTaskKind::kValue;
-};
-
-std::vector<ListedTask> ListTasks(IBaselineService* service) {
-    std::vector<ListedTask> tasks;
-    service->ListTasks([&tasks](const char* task_id,
-                                const char* task_name,
-                                BaselineTaskKind kind) {
-        ListedTask item;
-        item.id = task_id ? task_id : "";
-        item.name = task_name ? task_name : "";
-        item.kind = kind;
-        tasks.push_back(item);
-    });
-    return tasks;
+const char* ValueTaskConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_bps",
+        "task_name": "link bps baseline",
+        "task_kind": "value",
+        "feature_id": "bps",
+        "feature_type": "value_basic",
+        "profile": "default",
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
+        }
+    })";
 }
 
-bool ContainsTask(const std::vector<ListedTask>& tasks,
-                  const char* task_id,
-                  BaselineTaskKind expected_kind) {
-    for (const auto& task : tasks) {
-        if (task.id == (task_id ? task_id : "") && task.kind == expected_kind) {
-            return true;
+const char* SampledValueTaskConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_sampled_bps",
+        "task_name": "sampled link bps baseline",
+        "task_kind": "value",
+        "feature_id": "sampled_bps",
+        "feature_type": "value_sampled",
+        "profile": "cont_core",
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
         }
-    }
-    return false;
+    })";
 }
 
-class StaticBaselineSourceResolver : public IBaselineSourceResolver {
- public:
-    int ResolveBaselineSource(const BaselineStringRef& key,
-                              const BaselineStringRef& feature,
-                              std::string* out_config_json) override {
-        last_key_ = key.data ? std::string(key.data, key.size) : "";
-        last_feature_ = feature.data ? std::string(feature.data, feature.size) : "";
-        if (out_config_json) *out_config_json = "";
-        return error::OK;
-    }
-
-    const std::string& last_key() const { return last_key_; }
-    const std::string& last_feature() const { return last_feature_; }
-
- private:
-    std::string last_key_;
-    std::string last_feature_;
-};
-
-class RoutedBaselineSourceResolver : public IBaselineSourceResolver {
- public:
-    int ResolveBaselineSource(const BaselineStringRef& key,
-                              const BaselineStringRef& feature,
-                              std::string* out_config_json) override {
-        last_key_ = key.data ? std::string(key.data, key.size) : "";
-        last_feature_ = feature.data ? std::string(feature.data, feature.size) : "";
-        ++call_count_;
-        if (out_config_json) {
-            *out_config_json =
-                R"({"baseline_sources":[{"source_key":"svc-source"}]})";
+const char* OtherValueTaskConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_other_bps",
+        "task_name": "other link bps baseline",
+        "task_kind": "value",
+        "feature_id": "other_bps",
+        "feature_type": "value_basic",
+        "profile": "default",
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
         }
-        return error::OK;
-    }
-
-    int call_count() const { return call_count_; }
-    const std::string& last_key() const { return last_key_; }
-    const std::string& last_feature() const { return last_feature_; }
-
- private:
-    int call_count_ = 0;
-    std::string last_key_;
-    std::string last_feature_;
-};
-
-template <typename Predicate>
-bool WaitUntil(Predicate&& pred, int timeout_ms = 2000) {
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return pred();
+    })";
 }
 
-class CountingValueHistoryReader : public IBaselineValueHistoryReader {
- public:
-    int Fetch(const HistoryFetchRequest& req,
-              std::function<int(const ValueObservation&)> on_point) override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_key_ = req.key.data ? std::string(req.key.data, req.key.size) : "";
-            last_start_ = req.bucket_start;
-            last_end_ = req.bucket_end;
+const char* LegacyValueTaskConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_legacy_value",
+        "task_name": "legacy value baseline",
+        "task_kind": "value",
+        "feature_id": "legacy_bps",
+        "feature_type": "value",
+        "profile": "default",
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
         }
-        ++call_count_;
-        if (on_point) {
-            const int64_t first_bucket =
-                (req.bucket_end >= 2) ? (req.bucket_end - 2) : req.bucket_end;
-            for (int64_t bucket = first_bucket; bucket <= req.bucket_end; ++bucket) {
-                const ValueObservation replay{
-                    BaselineStringRef{last_key_.c_str(), static_cast<uint32_t>(last_key_.size())},
-                    bucket,
-                    static_cast<double>(bucket - first_bucket + 1),
-                    0};
-                const int rc = on_point(replay);
-                if (rc != error::OK) return rc;
-            }
-            return error::OK;
-        }
-        return error::OK;
-    }
-
-    int call_count() const { return call_count_.load(); }
-    std::string last_key() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_key_;
-    }
-    int64_t last_start() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_start_;
-    }
-    int64_t last_end() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_end_;
-    }
-
- private:
-    mutable std::mutex mutex_;
-    std::atomic<int> call_count_{0};
-    std::string last_key_;
-    int64_t last_start_ = 0;
-    int64_t last_end_ = 0;
-};
-
-class SinglePointValueHistoryReader : public IBaselineValueHistoryReader {
- public:
-    int Fetch(const HistoryFetchRequest& req,
-              std::function<int(const ValueObservation&)> on_point) override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_key_ = req.key.data ? std::string(req.key.data, req.key.size) : "";
-            last_start_ = req.bucket_start;
-            last_end_ = req.bucket_end;
-        }
-        ++call_count_;
-        if (!on_point) return error::OK;
-
-        const ValueObservation replay{
-            BaselineStringRef{last_key_.c_str(), static_cast<uint32_t>(last_key_.size())},
-            req.bucket_end,
-            7.0,
-            0};
-        return on_point(replay);
-    }
-
-    int call_count() const { return call_count_.load(); }
-
- private:
-    mutable std::mutex mutex_;
-    std::atomic<int> call_count_{0};
-    std::string last_key_;
-    int64_t last_start_ = 0;
-    int64_t last_end_ = 0;
-};
-
-class FailingRatioHistoryReader : public IBaselineRatioHistoryReader {
- public:
-    int Fetch(const HistoryFetchRequest& req,
-              std::function<int(const RatioObservation&)>) override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_key_ = req.key.data ? std::string(req.key.data, req.key.size) : "";
-            last_start_ = req.bucket_start;
-            last_end_ = req.bucket_end;
-        }
-        ++call_count_;
-        return error::UNAVAILABLE;
-    }
-
-    int call_count() const { return call_count_.load(); }
-    std::string last_key() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_key_;
-    }
-    int64_t last_start() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_start_;
-    }
-    int64_t last_end() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_end_;
-    }
-
- private:
-    mutable std::mutex mutex_;
-    std::atomic<int> call_count_{0};
-    std::string last_key_;
-    int64_t last_start_ = 0;
-    int64_t last_end_ = 0;
-};
-
-class CountingRatioHistoryReader : public IBaselineRatioHistoryReader {
- public:
-    int Fetch(const HistoryFetchRequest& req,
-              std::function<int(const RatioObservation&)> on_point) override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_key_ = req.key.data ? std::string(req.key.data, req.key.size) : "";
-            last_start_ = req.bucket_start;
-            last_end_ = req.bucket_end;
-        }
-        ++call_count_;
-        if (on_point) {
-            const int64_t first_bucket =
-                (req.bucket_end >= 2) ? (req.bucket_end - 2) : req.bucket_end;
-            for (int64_t bucket = first_bucket; bucket <= req.bucket_end; ++bucket) {
-                const double numerator =
-                    30.0 + 10.0 * static_cast<double>(bucket - first_bucket + 1);
-                const double denominator = numerator + 20.0;
-                const RatioObservation replay{
-                    BaselineStringRef{last_key_.c_str(), static_cast<uint32_t>(last_key_.size())},
-                    bucket,
-                    numerator,
-                    denominator};
-                const int rc = on_point(replay);
-                if (rc != error::OK) return rc;
-            }
-        }
-        return error::OK;
-    }
-
-    int call_count() const { return call_count_.load(); }
-
- private:
-    mutable std::mutex mutex_;
-    std::atomic<int> call_count_{0};
-    std::string last_key_;
-    int64_t last_start_ = 0;
-    int64_t last_end_ = 0;
-};
-
-class SwitchingValueHistoryReader : public IBaselineValueHistoryReader {
- public:
-    int Fetch(const HistoryFetchRequest& req,
-              std::function<int(const ValueObservation&)> on_point) override {
-        const int call_index = ++call_count_;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_key_ = req.key.data ? std::string(req.key.data, req.key.size) : "";
-            last_start_ = req.bucket_start;
-            last_end_ = req.bucket_end;
-            if (call_index == 2) second_fetch_started_ = true;
-        }
-        cv_.notify_all();
-
-        if (call_index == 2) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this]() { return allow_second_fetch_; });
-        }
-
-        const double value = call_index == 1 ? 1.0 : 64.0;
-        const int64_t replay_span = call_index == 1 ? 2 : 39;
-        const int64_t first_bucket =
-            std::max<int64_t>(req.bucket_start, req.bucket_end - replay_span);
-        for (int64_t bucket = first_bucket; bucket <= req.bucket_end; ++bucket) {
-            const ValueObservation replay{
-                BaselineStringRef{last_key_.c_str(), static_cast<uint32_t>(last_key_.size())},
-                bucket,
-                value,
-                0};
-            const int rc = on_point ? on_point(replay) : error::OK;
-            if (rc != error::OK) return rc;
-        }
-        return error::OK;
-    }
-
-    int call_count() const { return call_count_.load(); }
-
-    bool second_fetch_started() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return second_fetch_started_;
-    }
-
-    void AllowSecondFetch() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            allow_second_fetch_ = true;
-        }
-        cv_.notify_all();
-    }
-
- private:
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::atomic<int> call_count_{0};
-    std::string last_key_;
-    int64_t last_start_ = 0;
-    int64_t last_end_ = 0;
-    bool second_fetch_started_ = false;
-    bool allow_second_fetch_ = false;
-};
-
-class SwitchingRatioHistoryReader : public IBaselineRatioHistoryReader {
- public:
-    int Fetch(const HistoryFetchRequest& req,
-              std::function<int(const RatioObservation&)> on_point) override {
-        const int call_index = ++call_count_;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_key_ = req.key.data ? std::string(req.key.data, req.key.size) : "";
-            last_start_ = req.bucket_start;
-            last_end_ = req.bucket_end;
-            if (call_index == 2) second_fetch_started_ = true;
-        }
-        cv_.notify_all();
-
-        if (call_index == 2) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this]() { return allow_second_fetch_; });
-        }
-
-        const double numerator = call_index == 1 ? 10.0 : 23.0;
-        const double denominator = 100.0;
-        const int64_t replay_span = call_index == 1 ? 2 : 39;
-        const int64_t first_bucket =
-            std::max<int64_t>(req.bucket_start, req.bucket_end - replay_span);
-        for (int64_t bucket = first_bucket; bucket <= req.bucket_end; ++bucket) {
-            const RatioObservation replay{
-                BaselineStringRef{last_key_.c_str(), static_cast<uint32_t>(last_key_.size())},
-                bucket,
-                numerator,
-                denominator};
-            const int rc = on_point ? on_point(replay) : error::OK;
-            if (rc != error::OK) return rc;
-        }
-        return error::OK;
-    }
-
-    int call_count() const { return call_count_.load(); }
-
-    bool second_fetch_started() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return second_fetch_started_;
-    }
-
-    void AllowSecondFetch() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            allow_second_fetch_ = true;
-        }
-        cv_.notify_all();
-    }
-
- private:
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::atomic<int> call_count_{0};
-    std::string last_key_;
-    int64_t last_start_ = 0;
-    int64_t last_end_ = 0;
-    bool second_fetch_started_ = false;
-    bool allow_second_fetch_ = false;
-};
-
-struct OwnedRelationMetricReplay {
-    double total = 0.0;
-    uint32_t active_count = 0;
-    std::vector<double> values;
-    uint32_t flags = kRelationMetricHasActiveCount;
-};
-
-struct OwnedRelationReplayBlock {
-    int64_t bucket_id = 0;
-    std::vector<uint32_t> group_idx;
-    std::vector<OwnedRelationMetricReplay> metrics;
-};
-
-OwnedRelationReplayBlock MakeSingleMetricRelationBlock(int64_t bucket_id,
-                                                       double v0,
-                                                       double v1,
-                                                       double v2) {
-    return OwnedRelationReplayBlock{
-        bucket_id,
-        {11, 12, 13},
-        {{100.0, 3, {v0, v1, v2}}}};
+    })";
 }
 
-OwnedRelationReplayBlock MakeDualMetricRelationBlock(int64_t bucket_id,
-                                                     double conn0,
-                                                     double conn1,
-                                                     double conn2,
-                                                     double bps0,
-                                                     double bps1,
-                                                     double bps2) {
-    return OwnedRelationReplayBlock{
-        bucket_id,
-        {11, 12, 13},
-        {{100.0, 3, {conn0, conn1, conn2}},
-         {1000.0, 3, {bps0, bps1, bps2}}}};
+const char* BasicValueWithSampledProfileConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_basic_with_sampled_profile",
+        "task_name": "invalid basic sampled profile",
+        "task_kind": "value",
+        "feature_id": "basic_bps",
+        "feature_type": "value_basic",
+        "profile": "cont_core",
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
+        }
+    })";
 }
 
-class ScriptedRelationHistoryReader : public IBaselineRelationHistoryReader {
- public:
-    void AddFetchScript(std::vector<OwnedRelationReplayBlock> blocks) {
-        scripts_.push_back(std::move(blocks));
+const char* SampledValueWithDefaultProfileConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_sampled_with_default_profile",
+        "task_name": "invalid sampled default profile",
+        "task_kind": "value",
+        "feature_id": "sampled_bps",
+        "feature_type": "value_sampled",
+        "profile": "default",
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
+        }
+    })";
+}
+
+const char* RatioTaskConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_success_rate",
+        "task_name": "success rate baseline",
+        "task_kind": "ratio",
+        "feature_id": "success_rate",
+        "feature_type": "ratio",
+        "profile": "rate_core",
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
+        }
+    })";
+}
+
+const char* RelationTaskConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_client_mix",
+        "task_name": "client mix basis",
+        "task_kind": "relation",
+        "feature_id": "client_mix",
+        "feature_type": "relation",
+        "profile": "default",
+        "group_space_id": "client_group",
+        "group_space_version": "v1",
+        "metrics": ["bps"],
+        "support_policy": {
+            "k_support": 2,
+            "min_hist_share": 0.01,
+            "min_active_ratio": 0.1
+        },
+        "summary_policy": {
+            "k_head": 2,
+            "k_stable": 1
+        },
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
+        }
+    })";
+}
+
+void TestEventCalendarSchemaRejectsTaskScopedFields() {
+    std::printf("[TEST] B1 calendar schema rejects task-scoped fields...\n");
+
+    const std::string config_path = "/tmp/flowsql_baseline_calendar_schema_test.yaml";
+    {
+        std::ofstream file(config_path);
+        file << R"(
+calendars:
+  - calendar_id: "cn-holiday"
+    calendar_version: "2026.1"
+    entries:
+      - event_code: "promo"
+        scope_type: "feature"
+        feature: "bps"
+        alignment_mode: "absolute_utc"
+        start_ts: 1200
+        end_ts: 1500
+baseline:
+  parser:
+    tz_default: "UTC"
+  shared_profile_config:
+    daily_harmonic_order: 2
+    weekly_harmonic_order: 1
+    dme_max: 7
+    m_month_enable: 4
+    month_cov_min: 0.8
+    lambda_season: 1.0
+    lambda_dom: 4.0
+    lambda_dme: 2.0
+    lambda_lwd: 1.0
+    lambda_event: 0.1
+  value_sampled_profiles:
+    cont_core:
+      n_train_min: 50
+      transform_name_override: "log1p"
+  ratio_profiles:
+    global:
+      eps_logit: 1.0e-4
+      m_floor: 1.0e-4
+      v_floor: 0.25
+    rate_core:
+      d_min_train: 50
+      s_prior: 2.0
+      phi_over: 1.5
+  solver_constants:
+    solver_name: "weighted_huber_ridge_irls"
+    c_huber: 1.5
+    s_min_fit: 1.0e-3
+    max_iter_fit: 15
+    tol_obj_rel: 1.0e-4
+    tol_beta_inf: 1.0e-5
+    cond_max: 1.0e8
+)";
     }
 
-    int Fetch(const HistoryFetchRequest& req,
-              std::function<int(const RelationObservationBlock&)> on_block) override {
-        const std::string key = req.key.data ? std::string(req.key.data, req.key.size) : "";
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_key_ = key;
-            last_start_ = req.bucket_start;
-            last_end_ = req.bucket_end;
-        }
+    std::string err;
+    const int rc = flowsql::baseline::LoadBaselineRuntimeConfigFromYaml(config_path, true, &err);
+    assert(rc == error::BAD_REQUEST);
+    assert(err.find("not allowed") != std::string::npos || err.find("feature") != std::string::npos);
+    flowsql::baseline::ResetBaselineRuntimeConfig();
 
-        const int call_index = call_count_.fetch_add(1);
-        const size_t script_index =
-            std::min(static_cast<size_t>(call_index), scripts_.empty() ? size_t{0}
-                                                                       : scripts_.size() - 1);
-        if (scripts_.empty()) return error::OK;
+    std::printf("[PASS] B1 calendar schema rejects task-scoped fields\n");
+}
 
-        for (const auto& owned_block : scripts_[script_index]) {
-            metric_views_.clear();
-            metric_views_.reserve(owned_block.metrics.size());
-            for (const auto& metric : owned_block.metrics) {
-                metric_views_.push_back(RelationMetricBlock{
-                    metric.total,
-                    metric.flags,
-                    metric.active_count,
-                    metric.values.empty() ? nullptr : metric.values.data()});
-            }
-
-            const RelationObservationBlock view{
-                BaselineStringRef{key.c_str(), static_cast<uint32_t>(key.size())},
-                owned_block.bucket_id,
-                static_cast<uint32_t>(owned_block.group_idx.size()),
-                owned_block.group_idx.empty() ? nullptr : owned_block.group_idx.data(),
-                static_cast<uint32_t>(metric_views_.size()),
-                metric_views_.empty() ? nullptr : metric_views_.data(),
-            };
-            const int rc = on_block ? on_block(view) : error::OK;
-            if (rc != error::OK) return rc;
-        }
-        return error::OK;
-    }
-
-    int call_count() const { return call_count_.load(); }
-
- private:
-    mutable std::mutex mutex_;
-    std::atomic<int> call_count_{0};
-    std::string last_key_;
-    int64_t last_start_ = 0;
-    int64_t last_end_ = 0;
-    std::vector<std::vector<OwnedRelationReplayBlock>> scripts_;
-    std::vector<RelationMetricBlock> metric_views_;
-};
-
-rapidjson::Document ParseJson(const std::string& json) {
+void AssertSnapshotHasTask(const std::string& json,
+                           const char* expected_task_id,
+                           uint64_t expected_count) {
     rapidjson::Document doc;
     doc.Parse(json.c_str());
     assert(!doc.HasParseError());
     assert(doc.IsObject());
-    return doc;
+    assert(doc.HasMember("task_count"));
+    assert(doc["task_count"].GetUint64() == expected_count);
+    assert(doc.HasMember("tasks"));
+    assert(doc["tasks"].IsArray());
+
+    bool found = false;
+    for (const auto& item : doc["tasks"].GetArray()) {
+        assert(item.IsObject());
+        assert(item.HasMember("task_id"));
+        if (std::string(item["task_id"].GetString()) == expected_task_id) {
+            found = true;
+            assert(item.HasMember("kind"));
+            assert(std::string(item["kind"].GetString()) == "value");
+        }
+    }
+    assert(found == (expected_count > 0));
 }
 
-BaselineStringRef StringRef(const std::string& value) {
-    return BaselineStringRef{value.c_str(), static_cast<uint32_t>(value.size())};
+void TestCreateTaskUsesConfigIdentity() {
+    std::printf("[TEST] B1 task config identity...\n");
+    auto env = LoadBaselineService();
+
+    auto [status, task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+    assert(std::string(task->Id()) == "baseline_task_bps");
+    assert(std::string(task->Name()) == "link bps baseline");
+
+    auto [snapshot_status, snapshot] =
+        env.service->QueryServiceSnapshot(BaselineSerializationFormat::kJson);
+    assert(snapshot_status == BaselineStatus::kOk);
+    AssertSnapshotHasTask(snapshot, "baseline_task_bps", 1);
+
+    auto [dup_status, dup_task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(dup_status == BaselineStatus::kInvalidArgument);
+    assert(dup_task == nullptr);
+
+    assert(task->Close() == BaselineStatus::kOk);
+    auto [closed_snapshot_status, closed_snapshot] =
+        env.service->QueryServiceSnapshot(BaselineSerializationFormat::kJson);
+    assert(closed_snapshot_status == BaselineStatus::kOk);
+    AssertSnapshotHasTask(closed_snapshot, "baseline_task_bps", 0);
+
+    std::printf("[PASS] B1 task config identity\n");
 }
 
-void AssertDoubleNear(double actual, double expected, double epsilon = 1e-9) {
-    assert(std::fabs(actual - expected) <= epsilon);
+void TestInvalidTaskConfigRejected() {
+    std::printf("[TEST] B1 invalid task config rejected...\n");
+    auto env = LoadBaselineService();
+
+    auto [status, task] = env.service->CreateValueTask(
+        R"({"schema_version":1})", BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kParseFailed);
+    assert(task == nullptr);
+
+    auto [legacy_status, legacy_task] = env.service->CreateValueTask(
+        LegacyValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(legacy_status == BaselineStatus::kParseFailed);
+    assert(legacy_task == nullptr);
+
+    auto [basic_sampled_status, basic_sampled_task] = env.service->CreateValueTask(
+        BasicValueWithSampledProfileConfig(), BaselineSerializationFormat::kJson);
+    assert(basic_sampled_status == BaselineStatus::kParseFailed);
+    assert(basic_sampled_task == nullptr);
+
+    auto [sampled_default_status, sampled_default_task] = env.service->CreateValueTask(
+        SampledValueWithDefaultProfileConfig(), BaselineSerializationFormat::kJson);
+    assert(sampled_default_status == BaselineStatus::kParseFailed);
+    assert(sampled_default_task == nullptr);
+
+    std::printf("[PASS] B1 invalid task config rejected\n");
 }
 
-bool HasDominantSingleFeature(const rapidjson::Value& window, const char* feature) {
-    if (!feature || !window.IsObject() || !window.HasMember("dominant_single") ||
-        !window["dominant_single"].IsArray()) {
-        return false;
+ValueBootstrapInput BuildValueHistoryForSeries(const std::string& series_key,
+                                               double base_value) {
+    ValueBootstrapInput input;
+    input.series_key = series_key;
+    for (int64_t bucket = 0; bucket < 200; ++bucket) {
+        input.observations.push_back(
+            ValueBootstrapPoint{bucket, base_value + static_cast<double>(bucket % 10), 1});
     }
-    for (const auto& item : window["dominant_single"].GetArray()) {
-        if (!item.IsObject() || !item.HasMember("feature")) continue;
-        if (std::string(item["feature"].GetString()) == feature) return true;
-    }
-    return false;
+    return input;
 }
 
-bool HasDominantSinglePrefix(const rapidjson::Value& window, const char* prefix) {
-    if (!prefix || !window.IsObject() || !window.HasMember("dominant_single") ||
-        !window["dominant_single"].IsArray()) {
-        return false;
-    }
-    const std::string prefix_string = prefix;
-    for (const auto& item : window["dominant_single"].GetArray()) {
-        if (!item.IsObject() || !item.HasMember("feature")) continue;
-        const std::string feature = item["feature"].GetString();
-        if (feature.rfind(prefix_string, 0) == 0) return true;
-    }
-    return false;
+ValueBootstrapInput BuildValueHistory() {
+    return BuildValueHistoryForSeries("svc-a", 100.0);
 }
 
-double Median(std::vector<double> values) {
-    assert(!values.empty());
-    std::sort(values.begin(), values.end());
-    return values[values.size() / 2];
+ValueBootstrapInput BuildEventValueHistory() {
+    ValueBootstrapInput input;
+    input.series_key = "svc-event";
+    for (int64_t bucket = 0; bucket < 200; ++bucket) {
+        const bool event_bucket =
+            (bucket >= 20 && bucket < 25) ||
+            (bucket >= 80 && bucket < 85) ||
+            (bucket >= 140 && bucket < 145);
+        const double value = 100.0 + static_cast<double>(bucket % 3) +
+                             (event_bucket ? 400.0 : 0.0);
+        input.observations.push_back(ValueBootstrapPoint{bucket, value, 1});
+    }
+    return input;
 }
 
-double ComputeT1SigmaRef(const std::vector<double>& x_values,
-                         double intercept_x) {
-    std::vector<double> residuals;
-    residuals.reserve(x_values.size());
-    for (double x : x_values) {
-        residuals.push_back(x - intercept_x);
+RatioBootstrapInput BuildRatioHistory() {
+    RatioBootstrapInput input;
+    input.series_key = "svc-a";
+    for (int64_t bucket = 0; bucket < 200; ++bucket) {
+        input.observations.push_back(
+            RatioBootstrapPoint{bucket, 95.0 + static_cast<double>(bucket % 3), 100.0});
     }
-
-    const double median_r = Median(residuals);
-    std::vector<double> abs_deviation;
-    abs_deviation.reserve(residuals.size());
-    for (double r : residuals) {
-        abs_deviation.push_back(std::fabs(r - median_r));
-    }
-
-    return std::max(1e-3, 1.4826 * Median(abs_deviation));
+    return input;
 }
 
-double ComputeT2RateCorePredictValue(const std::vector<double>& numerators,
-                                     const std::vector<double>& denominators) {
-    assert(numerators.size() == denominators.size());
-    assert(!numerators.empty());
+ValueBootstrapInput BuildSampledValueHistory() {
+    ValueBootstrapInput input = BuildValueHistory();
+    for (auto& point : input.observations) {
+        point.sample_count = 50;
+    }
+    return input;
+}
 
-    double numerator_sum = 0.0;
-    double denominator_sum = 0.0;
-    for (std::size_t i = 0; i < numerators.size(); ++i) {
-        numerator_sum += numerators[i];
-        denominator_sum += denominators[i];
+RelationBootstrapInput BuildRelationHistory() {
+    RelationBootstrapInput input;
+    input.series_key = "svc-a";
+    for (int64_t bucket = 0; bucket < 10; ++bucket) {
+        RelationBootstrapBlock block;
+        block.bucket_id = bucket;
+        block.group_idx = {1, 2, 3};
+        RelationBootstrapMetric metric;
+        metric.metric = "bps";
+        metric.total = 100.0;
+        metric.values_by_group = {60.0, 30.0, 10.0};
+        block.metrics.push_back(metric);
+        input.blocks.push_back(block);
+    }
+    return input;
+}
+
+void TestTaskBootstrapPredictAndExport() {
+    std::printf("[TEST] B1 task bootstrap predict export...\n");
+    auto env = LoadBaselineService();
+
+    auto [value_status, value_task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(value_status == BaselineStatus::kOk);
+    assert(value_task != nullptr);
+    const BootstrapTrainResult value_train = value_task->Bootstrap(BuildValueHistory());
+    assert(value_train.status == BaselineStatus::kOk);
+    const BootstrapPrediction value_prediction =
+        value_task->PredictBootstrap("svc-a", 220, BootstrapPredictionOptions{});
+    assert(value_prediction.status == BaselineStatus::kOk);
+    auto [value_artifact_status, value_artifact] =
+        value_task->ExportBootstrapArtifact(BaselineSerializationFormat::kJson);
+    assert(value_artifact_status == BaselineStatus::kOk);
+    assert(value_artifact.find("\"document_kind\":\"bootstrap_artifact\"") != std::string::npos);
+    auto [value_seed_status, value_seed] =
+        value_task->ExportBootstrapSeed(BaselineSerializationFormat::kJson);
+    assert(value_seed_status == BaselineStatus::kOk);
+    assert(value_seed.find("\"document_kind\":\"bootstrap_seed\"") != std::string::npos);
+    assert(value_seed.find("\"algorithm_version\":\"b1-bootstrap-v1\"") != std::string::npos);
+    assert(value_seed.find("\"feature_type\":\"value_basic\"") != std::string::npos);
+    assert(value_seed.find("\"calendar_ref\"") != std::string::npos);
+    assert(value_seed.find("\"calendar_id\":\"cn-holiday\"") != std::string::npos);
+    assert(value_seed.find("\"calendar_version\":\"2026.1\"") != std::string::npos);
+    assert(value_seed.find("\"clock_spec\"") != std::string::npos);
+    assert(value_seed.find("\"bucket_seconds\":60") != std::string::npos);
+    assert(value_seed.find("\"timezone\":\"Asia/Shanghai\"") != std::string::npos);
+    assert(value_seed.find("\"seeded_components\"") != std::string::npos);
+    assert(value_seed.find("\"enabled_components\"") != std::string::npos);
+    assert(value_seed.find("\"level\"") != std::string::npos);
+    assert(value_seed.find("\"trend\"") != std::string::npos);
+    assert(value_seed.find("\"daily\"") != std::string::npos);
+    assert(value_seed.find("\"weekly\"") != std::string::npos);
+    assert(value_seed.find("\"core\"") == std::string::npos);
+    assert(value_seed.find("\"theta_init\"") != std::string::npos);
+    assert(value_seed.find("\"sigma_init\"") != std::string::npos);
+    assert(value_seed.find("\"uncertainty_init\"") != std::string::npos);
+    assert(value_seed.find("\"component_uncertainty\"") != std::string::npos);
+    assert(value_seed.find("\"maturity_init\"") != std::string::npos);
+    assert(value_seed.find("\"model\"") == std::string::npos);
+
+    auto [sampled_value_status, sampled_value_task] = env.service->CreateValueTask(
+        SampledValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(sampled_value_status == BaselineStatus::kOk);
+    assert(sampled_value_task != nullptr);
+    const BootstrapTrainResult sampled_value_train =
+        sampled_value_task->Bootstrap(BuildSampledValueHistory());
+    assert(sampled_value_train.status == BaselineStatus::kOk);
+
+    auto [ratio_status, ratio_task] = env.service->CreateRatioTask(
+        RatioTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(ratio_status == BaselineStatus::kOk);
+    assert(ratio_task != nullptr);
+    const BootstrapTrainResult ratio_train = ratio_task->Bootstrap(BuildRatioHistory());
+    assert(ratio_train.status == BaselineStatus::kOk);
+    const BootstrapPrediction ratio_prediction =
+        ratio_task->PredictBootstrap("svc-a", 220, BootstrapPredictionOptions{});
+    assert(ratio_prediction.status == BaselineStatus::kOk);
+    assert(ratio_prediction.baseline_mu >= 0.0);
+    assert(ratio_prediction.baseline_mu <= 1.0);
+    auto [ratio_seed_status, ratio_seed] =
+        ratio_task->ExportBootstrapSeed(BaselineSerializationFormat::kJson);
+    assert(ratio_seed_status == BaselineStatus::kOk);
+    assert(ratio_seed.find("\"feature_type\":\"ratio\"") != std::string::npos);
+    assert(ratio_seed.find("\"calendar_ref\"") != std::string::npos);
+    assert(ratio_seed.find("\"clock_spec\"") != std::string::npos);
+    assert(ratio_seed.find("\"seeded_components\"") != std::string::npos);
+    assert(ratio_seed.find("\"enabled_components\"") != std::string::npos);
+    assert(ratio_seed.find("\"theta_init\"") != std::string::npos);
+    assert(ratio_seed.find("\"sigma_init\"") != std::string::npos);
+    assert(ratio_seed.find("\"uncertainty_init\"") != std::string::npos);
+    assert(ratio_seed.find("\"component_uncertainty\"") != std::string::npos);
+    assert(ratio_seed.find("\"maturity_init\"") != std::string::npos);
+    assert(ratio_seed.find("\"ratio_prior_init\"") != std::string::npos);
+    assert(ratio_seed.find("\"model\"") == std::string::npos);
+
+    auto [relation_status, relation_task] = env.service->CreateRelationTask(
+        RelationTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(relation_status == BaselineStatus::kOk);
+    assert(relation_task != nullptr);
+    const BootstrapTrainResult relation_train =
+        relation_task->Bootstrap(BuildRelationHistory());
+    assert(relation_train.status == BaselineStatus::kOk);
+    auto [basis_status, basis_json] =
+        relation_task->QueryBootstrapBasis(BaselineSerializationFormat::kJson);
+    assert(basis_status == BaselineStatus::kOk);
+    assert(basis_json.find("\"support_explicit\"") != std::string::npos);
+    auto [relation_seed_status, relation_seed] =
+        relation_task->ExportBootstrapSeed(BaselineSerializationFormat::kJson);
+    assert(relation_seed_status == BaselineStatus::kOk);
+    assert(relation_seed.find("\"feature_type\":\"relation\"") != std::string::npos);
+    assert(relation_seed.find("\"calendar_ref\"") != std::string::npos);
+    assert(relation_seed.find("\"feature_type\":\"value_basic\"") != std::string::npos);
+    assert(relation_seed.find("\"feature_type\":\"ratio\"") != std::string::npos);
+    assert(relation_seed.find("\"clock_spec\"") != std::string::npos);
+    assert(relation_seed.find("\"seeded_components\"") != std::string::npos);
+    assert(relation_seed.find("\"enabled_components\"") != std::string::npos);
+    assert(relation_seed.find("\"relation_basis\"") != std::string::npos);
+    assert(relation_seed.find("\"relation_routed_summary_seeds\"") != std::string::npos);
+    assert(relation_seed.find("\"relation_basis_by_metric\"") != std::string::npos);
+    assert(relation_seed.find("\"summary\":\"entropy_shannon\"") != std::string::npos);
+    assert(relation_seed.find("\"summary\":\"top1_share\"") != std::string::npos);
+    assert(relation_seed.find("\"theta_init\"") != std::string::npos);
+    assert(relation_seed.find("\"sigma_init\"") != std::string::npos);
+    assert(relation_seed.find("\"uncertainty_init\"") != std::string::npos);
+    assert(relation_seed.find("\"component_uncertainty\"") != std::string::npos);
+    assert(relation_seed.find("\"maturity_init\"") != std::string::npos);
+    assert(relation_seed.find("\"ratio_prior_init\"") != std::string::npos);
+    assert(relation_seed.find("\"model\"") == std::string::npos);
+
+    std::printf("[PASS] B1 task bootstrap predict export\n");
+}
+
+void TestValueTaskKeepsBootstrapPerSeriesAndExportsAll() {
+    std::printf("[TEST] B1 value task keeps bootstrap per series and exports all...\n");
+
+    auto env = LoadBaselineService();
+    auto [value_status, value_task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(value_status == BaselineStatus::kOk);
+    assert(value_task != nullptr);
+
+    const BootstrapTrainResult train_a =
+        value_task->Bootstrap(BuildValueHistoryForSeries("svc-a", 100.0));
+    assert(train_a.status == BaselineStatus::kOk);
+    ValueBootstrapInput no_replace_input = BuildValueHistoryForSeries("svc-a", 120.0);
+    no_replace_input.options.force_replace_existing_artifact = false;
+    const BootstrapTrainResult no_replace_result =
+        value_task->Bootstrap(no_replace_input);
+    assert(no_replace_result.status == BaselineStatus::kInvalidArgument);
+    const BootstrapTrainResult train_b =
+        value_task->Bootstrap(BuildValueHistoryForSeries("svc-b", 500.0));
+    assert(train_b.status == BaselineStatus::kOk);
+
+    const BootstrapPrediction prediction_a =
+        value_task->PredictBootstrap("svc-a", 220, BootstrapPredictionOptions{});
+    const BootstrapPrediction prediction_b =
+        value_task->PredictBootstrap("svc-b", 220, BootstrapPredictionOptions{});
+    assert(prediction_a.status == BaselineStatus::kOk);
+    assert(prediction_b.status == BaselineStatus::kOk);
+    assert(prediction_a.series_key == "svc-a");
+    assert(prediction_b.series_key == "svc-b");
+    assert(prediction_b.baseline_mu > prediction_a.baseline_mu + 300.0);
+
+    auto [artifact_status, artifact_json] =
+        value_task->ExportBootstrapArtifact(BaselineSerializationFormat::kJson);
+    assert(artifact_status == BaselineStatus::kOk);
+    assert(artifact_json.find("\"series_artifacts\"") != std::string::npos);
+    assert(artifact_json.find("\"series_key\":\"svc-a\"") != std::string::npos);
+    assert(artifact_json.find("\"series_key\":\"svc-b\"") != std::string::npos);
+
+    auto [seed_status, seed_json] =
+        value_task->ExportBootstrapSeed(BaselineSerializationFormat::kJson);
+    assert(seed_status == BaselineStatus::kOk);
+    assert(seed_json.find("\"series_seeds\"") != std::string::npos);
+    assert(seed_json.find("\"series_key\":\"svc-a\"") != std::string::npos);
+    assert(seed_json.find("\"series_key\":\"svc-b\"") != std::string::npos);
+
+    auto [reload_status, reload_task] = env.service->CreateValueTask(
+        R"({
+            "schema_version": 1,
+            "task_id": "baseline_task_bps_reload",
+            "task_name": "link bps baseline reload",
+            "task_kind": "value",
+            "feature_id": "bps",
+            "feature_type": "value_basic",
+            "profile": "default",
+            "clock_spec": {
+                "bucket_seconds": 60,
+                "timezone": "Asia/Shanghai"
+            },
+            "calendar_ref": {
+                "calendar_id": "cn-holiday",
+                "calendar_version": "2026.1"
+            }
+        })",
+        BaselineSerializationFormat::kJson);
+    assert(reload_status == BaselineStatus::kOk);
+    assert(reload_task != nullptr);
+    assert(reload_task->LoadBootstrapArtifact(
+               artifact_json, BaselineSerializationFormat::kJson) ==
+           BaselineStatus::kIncompatibleArtifact);
+
+    assert(value_task->Close() == BaselineStatus::kOk);
+    auto [restored_status, restored_task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(restored_status == BaselineStatus::kOk);
+    assert(restored_task != nullptr);
+    assert(restored_task->LoadBootstrapArtifact(
+               artifact_json, BaselineSerializationFormat::kJson) == BaselineStatus::kOk);
+    const BootstrapPrediction reloaded_prediction_a =
+        restored_task->PredictBootstrap("svc-a", 220, BootstrapPredictionOptions{});
+    const BootstrapPrediction reloaded_prediction_b =
+        restored_task->PredictBootstrap("svc-b", 220, BootstrapPredictionOptions{});
+    assert(reloaded_prediction_a.status == BaselineStatus::kOk);
+    assert(reloaded_prediction_b.status == BaselineStatus::kOk);
+    assert(reloaded_prediction_b.baseline_mu > reloaded_prediction_a.baseline_mu + 300.0);
+
+    std::printf("[PASS] B1 value task keeps bootstrap per series and exports all\n");
+}
+
+void TestBootstrapUsesConfiguredEventCalendar() {
+    std::printf("[TEST] B1 bootstrap uses configured event calendar...\n");
+
+    const std::string config_path = "/tmp/flowsql_baseline_event_calendar_test.yaml";
+    {
+        std::ofstream file(config_path);
+        file << R"(
+calendars:
+  - calendar_id: "cn-holiday"
+    calendar_version: "2026.1"
+    entries:
+      - event_code: "holiday"
+        alignment_mode: "absolute_utc"
+        start_ts: 1200
+        end_ts: 1500
+      - event_code: "holiday"
+        alignment_mode: "absolute_utc"
+        start_ts: 4800
+        end_ts: 5100
+      - event_code: "holiday"
+        alignment_mode: "absolute_utc"
+        start_ts: 8400
+        end_ts: 8700
+      - event_code: "holiday"
+        alignment_mode: "absolute_utc"
+        start_ts: 13200
+        end_ts: 13500
+baseline:
+  parser:
+    tz_default: "UTC"
+  shared_profile_config:
+    daily_harmonic_order: 2
+    weekly_harmonic_order: 1
+    dme_max: 7
+    m_month_enable: 4
+    month_cov_min: 0.8
+    lambda_season: 1.0
+    lambda_dom: 4.0
+    lambda_dme: 2.0
+    lambda_lwd: 1.0
+    lambda_event: 0.1
+  value_sampled_profiles:
+    cont_core:
+      n_train_min: 50
+      transform_name_override: "log1p"
+  ratio_profiles:
+    global:
+      eps_logit: 1.0e-4
+      m_floor: 1.0e-4
+      v_floor: 0.25
+    rate_core:
+      d_min_train: 50
+      s_prior: 2.0
+      phi_over: 1.5
+  solver_constants:
+    solver_name: "weighted_huber_ridge_irls"
+    c_huber: 1.5
+    s_min_fit: 1.0e-3
+    max_iter_fit: 15
+    tol_obj_rel: 1.0e-4
+    tol_beta_inf: 1.0e-5
+    cond_max: 1.0e8
+)";
+        assert(file.good());
     }
 
-    const double m0 = numerator_sum / denominator_sum;
-    const double alpha0 = 2.0 * m0;
-    const double beta0 = 2.0 * (1.0 - m0);
+    auto env = LoadBaselineService("config_file=" + config_path + ";strict=true");
+    auto [value_status, value_task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(value_status == BaselineStatus::kOk);
+    assert(value_task != nullptr);
 
-    double weighted_eta = 0.0;
-    double total_weight = 0.0;
-    for (std::size_t i = 0; i < numerators.size(); ++i) {
-        const double smoothed =
-            (numerators[i] + alpha0) / (denominators[i] + alpha0 + beta0);
-        const double eta = std::log(smoothed / (1.0 - smoothed));
-        weighted_eta += eta * denominators[i];
-        total_weight += denominators[i];
+    const BootstrapTrainResult train = value_task->Bootstrap(BuildEventValueHistory());
+    assert(train.status == BaselineStatus::kOk);
+
+    auto [artifact_status, artifact_json] =
+        value_task->ExportBootstrapArtifact(BaselineSerializationFormat::kJson);
+    assert(artifact_status == BaselineStatus::kOk);
+    assert(artifact_json.find("\"event_block\"") != std::string::npos);
+    assert(artifact_json.find("\"active_event_codes\"") != std::string::npos);
+    assert(artifact_json.find("\"holiday\"") != std::string::npos);
+
+    auto [seed_status, seed_json] =
+        value_task->ExportBootstrapSeed(BaselineSerializationFormat::kJson);
+    assert(seed_status == BaselineStatus::kOk);
+    assert(seed_json.find("\"event_hint\"") != std::string::npos);
+    assert(seed_json.find("\"event\"") != std::string::npos);
+    assert(seed_json.find("\"holiday\"") != std::string::npos);
+
+    const BootstrapPrediction event_prediction =
+        value_task->PredictBootstrap("svc-event", 220, BootstrapPredictionOptions{});
+    const BootstrapPrediction normal_prediction =
+        value_task->PredictBootstrap("svc-event", 230, BootstrapPredictionOptions{});
+    assert(event_prediction.status == BaselineStatus::kOk);
+    assert(normal_prediction.status == BaselineStatus::kOk);
+    assert(event_prediction.baseline_mu > normal_prediction.baseline_mu + 100.0);
+
+    std::printf("[PASS] B1 bootstrap uses configured event calendar\n");
+}
+
+void TestTaskRejectsIncompatibleBootstrapArtifact() {
+    std::printf("[TEST] B1 task rejects incompatible bootstrap artifact...\n");
+
+    auto env = LoadBaselineService();
+    auto [value_status, value_task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(value_status == BaselineStatus::kOk);
+    assert(value_task != nullptr);
+    const BootstrapTrainResult train = value_task->Bootstrap(BuildValueHistory());
+    assert(train.status == BaselineStatus::kOk);
+    auto [artifact_status, artifact_json] =
+        value_task->ExportBootstrapArtifact(BaselineSerializationFormat::kJson);
+    assert(artifact_status == BaselineStatus::kOk);
+    assert(value_task->LoadBootstrapArtifact(
+               artifact_json, BaselineSerializationFormat::kJson) == BaselineStatus::kOk);
+
+    auto [other_status, other_task] = env.service->CreateValueTask(
+        OtherValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(other_status == BaselineStatus::kOk);
+    assert(other_task != nullptr);
+    assert(other_task->LoadBootstrapArtifact(
+               artifact_json, BaselineSerializationFormat::kJson) ==
+           BaselineStatus::kIncompatibleArtifact);
+
+    std::string bad_schema_json = artifact_json;
+    const std::string schema_needle = "\"schema_version\":1";
+    const std::size_t schema_pos = bad_schema_json.find(schema_needle);
+    assert(schema_pos != std::string::npos);
+    bad_schema_json.replace(schema_pos, schema_needle.size(), "\"schema_version\":2");
+    assert(value_task->LoadBootstrapArtifact(
+               bad_schema_json, BaselineSerializationFormat::kJson) ==
+           BaselineStatus::kIncompatibleArtifact);
+
+    std::string bad_algorithm_json = artifact_json;
+    const std::string algorithm_needle = "\"algorithm_version\":\"b1-bootstrap-v1\"";
+    const std::size_t algorithm_pos = bad_algorithm_json.find(algorithm_needle);
+    assert(algorithm_pos != std::string::npos);
+    bad_algorithm_json.replace(algorithm_pos,
+                               algorithm_needle.size(),
+                               "\"algorithm_version\":\"unknown\"");
+    assert(value_task->LoadBootstrapArtifact(
+               bad_algorithm_json, BaselineSerializationFormat::kJson) ==
+           BaselineStatus::kIncompatibleArtifact);
+
+    std::string bad_top_task_json = artifact_json;
+    const std::string top_task_needle =
+        "\"task_identity\":{\"task_id\":\"baseline_task_bps\"";
+    const std::size_t top_task_pos = bad_top_task_json.find(top_task_needle);
+    assert(top_task_pos != std::string::npos);
+    bad_top_task_json.replace(
+        top_task_pos,
+        top_task_needle.size(),
+        "\"task_identity\":{\"task_id\":\"baseline_task_other\"");
+    assert(value_task->LoadBootstrapArtifact(
+               bad_top_task_json, BaselineSerializationFormat::kJson) ==
+           BaselineStatus::kIncompatibleArtifact);
+
+    std::printf("[PASS] B1 task rejects incompatible bootstrap artifact\n");
+}
+
+void TestRuntimeConfigHarmonicOrders() {
+    std::printf("[TEST] B1 runtime config harmonic orders...\n");
+
+    const std::string config_path = "/tmp/flowsql_baseline_harmonic_order_test.yaml";
+    {
+        std::ofstream file(config_path);
+        file << R"(
+baseline:
+  parser:
+    tz_default: "UTC"
+  shared_profile_config:
+    daily_harmonic_order: 8
+    weekly_harmonic_order: 5
+    dme_max: 7
+    m_month_enable: 4
+    month_cov_min: 0.8
+    lambda_season: 1.0
+    lambda_dom: 4.0
+    lambda_dme: 2.0
+    lambda_lwd: 1.0
+    lambda_event: 2.0
+  value_sampled_profiles:
+    cont_core:
+      n_train_min: 50
+      transform_name_override: "log1p"
+  ratio_profiles:
+    global:
+      eps_logit: 1.0e-4
+      m_floor: 1.0e-4
+      v_floor: 0.25
+    rate_core:
+      d_min_train: 50
+      s_prior: 2.0
+      phi_over: 1.5
+  solver_constants:
+    solver_name: "weighted_huber_ridge_irls"
+    c_huber: 1.5
+    s_min_fit: 1.0e-3
+    max_iter_fit: 15
+    tol_obj_rel: 1.0e-4
+    tol_beta_inf: 1.0e-5
+    cond_max: 1.0e8
+)";
+        assert(file.good());
     }
 
-    const double eta_hat = weighted_eta / total_weight;
-    return 1.0 / (1.0 + std::exp(-eta_hat));
+    auto env = LoadBaselineService("config_file=" + config_path + ";strict=true");
+    auto [value_status, value_task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(value_status == BaselineStatus::kOk);
+    assert(value_task != nullptr);
+    const BootstrapTrainResult train = value_task->Bootstrap(BuildValueHistory());
+    assert(train.status == BaselineStatus::kOk);
+
+    auto [seed_status, seed_json] =
+        value_task->ExportBootstrapSeed(BaselineSerializationFormat::kJson);
+    assert(seed_status == BaselineStatus::kOk);
+
+    rapidjson::Document doc;
+    doc.Parse(seed_json.c_str());
+    assert(!doc.HasParseError());
+    assert(doc.HasMember("series_seeds"));
+    assert(doc["series_seeds"].IsArray());
+    assert(doc["series_seeds"].Size() == 1);
+    const auto& seed_item = doc["series_seeds"][0];
+    assert(seed_item.HasMember("theta_init"));
+    assert(seed_item["theta_init"].HasMember("daily_harmonic"));
+    assert(seed_item["theta_init"].HasMember("weekly_harmonic"));
+    assert(seed_item["theta_init"]["daily_harmonic"].IsArray());
+    assert(seed_item["theta_init"]["weekly_harmonic"].IsArray());
+    assert(seed_item["theta_init"]["daily_harmonic"].Size() == 8);
+    assert(seed_item["theta_init"]["weekly_harmonic"].Size() == 5);
+
+    std::printf("[PASS] B1 runtime config harmonic orders\n");
+}
+
+void TestRuntimeConfigDefaultDailyHarmonicOrder() {
+    std::printf("[TEST] B1 runtime config default daily harmonic order...\n");
+
+    auto env = LoadBaselineService();
+    auto [value_status, value_task] = env.service->CreateValueTask(
+        ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(value_status == BaselineStatus::kOk);
+    assert(value_task != nullptr);
+    const BootstrapTrainResult train = value_task->Bootstrap(BuildValueHistory());
+    assert(train.status == BaselineStatus::kOk);
+
+    auto [seed_status, seed_json] =
+        value_task->ExportBootstrapSeed(BaselineSerializationFormat::kJson);
+    assert(seed_status == BaselineStatus::kOk);
+
+    rapidjson::Document doc;
+    doc.Parse(seed_json.c_str());
+    assert(!doc.HasParseError());
+    assert(doc.HasMember("series_seeds"));
+    assert(doc["series_seeds"].IsArray());
+    assert(doc["series_seeds"].Size() == 1);
+    const auto& seed_item = doc["series_seeds"][0];
+    assert(seed_item.HasMember("theta_init"));
+    assert(seed_item["theta_init"].HasMember("daily_harmonic"));
+    assert(seed_item["theta_init"]["daily_harmonic"].IsArray());
+    assert(seed_item["theta_init"]["daily_harmonic"].Size() == 6);
+
+    std::printf("[PASS] B1 runtime config default daily harmonic order\n");
 }
 
 }  // namespace
 
-static void TestBaselineServiceHeaderAndIid() {
-    std::printf("[TEST] Baseline service IID/header contract...\n");
-    const Guid iid = IID_BASELINE_SERVICE;
-    (void)iid;
-    std::printf("[PASS] Baseline service IID/header contract\n");
-}
-
-static void TestBaselinePluginLoadAndQuery() {
-    std::printf("[TEST] Baseline plugin load and query...\n");
-    auto env = LoadBaselineService();
-    assert(env.service != nullptr);
-
-    std::printf("[PASS] Baseline plugin load and query\n");
-}
-
-static void TestBaselineTaskLifecycleAndConfigValidation() {
-    std::printf("[TEST] Baseline task lifecycle and config validation...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"value_sampled","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai"})";
-    const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count","bps"],"encode_type":"exact_sparse","support_policy":{"k_support":16,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":5,"k_stable":5},"event_calendar_spec":{"calendar_id":"relation-calendar","calendar_version":"v1","entries":[{"event_code":"month_close","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
-
-    IBaselineValueTask* value_task = nullptr;
-    IBaselineRatioTask* ratio_task = nullptr;
-    IBaselineRelationTask* relation_task = nullptr;
-    StaticBaselineSourceResolver relation_resolver;
-
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(value_task != nullptr);
-    const std::string value_task_id = value_task->Id();
-    assert(std::string(value_task->Name()) == "avg_rtt");
-    assert(value_task->Kind() == BaselineTaskKind::kValue);
-    assert(std::string(value_task->ConfigJson()) == value_cfg);
-
-    assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(ratio_task != nullptr);
-    const std::string ratio_task_id = ratio_task->Id();
-    assert(std::string(ratio_task->Name()) == "success_rate");
-    assert(ratio_task->Kind() == BaselineTaskKind::kRatio);
-    assert(std::string(ratio_task->ConfigJson()) == ratio_cfg);
-
-    assert(service->CreateRelationTask(relation_cfg, &relation_resolver, &relation_task) ==
-           error::OK);
-    assert(relation_task != nullptr);
-    const std::string relation_task_id = relation_task->Id();
-    assert(std::string(relation_task->Name()) == "client_group_mix");
-    assert(relation_task->Kind() == BaselineTaskKind::kRelation);
-    assert(std::string(relation_task->ConfigJson()) == relation_cfg);
-
-    const auto listed_before_close = ListTasks(service);
-    assert(ContainsTask(listed_before_close, value_task_id.c_str(), BaselineTaskKind::kValue));
-    assert(ContainsTask(listed_before_close, ratio_task_id.c_str(), BaselineTaskKind::kRatio));
-    assert(ContainsTask(listed_before_close, relation_task_id.c_str(), BaselineTaskKind::kRelation));
-
-    std::string task_snapshot;
-    assert(value_task->QueryTaskSnapshotJson(&task_snapshot) == error::OK);
-    assert(task_snapshot.find("\"name\":\"avg_rtt\"") != std::string::npos);
-    assert(relation_task->QueryTaskSnapshotJson(&task_snapshot) == error::OK);
-    auto relation_task_doc = ParseJson(task_snapshot);
-    assert(relation_task_doc["delta"].GetInt64() == 60);
-    assert(std::string(relation_task_doc["tz"].GetString()) == "Asia/Shanghai");
-    assert(relation_task_doc["event_calendar_present"].GetBool() == true);
-    assert(std::string(relation_task_doc["event_calendar_id"].GetString()) ==
-           "relation-calendar");
-    assert(std::string(relation_task_doc["event_calendar_version"].GetString()) == "v1");
-    assert(relation_task_doc["event_calendar_entry_count"].GetUint64() == 1);
-    assert(relation_task_doc["source_resolver_bound"].GetBool() == true);
-
-    assert(value_task->Close() == error::OK);
-    assert(ratio_task->Close() == error::OK);
-    assert(relation_task->Close() == error::OK);
-
-    const auto listed_after_close = ListTasks(service);
-    assert(!ContainsTask(listed_after_close, value_task_id.c_str(), BaselineTaskKind::kValue));
-    assert(!ContainsTask(listed_after_close, ratio_task_id.c_str(), BaselineTaskKind::kRatio));
-    assert(!ContainsTask(listed_after_close, relation_task_id.c_str(), BaselineTaskKind::kRelation));
-
-    IBaselineValueTask* bad_value_task = reinterpret_cast<IBaselineValueTask*>(0x1);
-    IBaselineRatioTask* bad_ratio_task = reinterpret_cast<IBaselineRatioTask*>(0x1);
-    IBaselineRelationTask* bad_relation_task = reinterpret_cast<IBaselineRelationTask*>(0x1);
-
-    assert(service->CreateValueTask(R"({"name":"bad","feature":"avg_rtt"})", &bad_value_task) == error::BAD_REQUEST);
-    assert(bad_value_task == nullptr);
-
-    assert(service->CreateRatioTask(R"({"name":"bad","feature":"success_rate","delta":60})", &bad_ratio_task) == error::BAD_REQUEST);
-    assert(bad_ratio_task == nullptr);
-
-    assert(service->CreateRelationTask(R"({"name":"bad","feature_base":"client_group_mix"})", nullptr, &bad_relation_task) == error::BAD_REQUEST);
-    assert(bad_relation_task == nullptr);
-
-    const char* bad_source_cfg =
-        R"({"name":"avg_rtt","key":"svc-a","feature":"avg_rtt","feature_type":"value_sampled","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-a","baseline_sources":[{"source_key":"svc-a"}]}]})";
-    assert(service->CreateValueTask(bad_source_cfg, &bad_value_task) == error::BAD_REQUEST);
-    assert(bad_value_task == nullptr);
-
-    std::printf("[PASS] Baseline task lifecycle and config validation\n");
-}
-
-static void TestBaselineSeriesStoreCommonState() {
-    std::printf("[TEST] Baseline series store common state...\n");
-
-    baseline::SeriesStore store;
-    assert(baseline::SeriesStore::kShardCount > 1);
-    const BaselineStringRef key{"service-a", 9};
-    std::string key_a = "service-a";
-    std::string key_b = "service-b";
-    size_t shard_a = store.ShardIndex(key_a);
-    size_t shard_b = store.ShardIndex(key_b);
-    for (int i = 0; shard_a == shard_b && i < 256; ++i) {
-        key_b = "service-b-" + std::to_string(i);
-        shard_b = store.ShardIndex(key_b);
-    }
-    assert(shard_a != shard_b);
-
-    baseline::SeriesUpdateResult first;
-    assert(store.ApplyObservation(key, 100, true, &first) == error::OK);
-    assert((first.flags & kBaselineFlagColdStart) != 0);
-    assert(first.gap == 0);
-    assert(first.persistence == 1);
-
-    DetectorResult result{};
-    baseline::FillBaseResult(first, &result);
-    assert(result.status == error::OK);
-    assert(result.persistence == 1);
-    assert((result.flags & kBaselineFlagColdStart) != 0);
-
-    baseline::SeriesUpdateResult gap_update;
-    assert(store.ApplyObservation(key, 103, true, &gap_update) == error::OK);
-    assert((gap_update.flags & kBaselineFlagGapBefore) != 0);
-    assert(gap_update.gap == 2);
-    assert(gap_update.persistence == 2);
-
-    baseline::SeriesUpdateResult normal_update;
-    assert(store.ApplyObservation(key, 104, false, &normal_update) == error::OK);
-    assert(normal_update.gap == 0);
-    assert(normal_update.persistence == 0);
-
-    baseline::SeriesUpdateResult out_of_order;
-    assert(store.ApplyObservation(key, 102, true, &out_of_order) == error::BAD_REQUEST);
-    assert((out_of_order.flags & kBaselineFlagOutOfOrder) != 0);
-    assert(out_of_order.persistence == 0);
-
-    baseline::SeriesState state;
-    assert(store.GetState(key, &state) == error::OK);
-    assert(state.initialized);
-    assert(state.last_bucket_id == 104);
-    assert(state.observation_count == 3);
-
-    baseline::SeriesUpdateResult other_key;
-    assert(store.ApplyObservation(BaselineStringRef{key_b.c_str(),
-                                                    static_cast<uint32_t>(key_b.size())},
-                                  200,
-                                  true,
-                                  &other_key) == error::OK);
-
-    std::printf("[PASS] Baseline series store common state\n");
-}
-
-static void TestBaselineValueTaskHotPath() {
-    std::printf("[TEST] Baseline value task hot path...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_basic_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
-    const char* value_sampled_cfg =
-        R"({"name":"avg_rtt","key":"service","feature":"avg_rtt","feature_type":"value_sampled","feature_profile":"cont_core","delta":60,"tz":"Asia/Shanghai"})";
-
-    IBaselineValueTask* value_basic_task = nullptr;
-    IBaselineValueTask* value_sampled_task = nullptr;
-    assert(service->CreateValueTask(value_basic_cfg, &value_basic_task) == error::OK);
-    assert(service->CreateValueTask(value_sampled_cfg, &value_sampled_task) == error::OK);
-    assert(value_basic_task != nullptr);
-    assert(value_sampled_task != nullptr);
-
-    DetectorResult value_basic_result{};
-    const ValueObservation value_basic_obs{BaselineStringRef{"svc-a", 5}, 100, 2048.0, 0};
-    assert(value_basic_task->SubmitObservation(value_basic_obs, &value_basic_result) == error::OK);
-    assert(value_basic_result.status == error::OK);
-    assert((value_basic_result.flags & kBaselineFlagColdStart) != 0);
-    assert(value_basic_result.raw_score == 0.0);
-    assert(value_basic_result.normalized_score == 0.0);
-
-    std::string value_basic_series_snapshot;
-    assert(value_basic_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-a", 5},
-                                                     &value_basic_series_snapshot) == error::OK);
-    assert(value_basic_series_snapshot.find("\"last_bucket_id\":100") != std::string::npos);
-    assert(value_basic_series_snapshot.find("\"observation_count\":1") != std::string::npos);
-
-    DetectorResult low_sample_result{};
-    const ValueObservation low_sample_obs{BaselineStringRef{"svc-b", 5}, 200, 12.5, 10};
-    assert(value_sampled_task->SubmitObservation(low_sample_obs, &low_sample_result) == error::OK);
-    assert(low_sample_result.status == error::OK);
-    assert(low_sample_result.raw_score == 0.0);
-    assert(low_sample_result.normalized_score == 0.0);
-
-    std::string low_sample_snapshot;
-    assert(value_sampled_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-b", 5},
-                                                       &low_sample_snapshot) == error::OK);
-    assert(low_sample_snapshot.find("\"last_gate_score\":false") != std::string::npos);
-    assert(low_sample_snapshot.find("\"last_gate_shift\":false") != std::string::npos);
-    assert(low_sample_snapshot.find("\"last_sample_count\":10") != std::string::npos);
-
-    DetectorResult enough_sample_result{};
-    const ValueObservation enough_sample_obs{BaselineStringRef{"svc-b", 5}, 201, 13.5, 50};
-    assert(value_sampled_task->SubmitObservation(enough_sample_obs, &enough_sample_result) ==
-           error::OK);
-    assert(enough_sample_result.status == error::OK);
-
-    std::string enough_sample_snapshot;
-    assert(value_sampled_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-b", 5},
-                                                        &enough_sample_snapshot) == error::OK);
-    assert(enough_sample_snapshot.find("\"last_gate_score\":true") != std::string::npos);
-    assert(enough_sample_snapshot.find("\"last_gate_shift\":false") != std::string::npos);
-    assert(enough_sample_snapshot.find("\"last_sample_count\":50") != std::string::npos);
-
-    DetectorResult out_of_order_result{};
-    const ValueObservation out_of_order_obs{BaselineStringRef{"svc-b", 5}, 199, 11.5, 50};
-    assert(value_sampled_task->SubmitObservation(out_of_order_obs, &out_of_order_result) ==
-           error::BAD_REQUEST);
-    assert(out_of_order_result.status == error::BAD_REQUEST);
-    assert((out_of_order_result.flags & kBaselineFlagOutOfOrder) != 0);
-
-    assert(value_basic_task->Close() == error::OK);
-    assert(value_sampled_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline value task hot path\n");
-}
-
-static void TestBaselineRatioTaskHotPath() {
-    std::printf("[TEST] Baseline ratio task hot path...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
-
-    IBaselineRatioTask* ratio_task = nullptr;
-    assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(ratio_task != nullptr);
-
-    DetectorResult low_den_result{};
-    const RatioObservation low_den_obs{BaselineStringRef{"svc-r", 5}, 300, 18.0, 20.0};
-    assert(ratio_task->SubmitObservation(low_den_obs, &low_den_result) == error::OK);
-    assert(low_den_result.status == error::OK);
-    assert(low_den_result.raw_score == 0.0);
-    assert(low_den_result.normalized_score == 0.0);
-
-    std::string low_den_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-r", 5}, &low_den_snapshot) == error::OK);
-    assert(low_den_snapshot.find("\"last_gate_score\":false") != std::string::npos);
-    assert(low_den_snapshot.find("\"last_gate_shift\":false") != std::string::npos);
-    assert(low_den_snapshot.find("\"last_denominator\":20.0") != std::string::npos);
-
-    DetectorResult enough_den_result{};
-    const RatioObservation enough_den_obs{BaselineStringRef{"svc-r", 5}, 301, 55.0, 60.0};
-    assert(ratio_task->SubmitObservation(enough_den_obs, &enough_den_result) == error::OK);
-    assert(enough_den_result.status == error::OK);
-
-    std::string enough_den_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-r", 5}, &enough_den_snapshot) == error::OK);
-    assert(enough_den_snapshot.find("\"last_gate_score\":true") != std::string::npos);
-    assert(enough_den_snapshot.find("\"last_gate_shift\":false") != std::string::npos);
-    assert(enough_den_snapshot.find("\"last_denominator\":60.0") != std::string::npos);
-
-    DetectorResult out_of_order_result{};
-    const RatioObservation out_of_order_obs{BaselineStringRef{"svc-r", 5}, 299, 10.0, 20.0};
-    assert(ratio_task->SubmitObservation(out_of_order_obs, &out_of_order_result) == error::BAD_REQUEST);
-    assert(out_of_order_result.status == error::BAD_REQUEST);
-    assert((out_of_order_result.flags & kBaselineFlagOutOfOrder) != 0);
-
-    assert(ratio_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline ratio task hot path\n");
-}
-
-static void TestBaselineRelationTaskHotPath() {
-    std::printf("[TEST] Baseline relation task hot path...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count","bps"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2},"event_calendar_spec":{"calendar_id":"relation-calendar","calendar_version":"v1","entries":[{"event_code":"global_event","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"},{"event_code":"entropy_event","scope_type":"feature","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"feature":"client_group_mix_conn_count_entropy_shannon","tz":"Asia/Shanghai"}]}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    RoutedBaselineSourceResolver resolver;
-    assert(service->CreateRelationTask(relation_cfg, &resolver, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    const uint32_t group_idx[] = {11, 12, 50};
-    const double conn_values[] = {50.0, 30.0, 20.0};
-    const double bps_values[] = {400.0, 350.0, 250.0};
-    const RelationMetricBlock metrics[] = {
-        {100.0, kRelationMetricHasActiveCount, 3, conn_values},
-        {1000.0, kRelationMetricHasActiveCount, 3, bps_values},
-    };
-    const RelationObservationBlock block{
-        BaselineStringRef{"svc-relation", 12},
-        10,
-        3,
-        group_idx,
-        2,
-        metrics,
-    };
-
-    FusionResult result;
-    assert(relation_task->SubmitBlock(block, &result) == error::OK);
-    assert(result.ts == 10);
-
-    std::string task_snapshot;
-    assert(relation_task->QueryTaskSnapshotJson(&task_snapshot) == error::OK);
-    auto task_doc = ParseJson(task_snapshot);
-    assert(task_doc["routed_feature_count"].GetUint64() > 0);
-    assert(task_doc["key_runtime_count"].GetUint64() == 1);
-    assert(task_doc["event_calendar_present"].GetBool() == true);
-    assert(task_doc["source_resolver_bound"].GetBool() == true);
-
-    std::string series_snapshot;
-    assert(relation_task->QuerySeriesSnapshotJson(
-               BaselineStringRef{"svc-relation", 12}, &series_snapshot) == error::OK);
-    auto series_doc = ParseJson(series_snapshot);
-    assert(series_doc["seen_block_count"].GetUint64() == 1);
-    assert(series_doc["basis_metric_count"].GetUint64() == 2);
-    assert(series_doc["last_fusion_result"]["available"].GetBool() == true);
-    assert(series_doc["metrics"].IsArray());
-    assert(series_doc["metrics"].Size() == 2);
-    assert(series_doc["metrics"][0]["service_basis"]["support_explicit"].IsArray());
-    assert(series_doc["metrics"][0]["service_basis"]["support_explicit"].Size() >= 1);
-    assert(series_doc["metrics"][0]["routed_features"].IsArray());
-    assert(series_doc["metrics"][0]["routed_feature_count"].GetUint64() >= 6);
-    assert(series_doc["metrics"][0]["routed_features"][0]["delta"].GetInt64() == 60);
-    assert(std::string(series_doc["metrics"][0]["routed_features"][0]["tz"].GetString()) ==
-           "Asia/Shanghai");
-    assert(series_doc["metrics"][0]["routed_features"][0]["baseline_source_present"].GetBool() ==
-           true);
-    assert(series_doc["metrics"][0]["routed_features"][0]["event_calendar_present"].GetBool() ==
-           true);
-    assert(series_doc["metrics"][0]["routed_features"][0]["last_detector_result"]["available"]
-               .GetBool() == true);
-    assert(resolver.call_count() > 0);
-    assert(resolver.last_key() == "svc-relation");
-
-    assert(relation_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline relation task hot path\n");
-}
-
-static void TestBaselineRelationTaskResultLifetime() {
-    std::printf("[TEST] Baseline relation task result lifetime...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    const std::string key =
-        "svc-relation-lifetime-" + std::string(224, 'x');
-    const uint32_t group_idx[] = {11, 12, 50};
-    const double conn_values[] = {50.0, 30.0, 20.0};
-    const RelationMetricBlock metrics[] = {
-        {100.0, kRelationMetricHasActiveCount, 3, conn_values},
-    };
-    const RelationObservationBlock block{
-        StringRef(key),
-        10,
-        3,
-        group_idx,
-        1,
-        metrics,
-    };
-
-    FusionResult result{};
-    assert(relation_task->SubmitBlock(block, &result) == error::OK);
-    assert(result.key.data != nullptr);
-    assert(result.key.size == key.size());
-    assert(std::string(result.key.data, result.key.size) == key);
-
-    const char* returned_key_ptr = result.key.data;
-    bool reused = false;
-    std::vector<std::string> heap_clobbers;
-    heap_clobbers.reserve(4096);
-    for (size_t i = 0; i < 4096; ++i) {
-        heap_clobbers.emplace_back(key.size(), static_cast<char>('a' + (i % 26)));
-        if (heap_clobbers.back().data() == returned_key_ptr) {
-            reused = true;
-            break;
-        }
-    }
-
-    assert(reused == false);
-    assert(std::string(result.key.data, result.key.size) == key);
-
-    assert(relation_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline relation task result lifetime\n");
-}
-
-static void TestBaselineRelationTaskReusesRoutedRuntime() {
-    std::printf("[TEST] Baseline relation task reuses routed runtime...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2},"event_calendar_spec":{"calendar_id":"relation-calendar","calendar_version":"v1","entries":[{"event_code":"global_event","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    RoutedBaselineSourceResolver resolver;
-    assert(service->CreateRelationTask(relation_cfg, &resolver, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    const uint32_t group_idx[] = {11, 12, 50};
-    const double conn_values_10[] = {50.0, 30.0, 20.0};
-    const RelationMetricBlock metrics_10[] = {
-        {100.0, kRelationMetricHasActiveCount, 3, conn_values_10},
-    };
-    const RelationObservationBlock block_10{
-        BaselineStringRef{"svc-relation-reuse", 18},
-        10,
-        3,
-        group_idx,
-        1,
-        metrics_10,
-    };
-
-    const double conn_values_11[] = {48.0, 32.0, 20.0};
-    const RelationMetricBlock metrics_11[] = {
-        {100.0, kRelationMetricHasActiveCount, 3, conn_values_11},
-    };
-    const RelationObservationBlock block_11{
-        BaselineStringRef{"svc-relation-reuse", 18},
-        11,
-        3,
-        group_idx,
-        1,
-        metrics_11,
-    };
-
-    FusionResult result{};
-    assert(relation_task->SubmitBlock(block_10, &result) == error::OK);
-    const int resolver_calls_after_first = resolver.call_count();
-    assert(resolver_calls_after_first > 0);
-
-    assert(relation_task->SubmitBlock(block_11, &result) == error::OK);
-    assert(resolver.call_count() == resolver_calls_after_first);
-
-    assert(relation_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline relation task reuses routed runtime\n");
-}
-
-static void TestBaselineRelationTaskRebuildDirectApply() {
-    std::printf("[TEST] Baseline relation task rebuild direct apply...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    ScriptedRelationHistoryReader reader;
-    reader.AddFetchScript({
-        {100, {11, 12, 13}, {{100.0, 3, {78.0, 17.0, 5.0}}}},
-        {101, {11, 12, 13}, {{100.0, 3, {76.0, 18.0, 6.0}}}},
-        {102, {11, 12, 13}, {{100.0, 3, {80.0, 15.0, 5.0}}}},
-        {103, {11, 12, 13}, {{100.0, 3, {79.0, 16.0, 5.0}}}},
-        {104, {11, 12, 13}, {{100.0, 3, {77.0, 17.0, 6.0}}}},
-        {105, {11, 12, 13}, {{100.0, 3, {78.0, 16.0, 6.0}}}},
-    });
-    assert(relation_task->SetHistoryReader(&reader) == error::OK);
-
-    assert(relation_task->RequestRebuild(BaselineStringRef{"svc-relation-rebuild", 20},
-                                         BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&reader]() { return reader.call_count() == 1; }));
-    assert(WaitUntil([&relation_task]() {
-        std::string snapshot;
-        if (relation_task->QueryTaskSnapshotJson(&snapshot) != error::OK) return false;
-        auto doc = ParseJson(snapshot);
-        return doc["rebuild_completed"].GetUint64() == 1;
-    }));
-
-    std::string task_snapshot;
-    assert(relation_task->QueryTaskSnapshotJson(&task_snapshot) == error::OK);
-    auto task_doc = ParseJson(task_snapshot);
-    assert(task_doc["rebuild_completed"].GetUint64() == 1);
-
-    std::string series_snapshot;
-    assert(relation_task->QuerySeriesSnapshotJson(
-               BaselineStringRef{"svc-relation-rebuild", 20}, &series_snapshot) == error::OK);
-    auto series_doc = ParseJson(series_snapshot);
-    assert(std::string(series_doc["switch_state"].GetString()) == "formal_applied");
-    assert(std::string(series_doc["candidate_state"].GetString()) == "accepted");
-    assert(series_doc["basis_metric_count"].GetUint64() == 1);
-    assert(series_doc["validation_feature_count"].GetUint64() == 0);
-    assert(series_doc["metrics"].IsArray());
-    assert(series_doc["metrics"].Size() == 1);
-    assert(series_doc["metrics"][0]["basis_version"].GetUint64() == 1);
-
-    assert(relation_task->Close() == error::OK);
-    std::printf("[PASS] Baseline relation task rebuild direct apply\n");
-}
-
-static void TestBaselineRelationTaskRebuildFormalApply() {
-    std::printf("[TEST] Baseline relation task rebuild formal apply...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    ScriptedRelationHistoryReader reader;
-    std::vector<OwnedRelationReplayBlock> first_script;
-    std::vector<OwnedRelationReplayBlock> second_script;
-    for (int i = 0; i < 40; ++i) {
-        const double first_v0 = 82.0 - static_cast<double>(i % 5);
-        const double first_v1 = 13.0 + static_cast<double>(i % 4);
-        first_script.push_back(MakeSingleMetricRelationBlock(
-            200 + i, first_v0, first_v1, 100.0 - first_v0 - first_v1));
-        const double second_v0 = 42.0 - static_cast<double>(i % 4);
-        const double second_v1 = 53.0 + static_cast<double>(i % 4);
-        second_script.push_back(MakeSingleMetricRelationBlock(
-            300 + i, second_v0, second_v1, 100.0 - second_v0 - second_v1));
-    }
-    reader.AddFetchScript(std::move(first_script));
-    reader.AddFetchScript(std::move(second_script));
-    assert(relation_task->SetHistoryReader(&reader) == error::OK);
-
-    const BaselineStringRef key{"svc-relation-formal", 19};
-    assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&reader]() { return reader.call_count() == 1; }));
-    std::string first_rebuild_snapshot;
-    const bool first_rebuild_ready = WaitUntil([&]() {
-        if (relation_task->QuerySeriesSnapshotJson(key, &first_rebuild_snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(first_rebuild_snapshot);
-        return std::string(doc["candidate_state"].GetString()) == "accepted" &&
-               std::string(doc["switch_state"].GetString()) == "formal_applied" &&
-               doc["metrics"].IsArray() && doc["metrics"].Size() == 1 &&
-               doc["metrics"][0]["basis_version"].GetUint64() == 1;
-    });
-    if (!first_rebuild_ready) {
-        std::fprintf(stderr, "[DEBUG] relation first rebuild snapshot: %s\n",
-                     first_rebuild_snapshot.c_str());
-    }
-    assert(first_rebuild_ready);
-
-    assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&reader]() { return reader.call_count() == 2; }));
-    assert(WaitUntil([&relation_task]() {
-        std::string snapshot;
-        if (relation_task->QueryTaskSnapshotJson(&snapshot) != error::OK) return false;
-        auto doc = ParseJson(snapshot);
-        return doc["rebuild_completed"].GetUint64() >= 2;
-    }));
-
-    std::string series_snapshot;
-    const bool formal_applied = WaitUntil([&]() {
-        if (relation_task->QuerySeriesSnapshotJson(key, &series_snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(series_snapshot);
-        return std::string(doc["candidate_state"].GetString()) == "accepted" &&
-               std::string(doc["switch_state"].GetString()) == "formal_applied" &&
-               doc["validation_feature_count"].GetUint64() > 0;
-    });
-    if (!formal_applied) {
-        std::fprintf(stderr, "[DEBUG] relation formal apply snapshot: %s\n",
-                     series_snapshot.c_str());
-    }
-    assert(formal_applied);
-
-    auto series_doc = ParseJson(series_snapshot);
-    assert(std::string(series_doc["candidate_state"].GetString()) == "accepted");
-    assert(std::string(series_doc["switch_state"].GetString()) == "formal_applied");
-    assert(std::string(series_doc["failure_reason"].GetString()) == "none");
-    assert(series_doc["stage_seen_building"].GetBool() == true);
-    assert(series_doc["stage_seen_built"].GetBool() == true);
-    assert(series_doc["stage_seen_validating"].GetBool() == true);
-    assert(series_doc["last_candidate_loss"].GetDouble() >= 0.0);
-    assert(series_doc["last_incumbent_loss"].GetDouble() >= 0.0);
-    assert(series_doc["validation_feature_count"].GetUint64() > 0);
-    assert(series_doc["metrics"].IsArray());
-    assert(series_doc["metrics"].Size() == 1);
-    assert(series_doc["metrics"][0]["basis_version"].GetUint64() >= 2);
-
-    assert(relation_task->Close() == error::OK);
-    std::printf("[PASS] Baseline relation task rebuild formal apply\n");
-}
-
-static void TestBaselineRelationTaskRebuildCandidateFail() {
-    std::printf("[TEST] Baseline relation task rebuild candidate fail...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    ScriptedRelationHistoryReader reader;
-    std::vector<OwnedRelationReplayBlock> first_script;
-    std::vector<OwnedRelationReplayBlock> second_script;
-    for (int i = 0; i < 40; ++i) {
-        const double first_v0 = 82.0 - static_cast<double>(i % 5);
-        const double first_v1 = 13.0 + static_cast<double>(i % 4);
-        first_script.push_back(MakeSingleMetricRelationBlock(
-            400 + i, first_v0, first_v1, 100.0 - first_v0 - first_v1));
-        if (i < 24) {
-            const double second_v0 = 42.0 - static_cast<double>(i % 4);
-            const double second_v1 = 53.0 + static_cast<double>(i % 4);
-            second_script.push_back(MakeSingleMetricRelationBlock(
-                500 + i, second_v0, second_v1, 100.0 - second_v0 - second_v1));
-        } else {
-            const double tail_v0 = 82.0 - static_cast<double>(i % 5);
-            const double tail_v1 = 13.0 + static_cast<double>(i % 4);
-            second_script.push_back(MakeSingleMetricRelationBlock(
-                500 + i, tail_v0, tail_v1, 100.0 - tail_v0 - tail_v1));
-        }
-    }
-    reader.AddFetchScript(std::move(first_script));
-    reader.AddFetchScript(std::move(second_script));
-    assert(relation_task->SetHistoryReader(&reader) == error::OK);
-
-    const BaselineStringRef key{"svc-relation-reject", 19};
-    assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&reader]() { return reader.call_count() == 1; }));
-    assert(WaitUntil([&]() {
-        std::string snapshot;
-        if (relation_task->QuerySeriesSnapshotJson(key, &snapshot) != error::OK) return false;
-        auto doc = ParseJson(snapshot);
-        return std::string(doc["switch_state"].GetString()) == "formal_applied";
-    }));
-
-    assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&reader]() { return reader.call_count() == 2; }));
-
-    std::string series_snapshot;
-    const bool candidate_rejected = WaitUntil([&]() {
-        if (relation_task->QuerySeriesSnapshotJson(key, &series_snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(series_snapshot);
-        return std::string(doc["candidate_state"].GetString()) == "rejected";
-    });
-    if (!candidate_rejected) {
-        std::fprintf(stderr, "[DEBUG] relation candidate fail snapshot: %s\n",
-                     series_snapshot.c_str());
-    }
-    assert(candidate_rejected);
-
-    auto series_doc = ParseJson(series_snapshot);
-    assert(std::string(series_doc["candidate_state"].GetString()) == "rejected");
-    assert(std::string(series_doc["failure_reason"].GetString()) == "validation_failed");
-    assert(std::string(series_doc["switch_state"].GetString()) == "idle");
-    assert(series_doc["stage_seen_building"].GetBool() == true);
-    assert(series_doc["stage_seen_built"].GetBool() == true);
-    assert(series_doc["stage_seen_validating"].GetBool() == true);
-    assert(std::string(series_doc["lineage_compatibility"].GetString()) == "identical");
-    assert(series_doc["validation_feature_count"].GetUint64() > 0);
-    assert(series_doc["metrics"].IsArray());
-    assert(series_doc["metrics"].Size() == 1);
-    assert(series_doc["metrics"][0]["basis_version"].GetUint64() == 1);
-
-    assert(relation_task->Close() == error::OK);
-    std::printf("[PASS] Baseline relation task rebuild candidate fail\n");
-}
-
-static void TestBaselineRelationTaskRebuildNewLineage() {
-    std::printf("[TEST] Baseline relation task rebuild new lineage...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v2","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    auto* relation_impl =
-        static_cast<flowsql::baseline::BaselineRelationTask*>(relation_task);
-    flowsql::baseline::RelationServiceBasis incumbent_basis;
-    incumbent_basis.basis_version = 7;
-    incumbent_basis.feature_base = "client_group_mix";
-    incumbent_basis.metric_name = "conn_count";
-    incumbent_basis.group_space_id = "client_group";
-    incumbent_basis.group_space_version = "v1";
-    incumbent_basis.k_head = 2;
-    incumbent_basis.support_explicit = {11, 12, 13};
-    incumbent_basis.stable_head = {11, 12};
-    incumbent_basis.head_proto_q = {0.8, 0.2};
-    flowsql::baseline::RelationTaskTestAccess::SeedMetricBasis(relation_impl,
-                                                               "svc-relation-new-lineage",
-                                                               "conn_count",
-                                                               incumbent_basis);
-
-    ScriptedRelationHistoryReader reader;
-    reader.AddFetchScript({
-        MakeSingleMetricRelationBlock(600, 76.0, 19.0, 5.0),
-        MakeSingleMetricRelationBlock(601, 77.0, 18.0, 5.0),
-        MakeSingleMetricRelationBlock(602, 75.0, 20.0, 5.0),
-        MakeSingleMetricRelationBlock(603, 78.0, 17.0, 5.0),
-        MakeSingleMetricRelationBlock(604, 76.0, 19.0, 5.0),
-        MakeSingleMetricRelationBlock(605, 77.0, 18.0, 5.0),
-    });
-    assert(relation_task->SetHistoryReader(&reader) == error::OK);
-
-    const BaselineStringRef key{"svc-relation-new-lineage", 24};
-    assert(relation_task->RequestRebuild(key, BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&reader]() { return reader.call_count() == 1; }));
-
-    std::string series_snapshot;
-    const bool lineage_switched = WaitUntil([&]() {
-        if (relation_task->QuerySeriesSnapshotJson(key, &series_snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(series_snapshot);
-        return std::string(doc["lineage_compatibility"].GetString()) == "new_lineage" &&
-               std::string(doc["candidate_state"].GetString()) == "accepted" &&
-               std::string(doc["switch_state"].GetString()) == "formal_applied";
-    });
-    if (!lineage_switched) {
-        std::fprintf(stderr, "[DEBUG] relation new lineage snapshot: %s\n",
-                     series_snapshot.c_str());
-    }
-    assert(lineage_switched);
-
-    auto series_doc = ParseJson(series_snapshot);
-    assert(std::string(series_doc["lineage_compatibility"].GetString()) == "new_lineage");
-    assert(std::string(series_doc["candidate_state"].GetString()) == "accepted");
-    assert(std::string(series_doc["switch_state"].GetString()) == "formal_applied");
-    assert(std::string(series_doc["failure_reason"].GetString()) == "none");
-    assert(series_doc["stage_seen_building"].GetBool() == true);
-    assert(series_doc["stage_seen_built"].GetBool() == true);
-    assert(series_doc["validation_feature_count"].GetUint64() == 0);
-    assert(series_doc["metrics"].IsArray());
-    assert(series_doc["metrics"].Size() == 1);
-    assert(series_doc["metrics"][0]["basis_version"].GetUint64() == 8);
-
-    assert(relation_task->Close() == error::OK);
-    std::printf("[PASS] Baseline relation task rebuild new lineage\n");
-}
-
-static void TestBaselineRebuildInfrastructure() {
-    std::printf("[TEST] Baseline rebuild infrastructure...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
-    const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
-
-    IBaselineValueTask* value_task = nullptr;
-    IBaselineRatioTask* ratio_task = nullptr;
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(value_task != nullptr);
-    assert(ratio_task != nullptr);
-
-    CountingValueHistoryReader value_reader;
-    FailingRatioHistoryReader ratio_reader;
-    assert(value_task->SetHistoryReader(&value_reader) == error::OK);
-    assert(ratio_task->SetHistoryReader(&ratio_reader) == error::OK);
-
-    DetectorResult value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-rebuild", 11}, 400, 128.0, 0},
-               &value_result) == error::OK);
-    DetectorResult ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-rebuild", 11}, 500, 45.0, 60.0},
-               &ratio_result) == error::OK);
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-rebuild", 11},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-rebuild", 11},
-                                      BaselineRebuildReason::kManual) == error::OK);
-
-    assert(WaitUntil([&value_reader]() { return value_reader.call_count() == 1; }));
-    assert(WaitUntil([&ratio_reader]() { return ratio_reader.call_count() == 1; }));
-    assert(WaitUntil([&value_task]() {
-        std::string snapshot;
-        if (value_task->QueryTaskSnapshotJson(&snapshot) != error::OK) return false;
-        return snapshot.find("\"rebuild_completed\":1") != std::string::npos;
-    }));
-    assert(WaitUntil([&ratio_task]() {
-        std::string snapshot;
-        if (ratio_task->QueryTaskSnapshotJson(&snapshot) != error::OK) return false;
-        return snapshot.find("\"rebuild_completed\":1") != std::string::npos;
-    }));
-
-    assert(value_reader.last_key() == "svc-rebuild");
-    assert(value_reader.last_start() == 0);
-    assert(value_reader.last_end() == 400);
-
-    assert(ratio_reader.last_key() == "svc-rebuild");
-    assert(ratio_reader.last_start() == 0);
-    assert(ratio_reader.last_end() == 500);
-
-    std::string value_task_snapshot;
-    assert(value_task->QueryTaskSnapshotJson(&value_task_snapshot) == error::OK);
-    assert(value_task_snapshot.find("\"reader_bound\":true") != std::string::npos);
-    assert(value_task_snapshot.find("\"last_rebuild_status\":0") != std::string::npos);
-    assert(value_task_snapshot.find("\"last_rebuild_reason\":\"manual\"") != std::string::npos);
-    assert(value_task_snapshot.find("\"last_rebuild_key\":\"svc-rebuild\"") != std::string::npos);
-
-    std::string value_series_snapshot;
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-rebuild", 11},
-                                               &value_series_snapshot) == error::OK);
-    assert(value_series_snapshot.find("\"formal_ready\":true") != std::string::npos);
-    assert(value_series_snapshot.find("\"formal_model_version\":1") != std::string::npos);
-    assert(value_series_snapshot.find("\"formal_model_kind\":\"value_baseline\"") != std::string::npos);
-    assert(value_series_snapshot.find("\"candidate_generation\":1") != std::string::npos);
-    assert(value_series_snapshot.find("\"candidate_state\":\"accepted\"") != std::string::npos);
-    assert(value_series_snapshot.find("\"candidate_model_kind\":\"none\"") != std::string::npos);
-    assert(value_series_snapshot.find("\"switch_state\":\"formal_applied\"") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_rebuild_bucket_start\":0") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_rebuild_bucket_end\":400") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_replay_observation_count\":3") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_replay_first_bucket_id\":398") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_replay_last_bucket_id\":400") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_train_observation_count\":3") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_train_first_bucket_id\":398") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_train_last_bucket_id\":400") != std::string::npos);
-    assert(value_series_snapshot.find("\"last_holdout_observation_count\":0") != std::string::npos);
-
-    std::string ratio_task_snapshot;
-    assert(ratio_task->QueryTaskSnapshotJson(&ratio_task_snapshot) == error::OK);
-    assert(ratio_task_snapshot.find("\"reader_bound\":true") != std::string::npos);
-    assert(ratio_task_snapshot.find("\"last_rebuild_status\":-5") != std::string::npos);
-    assert(ratio_task_snapshot.find("\"last_rebuild_reason\":\"manual\"") != std::string::npos);
-    assert(ratio_task_snapshot.find("\"last_rebuild_key\":\"svc-rebuild\"") != std::string::npos);
-
-    std::string ratio_series_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-rebuild", 11},
-                                               &ratio_series_snapshot) == error::OK);
-    assert(ratio_series_snapshot.find("\"formal_ready\":false") != std::string::npos);
-    assert(ratio_series_snapshot.find("\"formal_model_version\":0") != std::string::npos);
-    assert(ratio_series_snapshot.find("\"candidate_generation\":0") != std::string::npos);
-    assert(ratio_series_snapshot.find("\"candidate_state\":\"failed\"") != std::string::npos);
-    assert(ratio_series_snapshot.find("\"failure_reason\":\"unavailable\"") != std::string::npos);
-    assert(ratio_series_snapshot.find("\"last_rebuild_bucket_start\":0") != std::string::npos);
-    assert(ratio_series_snapshot.find("\"last_rebuild_bucket_end\":500") != std::string::npos);
-    assert(ratio_series_snapshot.find("\"last_replay_observation_count\":0") != std::string::npos);
-
-    DetectorResult post_failure_ratio{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-rebuild", 11}, 501, 30.0, 40.0},
-               &post_failure_ratio) == error::OK);
-    assert(post_failure_ratio.status == error::OK);
-
-    assert(value_task->Close() == error::OK);
-    assert(ratio_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline rebuild infrastructure\n");
-}
-
-static void TestBaselineFormalPredictorSkeleton() {
-    std::printf("[TEST] Baseline formal predictor skeleton...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
-    const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
-
-    IBaselineValueTask* value_task = nullptr;
-    IBaselineRatioTask* ratio_task = nullptr;
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(value_task != nullptr);
-    assert(ratio_task != nullptr);
-
-    CountingValueHistoryReader value_reader;
-    CountingRatioHistoryReader ratio_reader;
-    assert(value_task->SetHistoryReader(&value_reader) == error::OK);
-    assert(ratio_task->SetHistoryReader(&ratio_reader) == error::OK);
-
-    DetectorResult value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-predict", 11}, 700, 64.0, 0},
-               &value_result) == error::OK);
-    DetectorResult ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-predict", 11}, 800, 9.0, 10.0},
-               &ratio_result) == error::OK);
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-predict", 11},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-predict", 11},
-                                      BaselineRebuildReason::kManual) == error::OK);
-
-    assert(WaitUntil([&value_reader]() { return value_reader.call_count() == 1; }));
-    assert(WaitUntil([&ratio_reader]() { return ratio_reader.call_count() == 1; }));
-    assert(WaitUntil([&value_task]() {
-        std::string snapshot;
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-predict", 11},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-    assert(WaitUntil([&ratio_task]() {
-        std::string snapshot;
-        if (ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-predict", 11},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-
-    std::string value_series_snapshot;
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-predict", 11},
-                                               &value_series_snapshot) == error::OK);
-    auto value_doc = ParseJson(value_series_snapshot);
-    assert(value_doc["formal_ready"].GetBool() == true);
-    assert(std::string(value_doc["formal_model_kind"].GetString()) == "value_baseline");
-    assert(value_doc["formal_model_version"].GetUint64() == 1);
-    assert(value_doc["formal_predict_ready"].GetBool() == true);
-    assert(value_doc["formal_predict_bucket_id"].GetInt64() == 700);
-    assert(value_doc["formal_predict_value"].GetDouble() > 0.0);
-    assert(value_doc["formal_predict_sigma_ref"].GetDouble() >= 1e-3);
-    assert(value_doc["candidate_generation"].GetUint64() == 1);
-    assert(value_doc["candidate_model_version"].GetUint64() == 0);
-    assert(std::string(value_doc["candidate_model_kind"].GetString()) == "none");
-    assert(std::string(value_doc["candidate_state"].GetString()) == "accepted");
-    assert(std::string(value_doc["switch_state"].GetString()) == "formal_applied");
-    assert(value_doc["candidate_predict_ready"].GetBool() == false);
-    AssertDoubleNear(value_doc["candidate_predict_sigma_ref"].GetDouble(), 0.0);
-    assert(value_doc["last_train_observation_count"].GetUint64() == 3);
-    assert(value_doc["last_holdout_observation_count"].GetUint64() == 0);
-
-    std::string ratio_series_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-predict", 11},
-                                               &ratio_series_snapshot) == error::OK);
-    auto ratio_doc = ParseJson(ratio_series_snapshot);
-    assert(ratio_doc["formal_ready"].GetBool() == true);
-    assert(std::string(ratio_doc["formal_model_kind"].GetString()) == "ratio_baseline");
-    assert(ratio_doc["formal_model_version"].GetUint64() == 1);
-    assert(ratio_doc["formal_predict_ready"].GetBool() == true);
-    assert(ratio_doc["formal_predict_bucket_id"].GetInt64() == 800);
-    assert(ratio_doc["formal_predict_value"].GetDouble() > 0.0);
-    assert(ratio_doc["formal_predict_value"].GetDouble() < 1.0);
-    assert(ratio_doc["candidate_generation"].GetUint64() == 1);
-    assert(ratio_doc["candidate_model_version"].GetUint64() == 0);
-    assert(std::string(ratio_doc["candidate_model_kind"].GetString()) == "none");
-    assert(std::string(ratio_doc["candidate_state"].GetString()) == "accepted");
-    assert(std::string(ratio_doc["switch_state"].GetString()) == "formal_applied");
-    assert(ratio_doc["candidate_predict_ready"].GetBool() == false);
-    assert(ratio_doc["last_train_observation_count"].GetUint64() == 3);
-    assert(ratio_doc["last_holdout_observation_count"].GetUint64() == 0);
-
-    assert(value_task->Close() == error::OK);
-    assert(ratio_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline formal predictor skeleton\n");
-}
-
-static void TestBaselineFormalTrainerFailureReason() {
-    std::printf("[TEST] Baseline formal trainer failure reason...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
-
-    IBaselineValueTask* value_task = nullptr;
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(value_task != nullptr);
-
-    SinglePointValueHistoryReader value_reader;
-    assert(value_task->SetHistoryReader(&value_reader) == error::OK);
-
-    DetectorResult value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-single", 10}, 900, 12.0, 0},
-               &value_result) == error::OK);
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-single", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&value_reader]() { return value_reader.call_count() == 1; }));
-    assert(WaitUntil([&value_task]() {
-        std::string snapshot;
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-single", 10},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return std::string(doc["candidate_state"].GetString()) == "failed" &&
-               doc.HasMember("failure_reason") &&
-               std::string(doc["failure_reason"].GetString()) == "insufficient_data";
-    }));
-
-    std::string series_snapshot;
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-single", 10},
-                                               &series_snapshot) == error::OK);
-    auto doc = ParseJson(series_snapshot);
-    assert(doc["candidate_generation"].GetUint64() == 0);
-    assert(doc["candidate_model_version"].GetUint64() == 0);
-    assert(std::string(doc["candidate_model_kind"].GetString()) == "none");
-    assert(std::string(doc["candidate_state"].GetString()) == "failed");
-    assert(doc.HasMember("failure_reason"));
-    assert(std::string(doc["failure_reason"].GetString()) == "insufficient_data");
-    assert(doc["candidate_predict_ready"].GetBool() == false);
-    assert(doc["last_replay_observation_count"].GetUint64() == 1);
-    assert(doc["last_train_observation_count"].GetUint64() == 0);
-    assert(doc["last_holdout_observation_count"].GetUint64() == 0);
-
-    assert(value_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline formal trainer failure reason\n");
-}
-
-static void TestBaselineSourceSelectionWithFormalModel() {
-    std::printf("[TEST] Baseline source selection with formal model...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
-    const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
-
-    IBaselineValueTask* value_task = nullptr;
-    IBaselineRatioTask* ratio_task = nullptr;
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(value_task != nullptr);
-    assert(ratio_task != nullptr);
-
-    std::string value_task_snapshot;
-    assert(value_task->QueryTaskSnapshotJson(&value_task_snapshot) == error::OK);
-    auto value_task_doc = ParseJson(value_task_snapshot);
-    assert(value_task_doc["baseline_source_config_count"].GetUint64() == 1);
-
-    std::string ratio_task_snapshot;
-    assert(ratio_task->QueryTaskSnapshotJson(&ratio_task_snapshot) == error::OK);
-    auto ratio_task_doc = ParseJson(ratio_task_snapshot);
-    assert(ratio_task_doc["baseline_source_config_count"].GetUint64() == 1);
-
-    CountingValueHistoryReader value_reader;
-    CountingRatioHistoryReader ratio_reader;
-    assert(value_task->SetHistoryReader(&value_reader) == error::OK);
-    assert(ratio_task->SetHistoryReader(&ratio_reader) == error::OK);
-
-    DetectorResult source_value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-source", 10}, 1000, 64.0, 0},
-               &source_value_result) == error::OK);
-    DetectorResult source_ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-source", 10}, 1000, 9.0, 10.0},
-               &source_ratio_result) == error::OK);
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-source", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-source", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-
-    assert(WaitUntil([&value_reader]() { return value_reader.call_count() == 1; }));
-    assert(WaitUntil([&ratio_reader]() { return ratio_reader.call_count() == 1; }));
-    assert(WaitUntil([&value_task]() {
-        std::string snapshot;
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-source", 10},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-    assert(WaitUntil([&ratio_task]() {
-        std::string snapshot;
-        if (ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-source", 10},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-
-    DetectorResult unconfigured_value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-none", 8}, 1001, 32.0, 0},
-               &unconfigured_value_result) == error::OK);
-    assert(unconfigured_value_result.provider != BaselineProvider::kSource);
-
-    DetectorResult unconfigured_ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-none", 8}, 1001, 7.0, 10.0},
-               &unconfigured_ratio_result) == error::OK);
-    assert(unconfigured_ratio_result.provider != BaselineProvider::kSource);
-
-    DetectorResult target_value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-target", 10}, 1001, 32.0, 0},
-               &target_value_result) == error::OK);
-    assert(target_value_result.provider == BaselineProvider::kSource);
-
-    DetectorResult target_ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-target", 10}, 1001, 7.0, 10.0},
-               &target_ratio_result) == error::OK);
-    assert(target_ratio_result.provider == BaselineProvider::kSource);
-
-    std::string value_series_snapshot;
-    std::string value_source_snapshot;
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-source", 10},
-                                               &value_source_snapshot) == error::OK);
-    auto value_source_doc = ParseJson(value_source_snapshot);
-    assert(value_source_doc["formal_ready"].GetBool() == true);
-    assert(value_source_doc["formal_model_version"].GetUint64() == 1);
-
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-target", 10},
-                                               &value_series_snapshot) == error::OK);
-    auto value_doc = ParseJson(value_series_snapshot);
-    assert(std::string(value_doc["baseline_source_kind"].GetString()) == "configured_source");
-    assert(std::string(value_doc["baseline_source_key"].GetString()) == "svc-source");
-    assert(std::string(value_doc["model_state"].GetString()) == "serviceable_source");
-
-    std::string value_none_snapshot;
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-none", 8},
-                                               &value_none_snapshot) == error::OK);
-    auto value_none_doc = ParseJson(value_none_snapshot);
-    assert(std::string(value_none_doc["baseline_source_kind"].GetString()) == "none");
-
-    std::string ratio_series_snapshot;
-    std::string ratio_source_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-source", 10},
-                                               &ratio_source_snapshot) == error::OK);
-    auto ratio_source_doc = ParseJson(ratio_source_snapshot);
-    assert(ratio_source_doc["formal_ready"].GetBool() == true);
-    assert(ratio_source_doc["formal_model_version"].GetUint64() == 1);
-
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-target", 10},
-                                               &ratio_series_snapshot) == error::OK);
-    auto ratio_doc = ParseJson(ratio_series_snapshot);
-    assert(std::string(ratio_doc["baseline_source_kind"].GetString()) == "configured_source");
-    assert(std::string(ratio_doc["baseline_source_key"].GetString()) == "svc-source");
-    assert(std::string(ratio_doc["model_state"].GetString()) == "serviceable_source");
-
-    std::string ratio_none_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-none", 8},
-                                               &ratio_none_snapshot) == error::OK);
-    auto ratio_none_doc = ParseJson(ratio_none_snapshot);
-    assert(std::string(ratio_none_doc["baseline_source_kind"].GetString()) == "none");
-
-    assert(value_task->Close() == error::OK);
-    assert(ratio_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline source selection with formal model\n");
-}
-
-static void TestBaselineShadowBaselineAndFormalSwitch() {
-    std::printf("[TEST] Baseline shadow baseline and formal switch...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
-    const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai"})";
-
-    IBaselineValueTask* value_task = nullptr;
-    IBaselineRatioTask* ratio_task = nullptr;
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(value_task != nullptr);
-    assert(ratio_task != nullptr);
-
-    SwitchingValueHistoryReader value_reader;
-    SwitchingRatioHistoryReader ratio_reader;
-    assert(value_task->SetHistoryReader(&value_reader) == error::OK);
-    assert(ratio_task->SetHistoryReader(&ratio_reader) == error::OK);
-
-    DetectorResult warmup_value{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-switch", 10}, 200, 1.0, 0},
-               &warmup_value) == error::OK);
-    DetectorResult warmup_ratio{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-switch", 10}, 200, 10.0, 100.0},
-               &warmup_ratio) == error::OK);
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-switch", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-switch", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&value_reader]() { return value_reader.call_count() == 1; }));
-    assert(WaitUntil([&ratio_reader]() { return ratio_reader.call_count() == 1; }));
-    assert(WaitUntil([&value_task]() {
-        std::string snapshot;
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-    assert(WaitUntil([&ratio_task]() {
-        std::string snapshot;
-        if (ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-
-    std::string value_initial_snapshot;
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
-                                               &value_initial_snapshot) == error::OK);
-    auto value_initial_doc = ParseJson(value_initial_snapshot);
-    assert(value_initial_doc["formal_ready"].GetBool() == true);
-    assert(value_initial_doc["formal_model_version"].GetUint64() == 1);
-
-    std::string ratio_initial_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
-                                               &ratio_initial_snapshot) == error::OK);
-    auto ratio_initial_doc = ParseJson(ratio_initial_snapshot);
-    assert(ratio_initial_doc["formal_ready"].GetBool() == true);
-    assert(ratio_initial_doc["formal_model_version"].GetUint64() == 1);
-
-    DetectorResult value_shift_1{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-switch", 10}, 201, 64.0, 0},
-               &value_shift_1) == error::OK);
-    assert((value_shift_1.flags & kBaselineFlagShadowActive) == 0);
-
-    DetectorResult value_shift_2{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-switch", 10}, 202, 64.0, 0},
-               &value_shift_2) == error::OK);
-    assert((value_shift_2.flags & kBaselineFlagShadowActive) == 0);
-
-    DetectorResult value_shift_3{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-switch", 10}, 203, 64.0, 0},
-               &value_shift_3) == error::OK);
-    assert((value_shift_3.flags & kBaselineFlagShadowActive) == 0);
-
-    DetectorResult value_shift_4{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-switch", 10}, 204, 64.0, 0},
-               &value_shift_4) == error::OK);
-    assert((value_shift_4.flags & kBaselineFlagShadowActive) == 0);
-
-    DetectorResult value_shift_5{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-switch", 10}, 205, 64.0, 0},
-               &value_shift_5) == error::OK);
-    assert(value_shift_5.provider == BaselineProvider::kShadow);
-    assert((value_shift_5.flags & kBaselineFlagShadowActive) != 0);
-    assert((value_shift_5.flags & kBaselineFlagRebuildQueued) == 0);
-
-    DetectorResult ratio_shift_1{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-switch", 10}, 201, 23.0, 100.0},
-               &ratio_shift_1) == error::OK);
-    assert((ratio_shift_1.flags & kBaselineFlagShadowActive) == 0);
-
-    DetectorResult ratio_shift_2{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-switch", 10}, 202, 23.0, 100.0},
-               &ratio_shift_2) == error::OK);
-    assert((ratio_shift_2.flags & kBaselineFlagShadowActive) == 0);
-
-    DetectorResult ratio_shift_3{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-switch", 10}, 203, 23.0, 100.0},
-               &ratio_shift_3) == error::OK);
-    assert((ratio_shift_3.flags & kBaselineFlagShadowActive) == 0);
-
-    DetectorResult ratio_shift_4{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-switch", 10}, 204, 23.0, 100.0},
-               &ratio_shift_4) == error::OK);
-    assert((ratio_shift_4.flags & kBaselineFlagShadowActive) == 0);
-
-    DetectorResult ratio_shift_5{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-switch", 10}, 205, 23.0, 100.0},
-               &ratio_shift_5) == error::OK);
-    assert(ratio_shift_5.provider == BaselineProvider::kShadow);
-    assert((ratio_shift_5.flags & kBaselineFlagShadowActive) != 0);
-    assert((ratio_shift_5.flags & kBaselineFlagRebuildQueued) == 0);
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-switch", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-switch", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-
-    assert(WaitUntil([&value_reader]() { return value_reader.second_fetch_started(); }));
-
-    std::string value_shadow_snapshot;
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
-                                               &value_shadow_snapshot) == error::OK);
-    auto value_shadow_doc = ParseJson(value_shadow_snapshot);
-    assert(value_shadow_doc["shadow_active"].GetBool() == true);
-    assert(value_shadow_doc["formal_model_version"].GetUint64() == 1);
-    assert(std::string(value_shadow_doc["model_state"].GetString()) == "shadow_self");
-    assert(std::string(value_shadow_doc["shadow_ref_kind"].GetString()) == "self_formal");
-    assert(value_shadow_doc["shadow_ref_model_version"].GetUint64() == 1);
-    assert(std::string(value_shadow_doc["candidate_state"].GetString()) == "building");
-    assert(std::string(value_shadow_doc["switch_state"].GetString()) == "rebuild_pending");
-
-    std::string ratio_shadow_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
-                                               &ratio_shadow_snapshot) == error::OK);
-    auto ratio_shadow_doc = ParseJson(ratio_shadow_snapshot);
-    assert(ratio_shadow_doc["shadow_active"].GetBool() == true);
-    assert(ratio_shadow_doc["formal_model_version"].GetUint64() == 1);
-    assert(std::string(ratio_shadow_doc["model_state"].GetString()) == "shadow_self");
-    assert(std::string(ratio_shadow_doc["shadow_ref_kind"].GetString()) == "self_formal");
-    assert(ratio_shadow_doc["shadow_ref_model_version"].GetUint64() == 1);
-    assert(std::string(ratio_shadow_doc["candidate_state"].GetString()) == "building");
-    assert(std::string(ratio_shadow_doc["switch_state"].GetString()) == "rebuild_pending");
-
-    value_reader.AllowSecondFetch();
-    assert(WaitUntil([&ratio_reader]() { return ratio_reader.second_fetch_started(); }));
-    ratio_reader.AllowSecondFetch();
-
-    for (int64_t bucket = 206; bucket <= 240; ++bucket) {
-        DetectorResult value_bridge{};
-        assert(value_task->SubmitObservation(
-                   ValueObservation{BaselineStringRef{"svc-switch", 10}, bucket, 64.0, 0},
-                   &value_bridge) == error::OK);
-        DetectorResult ratio_bridge{};
-        assert(ratio_task->SubmitObservation(
-                   RatioObservation{BaselineStringRef{"svc-switch", 10}, bucket, 23.0, 100.0},
-                   &ratio_bridge) == error::OK);
-    }
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-switch", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-switch", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(WaitUntil([&value_reader]() { return value_reader.call_count() == 3; }));
-    assert(WaitUntil([&ratio_reader]() { return ratio_reader.call_count() == 3; }));
-
-    std::string value_final_snapshot;
-    const bool value_switched = WaitUntil([&]() {
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
-                                                &value_final_snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(value_final_snapshot);
-        return doc["formal_ready"].GetBool() &&
-               doc["formal_model_version"].GetUint64() >= 2 &&
-               doc["shadow_active"].GetBool() == false &&
-               std::string(doc["switch_state"].GetString()) == "formal_applied";
-    });
-    if (!value_switched) {
-        std::fprintf(stderr, "[DEBUG] value switch snapshot: %s\n",
-                     value_final_snapshot.c_str());
-    }
-    assert(value_switched);
-    auto value_final_doc = ParseJson(value_final_snapshot);
-    assert(value_final_doc["stage_seen_building"].GetBool() == true);
-    assert(value_final_doc["stage_seen_built"].GetBool() == true);
-    assert(value_final_doc["stage_seen_validating"].GetBool() == true);
-
-    std::string ratio_final_snapshot;
-    const bool ratio_switched = WaitUntil([&]() {
-        if (ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-switch", 10},
-                                                &ratio_final_snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(ratio_final_snapshot);
-        return doc["formal_ready"].GetBool() &&
-               doc["formal_model_version"].GetUint64() >= 2 &&
-               doc["shadow_active"].GetBool() == false &&
-               std::string(doc["switch_state"].GetString()) == "formal_applied";
-    });
-    if (!ratio_switched) {
-        std::fprintf(stderr, "[DEBUG] ratio switch snapshot: %s\n",
-                     ratio_final_snapshot.c_str());
-    }
-    assert(ratio_switched);
-    auto ratio_final_doc = ParseJson(ratio_final_snapshot);
-    assert(ratio_final_doc["stage_seen_building"].GetBool() == true);
-    assert(ratio_final_doc["stage_seen_built"].GetBool() == true);
-    assert(ratio_final_doc["stage_seen_validating"].GetBool() == true);
-
-    DetectorResult value_after_switch{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-switch", 10}, 241, 64.0, 0},
-               &value_after_switch) == error::OK);
-    assert(value_after_switch.provider == BaselineProvider::kFormal);
-    assert((value_after_switch.flags & kBaselineFlagShadowActive) == 0);
-    assert(value_after_switch.raw_score < 0.05);
-
-    DetectorResult ratio_after_switch{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-switch", 10}, 241, 23.0, 100.0},
-               &ratio_after_switch) == error::OK);
-    assert(ratio_after_switch.provider == BaselineProvider::kFormal);
-    assert((ratio_after_switch.flags & kBaselineFlagShadowActive) == 0);
-    assert(ratio_after_switch.raw_score < 0.05);
-
-    assert(value_task->Close() == error::OK);
-    assert(ratio_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline shadow baseline and formal switch\n");
-}
-
-static void TestBaselineMainScoringChain() {
-    std::printf("[TEST] Baseline main scoring chain...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-source-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
-    const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","baseline_source_configs":[{"key":"svc-source-target","baseline_sources":[{"source_key":"svc-source"}]}]})";
-
-    IBaselineValueTask* value_task = nullptr;
-    IBaselineRatioTask* ratio_task = nullptr;
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(value_task != nullptr);
-    assert(ratio_task != nullptr);
-
-    CountingValueHistoryReader value_reader;
-    CountingRatioHistoryReader ratio_reader;
-    assert(value_task->SetHistoryReader(&value_reader) == error::OK);
-    assert(ratio_task->SetHistoryReader(&ratio_reader) == error::OK);
-
-    DetectorResult warmup_value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-self", 8}, 1100, 16.0, 0},
-               &warmup_value_result) == error::OK);
-    DetectorResult warmup_ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-self", 8}, 1100, 9.0, 10.0},
-               &warmup_ratio_result) == error::OK);
-
-    DetectorResult source_value_warmup{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-source", 10}, 1100, 16.0, 0},
-               &source_value_warmup) == error::OK);
-    DetectorResult source_ratio_warmup{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-source", 10}, 1100, 9.0, 10.0},
-               &source_ratio_warmup) == error::OK);
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-self", 8},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-self", 8},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-source", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-source", 10},
-                                      BaselineRebuildReason::kManual) == error::OK);
-
-    assert(WaitUntil([&value_reader]() { return value_reader.call_count() == 2; }));
-    assert(WaitUntil([&ratio_reader]() { return ratio_reader.call_count() == 2; }));
-    assert(WaitUntil([&value_task]() {
-        std::string snapshot;
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-self", 8},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-    assert(WaitUntil([&ratio_task]() {
-        std::string snapshot;
-        if (ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-self", 8},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-    assert(WaitUntil([&value_task]() {
-        std::string snapshot;
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-source", 10},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-    assert(WaitUntil([&ratio_task]() {
-        std::string snapshot;
-        if (ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-source", 10},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return doc["formal_ready"].GetBool() == true;
-    }));
-
-    DetectorResult self_value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-self", 8}, 1101, 64.0, 0},
-               &self_value_result) == error::OK);
-    assert(self_value_result.provider == BaselineProvider::kFormal);
-    assert(self_value_result.raw_score > 0.0);
-    assert(self_value_result.normalized_score > 0.0);
-    assert(self_value_result.confidence > 0.0);
-    assert(self_value_result.reason_code == BaselineReasonCode::kBaselineShiftUp);
-
-    DetectorResult self_ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-self", 8}, 1101, 60.0, 60.0},
-               &self_ratio_result) == error::OK);
-    assert(self_ratio_result.provider == BaselineProvider::kFormal);
-    assert(self_ratio_result.raw_score > 0.0);
-    assert(self_ratio_result.normalized_score > 0.0);
-    assert(self_ratio_result.confidence > 0.0);
-    assert(self_ratio_result.reason_code == BaselineReasonCode::kSpike);
-
-    DetectorResult source_value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-source-target", 17}, 1101, 64.0, 0},
-               &source_value_result) == error::OK);
-    assert(source_value_result.provider == BaselineProvider::kSource);
-    AssertDoubleNear(source_value_result.raw_score, self_value_result.raw_score);
-    assert(source_value_result.normalized_score > 0.0);
-    assert(source_value_result.confidence > 0.0);
-    assert(source_value_result.reason_code == BaselineReasonCode::kBaselineShiftUp);
-
-    DetectorResult source_ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-source-target", 17}, 1101, 0.0, 60.0},
-               &source_ratio_result) == error::OK);
-    assert(source_ratio_result.provider == BaselineProvider::kSource);
-    assert(source_ratio_result.raw_score > 0.0);
-    assert(source_ratio_result.normalized_score > 0.0);
-    assert(source_ratio_result.confidence > 0.0);
-    assert(source_ratio_result.reason_code == BaselineReasonCode::kDrop);
-
-    DetectorResult none_value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-none", 8}, 1101, 64.0, 0},
-               &none_value_result) == error::OK);
-    assert(none_value_result.provider == BaselineProvider::kNone);
-    assert(none_value_result.raw_score == 0.0);
-    assert(none_value_result.normalized_score == 0.0);
-    assert(none_value_result.confidence == 0.0);
-    assert(none_value_result.reason_code == BaselineReasonCode::kUnknown);
-
-    DetectorResult none_ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-none", 8}, 1101, 0.0, 60.0},
-               &none_ratio_result) == error::OK);
-    assert(none_ratio_result.provider == BaselineProvider::kNone);
-    assert(none_ratio_result.raw_score == 0.0);
-    assert(none_ratio_result.normalized_score == 0.0);
-    assert(none_ratio_result.confidence == 0.0);
-    assert(none_ratio_result.reason_code == BaselineReasonCode::kUnknown);
-
-    assert(value_task->Close() == error::OK);
-    assert(ratio_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline main scoring chain\n");
-}
-
-static void TestBaselineEventCalendarConfigAndSnapshot() {
-    std::printf("[TEST] Baseline event calendar config and snapshot...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"month_close","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
-    const char* ratio_cfg =
-        R"({"name":"success_rate","key":"service","feature":"success_rate","feature_type":"ratio","feature_profile":"rate_core","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"month_close","scope_type":"global","alignment_mode":"local_wall_clock","start_ts":1711900800,"end_ts":1711987199,"enabled":true,"tz":"Asia/Shanghai"}]}})";
-    const char* bad_value_cfg =
-        R"({"name":"bytes_total","key":"service","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai","event_calendar_spec":{"calendar_id":"ops-calendar","calendar_version":"2026.04","entries":[{"event_code":"broken","scope_type":"global","alignment_mode":"absolute_utc","start_ts":1711987199,"end_ts":1711900800,"enabled":true}]}})";
-
-    IBaselineValueTask* bad_value_task = reinterpret_cast<IBaselineValueTask*>(0x1);
-    assert(service->CreateValueTask(bad_value_cfg, &bad_value_task) == error::BAD_REQUEST);
-    assert(bad_value_task == nullptr);
-
-    IBaselineValueTask* value_task = nullptr;
-    IBaselineRatioTask* ratio_task = nullptr;
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(service->CreateRatioTask(ratio_cfg, &ratio_task) == error::OK);
-    assert(value_task != nullptr);
-    assert(ratio_task != nullptr);
-
-    std::string value_task_snapshot;
-    assert(value_task->QueryTaskSnapshotJson(&value_task_snapshot) == error::OK);
-    auto value_task_doc = ParseJson(value_task_snapshot);
-    assert(value_task_doc["event_calendar_present"].GetBool() == true);
-    assert(std::string(value_task_doc["event_calendar_id"].GetString()) == "ops-calendar");
-    assert(std::string(value_task_doc["event_calendar_version"].GetString()) == "2026.04");
-    assert(value_task_doc["event_calendar_entry_count"].GetUint64() == 1);
-
-    std::string ratio_task_snapshot;
-    assert(ratio_task->QueryTaskSnapshotJson(&ratio_task_snapshot) == error::OK);
-    auto ratio_task_doc = ParseJson(ratio_task_snapshot);
-    assert(ratio_task_doc["event_calendar_present"].GetBool() == true);
-    assert(std::string(ratio_task_doc["event_calendar_id"].GetString()) == "ops-calendar");
-    assert(std::string(ratio_task_doc["event_calendar_version"].GetString()) == "2026.04");
-    assert(ratio_task_doc["event_calendar_entry_count"].GetUint64() == 1);
-
-    CountingValueHistoryReader value_reader;
-    CountingRatioHistoryReader ratio_reader;
-    assert(value_task->SetHistoryReader(&value_reader) == error::OK);
-    assert(ratio_task->SetHistoryReader(&ratio_reader) == error::OK);
-
-    DetectorResult value_result{};
-    assert(value_task->SubmitObservation(
-               ValueObservation{BaselineStringRef{"svc-calendar", 12}, 1200, 64.0, 0},
-               &value_result) == error::OK);
-    DetectorResult ratio_result{};
-    assert(ratio_task->SubmitObservation(
-               RatioObservation{BaselineStringRef{"svc-calendar", 12}, 1200, 12.0, 20.0},
-               &ratio_result) == error::OK);
-
-    assert(value_task->RequestRebuild(BaselineStringRef{"svc-calendar", 12},
-                                      BaselineRebuildReason::kManual) == error::OK);
-    assert(ratio_task->RequestRebuild(BaselineStringRef{"svc-calendar", 12},
-                                      BaselineRebuildReason::kManual) == error::OK);
-
-    assert(WaitUntil([&value_reader]() { return value_reader.call_count() == 1; }));
-    assert(WaitUntil([&ratio_reader]() { return ratio_reader.call_count() == 1; }));
-    assert(WaitUntil([&value_task]() {
-        std::string snapshot;
-        if (value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-calendar", 12},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return std::string(doc["switch_state"].GetString()) == "formal_applied";
-    }));
-    assert(WaitUntil([&ratio_task]() {
-        std::string snapshot;
-        if (ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-calendar", 12},
-                                                &snapshot) != error::OK) {
-            return false;
-        }
-        auto doc = ParseJson(snapshot);
-        return std::string(doc["switch_state"].GetString()) == "formal_applied";
-    }));
-
-    std::string value_series_snapshot;
-    assert(value_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-calendar", 12},
-                                               &value_series_snapshot) == error::OK);
-    auto value_doc = ParseJson(value_series_snapshot);
-    assert(std::string(value_doc["formal_calendar_id"].GetString()) == "ops-calendar");
-    assert(std::string(value_doc["formal_calendar_version"].GetString()) == "2026.04");
-    assert(value_doc["formal_event_enabled"].GetBool() == true);
-    assert(std::string(value_doc["formal_event_status"].GetString()) == "enabled");
-    assert(std::string(value_doc["switch_state"].GetString()) == "formal_applied");
-
-    std::string ratio_series_snapshot;
-    assert(ratio_task->QuerySeriesSnapshotJson(BaselineStringRef{"svc-calendar", 12},
-                                               &ratio_series_snapshot) == error::OK);
-    auto ratio_doc = ParseJson(ratio_series_snapshot);
-    assert(std::string(ratio_doc["formal_calendar_id"].GetString()) == "ops-calendar");
-    assert(std::string(ratio_doc["formal_calendar_version"].GetString()) == "2026.04");
-    assert(ratio_doc["formal_event_enabled"].GetBool() == true);
-    assert(std::string(ratio_doc["formal_event_status"].GetString()) == "enabled");
-    assert(std::string(ratio_doc["switch_state"].GetString()) == "formal_applied");
-
-    assert(value_task->Close() == error::OK);
-    assert(ratio_task->Close() == error::OK);
-
-    std::printf("[PASS] Baseline event calendar config and snapshot\n");
-}
-
-static void TestBaselineFormalPredictorEventCalendarContract() {
-    std::printf("[TEST] Baseline formal predictor event calendar contract...\n");
-
-    baseline::CompiledEventCalendar task_calendar;
-    task_calendar.calendar_id = "ops-calendar";
-    task_calendar.calendar_version = "2026.04";
-
-    baseline::FormalModelMetadata metadata;
-    metadata.kind = baseline::FormalModelKind::kValueBaseline;
-    metadata.model_version = 7;
-    metadata.calendar_id = "ops-calendar";
-    metadata.calendar_version = "2026.04";
-
-    task_calendar.calendar_version = "2026.05";
-    assert(baseline::EvaluateEventCalendarStatus(metadata, &task_calendar) ==
-           baseline::EventCalendarStatus::kDisabledCalendarMismatch);
-
-    assert(baseline::EvaluateEventCalendarStatus(
-               metadata, static_cast<const baseline::CompiledEventCalendar*>(nullptr)) ==
-           baseline::EventCalendarStatus::kDisabledNoTaskCalendar);
-
-    metadata.calendar_version = "";
-    task_calendar.calendar_version = "2026.04";
-    assert(baseline::EvaluateEventCalendarStatus(metadata, &task_calendar) ==
-           baseline::EventCalendarStatus::kDisabledNoModelCalendar);
-
-    metadata.calendar_version = "2026.04";
-    assert(baseline::EvaluateEventCalendarStatus(metadata, &task_calendar) ==
-           baseline::EventCalendarStatus::kEnabled);
-
-    std::printf("[PASS] Baseline formal predictor event calendar contract\n");
-}
-
-static void TestBaselineKeyFusionSnapshotForValueTask() {
-    std::printf("[TEST] Baseline key fusion snapshot for value task...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* value_cfg =
-        R"({"name":"bytes_total","key":"svc-fusion-value","feature":"bytes_total","feature_type":"value_basic","feature_profile":"traffic","delta":60,"tz":"Asia/Shanghai"})";
-
-    IBaselineValueTask* value_task = nullptr;
-    assert(service->CreateValueTask(value_cfg, &value_task) == error::OK);
-    assert(value_task != nullptr);
-
-    const std::string key = "svc-fusion-value";
-    DetectorResult result{};
-    assert(value_task->SubmitObservation(ValueObservation{StringRef(key), 100, 64.0, 0},
-                                         &result) == error::OK);
-
-    std::string snapshot;
-    assert(service->QueryKeyFusionSnapshotJson(StringRef(key), &snapshot) == error::OK);
-    auto doc = ParseJson(snapshot);
-    assert(doc["available"].GetBool() == true);
-    assert(doc.HasMember("active_window"));
-    assert(doc["active_window"]["ts"].GetInt64() == 100);
-
-    assert(value_task->Close() == error::OK);
-
-    assert(service->QueryKeyFusionSnapshotJson(StringRef(key), &snapshot) == error::OK);
-    doc = ParseJson(snapshot);
-    assert(doc["available"].GetBool() == false);
-
-    std::printf("[PASS] Baseline key fusion snapshot for value task\n");
-}
-
-static void TestBaselineKeyFusionSnapshotForRelationTask() {
-    std::printf("[TEST] Baseline key fusion snapshot for relation task...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count","bps"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    const std::string key = "svc-fusion-relation";
-    const uint32_t group_idx[] = {11, 12, 50};
-    const double conn_values_10[] = {50.0, 30.0, 20.0};
-    const double bps_values_10[] = {400.0, 350.0, 250.0};
-    const RelationMetricBlock metrics_10[] = {
-        {100.0, kRelationMetricHasActiveCount, 3, conn_values_10},
-        {1000.0, kRelationMetricHasActiveCount, 3, bps_values_10},
-    };
-    const RelationObservationBlock block_10{
-        StringRef(key),
-        10,
-        3,
-        group_idx,
-        2,
-        metrics_10,
-    };
-
-    const double conn_values_11[] = {48.0, 32.0, 20.0};
-    const double bps_values_11[] = {390.0, 360.0, 250.0};
-    const RelationMetricBlock metrics_11[] = {
-        {100.0, kRelationMetricHasActiveCount, 3, conn_values_11},
-        {1000.0, kRelationMetricHasActiveCount, 3, bps_values_11},
-    };
-    const RelationObservationBlock block_11{
-        StringRef(key),
-        11,
-        3,
-        group_idx,
-        2,
-        metrics_11,
-    };
-
-    FusionResult result_10{};
-    FusionResult result_11{};
-    assert(relation_task->SubmitBlock(block_10, &result_10) == error::OK);
-    assert(relation_task->SubmitBlock(block_11, &result_11) == error::OK);
-
-    std::string snapshot;
-    assert(service->QueryKeyFusionSnapshotJson(StringRef(key), &snapshot) == error::OK);
-    auto doc = ParseJson(snapshot);
-    assert(doc["available"].GetBool() == true);
-    assert(doc.HasMember("latest_finalized_result"));
-    assert(doc["latest_finalized_result"]["ts"].GetInt64() == 10);
-    AssertDoubleNear(doc["latest_finalized_result"]["risk"].GetDouble(), result_10.risk);
-    assert(doc.HasMember("active_window"));
-    assert(doc["active_window"]["ts"].GetInt64() == 11);
-    AssertDoubleNear(doc["active_window"]["risk"].GetDouble(), result_11.risk);
-
-    assert(relation_task->Close() == error::OK);
-
-    assert(service->QueryKeyFusionSnapshotJson(StringRef(key), &snapshot) == error::OK);
-    doc = ParseJson(snapshot);
-    assert(doc["available"].GetBool() == false);
-
-    std::printf("[PASS] Baseline key fusion snapshot for relation task\n");
-}
-
-static void TestBaselineRelationAndKeyFusionPruneIdleKeys() {
-    std::printf("[TEST] Baseline relation and key fusion prune idle keys...\n");
-
-    auto env = LoadBaselineService();
-    auto* service = env.service;
-
-    const char* relation_cfg =
-        R"({"name":"client_group_mix","feature_base":"client_group_mix","group_space_id":"client_group","group_space_version":"v1","delta":60,"tz":"Asia/Shanghai","metric_set_id":"net_metrics","metrics":["conn_count"],"encode_type":"exact_sparse","support_policy":{"k_support":8,"min_hist_share":0.005,"min_active_ratio":0.2},"summary_policy":{"k_head":2,"k_stable":2}})";
-
-    IBaselineRelationTask* relation_task = nullptr;
-    assert(service->CreateRelationTask(relation_cfg, nullptr, &relation_task) == error::OK);
-    assert(relation_task != nullptr);
-
-    const uint32_t group_idx[] = {11, 12, 13};
-    auto submit_block = [&](const std::string& key,
-                            int64_t bucket_id,
-                            double v0,
-                            double v1,
-                            double v2) {
-        const double values[] = {v0, v1, v2};
-        const RelationMetricBlock metrics[] = {
-            {100.0, kRelationMetricHasActiveCount, 3, values},
-        };
-        FusionResult result{};
-        const RelationObservationBlock block{
-            StringRef(key),
-            bucket_id,
-            3,
-            group_idx,
-            1,
-            metrics,
-        };
-        assert(relation_task->SubmitBlock(block, &result) == error::OK);
-    };
-
-    submit_block("svc-stale-a", 1, 50.0, 30.0, 20.0);
-    submit_block("svc-stale-b", 1, 48.0, 32.0, 20.0);
-    for (int64_t bucket = 5000; bucket < 5070; ++bucket) {
-        submit_block("svc-hot", bucket, 60.0, 25.0, 15.0);
-    }
-
-    std::string task_snapshot;
-    assert(relation_task->QueryTaskSnapshotJson(&task_snapshot) == error::OK);
-    auto task_doc = ParseJson(task_snapshot);
-    assert(task_doc["idle_prune_bucket_gap"].GetInt64() > 0);
-    assert(task_doc["pruned_key_count_total"].GetUint64() >= 2);
-    assert(task_doc["key_runtime_count"].GetUint64() == 1);
-
-    std::string service_stats;
-    assert(service->QueryServiceStatsJson(&service_stats) == error::OK);
-    auto stats_doc = ParseJson(service_stats);
-    assert(stats_doc["key_fusion_idle_prune_bucket_gap"].GetInt64() > 0);
-    assert(stats_doc["key_fusion_pruned_key_count_total"].GetUint64() >= 2);
-    assert(stats_doc["key_fusion_key_count"].GetUint64() == 1);
-
-    std::string stale_snapshot;
-    assert(service->QueryKeyFusionSnapshotJson(StringRef("svc-stale-a"), &stale_snapshot) ==
-           error::OK);
-    auto stale_doc = ParseJson(stale_snapshot);
-    assert(stale_doc["available"].GetBool() == false);
-
-    assert(relation_task->Close() == error::OK);
-    std::printf("[PASS] Baseline relation and key fusion prune idle keys\n");
-}
-
 int main() {
-    TestBaselineServiceHeaderAndIid();
-    TestBaselinePluginLoadAndQuery();
-    TestBaselineTaskLifecycleAndConfigValidation();
-    TestBaselineSeriesStoreCommonState();
-    TestBaselineValueTaskHotPath();
-    TestBaselineRatioTaskHotPath();
-    TestBaselineRelationTaskHotPath();
-    TestBaselineRelationTaskResultLifetime();
-    TestBaselineRelationTaskReusesRoutedRuntime();
-    TestBaselineRelationTaskRebuildDirectApply();
-    TestBaselineRelationTaskRebuildFormalApply();
-    TestBaselineRelationTaskRebuildCandidateFail();
-    TestBaselineRelationTaskRebuildNewLineage();
-    TestBaselineRebuildInfrastructure();
-    TestBaselineFormalPredictorSkeleton();
-    TestBaselineFormalTrainerFailureReason();
-    TestBaselineSourceSelectionWithFormalModel();
-    TestBaselineMainScoringChain();
-    TestBaselineEventCalendarConfigAndSnapshot();
-    TestBaselineFormalPredictorEventCalendarContract();
-    TestBaselineShadowBaselineAndFormalSwitch();
-    TestBaselineKeyFusionSnapshotForValueTask();
-    TestBaselineKeyFusionSnapshotForRelationTask();
-    TestBaselineRelationAndKeyFusionPruneIdleKeys();
-    std::printf("[DONE] test_baseline\n");
+    TestEventCalendarSchemaRejectsTaskScopedFields();
+    TestCreateTaskUsesConfigIdentity();
+    TestInvalidTaskConfigRejected();
+    TestTaskBootstrapPredictAndExport();
+    TestValueTaskKeepsBootstrapPerSeriesAndExportsAll();
+    TestBootstrapUsesConfiguredEventCalendar();
+    TestTaskRejectsIncompatibleBootstrapArtifact();
+    TestRuntimeConfigDefaultDailyHarmonicOrder();
+    TestRuntimeConfigHarmonicOrders();
     return 0;
 }

@@ -11,8 +11,6 @@
 
 #include <cstdint>
 
-#include <framework/interfaces/ibaseline_types.h>
-
 #include "plugins/baseline/model/profile_config.h"
 
 namespace flowsql {
@@ -50,15 +48,6 @@ struct ReadinessState {
     bool coverage_degraded = false;
 };
 
-void UpdateCoverageStats(ReadinessState* state, int64_t bucket_id, bool is_valid_bucket);
-bool EvaluateMonthPosEligibility(const ReadinessState& state, const SharedProfileConfig& config);
-double ComputeConfidenceBase(const ReadinessState& state,
-                             ModelReadiness readiness,
-                             BaselineSourceKind source_kind);
-void RefreshOnlineReadiness(ReadinessState* state,
-                            const SharedProfileConfig& config,
-                            ModelReadiness readiness,
-                            BaselineSourceKind source_kind);
 ReadinessState BuildTrainReadiness(const TrainingCoverageStats& stats,
                                    const SharedProfileConfig& config);
 

@@ -10,7 +10,6 @@
 
 #include <common/error_code.h>
 
-#include <algorithm>
 #include <unordered_map>
 
 #include "plugins/baseline/model/calendar_feature_helper.h"
@@ -20,23 +19,8 @@ namespace baseline {
 
 namespace {
 
-bool IsAllowedScope(const std::string& scope_type) {
-    return scope_type == "global" || scope_type == "feature" || scope_type == "key" ||
-           scope_type == "key_feature";
-}
-
 bool IsAllowedAlignment(const std::string& alignment_mode) {
     return alignment_mode == "absolute_utc" || alignment_mode == "local_wall_clock";
-}
-
-bool ScopeMatches(const CompiledEventCalendarEntry& entry, const BaselineTaskSpec& task_spec) {
-    if (entry.scope_type == "global") return true;
-    if (entry.scope_type == "feature") return entry.feature == task_spec.feature;
-    if (entry.scope_type == "key") return entry.key == task_spec.key;
-    if (entry.scope_type == "key_feature") {
-        return entry.key == task_spec.key && entry.feature == task_spec.feature;
-    }
-    return false;
 }
 
 bool IntervalsOverlap(int64_t lhs_start, int64_t lhs_end, int64_t rhs_start, int64_t rhs_end) {
@@ -83,25 +67,12 @@ int CompileEventCalendar(const EventCalendarSpec& spec,
             if (err) *err = "event_code must not be empty";
             return error::BAD_REQUEST;
         }
-        if (!IsAllowedScope(entry.scope_type)) {
-            if (err) *err = "scope_type is invalid";
-            return error::BAD_REQUEST;
-        }
         if (!IsAllowedAlignment(entry.alignment_mode)) {
             if (err) *err = "alignment_mode is invalid";
             return error::BAD_REQUEST;
         }
         if (entry.end_ts <= entry.start_ts) {
             if (err) *err = "event interval must be positive";
-            return error::BAD_REQUEST;
-        }
-        if ((entry.scope_type == "feature" || entry.scope_type == "key_feature") &&
-            entry.feature.empty()) {
-            if (err) *err = "feature scoped event must set feature";
-            return error::BAD_REQUEST;
-        }
-        if ((entry.scope_type == "key" || entry.scope_type == "key_feature") && entry.key.empty()) {
-            if (err) *err = "key scoped event must set key";
             return error::BAD_REQUEST;
         }
         auto code_it = code_index_by_name.find(entry.event_code);
@@ -113,12 +84,9 @@ int CompileEventCalendar(const EventCalendarSpec& spec,
 
         CompiledEventCalendarEntry compiled;
         compiled.event_code = entry.event_code;
-        compiled.scope_type = entry.scope_type;
         compiled.alignment_mode = entry.alignment_mode;
         compiled.start_ts = entry.start_ts;
         compiled.end_ts = entry.end_ts;
-        compiled.feature = entry.feature;
-        compiled.key = entry.key;
         compiled.tz = entry.tz;
         compiled.event_code_index = code_it->second;
         out->entries.push_back(std::move(compiled));
@@ -132,7 +100,6 @@ std::vector<std::string> ResolveBucketEvents(const CompiledEventCalendar& calend
                                              int64_t bucket_id) {
     std::vector<uint8_t> hit(calendar.enabled_event_codes.size(), 0);
     for (const auto& entry : calendar.entries) {
-        if (!ScopeMatches(entry, task_spec)) continue;
         if (!EntryOverlapsBucket(entry, task_spec, bucket_id)) continue;
         if (entry.event_code_index < hit.size()) {
             hit[entry.event_code_index] = 1;
@@ -154,7 +121,6 @@ int BuildEventIndicatorRow(const CompiledEventCalendar& calendar,
     if (!out_row || row_size < calendar.enabled_event_codes.size()) return error::BAD_REQUEST;
     std::fill(out_row, out_row + row_size, 0.0);
     for (const auto& entry : calendar.entries) {
-        if (!ScopeMatches(entry, task_spec)) continue;
         if (!EntryOverlapsBucket(entry, task_spec, bucket_id)) continue;
         if (entry.event_code_index < row_size) {
             out_row[entry.event_code_index] = 1.0;

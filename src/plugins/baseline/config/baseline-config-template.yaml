@@ -1,99 +1,89 @@
-# Baseline unified config template
-# Source snapshot date: 2026-04-26
+# Baseline B1 optional bootstrap config template
+# Source snapshot date: 2026-04-29
 #
 # Plugin load options:
 #   --option "config_file=/abs/path/to/baseline-config-template.yaml;strict=true"
-#
-# This file separates:
-# 1) task payload templates (configurable by Create*Task JSON)
-# 2) built-in defaults/constants (loaded by BaselinePlugin runtime config)
 
 examples:
   tasks:
-    value_task_basic:
-      name: "bytes_total"
-      key: "service"
-      feature: "bytes_total"
+    value_task:
+      schema_version: 1
+      task_id: "baseline_task_bps"
+      task_name: "link bps baseline"
+      task_kind: "value"
+      feature_id: "bps"
       feature_type: "value_basic"
-      feature_profile: "default"
-      delta: 60
-      tz: "Asia/Shanghai"
-      baseline_source_configs: []
-      event_calendar_spec: null
+      profile: "default"
+      clock_spec:
+        bucket_seconds: 60
+        timezone: "Asia/Shanghai"
+      calendar_ref:
+        calendar_id: "cn-holiday"
+        calendar_version: "2026.1"
 
-    value_task_sampled:
-      name: "avg_rtt"
-      key: "service"
-      feature: "avg_rtt"
+    sampled_value_task:
+      schema_version: 1
+      task_id: "baseline_task_sampled_bps"
+      task_name: "sampled link bps baseline"
+      task_kind: "value"
+      feature_id: "sampled_bps"
       feature_type: "value_sampled"
-      feature_profile: "cont_core"   # cont_core | cont_tail
-      delta: 60
-      tz: "Asia/Shanghai"
-      baseline_source_configs: []
-      event_calendar_spec: null
+      profile: "cont_core"
+      clock_spec:
+        bucket_seconds: 60
+        timezone: "Asia/Shanghai"
+      calendar_ref:
+        calendar_id: "cn-holiday"
+        calendar_version: "2026.1"
 
     ratio_task:
-      name: "success_rate"
-      key: "service"
-      feature: "success_rate"
+      schema_version: 1
+      task_id: "baseline_task_success_rate"
+      task_name: "success rate baseline"
+      task_kind: "ratio"
+      feature_id: "success_rate"
       feature_type: "ratio"
-      feature_profile: "rate_core"   # rate_core | ratio_bursty
-      delta: 60
-      tz: "Asia/Shanghai"
-      baseline_source_configs: []
-      event_calendar_spec: null
+      profile: "rate_core"
+      clock_spec:
+        bucket_seconds: 60
+        timezone: "Asia/Shanghai"
+      calendar_ref:
+        calendar_id: "cn-holiday"
+        calendar_version: "2026.1"
 
     relation_task:
-      name: "client_group_mix"
-      feature_base: "client_group_mix"
+      schema_version: 1
+      task_id: "baseline_task_client_mix"
+      task_name: "client mix basis"
+      task_kind: "relation"
+      feature_id: "client_mix"
+      feature_type: "relation"
+      profile: "default"
       group_space_id: "client_group"
       group_space_version: "v1"
-      metric_set_id: "net_metrics"
       metrics:
-        - "conn_count"
         - "bps"
-      encode_type: "exact_sparse"    # exact_sparse | topk_other
-      other_group_idxs: []           # optional; only valid for topk_other
       support_policy:
-        k_support: 16                # requested default
-        min_hist_share: 0.005        # requested default (0.5%)
-        min_active_ratio: 0.2        # requested default (20%)
+        k_support: 16
+        min_hist_share: 0.005
+        min_active_ratio: 0.2
       summary_policy:
-        k_head: 5                    # requested default
-        k_stable: 5                  # requested default
-      delta: 60
-      tz: "Asia/Shanghai"
-      event_calendar_spec: null
-
-  optional_blocks:
-    baseline_source_configs_example:
-      - key: "svc-target"
-        baseline_sources:
-          - source_key: "svc-source-a"
-          - source_key: "svc-source-b"
-
-    event_calendar_spec_example:
-      calendar_id: "ops-calendar"
-      calendar_version: "v1"
-      entries:
-        - event_code: "month_close"
-          scope_type: "global"         # global | feature | key | key_feature
-          alignment_mode: "local_wall_clock"  # local_wall_clock | absolute_utc
-          start_ts: 1711900800
-          end_ts: 1711987199
-          enabled: true
-          feature: ""
-          key: ""
-          tz: "Asia/Shanghai"
+        k_head: 5
+        k_stable: 5
+      clock_spec:
+        bucket_seconds: 60
+        timezone: "Asia/Shanghai"
+      calendar_ref:
+        calendar_id: "cn-holiday"
+        calendar_version: "2026.1"
 
 baseline:
   parser:
     tz_default: "Asia/Shanghai"
 
   shared_profile_config:
-    # src/plugins/baseline/model/profile_config.h
-    k_day: 4
-    k_week: 3
+    daily_harmonic_order: 6
+    weekly_harmonic_order: 3
     dme_max: 7
     m_month_enable: 4
     month_cov_min: 0.8
@@ -102,23 +92,6 @@ baseline:
     lambda_dme: 2.0
     lambda_lwd: 1.0
     lambda_event: 2.0
-    n_val_switch: 16              # legacy for non-shadow-refactor path
-    eps_switch: 0.05
-    z_warn: 3.0
-    z_crit: 5.0
-    w_shift: 0.8
-    drift:
-      alpha: 0.2
-      shift_clip: 6.0
-      lambda_mem: 0.9
-      kappa_shift: 0.25
-      u_min: 0.5
-      h_shift: 3.0
-      p_shift_low: 0.3
-      p_shift_high: 0.6
-      m_shift: 3
-      g_skip: 3
-      g_reset: 12
 
   value_sampled_profiles:
     cont_core:
@@ -151,55 +124,8 @@ baseline:
     tol_beta_inf: 1.0e-5
     cond_max: 1.0e8
 
-  runtime_and_rebuild_constants:
-    runtime_state_prune:
-      idle_bucket_gap: 4096
-      prune_scan_limit: 32
-    candidate_builder:
-      min_train_point_count: 2
-    shadow_policy:
-      z_shift_confirm_min: 1.44
-      c_rebuild_min: 5
-      z_win_shift_threshold: 2.2
-      min_shadow_points_for_candidate: 1440
-      min_shadow_holdout_points: 180
-      retry_cooldown_points: 180
-      shadow_stuck_alert_points: 4320
-    candidate_validator:
-      huber_delta: 1.5
-      shadow_alpha: 0.2
-      ratio_variance_floor: 0.25
-      switch_loss_abs_tol: 1.0e-12
-    relation_rebuild:
-      min_replay_for_holdout: 3
-      switch_validation_tail: 16
-
-  scoring_and_confidence_constants:
-    score_warn: 3.0
-    score_crit: 5.0
-    confidence_formal_base: 0.8
-    confidence_source_base: 0.6
-    confidence_shadow_base: 0.5
-    value_shadow_confidence_cap: 0.8
-    ratio_shadow_confidence_cap: 0.8
-    value_shadow_sigma_scale: 1.5
-    ratio_shadow_score_scale: 1.5
-
-  fusion_constants:
-    key_risk_fusion:
-      fuse_persistence_window: 3.0
-      window_limit: 2
-    relation_pattern_fusion:
-      lambda_sup: 0.5
-      lambda_opp: 0.5
-      fuse_persistence_window: 3.0
-
 notes:
   validation:
-    - "support_policy and summary_policy are required for relation task."
-    - "k_support must be >= k_stable."
-    - "min_hist_share and min_active_ratio must be in (0, 1]."
-    - "k_support/k_head/k_stable and delta must be > 0."
-    - "baseline_source_configs must not be empty if provided; source_key must not equal self key."
-    - "relation encode_type must be exact_sparse or topk_other."
-    - "other_group_idx/other_group_idxs are accepted only when encode_type=topk_other."
+    - "task config uses task_id/task_kind/feature_id/profile/clock_spec/calendar_ref."
+    - "historical series identity belongs to BootstrapInput.series_key, not task config."
+    - "relation support_policy and summary_policy are required."

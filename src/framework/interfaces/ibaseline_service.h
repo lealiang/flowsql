@@ -13,8 +13,9 @@
 #include <common/typedef.h>
 #include <framework/interfaces/ibaseline_types.h>
 
-#include <functional>
-#include <string>
+#include <memory>
+#include <string_view>
+#include <utility>
 
 namespace flowsql {
 
@@ -29,79 +30,80 @@ interface IBaselineTask {
     virtual const char* Id() const = 0;
     virtual const char* Name() const = 0;
     virtual BaselineTaskKind Kind() const = 0;
-    virtual const char* ConfigJson() const = 0;
 
-    virtual int QueryTaskSnapshotJson(std::string* out_json) const = 0;
-    virtual int QuerySeriesSnapshotJson(const BaselineStringRef& key,
-                                        std::string* out_json) const = 0;
+    virtual BaselineSerializationResult ExportConfig(
+        BaselineSerializationFormat format) const = 0;
 
-    virtual int RequestRebuild(const BaselineStringRef& key,
-                               BaselineRebuildReason reason) = 0;
+    virtual BaselineSerializationResult QueryTaskSnapshot(
+        BaselineSerializationFormat format) const = 0;
 
-    virtual int Close() = 0;
-};
+    virtual BaselineSerializationResult QuerySeriesSnapshot(
+        std::string_view series_key,
+        BaselineSerializationFormat format) const = 0;
 
-interface IBaselineValueHistoryReader {
-    virtual ~IBaselineValueHistoryReader() = default;
-    virtual int Fetch(const HistoryFetchRequest& req,
-                      std::function<int(const ValueObservation&)> on_point) = 0;
-};
-
-interface IBaselineRatioHistoryReader {
-    virtual ~IBaselineRatioHistoryReader() = default;
-    virtual int Fetch(const HistoryFetchRequest& req,
-                      std::function<int(const RatioObservation&)> on_point) = 0;
-};
-
-interface IBaselineRelationHistoryReader {
-    virtual ~IBaselineRelationHistoryReader() = default;
-    virtual int Fetch(const HistoryFetchRequest& req,
-                      std::function<int(const RelationObservationBlock&)> on_block) = 0;
-};
-
-interface IBaselineSourceResolver {
-    virtual ~IBaselineSourceResolver() = default;
-    virtual int ResolveBaselineSource(const BaselineStringRef& key,
-                                      const BaselineStringRef& feature,
-                                      std::string* out_config_json) = 0;
+    virtual BaselineStatus Close() = 0;
 };
 
 interface IBaselineValueTask : public IBaselineTask {
-    virtual int SetHistoryReader(IBaselineValueHistoryReader* reader) = 0;
-    virtual int SubmitObservation(const ValueObservation& obs,
-                                  DetectorResult* out) = 0;
+    virtual BootstrapTrainResult Bootstrap(const ValueBootstrapInput& input) = 0;
+    virtual BootstrapPrediction PredictBootstrap(
+        std::string_view series_key,
+        int64_t bucket_id,
+        const BootstrapPredictionOptions& options) const = 0;
+    virtual BaselineSerializationResult ExportBootstrapArtifact(
+        BaselineSerializationFormat format) const = 0;
+    virtual BaselineStatus LoadBootstrapArtifact(
+        std::string_view content,
+        BaselineSerializationFormat format) = 0;
+    virtual BaselineSerializationResult ExportBootstrapSeed(
+        BaselineSerializationFormat format) const = 0;
 };
 
 interface IBaselineRatioTask : public IBaselineTask {
-    virtual int SetHistoryReader(IBaselineRatioHistoryReader* reader) = 0;
-    virtual int SubmitObservation(const RatioObservation& obs,
-                                  DetectorResult* out) = 0;
+    virtual BootstrapTrainResult Bootstrap(const RatioBootstrapInput& input) = 0;
+    virtual BootstrapPrediction PredictBootstrap(
+        std::string_view series_key,
+        int64_t bucket_id,
+        const BootstrapPredictionOptions& options) const = 0;
+    virtual BaselineSerializationResult ExportBootstrapArtifact(
+        BaselineSerializationFormat format) const = 0;
+    virtual BaselineStatus LoadBootstrapArtifact(
+        std::string_view content,
+        BaselineSerializationFormat format) = 0;
+    virtual BaselineSerializationResult ExportBootstrapSeed(
+        BaselineSerializationFormat format) const = 0;
 };
 
 interface IBaselineRelationTask : public IBaselineTask {
-    virtual int SetHistoryReader(IBaselineRelationHistoryReader* reader) = 0;
-    virtual int SubmitBlock(const RelationObservationBlock& block,
-                            FusionResult* out) = 0;
+    virtual BootstrapTrainResult Bootstrap(const RelationBootstrapInput& input) = 0;
+    virtual BaselineSerializationResult ExportBootstrapArtifact(
+        BaselineSerializationFormat format) const = 0;
+    virtual BaselineStatus LoadBootstrapArtifact(
+        std::string_view content,
+        BaselineSerializationFormat format) = 0;
+    virtual BaselineSerializationResult ExportBootstrapSeed(
+        BaselineSerializationFormat format) const = 0;
+    virtual BaselineSerializationResult QueryBootstrapBasis(
+        BaselineSerializationFormat format) const = 0;
 };
 
 interface IBaselineService {
     virtual ~IBaselineService() = default;
 
-    virtual int CreateValueTask(const char* config_json,
-                                IBaselineValueTask** out) = 0;
-    virtual int CreateRatioTask(const char* config_json,
-                                IBaselineRatioTask** out) = 0;
-    virtual int CreateRelationTask(const char* config_json,
-                                   IBaselineSourceResolver* resolver,
-                                   IBaselineRelationTask** out) = 0;
+    virtual std::pair<BaselineStatus, std::shared_ptr<IBaselineValueTask>>
+    CreateValueTask(std::string_view config_content,
+                    BaselineSerializationFormat format) = 0;
 
-    virtual void ListTasks(std::function<void(const char* task_id,
-                                              const char* task_name,
-                                              BaselineTaskKind kind)> cb) = 0;
+    virtual std::pair<BaselineStatus, std::shared_ptr<IBaselineRatioTask>>
+    CreateRatioTask(std::string_view config_content,
+                    BaselineSerializationFormat format) = 0;
 
-    virtual int QueryKeyFusionSnapshotJson(const BaselineStringRef& key,
-                                           std::string* out_json) const = 0;
-    virtual int QueryServiceStatsJson(std::string* out_json) const = 0;
+    virtual std::pair<BaselineStatus, std::shared_ptr<IBaselineRelationTask>>
+    CreateRelationTask(std::string_view config_content,
+                       BaselineSerializationFormat format) = 0;
+
+    virtual BaselineSerializationResult QueryServiceSnapshot(
+        BaselineSerializationFormat format) const = 0;
 };
 
 }  // namespace flowsql

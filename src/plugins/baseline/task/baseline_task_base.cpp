@@ -19,13 +19,11 @@ namespace flowsql {
 namespace baseline {
 
 BaselineTaskBase::BaselineTaskBase(TaskRegistry* registry,
-                                   RebuildQueue* rebuild_queue,
                                    std::string task_id,
                                    BaselineTaskKind kind,
                                    std::string task_name,
                                    std::string config_json)
     : registry_(registry),
-      rebuild_queue_(rebuild_queue),
       task_id_(std::move(task_id)),
       kind_(kind),
       task_name_(std::move(task_name)),
@@ -34,12 +32,23 @@ BaselineTaskBase::BaselineTaskBase(TaskRegistry* registry,
 const char* BaselineTaskBase::Id() const { return task_id_.c_str(); }
 const char* BaselineTaskBase::Name() const { return task_name_.c_str(); }
 BaselineTaskKind BaselineTaskBase::Kind() const { return kind_; }
-const char* BaselineTaskBase::ConfigJson() const { return config_json_.c_str(); }
 const std::string& BaselineTaskBase::TaskId() const { return task_id_; }
 
-int BaselineTaskBase::QueryTaskSnapshotJson(std::string* out_json) const {
-    if (!out_json) return error::BAD_REQUEST;
+BaselineSerializationResult BaselineTaskBase::ExportConfig(
+    BaselineSerializationFormat format) const {
+    if (format != BaselineSerializationFormat::kJson) {
+        return UnsupportedFormatResult(format);
+    }
 
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {BaselineStatus::kOk, config_json_};
+}
+
+BaselineSerializationResult BaselineTaskBase::QueryTaskSnapshot(
+    BaselineSerializationFormat format) const {
+    if (format != BaselineSerializationFormat::kJson) {
+        return UnsupportedFormatResult(format);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
@@ -53,14 +62,15 @@ int BaselineTaskBase::QueryTaskSnapshotJson(std::string* out_json) const {
     writer.Key("closed");
     writer.Bool(closed_);
     writer.EndObject();
-    *out_json = buf.GetString();
-    return error::OK;
+    return {BaselineStatus::kOk, buf.GetString()};
 }
 
-int BaselineTaskBase::QuerySeriesSnapshotJson(const BaselineStringRef& key,
-                                              std::string* out_json) const {
-    if (!out_json) return error::BAD_REQUEST;
-
+BaselineSerializationResult BaselineTaskBase::QuerySeriesSnapshot(
+    std::string_view series_key,
+    BaselineSerializationFormat format) const {
+    if (format != BaselineSerializationFormat::kJson) {
+        return UnsupportedFormatResult(format);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
@@ -68,41 +78,34 @@ int BaselineTaskBase::QuerySeriesSnapshotJson(const BaselineStringRef& key,
     writer.Key("task_id");
     writer.String(task_id_.c_str());
     writer.Key("key");
-    const std::string key_copy = CopyStringRef(key);
+    const std::string key_copy(series_key);
     writer.String(key_copy.c_str());
     writer.Key("status");
     writer.String("not_ready");
     writer.EndObject();
-    *out_json = buf.GetString();
-    return error::OK;
+    return {BaselineStatus::kOk, buf.GetString()};
 }
 
-int BaselineTaskBase::RequestRebuild(const BaselineStringRef&, BaselineRebuildReason) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (EnsureOpenLocked() != error::OK) return error::UNAVAILABLE;
-    return error::UNAVAILABLE;
-}
-
-int BaselineTaskBase::Close() {
+BaselineStatus BaselineTaskBase::Close() {
     std::shared_ptr<BaselineTaskBase> self = shared_from_this();
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (closed_) return error::OK;
+        if (closed_) return BaselineStatus::kOk;
         closed_ = true;
         OnClosingLocked();
     }
 
     if (registry_) registry_->Unregister(task_id_, this);
-    return error::OK;
+    return BaselineStatus::kOk;
 }
 
-int BaselineTaskBase::EnsureOpenLocked() const {
-    return closed_ ? error::UNAVAILABLE : error::OK;
+BaselineStatus BaselineTaskBase::EnsureOpenLocked() const {
+    return closed_ ? BaselineStatus::kInvalidArgument : BaselineStatus::kOk;
 }
 
-std::string BaselineTaskBase::CopyStringRef(const BaselineStringRef& ref) {
-    if (!ref.data || ref.size == 0) return "";
-    return std::string(ref.data, ref.size);
+BaselineSerializationResult BaselineTaskBase::UnsupportedFormatResult(
+    BaselineSerializationFormat) {
+    return {BaselineStatus::kUnsupportedFormat, ""};
 }
 
 void BaselineTaskBase::OnClosingLocked() {}

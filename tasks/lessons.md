@@ -220,6 +220,28 @@ NDEBUG 问题尤其严重：它破坏的不是单个测试用例，而是整个�
 
 ---
 
+## L58: 阶段内模块交接优先使用结构体，不用序列化绕路
+
+**来源**：Sprint 21 BaselineB — B1 `BootstrapSeed` 向 B2 `Online Rolling Core` 交接方式纠正
+
+**问题**：如果 B1 先把 `BootstrapSeed` 导出成 JSON，再让 B2 重新 parse / load，等于把进程内阶段交接退化成外部持久化协议。这样会引入不必要的解析成本、格式耦合和错误面，也容易让 B2 core 误依赖 JSON schema。
+
+**原则**：同一进程、同一任务内的阶段交接必须优先使用明确的内部 C++ 结构体。序列化只服务于持久化、审计、跨进程导入、调试和重启恢复，不作为热路径或主路径的模块边界。
+
+**修正**：`B1 -> B2` 的主路径使用 baseline task 内部持有的 `BootstrapSeed` 结构体；该结构体不进入 `framework/interfaces` 公共 ABI。如未来需要从已保存 seed 恢复，应在 baseline plugin 内部先反序列化为结构体，再进入 rolling 初始化流程。
+
+---
+
+## L16: 删除旧链路时必须保留仍有迁移价值的离线产物能力
+
+**来源**：Sprint 21 BaselineB B1 — Relation 旧在线路由删除后的能力缺口
+
+**问题**：将旧 baseline 的在线 relation route / shadow / candidate / rebuild 链路删除时，如果连“历史 relation 数据聚合成 routed value/ratio 摘要基线”的能力也一起丢弃，就会导致 Optional Bootstrap Engine 无法为后续 Online Rolling Core 提供 relation 摘要 seed。
+
+**原则**：清理旧在线链路时，要区分“旧热路径控制流”和“可迁移的离线产物能力”。前者应删除，后者应改造成 B1-only 离线 bootstrap 能力，并通过测试证明历史数据能产出可交给 rolling 阶段使用的 seed。
+
+---
+
 ## L16: 测试数据路径属于运行时输入，禁止写入 CMake
 
 **来源**：Baseline value replay 示例程序实现纠偏
@@ -855,3 +877,127 @@ pip3 install -e src/python/ --break-system-packages
 4. 若构建失败，先检查缓存、路径大小写和已有 `build/CMakeCache.txt`，不要先怀疑项目入口位置。
 5. `README.md` 已明确给出构建方法时，优先视为“执行未遵守”，而不是“文档缺失”。
 6. 不仅文档和回复中要写对，**所有工具调用的 `workdir`、绝对路径、构建命令也必须统一使用 `/mnt/d/working/flowSQL`**；即使小写路径在当前环境下会解析成功，也不能继续依赖这种“碰巧可用”的别名。
+
+---
+
+## L54: 大型历史设计文档只能定向参考，禁止全文灌入上下文
+
+**来源**：Sprint 21 BaselineB 文档定位讨论 — 用户提醒老基线算法方案来自 `tasks/sprints/sprint19-baseline/design.md`，后续可能需要参考，但该文档非常大，不应全文引用。
+
+**问题**：`sprint19-baseline/design.md` 是旧基线方案的重要来源，但它包含完整老方案上下文，体量大且包含 BaselineB 明确要下线的 `shadow/candidate/rebuild` 主路径。如果后续阶段设计或代码改造时全文读取 / 全文引用，很容易造成上下文污染，把旧方案的生命周期假设重新带入新设计。
+
+**原则（强制）**：
+1. 参考大型历史设计文档前，先明确当前问题：接口、算法、训练器、预测器、T3 basis，还是状态机迁移。
+2. 优先使用 `rg` 定位关键词，再只读取相关章节；禁止为了“了解背景”整篇引用或整篇复制。
+3. 阶段设计文档引用 `sprint19-baseline/design.md` 时，必须写清楚：
+   - 本次继承的能力；
+   - 本次删除或降级的旧语义；
+   - 旧方案内容是否进入当前阶段范围。
+4. 对 `shadow baseline`、`candidate model`、`baseline rebuild` 等旧生命周期内容，只能作为迁移对象或反例参考，不得未经重新设计直接带入 BaselineB 主路径。
+5. 如确需阅读较长上下文，先做小范围摘要，再把摘要用于当前阶段设计；不要把原文大段塞进后续工作上下文。
+
+---
+
+## L55: Baseline 特征类型不能把业务语义折叠进 profile
+
+**来源**：Sprint 21 BaselineB B1 实现反馈 — 用户指出把 `value_basic/value_sampled` 折叠为 `feature_type=value` + `profile` 是“走历史倒车”。
+
+**问题**：B1 实现把 `feature_type` 简化为 `value|ratio|relation`，再用 `profile != default` 隐式判断是否为 sampled value。这个设计把“观测语义类型”（basic 还是 sampled）和“参数配置档位”（profile）混在一起，导致接口不明确，也让后续新增非 sampled profile 或 sampled profile 变体时边界变脆。
+
+**原则（强制）**：
+1. `feature_type` 必须表达观测语义类型；`value_basic` 与 `value_sampled` 要显式区分。
+2. `profile` 只表达该类型下的参数档位，不能承担类型判定职责。
+3. 训练分支必须依据显式 `feature_type`，禁止用 `profile != default` 这种隐式规则判断 sampled。
+4. relation routed value 摘要如果没有样本数语义，应默认走 `value_basic`，不能被某个非 default profile 意外解释成 sampled。
+5. 配置、文档、测试必须同时覆盖 `value_basic`、`value_sampled` 的合法路径和互斥约束。
+
+---
+
+## L56: `BootstrapSeed` 只能表达 Online Rolling 可直接消费的初始化参数
+
+**来源**：Sprint 21 BaselineB B1 seed 导出反馈 — 用户指出当前 seed 像带 model 的 artifact hybrid，`B2` 不应从 `model.core_block` 中猜 rolling 初始化字段。
+
+**问题**：如果 `BootstrapSeed` 继续导出旧模型块，短期看复用方便，长期会把 B1 bootstrap 的内部模型结构泄漏给 B2 rolling core。B2 会被迫理解 `CoreBlock`、训练残差、ratio prior 等旧实现细节，导致后续在线滚动状态设计被旧离线模型绑定。
+
+**原则（强制）**：
+1. `BootstrapArtifact` 保存完整训练模型；`BootstrapSeed` 只保存交接给 Online Rolling 的初始化参数。
+2. seed 必须显式导出 `task_identity.feature_type`、`clock_spec`、`theta_init`、`sigma_init`、`uncertainty_init`、`maturity_init`、`seeded_components` 和 `enabled_components`。
+3. `theta_init` 中的 `level/trend/daily_harmonic/weekly_harmonic` 可以来自旧 `CoreBlock`，但对外命名必须使用 rolling 初始化语义。
+4. Ratio seed 如需使用 `m0/alpha0/beta0`，必须通过 `ratio_prior_init` 显式导出，不能让 B2 从旧 ratio model 中读取。
+5. `enabled_components` 禁止使用 `"core"` 这类打包名称；若参数已交接但不确定是否能直接启用，应放入 `seeded_components`，再由 `enabled_components` 表达保守启用结果。
+6. `uncertainty_init` 至少包含组件级不确定性提示，给 B2 初始 covariance 或等价不确定性构造提供依据。
+7. seed JSON 禁止导出旧 `model/core_block`；B2 不应依赖 B1 训练模型的内部结构。
+
+---
+
+## L57: Bootstrap 成熟度只能基于实际训练支撑，不能基于原始输入数量
+
+**来源**：Sprint 21 BaselineB B1 代码审查反馈 — `value_sampled` / `ratio` 在 trainer 内部过滤低支撑 bucket，但外层 coverage 和 seed maturity 仍按原始 replay 点数计算。
+
+**问题**：如果 `accepted_count`、`coverage_ratio`、`maturity_init` 基于“通过基础格式校验的原始输入点”，而不是“规范化后实际进入训练的 bucket”，`B2` 会把低支撑 seed 当成成熟 seed 使用。重复 bucket、sample_count 不足、denominator 不足都会被错误计入覆盖度，导致 band 和启用组件过于乐观。
+
+**原则（强制）**：
+1. Bootstrap 训练前必须先按 `bucket_id` 规范化：value 按样本数加权聚合，ratio 累加 numerator / denominator。
+2. `accepted_count` 表示实际进入模型训练的唯一 bucket 数；被 profile 阈值过滤的 bucket 计入 `rejected_count`。
+3. `coverage_ratio` 使用实际训练 bucket 在训练跨度中的覆盖比例，不能简单写成 `1.0`。
+4. `maturity_init` 和 `enabled_components` 必须从修正后的 coverage 派生，不能使用原始输入点数。
+5. `BootstrapArtifact` / `BootstrapSeed` 的 task identity、clock 和 calendar 必须完整导出并在 reload 时严格校验；不兼容 artifact 不能静默加载。
+6. Ratio seed 的 `theta_init` 与 `sigma_init` 必须处在同一模型空间；logit 模型的 rolling seed 不能混用 probability-space sigma。
+
+---
+
+## L59: `BootstrapSeed` 归属 task，但模型参数粒度必须是 series 级
+
+**来源**：Sprint 21 BaselineB B2 设计纠偏 — 用户指出不同 `series_key` 训练参数极可能不同，单一 task 级 seed 颗粒度过粗。
+
+**问题**：如果把 `BootstrapSeed` 理解为单一 task 级初始化模板，同一 task 下所有 `series_key` 都会共享一组 `theta/sigma/uncertainty/maturity`。这与实际建模单元 `Series = (series_key, feature)` 冲突：不同 key 的 level、trend、day/week 形状和不确定性可能完全不同。用单个 seed 覆盖多个 series 会削弱 bootstrap 的准确性，甚至误导 rolling 初始化。
+
+**原则（强制）**：
+1. `BootstrapSeed` 的生命周期归属于 `IBaselineTask`，不作为独立 public 实体暴露。
+2. `BootstrapSeed` 的模型参数粒度必须是 `series_key`；task 内部应按 `BootstrapSeed[series_key]` 或等价 store 管理。
+3. `InitRollingFromBootstrap(series_key, options)` 消费 task 内部对应 key 的 seed，不接收外部 seed 参数。
+4. `ExportBootstrapSeed(format)` 可以是 task 级全量序列化接口，但序列化文档必须包含每个 series 的 `series_identity.series_key`，不能把 task 级导出误解成 task 级模型参数。
+5. 新 `Series` 首次到达时，只能使用同 key 的 seed 初始化；没有同 key seed 时再按空启动处理。
+6. 在线 `RollingState[series_key]` 初始化后与 `BootstrapSeed[series_key]` 解耦，后续滚动更新不得反写 bootstrap seed。
+
+---
+
+## L60: 阶段设计的实现任务必须反链到算法章节
+
+**来源**：Sprint 21 BaselineB B2 设计文档纠偏 — 用户指出 `8.1 实现任务` 与前文算法设计章节缺少对应引用，后续编码容易跑偏。
+
+**问题**：阶段设计文档压缩后，如果实现任务表只列任务、文件和完成标志，却不指向前文的接口、配置、算法、启动语义和边界章节，编码时会把任务表当成唯一依据，导致实现顺序与设计约束脱节。尤其是算法型任务，缺少章节反链会让实现者遗漏 band、gate、scale、drift、seed 交接等关键细节。
+
+**原则（强制）**：
+1. 阶段设计文档的实现任务表必须包含“参考章节”列，明确每个任务以哪些设计章节为准。
+2. 任务表只描述实现顺序和完成标志，不重复大段算法细节。
+3. 压缩设计文档时不能删除实现所需的核心契约：目标 / 非目标、public ABI、输入语义、配置默认值、主算法流程、启动失败语义、状态边界和测试矩阵。
+4. 对外部算法来源只保留短说明和 reference 链接，避免把参考资料全文搬进阶段设计文档。
+
+---
+
+## L62: 阶段设计必须钉死重置语义、扩展字段边界和快照 schema
+
+**来源**：Sprint 21 BaselineB B2 设计审查反馈 — 用户指出 `force_reset_existing_state`、`BootstrapSeed` 扩展字段和 `QuerySeriesSnapshot` / `QueryTaskSnapshot` 的 JSON 契约还不够确定。
+
+**问题**：如果阶段设计只写“支持 reset”而不说明是原子重建还是先清后建，如果只写“可携带扩展字段”而不说明 B2 是忽略还是拒绝，如果只写“可输出快照”却不给最小 JSON schema，后续实现会在关键分支和输出格式上各自理解，导致接口和测试都不稳定。
+
+**原则（强制）**：
+1. 所有 destructive / replace 型接口必须写清失败时是否保留旧状态，以及成功时是否原子替换。
+2. 跨阶段交接的结构体必须明确核心字段和扩展字段的处理规则，核心初始化只依赖哪些字段要写清楚。
+3. `Query*Snapshot` 这类机器可读输出必须定义最小 schema，明确必填字段、可选字段和 document kind。
+4. 设计文档中的“可输出”“可保留”“可忽略”都不是可执行契约，必须落成具体字段和行为描述。
+
+---
+
+## L61: Calendar 必须保持静态事件表，任务只通过 `calendar_ref` 引用
+
+**来源**：Sprint 21 BaselineB B1 设计纠偏 — 用户指出 calendar 不应携带 task-scoped 语义。
+
+**问题**：如果 calendar entry 里混入 `feature`、`key`、`scope_type` 之类任务语义，calendar 就不再是静态配置，而变成“任务选择 + 事件定义”的混合体。这样会把日历复用、配置校验和事件启用责任搅在一起，导致 schema 边界不清、复用困难。
+
+**原则（强制）**：
+1. `calendar` 只描述静态事件本身，保留 `event_code`、`alignment_mode`、`start_ts`、`end_ts` 和可选 `tz`。
+2. 任务是否启用事件修正，由 task config / task options 决定，不写回 calendar schema。
+3. 任务只能通过 `calendar_ref = {calendar_id, calendar_version}` 引用全局 calendar registry。
+4. strict 配置校验必须拒绝 task-scoped 字段出现在 calendar entry 中。

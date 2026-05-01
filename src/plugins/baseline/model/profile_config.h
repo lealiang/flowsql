@@ -14,8 +14,6 @@
 #include <cstdint>
 #include <string>
 
-#include "plugins/baseline/model/drift_state.h"
-
 namespace flowsql {
 namespace baseline {
 
@@ -26,7 +24,7 @@ constexpr double kRatioVFloor = 0.25;
 // SharedProfileConfig 承载 design.md 第 12 章定义的数值/比例公共主参数。
 // detector / trainer 不应各自硬编码这些值，后续参数标定也应从这里收口。
 struct SharedProfileConfig {
-    int32_t k_day = 4;
+    int32_t k_day = 6;
     int32_t k_week = 3;
     int32_t dme_max = 7;
     uint32_t m_month_enable = 4;
@@ -36,12 +34,6 @@ struct SharedProfileConfig {
     double lambda_dme = 2.0;
     double lambda_lwd = 1.0;
     double lambda_event = 2.0;
-    uint32_t n_val_switch = 16;
-    double eps_switch = 0.05;
-    double z_warn = 3.0;
-    double z_crit = 5.0;
-    double w_shift = 0.8;
-    DriftConfig drift;
 };
 
 struct ValueSampledProfileConfig;
@@ -54,17 +46,6 @@ bool TryGetRatioGlobalNumericalOverride(double* eps_logit, double* m_floor, doub
 
 inline SharedProfileConfig DefaultSharedProfileConfig() {
     SharedProfileConfig config;
-    config.drift.alpha = 0.2;
-    config.drift.shift_clip = 6.0;
-    config.drift.lambda_mem = 0.9;
-    config.drift.kappa_shift = 0.25;
-    config.drift.u_min = 0.5;
-    config.drift.h_shift = 3.0;
-    config.drift.p_shift_low = 0.3;
-    config.drift.p_shift_high = 0.6;
-    config.drift.m_shift = 3;
-    config.drift.g_skip = 3;
-    config.drift.g_reset = 12;
     SharedProfileConfig override;
     if (TryGetSharedProfileConfigOverride(&override)) return override;
     return config;

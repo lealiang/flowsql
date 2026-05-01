@@ -6,19 +6,20 @@
  *
  */
 
-#ifndef _FLOWSQL_PLUGINS_BASELINE_REBUILD_FORMAL_MODEL_TRAINER_H_
-#define _FLOWSQL_PLUGINS_BASELINE_REBUILD_FORMAL_MODEL_TRAINER_H_
+#ifndef _FLOWSQL_PLUGINS_BASELINE_BOOTSTRAP_FORMAL_MODEL_TRAINER_H_
+#define _FLOWSQL_PLUGINS_BASELINE_BOOTSTRAP_FORMAL_MODEL_TRAINER_H_
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 
-#include "plugins/baseline/detector/ratio_detector_core.h"
-#include "plugins/baseline/detector/value_detector_core.h"
 #include "plugins/baseline/model/event_calendar_matcher.h"
+#include "plugins/baseline/model/formal_model.h"
 #include "plugins/baseline/model/task_spec.h"
-#include "plugins/baseline/rebuild/replay_runner.h"
+#include "plugins/baseline/bootstrap/replay_runner.h"
+
+#include <cmath>
 
 namespace flowsql {
 namespace baseline {
@@ -32,6 +33,30 @@ enum class FormalTrainFailureCode : int32_t {
 
 const char* FormalTrainFailureCodeName(FormalTrainFailureCode code);
 
+struct ValueFeatureProfile {
+    std::string profile;
+    std::string transform_name = "log1p";
+    bool is_sampled = false;
+    uint32_t n_train_min = 0;
+    double kappa_sample = 0.0;
+};
+
+inline double TransformValuePoint(const ValueFeatureProfile& profile,
+                                  double value) {
+    if (profile.transform_name == "identity") return value;
+    return std::log1p(value);
+}
+
+struct RatioFeatureProfile {
+    std::string profile;
+    uint32_t d_min_train = 0;
+    uint32_t d_score_min = 0;
+    uint32_t d_shift_min = 0;
+    double kappa_den = 0.0;
+    double s_prior = 0.0;
+    double phi_over = 1.0;
+};
+
 struct ValueFormalTrainInput {
     const ValueFeatureProfile* profile = nullptr;
     const ValueReplaySeries* replay = nullptr;
@@ -43,6 +68,8 @@ struct ValueFormalTrainInput {
     int64_t delta = 0;
     std::string tz;
     const CompiledEventCalendar* compiled_event_calendar = nullptr;
+    bool enable_monthpos = true;
+    bool enable_event = true;
 };
 
 struct ValueFormalTrainResult {
@@ -61,6 +88,8 @@ struct RatioFormalTrainInput {
     int64_t delta = 0;
     std::string tz;
     const CompiledEventCalendar* compiled_event_calendar = nullptr;
+    bool enable_monthpos = true;
+    bool enable_event = true;
 };
 
 struct RatioFormalTrainResult {
@@ -79,4 +108,4 @@ class FormalModelTrainer {
 }  // namespace baseline
 }  // namespace flowsql
 
-#endif  // _FLOWSQL_PLUGINS_BASELINE_REBUILD_FORMAL_MODEL_TRAINER_H_
+#endif  // _FLOWSQL_PLUGINS_BASELINE_BOOTSTRAP_FORMAL_MODEL_TRAINER_H_

@@ -18,14 +18,6 @@
 namespace flowsql {
 namespace baseline {
 
-enum class RelationLineageCompatibility : int32_t {
-    kIdentical = 0,
-    kCompatible = 1,
-    kNewLineage = 2,
-};
-
-const char* RelationLineageCompatibilityName(RelationLineageCompatibility value);
-
 struct RelationGroupHistoryStat {
     uint32_t group_idx = 0;
     double hist_mass = 0.0;
@@ -58,25 +50,10 @@ struct RelationServiceBasis {
     std::vector<double> head_proto_q;
 };
 
-struct RelationEvalBasis {
-    bool has_incumbent = false;
-    RelationLineageCompatibility compatibility =
-        RelationLineageCompatibility::kCompatible;
-    RelationServiceBasis basis;
-};
-
 class RelationBasisBuilder {
  public:
     static int BuildServiceBasis(const RelationBasisBuildInput& input,
                                  RelationServiceBasis* out_basis);
-
-    static RelationLineageCompatibility DetermineCompatibility(
-        const RelationServiceBasis* incumbent_basis,
-        const RelationTaskSpec& task_spec);
-
-    static int BuildEvalBasis(const RelationServiceBasis* incumbent_basis,
-                              const RelationTaskSpec& task_spec,
-                              RelationEvalBasis* out_eval_basis);
 };
 
 }  // namespace baseline

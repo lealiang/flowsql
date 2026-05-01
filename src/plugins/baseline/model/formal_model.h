@@ -90,7 +90,7 @@ struct ValueFormalModel {
     std::string fit_strategy = "stage_fit";
     int64_t delta = 0;
     std::string tz;
-    std::string feature_profile;
+    std::string profile;
     CoreBlock core_block;
     MonthPosBlock monthpos_block;
     EventBlock event_block;
@@ -112,11 +112,12 @@ struct RatioFormalModel {
     double beta0 = 0.0;
     int64_t delta = 0;
     std::string tz;
-    std::string feature_profile;
+    std::string profile;
     CoreBlock core_block;
     MonthPosBlock monthpos_block;
     EventBlock event_block;
     std::vector<FitBlockDigest> fit_summary;
+    double sigma_ref = 0.0;
     int64_t train_start = 0;
     int64_t train_end = 0;
     double confidence_base_at_train = 0.0;

@@ -15,17 +15,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <utility>
 
 #include "config/runtime_config.h"
 #include "config_parser.h"
-#include "fusion/key_risk_fusion.h"
-#include "model/event_calendar_matcher.h"
-#include "rebuild/rebuild_queue.h"
-#include "rebuild/rebuild_worker.h"
+#include "model/task_spec.h"
 #include "solver/solver_backend.h"
 #include "task/relation_task.h"
-#include "task/task_registry.h"
 #include "task/ratio_task.h"
+#include "task/task_registry.h"
 #include "task/value_task.h"
 
 namespace flowsql {
@@ -33,40 +31,24 @@ namespace baseline {
 
 namespace {
 
-int CompileStaticTaskCalendar(const BaselineTaskSpec& spec,
-                              std::shared_ptr<const CompiledEventCalendar>* out_calendar) {
-    if (!out_calendar) return error::BAD_REQUEST;
-    out_calendar->reset();
-    if (!spec.event_calendar_spec.has_value()) return error::OK;
-
-    CompiledEventCalendar compiled;
-    std::string err;
-    const int rc = CompileEventCalendar(*spec.event_calendar_spec, spec, &compiled, &err);
-    if (rc != error::OK) return rc;
-    *out_calendar = std::make_shared<CompiledEventCalendar>(std::move(compiled));
-    return error::OK;
+BaselineStatus ValidateCreateFormat(BaselineSerializationFormat format) {
+    return format == BaselineSerializationFormat::kJson
+               ? BaselineStatus::kOk
+               : BaselineStatus::kUnsupportedFormat;
 }
 
-int ValidateRelationTaskCalendar(const RelationTaskCreateSpec& create_spec) {
-    if (!create_spec.event_calendar_spec.has_value()) return error::OK;
+std::string MakeConfigCopy(std::string_view config_content) {
+    return std::string(config_content.data(), config_content.size());
+}
 
-    BaselineTaskSpec task_spec;
-    task_spec.feature = create_spec.task_spec.feature_base;
-    task_spec.delta = create_spec.clock_spec.delta;
-    task_spec.tz = create_spec.clock_spec.tz;
-
-    CompiledEventCalendar compiled;
-    std::string err;
-    return CompileEventCalendar(*create_spec.event_calendar_spec, task_spec, &compiled, &err);
+BaselineStatus ParseFailureStatus(int rc) {
+    return rc == error::OK ? BaselineStatus::kOk : BaselineStatus::kParseFailed;
 }
 
 }  // namespace
 
 BaselinePlugin::BaselinePlugin()
-    : task_registry_(std::make_unique<TaskRegistry>()),
-      rebuild_queue_(std::make_unique<RebuildQueue>()),
-      rebuild_worker_(std::make_unique<RebuildWorker>(rebuild_queue_.get())),
-      key_risk_fusion_(std::make_unique<KeyRiskFusion>()) {}
+    : task_registry_(std::make_unique<TaskRegistry>()) {}
 
 BaselinePlugin::~BaselinePlugin() = default;
 
@@ -125,159 +107,137 @@ int BaselinePlugin::Load(IQuerier* querier) {
 int BaselinePlugin::Unload() {
     Stop();
     task_registry_ = std::make_unique<TaskRegistry>();
-    rebuild_queue_ = std::make_unique<RebuildQueue>();
-    rebuild_worker_ = std::make_unique<RebuildWorker>(rebuild_queue_.get());
-    key_risk_fusion_ = std::make_unique<KeyRiskFusion>();
     querier_ = nullptr;
     ResetBaselineRuntimeConfig();
     return error::OK;
 }
 
-int BaselinePlugin::Start() {
-    if (!rebuild_worker_) {
-        rebuild_queue_ = std::make_unique<RebuildQueue>();
-        rebuild_worker_ = std::make_unique<RebuildWorker>(rebuild_queue_.get());
-    }
-    if (!key_risk_fusion_) key_risk_fusion_ = std::make_unique<KeyRiskFusion>();
-    return rebuild_worker_->Start();
-}
+int BaselinePlugin::Start() { return error::OK; }
 
 int BaselinePlugin::Stop() {
     if (task_registry_) {
         const auto tasks = task_registry_->Snapshot();
         for (const auto& task : tasks) {
-            if (task) task->Close();
+            if (task) (void)task->Close();
         }
     }
-    if (rebuild_worker_) rebuild_worker_->Stop();
-    rebuild_queue_ = std::make_unique<RebuildQueue>();
-    rebuild_worker_ = std::make_unique<RebuildWorker>(rebuild_queue_.get());
-    key_risk_fusion_ = std::make_unique<KeyRiskFusion>();
     return error::OK;
 }
 
-int BaselinePlugin::CreateValueTask(const char* config_json,
-                                    IBaselineValueTask** out) {
-    if (!out) return error::BAD_REQUEST;
-    *out = nullptr;
+std::pair<BaselineStatus, std::shared_ptr<IBaselineValueTask>>
+BaselinePlugin::CreateValueTask(std::string_view config_content,
+                                BaselineSerializationFormat format) {
+    const BaselineStatus format_status = ValidateCreateFormat(format);
+    if (format_status != BaselineStatus::kOk) return {format_status, nullptr};
+    if (!task_registry_) return {BaselineStatus::kInvalidArgument, nullptr};
 
+    const std::string config = MakeConfigCopy(config_content);
     BaselineTaskSpec spec;
     std::string err;
-    int rc = ConfigParser::ParseValueTask(config_json, &spec, &err);
-    if (rc != error::OK) return rc;
+    const BaselineStatus parse_status =
+        ParseFailureStatus(ConfigParser::ParseValueTask(config.c_str(), &spec, &err));
+    if (parse_status != BaselineStatus::kOk) return {parse_status, nullptr};
 
-    std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar;
-    rc = CompileStaticTaskCalendar(spec, &compiled_event_calendar);
-    if (rc != error::OK) return rc;
-
+    auto calendar = FindBaselineEventCalendar(spec.calendar_ref);
     auto task = std::make_shared<BaselineValueTask>(
-        task_registry_.get(),
-        rebuild_queue_.get(),
-        task_registry_->AllocateTaskId(BaselineTaskKind::kValue),
-        spec,
-        compiled_event_calendar,
-        key_risk_fusion_.get());
-    rc = task_registry_->Register(task);
-    if (rc != error::OK) return rc;
-
-    *out = task.get();
-    return error::OK;
+        task_registry_.get(), spec.task_id, spec.name, config, spec, std::move(calendar));
+    if (task_registry_->Register(task) != error::OK) {
+        return {BaselineStatus::kInvalidArgument, nullptr};
+    }
+    return {BaselineStatus::kOk, task};
 }
 
-int BaselinePlugin::CreateRatioTask(const char* config_json,
-                                    IBaselineRatioTask** out) {
-    if (!out) return error::BAD_REQUEST;
-    *out = nullptr;
+std::pair<BaselineStatus, std::shared_ptr<IBaselineRatioTask>>
+BaselinePlugin::CreateRatioTask(std::string_view config_content,
+                                BaselineSerializationFormat format) {
+    const BaselineStatus format_status = ValidateCreateFormat(format);
+    if (format_status != BaselineStatus::kOk) return {format_status, nullptr};
+    if (!task_registry_) return {BaselineStatus::kInvalidArgument, nullptr};
 
+    const std::string config = MakeConfigCopy(config_content);
     BaselineTaskSpec spec;
     std::string err;
-    int rc = ConfigParser::ParseRatioTask(config_json, &spec, &err);
-    if (rc != error::OK) return rc;
+    const BaselineStatus parse_status =
+        ParseFailureStatus(ConfigParser::ParseRatioTask(config.c_str(), &spec, &err));
+    if (parse_status != BaselineStatus::kOk) return {parse_status, nullptr};
 
-    std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar;
-    rc = CompileStaticTaskCalendar(spec, &compiled_event_calendar);
-    if (rc != error::OK) return rc;
-
+    auto calendar = FindBaselineEventCalendar(spec.calendar_ref);
     auto task = std::make_shared<BaselineRatioTask>(
-        task_registry_.get(),
-        rebuild_queue_.get(),
-        task_registry_->AllocateTaskId(BaselineTaskKind::kRatio),
-        spec,
-        compiled_event_calendar,
-        key_risk_fusion_.get());
-    rc = task_registry_->Register(task);
-    if (rc != error::OK) return rc;
-
-    *out = task.get();
-    return error::OK;
+        task_registry_.get(), spec.task_id, spec.name, config, spec, std::move(calendar));
+    if (task_registry_->Register(task) != error::OK) {
+        return {BaselineStatus::kInvalidArgument, nullptr};
+    }
+    return {BaselineStatus::kOk, task};
 }
 
-int BaselinePlugin::CreateRelationTask(const char* config_json,
-                                       IBaselineSourceResolver* resolver,
-                                       IBaselineRelationTask** out) {
-    if (!out) return error::BAD_REQUEST;
-    *out = nullptr;
+std::pair<BaselineStatus, std::shared_ptr<IBaselineRelationTask>>
+BaselinePlugin::CreateRelationTask(std::string_view config_content,
+                                   BaselineSerializationFormat format) {
+    const BaselineStatus format_status = ValidateCreateFormat(format);
+    if (format_status != BaselineStatus::kOk) return {format_status, nullptr};
+    if (!task_registry_) return {BaselineStatus::kInvalidArgument, nullptr};
 
+    const std::string config = MakeConfigCopy(config_content);
     RelationTaskCreateSpec create_spec;
     std::string err;
-    int rc = ConfigParser::ParseRelationTask(config_json, &create_spec, &err);
-    if (rc != error::OK) return rc;
-    rc = ValidateRelationTaskCalendar(create_spec);
-    if (rc != error::OK) return rc;
+    const BaselineStatus parse_status =
+        ParseFailureStatus(ConfigParser::ParseRelationTask(config.c_str(), &create_spec, &err));
+    if (parse_status != BaselineStatus::kOk) return {parse_status, nullptr};
 
-    const std::string task_id =
-        task_registry_->AllocateTaskId(BaselineTaskKind::kRelation);
-    create_spec.task_spec.task_id = task_id;
+    auto calendar = FindBaselineEventCalendar(create_spec.task_spec.calendar_ref);
     auto task = std::make_shared<BaselineRelationTask>(
         task_registry_.get(),
-        rebuild_queue_.get(),
-        task_id,
-        create_spec.task_spec,
-        create_spec.clock_spec,
-        create_spec.event_calendar_spec,
-        resolver,
-        key_risk_fusion_.get());
-    rc = task_registry_->Register(task);
-    if (rc != error::OK) return rc;
-
-    *out = task.get();
-    return error::OK;
+        create_spec.task_spec.task_id,
+        create_spec.task_spec.name,
+        config,
+        create_spec,
+        std::move(calendar));
+    if (task_registry_->Register(task) != error::OK) {
+        return {BaselineStatus::kInvalidArgument, nullptr};
+    }
+    return {BaselineStatus::kOk, task};
 }
 
-void BaselinePlugin::ListTasks(std::function<void(const char* task_id,
-                                                  const char* task_name,
-                                                  BaselineTaskKind kind)> cb) {
-    if (!task_registry_ || !cb) return;
-    task_registry_->List(std::move(cb));
-}
-
-int BaselinePlugin::QueryKeyFusionSnapshotJson(const BaselineStringRef& key,
-                                               std::string* out_json) const {
-    if (!key_risk_fusion_) return error::UNAVAILABLE;
-    return key_risk_fusion_->QueryKeyFusionSnapshotJson(key, out_json);
-}
-
-int BaselinePlugin::QueryServiceStatsJson(std::string* out_json) const {
-    if (!out_json) return error::BAD_REQUEST;
+BaselineSerializationResult BaselinePlugin::QueryServiceSnapshot(
+    BaselineSerializationFormat format) const {
+    if (format != BaselineSerializationFormat::kJson) {
+        return {BaselineStatus::kUnsupportedFormat, ""};
+    }
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
     writer.StartObject();
     writer.Key("task_count");
     writer.Uint64(task_registry_ ? task_registry_->Size() : 0);
-    writer.Key("rebuild_queue_depth");
-    writer.Uint64(rebuild_queue_ ? rebuild_queue_->Size() : 0);
-    writer.Key("rebuild_worker_running");
-    writer.Bool(rebuild_worker_ && rebuild_worker_->Running());
-    writer.Key("key_fusion_key_count");
-    writer.Uint64(key_risk_fusion_ ? key_risk_fusion_->KeyCount() : 0);
-    writer.Key("key_fusion_idle_prune_bucket_gap");
-    writer.Int64(key_risk_fusion_ ? key_risk_fusion_->IdlePruneBucketGap() : 0);
-    writer.Key("key_fusion_pruned_key_count_total");
-    writer.Uint64(key_risk_fusion_ ? key_risk_fusion_->PrunedKeyCount() : 0);
+    writer.Key("tasks");
+    writer.StartArray();
+    if (task_registry_) {
+        const auto tasks = task_registry_->Snapshot();
+        for (const auto& task : tasks) {
+            if (!task) continue;
+            writer.StartObject();
+            writer.Key("task_id");
+            writer.String(task->Id());
+            writer.Key("task_name");
+            writer.String(task->Name());
+            writer.Key("kind");
+            switch (task->Kind()) {
+                case BaselineTaskKind::kValue:
+                    writer.String("value");
+                    break;
+                case BaselineTaskKind::kRatio:
+                    writer.String("ratio");
+                    break;
+                case BaselineTaskKind::kRelation:
+                    writer.String("relation");
+                    break;
+            }
+            writer.EndObject();
+        }
+    }
+    writer.EndArray();
     writer.EndObject();
-    *out_json = buf.GetString();
-    return error::OK;
+    return {BaselineStatus::kOk, buf.GetString()};
 }
 
 }  // namespace baseline

@@ -14,17 +14,16 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 namespace flowsql {
 namespace baseline {
 
 class TaskRegistry;
-class RebuildQueue;
 
 class BaselineTaskBase : public std::enable_shared_from_this<BaselineTaskBase> {
  public:
     BaselineTaskBase(TaskRegistry* registry,
-                     RebuildQueue* rebuild_queue,
                      std::string task_id,
                      BaselineTaskKind kind,
                      std::string task_name,
@@ -34,21 +33,21 @@ class BaselineTaskBase : public std::enable_shared_from_this<BaselineTaskBase> {
     const char* Id() const;
     const char* Name() const;
     BaselineTaskKind Kind() const;
-    const char* ConfigJson() const;
     const std::string& TaskId() const;
 
-    int QueryTaskSnapshotJson(std::string* out_json) const;
-    int QuerySeriesSnapshotJson(const BaselineStringRef& key, std::string* out_json) const;
-    int RequestRebuild(const BaselineStringRef& key, BaselineRebuildReason reason);
-    int Close();
+    BaselineSerializationResult ExportConfig(BaselineSerializationFormat format) const;
+    BaselineSerializationResult QueryTaskSnapshot(BaselineSerializationFormat format) const;
+    BaselineSerializationResult QuerySeriesSnapshot(std::string_view series_key,
+                                                    BaselineSerializationFormat format) const;
+    BaselineStatus Close();
 
  protected:
-    int EnsureOpenLocked() const;
-    static std::string CopyStringRef(const BaselineStringRef& ref);
+    BaselineStatus EnsureOpenLocked() const;
+    static BaselineSerializationResult UnsupportedFormatResult(
+        BaselineSerializationFormat format);
     virtual void OnClosingLocked();
 
     mutable std::mutex mutex_;
-    RebuildQueue* rebuild_queue_ = nullptr;
 
  private:
     static const char* KindName(BaselineTaskKind kind);

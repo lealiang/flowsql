@@ -15,14 +15,12 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace flowsql {
 namespace baseline {
 
 class TaskRegistry;
-class RebuildQueue;
-class RebuildWorker;
-class KeyRiskFusion;
 
 class __attribute__((visibility("default"))) BaselinePlugin : public IPlugin, public IBaselineService {
  public:
@@ -35,19 +33,20 @@ class __attribute__((visibility("default"))) BaselinePlugin : public IPlugin, pu
     int Start() override;
     int Stop() override;
 
-    int CreateValueTask(const char* config_json,
-                        IBaselineValueTask** out) override;
-    int CreateRatioTask(const char* config_json,
-                        IBaselineRatioTask** out) override;
-    int CreateRelationTask(const char* config_json,
-                           IBaselineSourceResolver* resolver,
-                           IBaselineRelationTask** out) override;
-    void ListTasks(std::function<void(const char* task_id,
-                                      const char* task_name,
-                                      BaselineTaskKind kind)> cb) override;
-    int QueryKeyFusionSnapshotJson(const BaselineStringRef& key,
-                                   std::string* out_json) const override;
-    int QueryServiceStatsJson(std::string* out_json) const override;
+    std::pair<BaselineStatus, std::shared_ptr<IBaselineValueTask>>
+    CreateValueTask(std::string_view config_content,
+                    BaselineSerializationFormat format) override;
+
+    std::pair<BaselineStatus, std::shared_ptr<IBaselineRatioTask>>
+    CreateRatioTask(std::string_view config_content,
+                    BaselineSerializationFormat format) override;
+
+    std::pair<BaselineStatus, std::shared_ptr<IBaselineRelationTask>>
+    CreateRelationTask(std::string_view config_content,
+                       BaselineSerializationFormat format) override;
+
+    BaselineSerializationResult QueryServiceSnapshot(
+        BaselineSerializationFormat format) const override;
 
  private:
     IQuerier* querier_ = nullptr;
@@ -55,9 +54,6 @@ class __attribute__((visibility("default"))) BaselinePlugin : public IPlugin, pu
     std::string config_file_;
     bool config_strict_ = true;
     std::unique_ptr<TaskRegistry> task_registry_;
-    std::unique_ptr<RebuildQueue> rebuild_queue_;
-    std::unique_ptr<RebuildWorker> rebuild_worker_;
-    std::unique_ptr<KeyRiskFusion> key_risk_fusion_;
 };
 
 }  // namespace baseline

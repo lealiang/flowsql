@@ -11,6 +11,7 @@
 #include <common/error_code.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <set>
@@ -491,7 +492,7 @@ void CollectValueTrainRows(const ValueFormalTrainInput& input,
 
         ValueTrainRow row;
         row.bucket_id = point.bucket_id;
-        row.x = TransformValueObservation(*input.profile, point.value);
+        row.x = TransformValuePoint(*input.profile, point.value);
         if (input.profile->is_sampled) {
             const double rho = std::sqrt(
                 1.0 + input.profile->kappa_sample / static_cast<double>(point.sample_count));
@@ -770,7 +771,7 @@ FormalTrainFailureCode FormalModelTrainer::TrainValue(const ValueFormalTrainInpu
     model->fit_strategy = "stage_fit";
     model->delta = delta;
     model->tz = tz;
-    model->feature_profile = input.profile->feature_profile;
+    model->profile = input.profile->profile;
     model->train_start = rows.front().bucket_id;
     model->train_end = rows.back().bucket_id;
 
@@ -796,7 +797,7 @@ FormalTrainFailureCode FormalModelTrainer::TrainValue(const ValueFormalTrainInpu
         core_fit.condition_est));
 
     bool monthpos_applied = false;
-    if (train_readiness.monthpos_enabled) {
+    if (input.enable_monthpos && train_readiness.monthpos_enabled) {
         const MonthPosDesign month_design =
             BuildMonthPosDesign(rows,
                                 shared_config,
@@ -845,7 +846,8 @@ FormalTrainFailureCode FormalModelTrainer::TrainValue(const ValueFormalTrainInpu
 
     BlockFitSpec event_spec;
     std::vector<std::string> event_codes;
-    if (BuildEventFitSpec(input,
+    if (input.enable_event &&
+        BuildEventFitSpec(input,
                           rows,
                           model->core_block,
                           model->monthpos_block,
@@ -933,7 +935,7 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
         denominator_sum += point.denominator;
     }
     RatioProfileConfig profile_config;
-    if (!GetRatioProfileConfig(input.profile->feature_profile, &profile_config)) {
+    if (!GetRatioProfileConfig(input.profile->profile, &profile_config)) {
         return out->failure = FormalTrainFailureCode::kTrainFailed;
     }
     const RatioPriorConfig prior = ComputeRatioPrior(profile_config, numerator_sum, denominator_sum);
@@ -961,7 +963,7 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
     model->beta0 = prior.beta0;
     model->delta = delta;
     model->tz = tz;
-    model->feature_profile = input.profile->feature_profile;
+    model->profile = input.profile->profile;
     model->train_start = rows.front().bucket_id;
     model->train_end = rows.back().bucket_id;
 
@@ -987,7 +989,7 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
         core_fit.condition_est));
 
     bool monthpos_applied = false;
-    if (train_readiness.monthpos_enabled) {
+    if (input.enable_monthpos && train_readiness.monthpos_enabled) {
         const MonthPosDesign month_design =
             BuildMonthPosDesign(rows,
                                 shared_config,
@@ -1036,7 +1038,8 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
 
     BlockFitSpec event_spec;
     std::vector<std::string> event_codes;
-    if (BuildEventFitSpec(input,
+    if (input.enable_event &&
+        BuildEventFitSpec(input,
                           rows,
                           model->core_block,
                           model->monthpos_block,
@@ -1067,6 +1070,26 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
         model->fit_summary.push_back(BuildDigest("event", "skipped", 0, 0.0, 0.0));
     }
 
+    std::vector<double> residual;
+    residual.reserve(rows.size());
+    for (const auto& row : rows) {
+        double eta = EvaluateCore(model->core_block, row.bucket_id, model->train_start, delta, tz);
+        eta += EvaluateMonthPos(model->monthpos_block, row.bucket_id, delta, tz);
+        if (model->event_block.enabled && input.task_spec && input.compiled_event_calendar) {
+            std::vector<double> indicator(model->event_block.coeff.size(), 0.0);
+            if (BuildEventIndicatorRow(*input.compiled_event_calendar,
+                                       *input.task_spec,
+                                       row.bucket_id,
+                                       indicator.data(),
+                                       indicator.size()) == error::OK) {
+                for (std::size_t i = 0; i < indicator.size(); ++i) {
+                    eta += indicator[i] * model->event_block.coeff[i];
+                }
+            }
+        }
+        residual.push_back(row.eta - eta);
+    }
+    model->sigma_ref = EstimateSigmaMAD(residual);
     model->readiness = monthpos_applied ? ModelReadiness::kMonthposReady
                                         : ModelReadiness::kCoreNoMonthReady;
     model->confidence_base_at_train = train_readiness.confidence_base;

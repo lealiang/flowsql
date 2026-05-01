@@ -14,22 +14,33 @@
 #include <string>
 #include <vector>
 
-#include "event_calendar_spec.h"
-#include "series_override.h"
-
 namespace flowsql {
 namespace baseline {
 
+struct BaselineClockSpec {
+    int64_t bucket_seconds = 0;
+    std::string timezone;
+};
+
+struct BaselineCalendarRef {
+    std::string calendar_id;
+    std::string calendar_version;
+};
+
 struct BaselineTaskSpec {
+    std::string task_id;
     std::string name;
+    std::string task_kind;
+    std::string feature_id;
+    std::string profile;
+    BaselineClockSpec clock_spec;
+    BaselineCalendarRef calendar_ref;
+
     std::string key;
     std::string feature;
     std::string feature_type;
-    std::string feature_profile;
     int64_t delta = 0;
     std::string tz;
-    std::vector<SeriesBaselineSourceConfig> baseline_source_configs;
-    std::optional<EventCalendarSpec> event_calendar_spec;
     std::string config_json;
 };
 
@@ -47,6 +58,10 @@ struct RelationSummaryPolicySpec {
 struct RelationTaskSpec {
     std::string task_id;
     std::string name;
+    std::string task_kind;
+    std::string feature_id;
+    std::string profile;
+    BaselineCalendarRef calendar_ref;
     std::string feature_base;
     std::string group_space_id;
     std::optional<std::string> group_space_version;
@@ -67,7 +82,6 @@ struct RelationTaskClockSpec {
 struct RelationTaskCreateSpec {
     RelationTaskSpec task_spec;
     RelationTaskClockSpec clock_spec;
-    std::optional<EventCalendarSpec> event_calendar_spec;
 };
 
 }  // namespace baseline
