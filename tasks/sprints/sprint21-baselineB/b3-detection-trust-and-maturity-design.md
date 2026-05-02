@@ -30,11 +30,12 @@ stream observation
 - 实现完整 maturity 状态和组件解锁。
 - 实现月位置（`monthpos`）的 stream-only 慢成熟。
 - 完整 bootstrap seed 可提高初始 maturity 和初始 band 质量，但不能绕过 score trust / coverage 校准直接进入高置信异常判定。
+- 明确 `PredictRolling(series_key, bucket_id)` 的基础 Rolling/Bootstrap 融合 forecast view：冻结当前 rolling state 预测未来点，不更新状态，也不输出异常判定。
 
 本阶段不做：
 
-- `T3` stream-only basis 刷新，这归 `B4`。
-- 长周期自适应预测视图或正式 forecast 产品接口。
+- `T3` routed rolling 接入和 stream-only basis 刷新，这归 `B4`。
+- 长周期自适应 forecast 产品接口、批量 forecast API 或 Rolling 反向改写 bootstrap artifact。
 - Rolling 反向改写 `BootstrapSeed` 或 bootstrap artifact。
 - 新的 batch 重建链路。
 - 任何旧 `shadow/candidate/rebuild` 逻辑。
@@ -136,7 +137,7 @@ snapshot 可将这些字符串展开成 JSON object。
 
 - `RollingBaselineResult.z_score` 表示 calibrated detection band 上的检测 `Z-score`。
 - rolling 内部更新门控继续使用 update gate 的内部 `update_z`，即 `B2` estimator band 上的 `z_score`。
-- drift evidence 默认也继续使用 `update_z` / `B2` estimator band，避免 calibrated detection band 在重校准阶段过宽而掩盖真实 level shift。
+- drift evidence 使用 calibrated detection band 的标准差来标准化残差；这样累计水平偏移证据和实际检测条带使用同一尺度，避免正常日内形状误差被较窄的 estimator band 放大成 level shift。`ComputeUpdateGate()` 仍使用内部 `update_z`，保持污染防护与检测可信度分离。
 - 若需要调试内部更新分数，放入 `diagnostics` 或 snapshot，不新增必须 public 字段。
 
 原因：
@@ -162,13 +163,31 @@ band_std
 - `baseline_lower / baseline_upper` 是异常判定和解释的主依据。
 - `baseline_mu` 只是中心线，不单独代表完整基线。
 - 检测评分 band 必须经过 maturity、score trust、校准、低支撑输入和 drift 状态共同约束。
-- B3 不提供独立 forecast 产品接口；预测展示 band 只允许作为 snapshot / diagnostics 的辅助信息。
+- B3 不提供复杂 forecast 产品接口，但 `PredictRolling(series_key, bucket_id)` 必须提供基础 Rolling/Bootstrap 融合 forecast view，用于测试、验收和短期未来走势展示。
 
 `PredictRolling(series_key, bucket_id)` 没有观测值，也没有 sampled value / ratio 的支撑信息，因此不能输出 `can_alert` 或检测结论。B3 对该接口的约束是：
 
 - 保持只读，不更新 calibration / maturity / score trust。
-- 可以返回当前状态下的 calibrated prediction band，但 `RollingPrediction` 不表达异常判定。
-- 如果后续需要暴露 forecast 产品能力，另行设计接口，不在 B3 中扩展。
+- 返回 forecast/display band，不复用 `SubmitObservation()` 的 detection band。
+- 若同一 `series_key` 有可用 `BootstrapSeed`，forecast center 使用 Bootstrap 的稳定天/周形状，并叠加 Rolling 当前水平修正：
+
+```text
+bootstrap_mu(t+h) =
+  bootstrap_level(t+h) + bootstrap_daily_shape(t+h) + bootstrap_weekly_shape(t+h)
+
+correction =
+  rolling_confidence *
+  ((rolling_level_t - bootstrap_level(t))
+   + (rolling_trend_t - bootstrap_trend) * min(h, forecast_trend_cap_buckets))
+
+forecast_mu(t+h) = bootstrap_mu(t+h) + correction
+```
+
+- `rolling_confidence` 使用当前 rolling state 的 `effective_confidence`；该值不可用时回退 `confidence`，并夹紧到 `[0, 1]`。这样 Bootstrap 是 forecast prior，Rolling 是在线 correction，不会把短期在线水平完整套到长期预测曲线上。
+- 无可用 `BootstrapSeed` 时，回退纯 Rolling forecast：当前 `level + daily + weekly + optional monthpos`，局部 `trend` 只在 `forecast_trend_cap_buckets` 内外推；默认 `0` 表示解析为 `day_buckets`。
+- forecast band 使用快照参数不确定性和 residual sigma，不使用 `detection_band_multiplier`、maturity uncertainty、missing component uncertainty，也不叠加未来 process noise。上下界使用独立的 `forecast_band_z`，默认 `3.0`，不改变在线检测 `band_z=1.96`。
+- `RollingPrediction` 不表达异常判定；评估程序可以基于实际值额外计算 directional z-score，但该 z-score 不是 `can_alert`。
+- 如果后续需要批量 forecast、置信分位、场景化 horizon 策略或 Rolling 反向改写 Bootstrap artifact，另行设计接口。
 
 ## 4. 内部状态模型
 
@@ -236,6 +255,7 @@ last_degradation_bucket
 ```text
 detection_band_multiplier
 calibrated_sigma
+residual_scale_ewma
 coverage_ewma
 tail3_ewma
 tail5_ewma
@@ -249,7 +269,8 @@ calibration_status
 - `coverage_ewma`：近期观测落在 detection band 内的比例估计。
 - `tail3_ewma`：近期 `|Z| > 3` 比例估计。
 - `tail5_ewma`：近期 `|Z| > 5` 比例估计。
-- `detection_band_multiplier`：检测 band 的保守放大系数。
+- `residual_scale_ewma`：基于未校准 residual 的平方 EWMA，用于估计 residual scale。
+- `detection_band_multiplier`：`sqrt(residual_scale_ewma)` 经上下限夹紧后的检测 band 放大系数。
 - `calibration_status`：`uncalibrated`、`warming`、`calibrated`、`expanding`、`recalibrating`。
 
 `tail3_ewma` 和 `tail5_ewma` 只用常数内存 EWMA，不维护滑窗数组。
@@ -269,16 +290,20 @@ monthpos coverage bins
 ```text
 daily_bin_count[daily_coverage_bins]
 weekly_bin_count[weekly_coverage_bins]
-monthpos_count[31]
+monthpos_count[31]          // DOM
+monthpos_dme_count[dme_max + 1]
+monthpos_lwd_count[7]
 monthpos_seen_month_mask / month_transition_count
+maturity_prior_update_count
 ```
 
 约束：
 
 - `daily_coverage_bins` 和 `weekly_coverage_bins` 必须有配置上限。
 - 默认按 24 小时 bin 和 7 * 24 周 bin 统计。
-- `monthpos` 固定 31 个 bin。
+- `monthpos` 至少统计 DOM 和 DME coverage；LWD 以 last-weekday 更新次数 / weekday 覆盖作为保守 readiness evidence。
 - coverage 只记录支撑成熟度，不参与 batch 历史重建。
+- `maturity_prior_update_count` 只保存 bootstrap 历史支撑量，用于 maturity 计算；`accepted_update_count` 继续服务在线状态和 ready hint，不得因为 ready hint 截断而降低完整 seed 的 maturity。
 
 ### 4.5 Monthpos 状态
 
@@ -289,6 +314,9 @@ monthpos_lwd_coeff[7]
 monthpos_dom_center[31]
 monthpos_dme_center[dme_max + 1]
 monthpos_lwd_center[7]
+monthpos_dme_count[dme_max + 1]
+monthpos_lwd_count[7]
+monthpos_lwd_update_count
 monthpos_update_count
 monthpos_ready_count
 month_transition_count
@@ -315,17 +343,19 @@ validate
   -> evaluate active monthpos effect
   -> build calibrated detection band
   -> compute detection z-score
-  -> update score trust and calibration evidence
+  -> update calibration / score trust evidence for current bucket
+  -> capture public result snapshot
   -> compute update gate with update_z
   -> update rolling state
   -> update maturity / coverage / monthpos
-  -> map result
+  -> map result from public result snapshot
 ```
 
 实现约束：
 
 - `PredictRollingState()` 产出的 prediction / residual 是 pre-update evidence。
 - `detection_z`、calibration evidence、score trust 和 public result 都必须使用同一 bucket 的 pre-update estimator。
+- `public result snapshot` 在 score trust 更新后、rolling state 学习前捕获；对外 `maturity_status / score_trust_status / can_alert / enabled_components` 不得混用学习后的 maturity。
 - `UpdateRollingStateWithObservation()` 当前内部会重新预测并推进状态；其 `update_result` 只允许用于更新 state 和 residual scale，不得覆盖 pre-update estimator，不得用于填充 `RollingBaselineResult`。
 - `UpdateRollingStateWithObservation()` 的输入可以是扣除 ready monthpos effect 后的 adjusted observation，但输出仍必须按 pre-update detection evidence 映射回原始观测空间。
 - `ResidualScale` 继续跟随 update gate 的 `base_update_weight`，不能被 `score_trust` 降级直接冻结；否则 level shift 后可能长期无法恢复尺度。
@@ -451,8 +481,6 @@ detection_var_t =
   pred_var_t
   + calibrated_sigma_t^2
   + extra_obs_noise_t
-  + maturity_uncertainty_t
-  + component_missing_uncertainty_t
 ```
 
 检测 band：
@@ -470,7 +498,7 @@ detection_z_t =
   abs((y_model_t - detection_mu_t) / detection_band_std_t)
 ```
 
-`maturity_uncertainty_t` 用于冷启动、warming、低 score trust 和低支撑输入时扩宽 band。MVP 可按离散状态给出保守倍率：
+`maturity_uncertainty_t` 不进入 `detection_var_t`，只作为诊断与 score trust evidence。它用于解释当前检测可信度，不能把 `baseline_upper` / `baseline_lower` 直接拉宽。MVP 可按离散状态给出诊断量：
 
 ```text
 cold_learning      -> maturity_uncertainty_cold_scale * sigma^2
@@ -480,14 +508,14 @@ recalibrating      -> maturity_uncertainty_recalibrating_scale * sigma^2
 score_ready        -> 0
 ```
 
-`component_missing_uncertainty_t` 用于组件缺失时的保守检测：
+`component_missing_uncertainty_t` 不进入 `detection_var_t`，只作为组件成熟度诊断：
 
 ```text
 daily_ready = false  -> missing_daily_uncertainty_scale * sigma^2
 weekly_ready = false -> missing_weekly_uncertainty_scale * sigma^2
 ```
 
-该项不表示模型已经学到对应周期，只表示「当前检测不应把未建模周期波动当作高置信异常」。
+该项不表示模型已经学到对应周期，只表示「当前检测不应把未建模周期波动当作高置信异常」。它应影响 `can_alert`、`score_trust_status`、`effective_confidence` 和 diagnostics，而不是直接扩宽 band。
 
 ## 6. Score Trust 规则
 
@@ -513,22 +541,24 @@ score_untrusted
 - `tail3_ewma` 和 `tail5_ewma` 未超出保守阈值。
 - 当前不处于 drift / recalibration。
 - 至少有一个 ready component。
-- 若 `daily_ready = false`，只能进入 `score_ready` 的 `level_only_extreme` 子语义：`can_alert` 仅允许对极端突刺成立，并且 detection band 必须加入 `component_missing_uncertainty`。
+- 若 `daily_ready = false`，只能进入 `score_ready` 的 `level_only_extreme` 子语义：`can_alert` 仅允许对极端突刺成立，并且 component missing 必须降低 score trust 或 confidence。
 
 `score_ready` 不等价于 `monthly_ready`。但 `level_ready` 也不等价于完整可信检测。对于有明显日周期或周周期的数据，在 `daily_ready` / `weekly_ready` 之前，正常周期波动可能穿出 level-only band，因此：
 
 - `level_only_extreme` 只允许识别远超当前 band 的突刺，默认阈值高于常规 `z_skip`。
 - `enabled_components` 必须明确只有 `level`。
 - `uncertainty_source` 必须包含 `missing_daily_component` 或 `missing_weekly_component`。
-- `component_missing_uncertainty_t` 必须显著扩宽 detection band；若配置关闭该扩宽，则 `can_alert` 必须保持 `false`，直到 `daily_ready`。
+- `component_missing_uncertainty_t` 只进入 diagnostics；在 daily/weekly 未 ready 时，`can_alert` 必须保持保守，直到组件成熟或达到 `level_only_extreme_z`。
 
 ### 6.2 降级状态
 
 进入 `drift_learning`：
 
 ```text
-abs(drift_evidence) >= score_drift_degrade_start
+max(abs(drift_evidence), abs(level_shift_evidence)) >= score_drift_degrade_start
 ```
+
+其中 `drift_evidence` 是短/长 EWMA 残差差值；`level_shift_evidence` 是带泄漏的 CUSUM 累计证据，只累计超过 `level_shift_reference_z` 的同向标准化残差，并用 `level_shift_cusum_decay` 遗忘旧证据。CUSUM 累计值除以 `level_shift_cusum_threshold` 后进入同一 evidence 尺度；默认阈值偏保守，目标是识别持续水平偏移，而不是短时间日内形状误差。
 
 行为：
 
@@ -548,7 +578,7 @@ drift_evidence 回落
 
 - 继续输出诊断 score。
 - `can_alert = false`，直到 coverage / tail 统计恢复。
-- band 可慢收缩，不可快收缩。
+- multiplier 继续由 residual scale 估计给出；不得使用粘滞的乘法扩张 / 慢收缩状态机。
 
 恢复规则：
 
@@ -565,7 +595,7 @@ drift_learning
 
 ### 7.1 EWMA evidence
 
-对 update-eligible 且 score 支撑足够的点更新。`calibration_update_count < calibration_warmup_min_updates` 时只积累 evidence，不触发快扩张 / 慢收缩。
+对 update-eligible 且 score 支撑足够的点更新。`calibration_update_count < calibration_warmup_min_updates` 时只积累 evidence，不调整 `detection_band_multiplier`。
 
 ```text
 inside_band_t = abs(detection_z_t) <= band_z
@@ -587,6 +617,18 @@ tail5_ewma =
 abs_z_ewma =
   (1 - alpha_calibration) * abs_z_ewma
   + alpha_calibration * min(abs(detection_z_t), z_cap)
+
+raw_calibration_var_t =
+  pred_var_t
+  + sigma_t^2
+  + extra_obs_noise_t
+
+raw_z_t =
+  abs((y_model_t - detection_mu_t) / sqrt(raw_calibration_var_t))
+
+residual_scale_ewma =
+  (1 - alpha_calibration) * residual_scale_ewma
+  + alpha_calibration * min(raw_z_t, z_cap)^2
 ```
 
 低样本数、低分母、`can_score = false` 的点不更新 calibration evidence。
@@ -599,48 +641,23 @@ tail3_ewma = 0.0
 tail5_ewma = 0.0
 abs_z_ewma = 0.0
 detection_band_multiplier = max(1.0, seed_band_z / config.band_z)
+residual_scale_ewma = detection_band_multiplier^2
 ```
 
 没有 seed 时，`seed_band_z = config.band_z`。这样可以避免冷启动前几个点因为 `coverage_ewma = 0` 而立即把 band 放大到上限。
 
-### 7.2 快扩张
+### 7.2 Residual Scale Multiplier
 
-触发条件：
-
-```text
-coverage_ewma < calibration_coverage_floor
-or tail3_ewma > calibration_tail3_limit
-or tail5_ewma > calibration_tail5_limit
-```
-
-更新：
+`detection_band_multiplier` 不使用“坏了乘以扩张率、好了乘以收缩率”的粘滞状态机。它由 residual scale 估计直接给出：
 
 ```text
 detection_band_multiplier =
-  min(calibration_multiplier_max,
-      detection_band_multiplier * (1 + calibration_expand_rate))
+  clamp(sqrt(residual_scale_ewma),
+        calibration_multiplier_min,
+        calibration_multiplier_max)
 ```
 
-快扩张用于降低误报，不表示数据异常一定消失。
-
-### 7.3 慢收缩
-
-触发条件：
-
-- 当前为 `score_warming` 或 `score_ready`。
-- 不处于 `drift_learning` / `recalibrating`。
-- coverage 和 tail evidence 连续满足目标。
-- 已达到 `calibration_shrink_min_updates`。
-
-更新：
-
-```text
-detection_band_multiplier =
-  max(calibration_multiplier_min,
-      detection_band_multiplier * (1 - calibration_shrink_rate))
-```
-
-慢收缩必须明显慢于快扩张。
+当新估计值高于上一时刻 multiplier 时，`calibration_status = expanding`；否则为 `calibrated`。`coverage_ewma`、`tail3_ewma`、`tail5_ewma` 仍用于 score trust 和 diagnostics，但不再直接触发乘法扩张 / 慢收缩。
 
 ## 8. Maturity 与 Component Readiness
 
@@ -725,7 +742,8 @@ cold_learning
 `monthly_ready` 条件：
 
 - `month_transition_count >= monthpos_min_month_transitions`。
-- `monthpos_coverage_ratio >= monthpos_ready_coverage_ratio`。
+- DOM 和 DME coverage 均达到 `monthpos_ready_coverage_ratio`。
+- LWD 至少有 `monthpos_min_month_transitions` 次有效更新；只有 DOM / DME 学到时不得进入完整 `monthly_ready`。
 - monthpos coeff 更新稳定。
 - 未在最近一段时间内处于 `drift_learning`。
 
@@ -771,6 +789,12 @@ for each active basis slot:
     + alpha_monthpos_eff * basis_value * delta
 ```
 
+`active basis slot` 必须覆盖：
+
+- DOM：每个有效 bucket 更新当前 day-of-month slot。
+- DME：每个有效 bucket 更新当前 days-to-month-end slot。
+- LWD：仅当 bucket 落在当月最后一个相同 weekday 窗口时，更新对应 weekday slot。
+
 其中：
 
 ```text
@@ -802,7 +826,7 @@ confidence
 state_status
 ```
 
-它没有把 seed 的 `enabled_components`、`coverage_report`、`monthpos_hint` 或 `uncertainty_init.band_z` 持久化到 `RollingState`。因此 B3 必须在以下入口补齐 seed 到 B3 状态的映射：
+它没有把 seed 的 `enabled_components`、`coverage_report`、`monthpos_hint` 或 `uncertainty_init.band_z` 持久化到 `RollingState`，也没有区分“用于在线 ready hint 的 accepted count”和“用于成熟度的历史支撑量”。因此 B3 必须在以下入口补齐 seed 到 B3 状态的映射：
 
 ```text
 InitializeRollingStateFromBootstrapSeed(...)
@@ -818,6 +842,7 @@ SubmitObservation() bootstrap lazy init
 maturity_status = StatusFromLegacyStateStatus(state_status)
 score_trust_status = score_untrusted
 detection_band_multiplier = 1.0
+residual_scale_ewma = 1.0
 monthpos_status = disabled
 ```
 
@@ -828,9 +853,11 @@ maturity_status
 learning_confidence
 enabled_components candidate
 coverage counters
+maturity prior support
 monthpos coeff / center
 monthpos coverage
 detection_band_multiplier initial hint
+residual_scale_ewma initial hint
 ```
 
 但必须遵守：
@@ -838,8 +865,10 @@ detection_band_multiplier initial hint
 - `score_trust_status` 最高只能初始化为 `score_warming`。
 - 进入 `score_ready` 必须依赖流式阶段的 calibration evidence。
 - seed 的 `confidence` 不能直接映射为 `can_alert = true`。
+- 完整 seed 的历史支撑量必须保留为 maturity prior support；在线 `accepted_update_count` 可为 ready hint 截断，但不得导致后续流式点把 `weekly_ready` 降级为 `weekly_warming`。
 - seed 中缺少 monthpos support 时，不允许直接进入 `monthly_ready`。
 - `detection_band_multiplier initial hint` 从 `seed.uncertainty_init.band_z / config.band_z` 派生，并按 `calibration_multiplier_min/max` 夹紧；seed 没有该字段时使用 `1.0`。
+- `residual_scale_ewma initial hint = detection_band_multiplier^2`。
 - `monthpos_hint` 初始化必须保留 centered basis 的 center 信息；只拷贝 coeff 会改变预测语义。
 
 弱 seed / partial seed：
@@ -856,6 +885,11 @@ detection_band_multiplier initial hint
 
 ```json
 {
+  "control": {
+    "drift_evidence": 0.2,
+    "level_shift_evidence": 0.4,
+    "combined_drift_evidence": 0.4
+  },
   "maturity": {
     "status": "daily_ready",
     "learning_confidence": 0.72,
@@ -946,11 +980,11 @@ detection_band_multiplier initial hint
 | `score_ready_min_updates` | `240` | 进入 `score_ready` 的最少 calibration 点数 |
 | `score_recovery_min_updates` | `120` | drift 后恢复 score trust 的最少点数 |
 | `score_drift_degrade_start` | `1.5` | 进入检测降级的 drift evidence 阈值 |
+| `level_shift_reference_z` | `0.5` | CUSUM 累计前扣除的正常残差容忍量 |
+| `level_shift_cusum_decay` | `0.98` | CUSUM 泄漏遗忘系数，必须小于 1，避免状态粘滞 |
+| `level_shift_cusum_threshold` | `16.0` | CUSUM 累计证据归一化阈值；约等价于需要 16 个超出参考残差的同向标准化残差进入 `drift_start` |
 | `calibration_alpha` | `0.02` | coverage / tail EWMA 系数 |
-| `calibration_warmup_min_updates` | `60` | 校准 evidence 暖机点数，暖机前不扩张 / 收缩 |
-| `calibration_shrink_min_updates` | `240` | 允许 band 慢收缩的最少 calibration 点数 |
-| `calibration_expand_rate` | `0.15` | band 快扩张比例 |
-| `calibration_shrink_rate` | `0.01` | band 慢收缩比例 |
+| `calibration_warmup_min_updates` | `60` | 校准 evidence 暖机点数，暖机前不调整 multiplier |
 | `calibration_coverage_floor` | `0.98` | coverage 下限 |
 | `calibration_tail3_limit` | `0.02` | `|Z| > 3` 比例上限 |
 | `calibration_tail5_limit` | `0.002` | `|Z| > 5` 比例上限 |
@@ -962,13 +996,15 @@ detection_band_multiplier initial hint
 | `daily_ready_coverage_ratio` | `0.75` | daily coverage ready 阈值 |
 | `weekly_ready_min_weeks` | `2` | weekly ready 最少自然周 |
 | `weekly_ready_coverage_ratio` | `0.70` | weekly coverage ready 阈值 |
-| `maturity_uncertainty_cold_scale` | `9.0` | cold 阶段检测方差附加项，单位为 `sigma^2` |
-| `maturity_uncertainty_warming_scale` | `4.0` | warming 阶段检测方差附加项，单位为 `sigma^2` |
-| `maturity_uncertainty_drift_scale` | `4.0` | drift 阶段检测方差附加项，单位为 `sigma^2` |
-| `maturity_uncertainty_recalibrating_scale` | `2.0` | recalibrating 阶段检测方差附加项，单位为 `sigma^2` |
-| `missing_daily_uncertainty_scale` | `9.0` | daily 未 ready 时的组件缺失检测方差附加项 |
-| `missing_weekly_uncertainty_scale` | `4.0` | weekly 未 ready 时的组件缺失检测方差附加项 |
+| `maturity_uncertainty_cold_scale` | `9.0` | cold 阶段诊断不确定性，单位为 `sigma^2`，不进入 band 方差 |
+| `maturity_uncertainty_warming_scale` | `4.0` | warming 阶段诊断不确定性，单位为 `sigma^2`，不进入 band 方差 |
+| `maturity_uncertainty_drift_scale` | `4.0` | drift 阶段诊断不确定性，单位为 `sigma^2`，不进入 band 方差 |
+| `maturity_uncertainty_recalibrating_scale` | `2.0` | recalibrating 阶段诊断不确定性，单位为 `sigma^2`，不进入 band 方差 |
+| `missing_daily_uncertainty_scale` | `9.0` | daily 未 ready 时的组件缺失诊断量 |
+| `missing_weekly_uncertainty_scale` | `4.0` | weekly 未 ready 时的组件缺失诊断量 |
 | `level_only_extreme_z` | `8.0` | 仅 level ready 时允许 `can_alert` 的极端突刺阈值 |
+| `forecast_band_z` | `3.0` | `PredictRolling()` forecast/display lower-upper 的 Z 倍数，不影响检测 band |
+| `forecast_trend_cap_buckets` | `0` | `PredictRolling()` forecast view 的局部 trend 最大外推 bucket 数；`0` 表示解析为 `day_buckets` |
 | `monthpos_alpha` | `0.005` | monthpos 慢更新系数 |
 | `monthpos_delta_max_scale` | `0.5` | monthpos 单次更新裁剪，单位为 `sigma` |
 | `monthpos_min_month_transitions` | `2` | monthly ready 最少跨月次数 |
@@ -984,8 +1020,8 @@ detection_band_multiplier initial hint
 |---|---|---|---|---|
 | `B3-T01` | 扩展 public result 字段与兼容映射 | 第 3 节 | `framework/interfaces/ibaseline_types.h`、`rolling_task_runner.*` | `RollingBaselineResult` 输出 maturity、score trust、confidence、`can_alert` 和 component evidence |
 | `B3-T02` | 新增 maturity / score trust / calibration 状态 | 第 4 节、第 10 节 | `rolling/rolling_state.*` | `RollingState` 持有有界 B3 状态；bootstrap 初始化可把 seed 映射到 B3 状态；旧 `state_status` 可由 maturity 兼容映射 |
-| `B3-T03` | 实现 detection band calibration | 第 5 节、第 7 节 | `rolling/detection_calibration.*`、`rolling/rolling_estimator.*` | 输出 calibrated detection band，支持快扩张、慢收缩和 tail evidence |
-| `B3-T04` | 实现 score trust 状态机 | 第 6 节 | `rolling/score_trust.*` | 支持 `score_untrusted/warming/ready` 和 `drift_learning/recalibrating` 降级恢复 |
+| `B3-T03` | 实现 detection band calibration | 第 5 节、第 7 节 | `rolling/detection_calibration.*`、`rolling/rolling_estimator.*` | 输出 calibrated detection band，支持 residual scale multiplier、coverage / tail evidence |
+| `B3-T04` | 实现 score trust 状态机 | 第 6 节 | `rolling/score_trust.*`、`rolling/drift_adapt.*` | 支持 `score_untrusted/warming/ready` 和 `drift_learning/recalibrating` 降级恢复；drift 降级同时接入短长 EWMA 与累计水平偏移证据 |
 | `B3-T05` | 实现 maturity 与 component readiness | 第 8 节 | `rolling/maturity_gate.*` | level/day/week/monthpos 按 coverage 和稳定性逐步 ready |
 | `B3-T06` | 实现 monthpos state 与慢更新 | 第 9 节 | `rolling/monthpos_state.*` | monthpos 可 stream-only warming/ready，未成熟前不参与高置信评分 |
 | `B3-T07` | 接入 Value / Ratio task 与 snapshot | 第 10 节、第 11 节 | `task/value_task.*`、`task/ratio_task.*`、`rolling_task_runner.*` | task 输出和 snapshot 包含 B3 evidence |
@@ -999,25 +1035,28 @@ detection_band_multiplier initial hint
 | score trust 正常推进 | `score_untrusted -> score_warming -> score_ready` 按配置阈值推进 |
 | warming 阶段 | 可输出诊断 `Z-score`，但 `can_alert = false` 或 confidence capped |
 | full bootstrap seed | 可提高 maturity 和初始 band 质量，但不能直接 `score_ready` 或 `can_alert = true` |
+| full bootstrap seed maturity 保持 | 完整 seed 初始化后，首个流式更新不得因 `accepted_update_count` 截断把 `weekly_ready` 降级 |
 | weak / partial seed | 只能初始化较低 maturity，score trust 不能跳过校准 |
 | 稳定窗口校准 | coverage、`|Z| > 3`、`|Z| > 5` 比例处于合理范围 |
 | 短期平稳窗口 | detection band 不会快速收窄到误报 |
-| 短期 tail 升高 | `detection_band_multiplier` 快速扩张 |
+| 短期 tail 升高 | `tail3/tail5` evidence 影响 score trust；`detection_band_multiplier` 仅随 residual scale 估计变化 |
 | 校准暖机 | `calibration_update_count` 未达阈值前只积累 evidence，不触发 band 扩张到上限 |
-| 长期稳定 | `detection_band_multiplier` 慢速收缩且不低于下限 |
+| 长期稳定 | `detection_band_multiplier` 随 `residual_scale_ewma` 收敛且不低于下限 |
 | update_z 与 detection_z 分离 | update gate 使用内部 `update_z`，输出 `z_score` 使用 calibrated detection band |
 | pre-update 输出语义 | public result、detection_z 和 calibration evidence 使用 pre-update estimator；update result 只更新 state |
-| level-only 检测 | daily 未 ready 前只能对 `level_only_extreme_z` 以上突刺 `can_alert`，或因组件缺失扩宽 band 后保持低置信 |
-| level shift | 进入 `drift_learning`，降低 score trust，允许 level 加速学习 |
+| level-only 检测 | daily 未 ready 前只能对 `level_only_extreme_z` 以上突刺 `can_alert`；组件缺失只影响 trust/confidence/diagnostics |
+| level shift | 进入 `drift_learning`，降低 score trust；`adapt_boost` 满格后强残差进入有界降权更新，允许 level 加速学习 |
 | drift 恢复 | 从 `drift_learning -> recalibrating -> score_warming/ready` 恢复，不直接跳回 ready |
 | sampled value 低样本 | 降低 score trust 或禁用 score，不更新 calibration evidence |
 | ratio 低分母 | 降低 score trust 或禁用 score，不更新 calibration evidence |
+| `can_score=false` | 必须输出 `score_untrusted` / `can_alert=false`，不能保留上一点 stale `score_ready` |
 | daily readiness | 覆盖足够 daily bins 后 `daily_ready`，`enabled_components` 包含 `daily` |
 | weekly readiness | 覆盖足够 weekly bins 后 `weekly_ready`，`enabled_components` 包含 `weekly` |
 | monthpos 未跨月 | 不进入 `monthly_ready`，不参与高置信评分 |
 | monthpos ready 更新 | prediction 使用 state + bucket；detection center 加 monthpos effect；B2 core update 使用 `y_model - active_monthpos` |
 | monthpos 单月异常 | 不快速污染 monthpos coeff，不使 monthpos ready |
-| monthpos 跨月成熟 | 满足跨月次数和 coverage 后进入 `monthly_ready` |
+| monthpos DME/LWD 学习 | 在线更新必须同时更新 DOM、DME 和 last-weekday 条件下的 LWD coeff |
+| monthpos 跨月成熟 | 满足跨月次数、DOM/DME coverage 和 LWD 更新支撑后进入 `monthly_ready` |
 | bootstrap monthpos hint | centered basis 的 coeff 和 center 均被映射；缺失 center 时不得声明完整 monthly ready |
 | snapshot schema | series / task snapshot 包含 maturity、score trust、calibration 和 monthpos 字段 |
 | public ABI 边界 | public header 不暴露 `BootstrapSeed` 或内部状态结构 |

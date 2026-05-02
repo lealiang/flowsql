@@ -89,6 +89,7 @@ src/plugins/baseline/bootstrap/
 | `B1-T09` | 接入 T3 初始 basis 与离线摘要 bootstrap | `relation/relation_basis.*`、`bootstrap_trainer.*`、`task/relation_task.*` | `4.5`、`6.3`、`7.2`、`7.7` | 历史 `RelationBootstrapBlock` 聚合为 `RelationGroupHistoryStat` 后调用 `BuildServiceBasis`，并在该 basis 上离线路由 relation 摘要，导出 routed value/ratio seed；不调用 `BuildEvalBasis`，不恢复旧在线 route |
 | `B1-T10` | 删除旧在线恢复链路 | `rebuild/*`、`model/shadow_state.h`、`model/formal_model_state.h`、`task/*` | `5`、`8.3`、`9.3`、`11.3` | 代码中移除 `RequestRebuild`、`SetHistoryReader`、`SubmitObservation`、`SubmitBlock`、shadow / candidate / rebuild 状态和配置 |
 | `B1-T11` | 补齐验证 | `tests` / baseline 相关测试 | `10` | 覆盖训练、预测、序列化重载、无旧状态触发、配置清理；编译或测试能证明旧在线恢复符号不再进入 B1 主路径 |
+| `B1-T12` | 补充 `BootstrapSeed` 质量自动评价 | `bootstrap_engine.*`、`bootstrap_types.*`、`config/runtime_config.*`、`tests` | `6.3`、`6.3.1`、`8.2`、`10` | `EvaluateBootstrapSeedStatus()` 基于 profile 目标、训练跨度、覆盖率、phase coverage、组件可用性和 `sigma_init` 自动输出 `full/partial/weak/none`；调用方不能直接写入成熟度标签；routed summary seed 使用同一评价规则并补充测试 |
 
 ### 3.2 Event 与 MonthPos 收口待办
 
@@ -528,6 +529,50 @@ struct BootstrapMaturityInit {
 - `B1` 必须保证 `seed_status`、`coverage_ratio`、`maturity_init.confidence` 与实际训练支撑一致，供 `B2` 映射初始 `P`、confidence 和 cold/warming 状态。
 - `theta_init.model_space`、`sigma_init.model_space` 和任务 transform 必须一致；不一致的 seed 对 `B2` 来说是不可兼容 seed，不能依赖 B2 静默降级。
 - `relation_routed_summary_seeds` 中的每个 routed value/ratio seed 也必须满足上述要求，否则 `T3 routed summary -> T1/T2 rolling` 无法获得可靠历史启动参数。
+
+#### 6.3.1 Seed 质量自动评价
+
+`seed_status` 由 `BootstrapEngine` 自动计算，调用方不能在 `Bootstrap` 输入里直接指定 `full/partial/weak`。调用方只声明训练目标和 profile，例如是否要求 day/week 周期、最低训练跨度、最低覆盖率和 harmonic 阶数；实际评价必须基于规范化后真正进入训练的 bucket。
+
+`full` 是相对 profile 的完整，不是全能力完整。若当前 profile 只要求 day/week，则不应因为缺少 month/event 能力而降级；若 profile 要求 weekly，则必须有足够 weekly 覆盖才能评为 `full`。
+
+建议内部函数：
+
+```cpp
+BootstrapSeedStatus EvaluateBootstrapSeedStatus(
+    const BootstrapArtifact& artifact,
+    const BootstrapSeedQualityConfig& config,
+    std::vector<std::string>* diagnostics);
+```
+
+评价输入：
+
+- `artifact.train_status`、`theta_init.available` 和 `sigma_init.available`。
+- `coverage_report.accepted_count`、`rejected_count`、`train_start_bucket`、`train_end_bucket`、`coverage_ratio`。
+- `seeded_components` 与 `enabled_components`，尤其是 `daily`、`weekly` 是否可用。
+- profile 要求的核心周期，例如 `level_only`、`day`、`day_week`。
+- 日相位 / 周相位覆盖率；首版可以按 fixed phase bins 统计，不保存原始历史窗口。
+
+默认判定规则：
+
+```text
+none:
+  训练失败，或缺少 theta_init / sigma_init。
+
+weak:
+  只有 level / sigma 基本可用；
+  数据不足一个主要周期，或 coverage_ratio 低于 partial 阈值。
+
+partial:
+  有可用 seed，但只满足部分 profile 目标。
+  例如 daily 可用但 weekly 覆盖不足，或训练跨度足够但 phase coverage 不足。
+
+full:
+  profile 要求的核心组件全部可用；
+  训练跨度、accepted_count、coverage_ratio、phase coverage 和 sigma_init 均达标。
+```
+
+`BootstrapSeed` 顶层和 relation routed summary seed 必须使用同一评价函数。`maturity_init.seed_status` 与顶层 `seed_status` 必须一致；若评价降级，`diagnostics` 必须说明原因，例如 `insufficient_weekly_span`、`low_coverage_ratio`、`missing_sigma_init`。
 
 原因：
 
@@ -1318,6 +1363,13 @@ calendars:
 
 bootstrap:
   min_train_points: 2
+  seed_quality:
+    full_min_coverage_ratio: 0.90
+    partial_min_coverage_ratio: 0.50
+    daily_min_span_days: 1
+    weekly_min_span_days: 14
+    daily_phase_coverage_ratio: 0.75
+    weekly_phase_coverage_ratio: 0.70
   prediction_band:
     z_value: 3.0
     sigma_floor: 1.0e-3
@@ -1336,6 +1388,7 @@ shared_profile_config:
 
 - `calendars` 是全局 calendar registry。
 - `min_train_points` 替代旧 `candidate_builder.min_train_point_count`。
+- `seed_quality` 控制 `BootstrapSeed.seed_status` 的自动评价阈值；调用方只声明 profile 目标，不能直接覆盖 `full/partial/weak` 标签。
 - `prediction_band` 控制 B1 预测条带，不复用 shadow 放宽系数。
 - `export_seed` 控制 seed 中哪些组件允许导出。
 - `daily_harmonic_order` 和 `weekly_harmonic_order` 控制日 / 周周期 harmonic 阶数；默认日周期 `6` 阶、周周期 `3` 阶。
@@ -1414,6 +1467,7 @@ task/* 中的 ExecuteRebuild / RequestRebuild / SetHistoryReader
 - [ ] 可从历史 `RelationBootstrapBlock` 导出 `T3` 初始 basis seed 和 routed value/ratio summary seed。
 - [ ] 统一任务可按 `series_key` 完成 `Bootstrap -> PredictBootstrap`，并通过 task 级全量 `ExportBootstrapArtifact -> ExportBootstrapSeed` 导出全部 series。
 - [ ] 同一 task 下两个不同 `series_key` 连续训练时，artifact / seed / prediction 互不覆盖，导出的 JSON 每个 series 条目均包含正确 `series_identity`。
+- [ ] `BootstrapSeed.seed_status` 由 `BootstrapEngine` 自动评价；覆盖 `full/partial/weak/none`、daily-only、day-week、低覆盖、缺 `sigma_init` 和 routed summary seed 场景，调用方不能直接覆盖成熟度标签。
 - [ ] `BootstrapArtifact` 序列化内容可重新加载，并保持预测结果一致。
 - [ ] artifact / seed 序列化内容包含最小 schema 字段，并通过 task 身份、series 身份、clock、calendar 和版本的严格兼容性校验。
 - [ ] 任务通过全局 `calendar_ref` 使用 calendar；预测接口不要求调用方每次传 calendar 上下文。

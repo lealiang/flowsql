@@ -22,6 +22,7 @@ struct ValueSampledProfileConfig;
 struct RatioProfileConfig;
 struct BlockSolverConfig;
 struct BaselineRollingConfig;
+struct BootstrapSeedQualityConfig;
 
 int __attribute__((visibility("default"))) LoadBaselineRuntimeConfigFromYaml(
     const std::string& file_path,
@@ -39,6 +40,8 @@ bool TryGetRatioGlobalNumericalOverride(double* eps_logit,
                                         double* v_floor);
 bool TryGetBlockSolverConfigOverride(BlockSolverConfig* out);
 bool TryGetBaselineRollingConfigOverride(BaselineRollingConfig* out);
+bool __attribute__((visibility("default"))) TryGetBootstrapSeedQualityConfigOverride(
+    BootstrapSeedQualityConfig* out);
 
 std::string BaselineDefaultTimezone();
 std::shared_ptr<const CompiledEventCalendar> FindBaselineEventCalendar(

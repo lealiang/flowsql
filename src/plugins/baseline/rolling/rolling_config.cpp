@@ -27,6 +27,7 @@ bool Positive(double value) { return value > 0.0; }
 bool NonNegative(double value) { return value >= 0.0; }
 bool UnitClosed(double value) { return value >= 0.0 && value <= 1.0; }
 bool UnitOpenClosed(double value) { return value > 0.0 && value <= 1.0; }
+bool UnitClosedOpen(double value) { return value >= 0.0 && value < 1.0; }
 
 BaselineStatus Invalid(std::string* err, const char* message) {
     if (err) *err = message ? message : "invalid rolling config";
@@ -70,7 +71,9 @@ BaselineStatus ValidateBaselineRollingConfig(const BaselineRollingConfig& config
         !NonNegative(config.week_learning_scale) ||
         !NonNegative(config.cold_day_learning_scale) ||
         !NonNegative(config.cold_week_learning_scale) ||
-        !UnitClosed(config.seasonal_drift_min_scale)) {
+        !UnitClosed(config.seasonal_drift_min_scale) ||
+        !UnitClosed(config.full_seed_seasonal_scale) ||
+        !UnitClosed(config.partial_seed_seasonal_scale)) {
         return Invalid(err, "rolling_config learning scales are invalid");
     }
     if (!Positive(config.day_delta_coeff_max_scale) ||
@@ -106,6 +109,9 @@ BaselineStatus ValidateBaselineRollingConfig(const BaselineRollingConfig& config
     if (!Positive(config.z_cap) ||
         !NonNegative(config.drift_start) ||
         config.drift_full <= config.drift_start ||
+        !NonNegative(config.level_shift_reference_z) ||
+        !UnitClosedOpen(config.level_shift_cusum_decay) ||
+        !Positive(config.level_shift_cusum_threshold) ||
         !NonNegative(config.max_level_boost) ||
         !NonNegative(config.max_q_boost) ||
         !NonNegative(config.skip_relax)) {
@@ -115,7 +121,8 @@ BaselineStatus ValidateBaselineRollingConfig(const BaselineRollingConfig& config
         !Positive(config.c_sigma) ||
         !Positive(config.sigma_floor) ||
         !Positive(config.cold_start_band_scale) ||
-        !Positive(config.band_z)) {
+        !Positive(config.band_z) ||
+        !Positive(config.forecast_band_z)) {
         return Invalid(err, "rolling_config residual scale or band fields are invalid");
     }
     if (!UnitClosed(config.confidence_cold) ||
@@ -127,6 +134,46 @@ BaselineStatus ValidateBaselineRollingConfig(const BaselineRollingConfig& config
     }
     if (config.min_warming_updates == 0) {
         return Invalid(err, "rolling_config.min_warming_updates must be > 0");
+    }
+    if (config.level_ready_min_updates == 0 ||
+        config.score_warming_min_updates == 0 ||
+        config.score_ready_min_updates < config.score_warming_min_updates ||
+        config.score_recovery_min_updates == 0 ||
+        !NonNegative(config.score_drift_degrade_start)) {
+        return Invalid(err, "rolling_config score trust thresholds are invalid");
+    }
+    if (!UnitOpenClosed(config.calibration_alpha) ||
+        config.calibration_warmup_min_updates == 0 ||
+        !UnitOpenClosed(config.calibration_coverage_floor) ||
+        !NonNegative(config.calibration_tail3_limit) ||
+        !NonNegative(config.calibration_tail5_limit) ||
+        config.calibration_multiplier_min <= 0.0 ||
+        config.calibration_multiplier_max < config.calibration_multiplier_min) {
+        return Invalid(err, "rolling_config calibration fields are invalid");
+    }
+    if (config.daily_coverage_bins == 0 ||
+        config.weekly_coverage_bins == 0 ||
+        config.daily_ready_min_days == 0 ||
+        config.weekly_ready_min_weeks == 0 ||
+        !UnitOpenClosed(config.daily_ready_coverage_ratio) ||
+        !UnitOpenClosed(config.weekly_ready_coverage_ratio)) {
+        return Invalid(err, "rolling_config component readiness fields are invalid");
+    }
+    if (!NonNegative(config.maturity_uncertainty_cold_scale) ||
+        !NonNegative(config.maturity_uncertainty_warming_scale) ||
+        !NonNegative(config.maturity_uncertainty_drift_scale) ||
+        !NonNegative(config.maturity_uncertainty_recalibrating_scale) ||
+        !NonNegative(config.missing_daily_uncertainty_scale) ||
+        !NonNegative(config.missing_weekly_uncertainty_scale) ||
+        !Positive(config.level_only_extreme_z) ||
+        !Positive(config.detection_band_std_cap)) {
+        return Invalid(err, "rolling_config uncertainty scale fields are invalid");
+    }
+    if (!UnitOpenClosed(config.monthpos_alpha) ||
+        !Positive(config.monthpos_delta_max_scale) ||
+        config.monthpos_min_month_transitions == 0 ||
+        !UnitOpenClosed(config.monthpos_ready_coverage_ratio)) {
+        return Invalid(err, "rolling_config monthpos fields are invalid");
     }
     if (config.bucket_seconds <= 0 ||
         config.timezone.empty() ||
@@ -162,6 +209,9 @@ BaselineStatus ResolveBaselineRollingConfig(const BaselineTaskSpec& spec,
     }
     if (config.min_ready_hint_updates == 0) {
         config.min_ready_hint_updates = config.day_buckets;
+    }
+    if (config.forecast_trend_cap_buckets == 0) {
+        config.forecast_trend_cap_buckets = config.day_buckets;
     }
 
     const BaselineStatus validation = ValidateBaselineRollingConfig(config, err);

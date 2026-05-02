@@ -188,6 +188,15 @@ void TestTaskHeaderContracts() {
     assert(value_obs.sample_count == 0);
     assert(ratio_obs.denominator == 0.0);
     assert(rolling_result.status == BaselineStatus::kOk);
+    assert(rolling_result.maturity_status.empty());
+    assert(rolling_result.score_trust_status.empty());
+    assert(rolling_result.calibration_status.empty());
+    AssertNear(rolling_result.learning_confidence, 0.0);
+    AssertNear(rolling_result.score_confidence, 0.0);
+    AssertNear(rolling_result.effective_confidence, 0.0);
+    assert(!rolling_result.can_alert);
+    assert(rolling_result.enabled_components.empty());
+    assert(rolling_result.component_readiness.empty());
     assert(rolling_prediction.status == BaselineStatus::kOk);
     AssertNear(rolling_prediction.baseline_mu, 0.0);
     AssertNear(rolling_prediction.baseline_lower, 0.0);
@@ -517,6 +526,81 @@ void TestBootstrapEngineNormalizesHistoryBeforeTraining() {
     std::printf("[PASS] Bootstrap engine normalizes duplicate buckets before training\n");
 }
 
+void TestBootstrapSeedQualityStatusIsEvaluatedFromCoverage() {
+    std::printf("[TEST] Bootstrap seed quality status is evaluated from coverage...\n");
+
+    auto build_spec = [](const char* task_id) {
+        BaselineTaskSpec spec;
+        spec.task_id = task_id;
+        spec.feature_id = "bps";
+        spec.task_kind = "value";
+        spec.feature_type = "value_basic";
+        spec.profile = "default";
+        spec.clock_spec.bucket_seconds = 3600;
+        spec.clock_spec.timezone = "UTC";
+        spec.calendar_ref.calendar_id = "test-calendar";
+        spec.calendar_ref.calendar_version = "v1";
+        return spec;
+    };
+
+    auto build_input = [](const char* series_key,
+                          int64_t count,
+                          int64_t bucket_step) {
+        ValueBootstrapInput input;
+        input.series_key = series_key;
+        for (int64_t i = 0; i < count; ++i) {
+            const double daily_wave = static_cast<double>(i % 24);
+            input.observations.push_back(
+                ValueBootstrapPoint{i * bucket_step, 100.0 + daily_wave, 1});
+        }
+        return input;
+    };
+
+    BootstrapEngine engine;
+
+    BootstrapArtifact full_artifact;
+    const BootstrapTrainResult full_result =
+        engine.TrainValue(build_spec("bootstrap-quality-full"),
+                          build_input("svc-full", 14 * 24, 1),
+                          &full_artifact);
+    assert(full_result.status == BaselineStatus::kOk);
+    assert(full_result.seed_status == BootstrapSeedStatus::kFull);
+    BootstrapSeed full_seed;
+    assert(engine.ExportSeed(full_artifact, &full_seed) == BaselineStatus::kOk);
+    assert(full_seed.seed_status == BootstrapSeedStatus::kFull);
+    assert(full_seed.maturity_init.seed_status == BootstrapSeedStatus::kFull);
+
+    BootstrapArtifact partial_artifact;
+    const BootstrapTrainResult partial_result =
+        engine.TrainValue(build_spec("bootstrap-quality-partial"),
+                          build_input("svc-partial", 2 * 24, 1),
+                          &partial_artifact);
+    assert(partial_result.status == BaselineStatus::kOk);
+    assert(partial_result.seed_status == BootstrapSeedStatus::kPartial);
+    BootstrapSeed partial_seed;
+    assert(engine.ExportSeed(partial_artifact, &partial_seed) == BaselineStatus::kOk);
+    assert(partial_seed.seed_status == BootstrapSeedStatus::kPartial);
+
+    BootstrapArtifact weak_artifact;
+    const BootstrapTrainResult weak_result =
+        engine.TrainValue(build_spec("bootstrap-quality-weak"),
+                          build_input("svc-weak", 100, 10),
+                          &weak_artifact);
+    assert(weak_result.status == BaselineStatus::kOk);
+    assert(weak_result.seed_status == BootstrapSeedStatus::kWeak);
+    BootstrapSeed weak_seed;
+    assert(engine.ExportSeed(weak_artifact, &weak_seed) == BaselineStatus::kOk);
+    assert(weak_seed.seed_status == BootstrapSeedStatus::kWeak);
+
+    BootstrapArtifact failed_artifact;
+    failed_artifact.train_status = BaselineStatus::kTrainFailed;
+    BootstrapSeed none_seed;
+    assert(engine.ExportSeed(failed_artifact, &none_seed) == BaselineStatus::kNotTrained);
+    assert(none_seed.seed_status == BootstrapSeedStatus::kNone);
+
+    std::printf("[PASS] Bootstrap seed quality status is evaluated from coverage\n");
+}
+
 void TestBootstrapEnginePreservesMonthposArtifactAndSeed() {
     std::printf("[TEST] Bootstrap engine preserves monthpos artifact and seed...\n");
 
@@ -690,6 +774,7 @@ int main() {
     TestTaskHeaderContracts();
     TestBootstrapEngineTrainsValueAndRatio();
     TestBootstrapEngineNormalizesHistoryBeforeTraining();
+    TestBootstrapSeedQualityStatusIsEvaluatedFromCoverage();
     TestBootstrapEnginePreservesMonthposArtifactAndSeed();
     TestBootstrapEngineTrainsRelationBasis();
     return 0;

@@ -48,6 +48,11 @@ void TestUpdateGateWeights() {
     assert(!relaxed.skip_update);
     assert(relaxed.downweight_update);
     AssertNear(relaxed.skip_threshold, 7.0);
+
+    UpdateGateResult drift_learning = ComputeUpdateGate(9.0, 1.0, config);
+    assert(!drift_learning.skip_update);
+    assert(drift_learning.downweight_update);
+    AssertNear(drift_learning.gate_update_weight, 0.2);
 }
 
 void TestDriftEvidenceUsesShortLongEwma() {
@@ -87,6 +92,35 @@ void TestDriftEvidenceCanBeDisabledWhenScoreUnavailable() {
     AssertNear(result.adapt_boost, 0.0);
 }
 
+void TestLevelShiftEvidenceAccumulatesSameSideResiduals() {
+    BaselineRollingConfig config;
+    config.alpha_short = 0.02;
+    config.alpha_long = 0.01;
+    config.z_cap = 5.0;
+    config.drift_start = 1.0;
+    config.drift_full = 2.0;
+    config.level_shift_reference_z = 0.5;
+    config.level_shift_cusum_decay = 0.98;
+    config.level_shift_cusum_threshold = 4.0;
+
+    RollingState state;
+    DriftAdaptResult result;
+    for (int i = 0; i < 8; ++i) {
+        assert(UpdateDriftEvidence(1.5, 1.0, true, config, &state, &result) ==
+               BaselineStatus::kOk);
+    }
+
+    assert(std::fabs(state.drift_evidence) < config.drift_start);
+    assert(state.level_shift_evidence >= config.drift_start);
+    assert(result.level_shift_evidence >= config.drift_start);
+    assert(result.combined_drift_evidence == result.level_shift_evidence);
+    assert(result.adapt_boost > 0.0);
+
+    assert(UpdateDriftEvidence(-2.0, 1.0, true, config, &state, &result) ==
+           BaselineStatus::kOk);
+    assert(std::isfinite(result.level_shift_evidence));
+}
+
 void TestResidualScaleUpdate() {
     BaselineRollingConfig config;
     config.alpha_sigma = 0.5;
@@ -115,6 +149,7 @@ int main() {
     TestUpdateGateWeights();
     TestDriftEvidenceUsesShortLongEwma();
     TestDriftEvidenceCanBeDisabledWhenScoreUnavailable();
+    TestLevelShiftEvidenceAccumulatesSameSideResiduals();
     TestResidualScaleUpdate();
     return 0;
 }

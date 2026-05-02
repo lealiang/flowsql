@@ -93,6 +93,24 @@ baseline:
     lambda_lwd: 1.0
     lambda_event: 2.0
 
+  bootstrap:
+    min_train_points: 2
+    seed_quality:
+      full_min_coverage_ratio: 0.90
+      partial_min_coverage_ratio: 0.50
+      daily_min_span_days: 1
+      weekly_min_span_days: 14
+      daily_phase_coverage_ratio: 0.75
+      weekly_phase_coverage_ratio: 0.70
+    prediction_band:
+      z_value: 3.0
+      sigma_floor: 1.0e-3
+      low_maturity_band_scale: 1.5
+    export_seed:
+      include_monthpos_when_ready: true
+      include_event_when_ready: true
+      include_t3_basis_when_ready: true
+
   rolling_config:
     # value_sampled observation reliability
     n_min_score: 3
@@ -122,6 +140,9 @@ baseline:
     cold_day_learning_scale: 0.05
     cold_week_learning_scale: 0.01
     seasonal_drift_min_scale: 0.1
+    full_seed_seasonal_scale: 0.1
+    partial_seed_seasonal_scale: 0.5
+    freeze_seeded_seasonal_on_drift: true
     day_delta_coeff_max: 0.05
     week_delta_coeff_max: 0.02
 
@@ -154,6 +175,10 @@ baseline:
     z_cap: 5.0
     drift_start: 1.0
     drift_full: 2.0
+    # CUSUM-style level-shift evidence accumulates same-direction residuals over time.
+    level_shift_reference_z: 0.5
+    level_shift_cusum_decay: 0.98
+    level_shift_cusum_threshold: 16.0
     max_level_boost: 4.0
     max_q_boost: 9.0
     skip_relax: 2.0
@@ -163,7 +188,8 @@ baseline:
     c_sigma: 3.0
     sigma_floor: 0.05
     cold_start_band_scale: 3.0
-    band_z: 3.0
+    band_z: 1.96
+    forecast_band_z: 3.0
 
     # state maturity
     confidence_cold: 0.2
@@ -171,6 +197,43 @@ baseline:
     confidence_ready_hint_cap: 0.8
     min_warming_updates: 3
     min_ready_hint_updates: 0
+    level_ready_min_updates: 30
+
+    # detection trust and calibration
+    score_warming_min_updates: 60
+    score_ready_min_updates: 240
+    score_recovery_min_updates: 120
+    score_drift_degrade_start: 1.5
+    calibration_alpha: 0.02
+    calibration_warmup_min_updates: 60
+    calibration_coverage_floor: 0.98
+    calibration_tail3_limit: 0.02
+    calibration_tail5_limit: 0.002
+    calibration_multiplier_min: 1.0
+    calibration_multiplier_max: 6.0
+
+    # component readiness and conservative detection band
+    daily_coverage_bins: 24
+    weekly_coverage_bins: 168
+    daily_ready_min_days: 2
+    daily_ready_coverage_ratio: 0.75
+    weekly_ready_min_weeks: 2
+    weekly_ready_coverage_ratio: 0.70
+    maturity_uncertainty_cold_scale: 9.0
+    maturity_uncertainty_warming_scale: 4.0
+    maturity_uncertainty_drift_scale: 4.0
+    maturity_uncertainty_recalibrating_scale: 2.0
+    missing_daily_uncertainty_scale: 9.0
+    missing_weekly_uncertainty_scale: 4.0
+    level_only_extreme_z: 8.0
+    detection_band_std_cap: 0.5
+    forecast_trend_cap_buckets: 0
+
+    # month position slow learning
+    monthpos_alpha: 0.005
+    monthpos_delta_max_scale: 0.5
+    monthpos_min_month_transitions: 2
+    monthpos_ready_coverage_ratio: 0.60
 
   value_sampled_profiles:
     cont_core:

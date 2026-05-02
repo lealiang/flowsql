@@ -62,6 +62,8 @@ BootstrapSeed BuildValueSeed() {
     seed.coverage_report.train_start_bucket = 1;
     seed.coverage_report.train_end_bucket = 20;
     seed.coverage_report.coverage_ratio = 0.5;
+    seed.seeded_components = {"level", "trend", "daily", "weekly"};
+    seed.enabled_components = {"level", "trend", "daily", "weekly"};
     seed.theta_init.available = true;
     seed.theta_init.model_space = "log1p";
     seed.theta_init.reference_bucket_id = 10;
@@ -155,6 +157,9 @@ void TestBootstrapSeedInitialization() {
     AssertNear(state.theta.weekly.cos_coeff[0], 4.0);
     AssertNear(state.sigma_init, 0.2);
     AssertNear(state.sigma, 0.2);
+    assert(state.bootstrap_seed_status == BootstrapSeedStatus::kPartial);
+    assert(state.daily_prior_quality == RollingSeasonalPriorQuality::kPartial);
+    assert(state.weekly_prior_quality == RollingSeasonalPriorQuality::kPartial);
     AssertNear(state.confidence, 0.8);
     AssertNear(state.p_level, 0.72);
     AssertNear(state.p_trend, 1.92);

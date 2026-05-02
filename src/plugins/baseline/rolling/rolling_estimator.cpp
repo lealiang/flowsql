@@ -54,6 +54,21 @@ double SafeAdaptBoost(double adapt_boost) {
     return Clamp(adapt_boost, 0.0, 1.0);
 }
 
+double SeedSeasonalScale(RollingSeasonalPriorQuality quality,
+                         double adapt_boost,
+                         const BaselineRollingConfig& config) {
+    if (quality == RollingSeasonalPriorQuality::kFull) {
+        if (config.freeze_seeded_seasonal_on_drift && adapt_boost > 0.0) {
+            return 0.0;
+        }
+        return config.full_seed_seasonal_scale;
+    }
+    if (quality == RollingSeasonalPriorQuality::kPartial) {
+        return config.partial_seed_seasonal_scale;
+    }
+    return 1.0;
+}
+
 double EvaluateHarmonic(const RollingHarmonicState& harmonic,
                         const std::vector<double>& sin_feature,
                         const std::vector<double>& cos_feature) {
@@ -140,6 +155,15 @@ double ExtraObsVariance(const ObservedModelPoint& point,
 
 double ClipDelta(double value, double cap) {
     return Clamp(value, -cap, cap);
+}
+
+double ForecastTrendSteps(int64_t dt, const BaselineRollingConfig& config) {
+    const uint64_t cap =
+        config.forecast_trend_cap_buckets == 0
+            ? std::max<uint64_t>(1, config.day_buckets)
+            : config.forecast_trend_cap_buckets;
+    return static_cast<double>(
+        std::min<uint64_t>(cap, static_cast<uint64_t>(std::max<int64_t>(1, dt))));
 }
 
 void UpdateDiagonalHarmonic(const std::vector<double>& feature,
@@ -253,6 +277,58 @@ BaselineStatus PredictRollingState(const RollingState& state,
     return FillPrediction(advanced, point, config, feature, dt, out);
 }
 
+BaselineStatus PredictRollingForecastState(const RollingState& state,
+                                           int64_t bucket_id,
+                                           const BaselineRollingConfig& config,
+                                           RollingEstimatorResult* out) {
+    if (!out || !state.has_seen_observation) {
+        return BaselineStatus::kInvalidArgument;
+    }
+    const int64_t dt = bucket_id - state.last_seen_bucket;
+    if (dt <= 0) return BaselineStatus::kInvalidArgument;
+
+    RollingFeatureVector feature;
+    const BaselineStatus feature_status =
+        BuildRollingFeatureVector(bucket_id, config, &feature);
+    if (feature_status != BaselineStatus::kOk) return feature_status;
+
+    const double trend_steps = ForecastTrendSteps(dt, config);
+    const double seasonal_mu =
+        EvaluateHarmonic(state.theta.daily, feature.day_sin, feature.day_cos) +
+        EvaluateHarmonic(state.theta.weekly, feature.week_sin, feature.week_cos);
+    // Forecast view is a conditional baseline curve. The local trend may move
+    // the center line, but its covariance is not treated as long-horizon drift
+    // risk; drift risk is handled by online detection trust.
+    const double raw_pred_var =
+        state.p_level +
+        HarmonicVariance(state.theta.daily, feature.day_sin, feature.day_cos) +
+        HarmonicVariance(state.theta.weekly, feature.week_sin, feature.week_cos);
+    const double pred_var = std::max(0.0, raw_pred_var);
+    const double sigma =
+        std::max(config.sigma_floor,
+                 std::isfinite(state.sigma) ? state.sigma : config.sigma_floor);
+    const double obs_var = pred_var + sigma * sigma + config.sigma_floor * config.sigma_floor;
+    if (!std::isfinite(obs_var) || obs_var <= 0.0) {
+        return BaselineStatus::kInvalidArgument;
+    }
+
+    RollingEstimatorResult result;
+    result.status = BaselineStatus::kOk;
+    result.bucket_id = bucket_id;
+    result.dt = dt;
+    result.model_mu = state.theta.level + state.theta.trend * trend_steps + seasonal_mu;
+    result.pred_var = pred_var;
+    result.obs_var = obs_var;
+    result.band_std = std::sqrt(obs_var);
+    result.model_lower = result.model_mu - config.band_z * result.band_std;
+    result.model_upper = result.model_mu + config.band_z * result.band_std;
+    result.residual = 0.0;
+    result.z_score = 0.0;
+    result.pred_p_level = pred_var;
+    *out = result;
+    return BaselineStatus::kOk;
+}
+
 BaselineStatus UpdateRollingStateWithObservation(const ObservedModelPoint& point,
                                                  const BaselineRollingConfig& config,
                                                  RollingState* state,
@@ -290,6 +366,10 @@ BaselineStatus UpdateRollingStateWithObservation(const ObservedModelPoint& point
     const bool cold = advanced.state_status == RollingStateStatus::kColdLearning;
     const double seasonal_drift_scale =
         std::max(config.seasonal_drift_min_scale, 1.0 - safe_boost);
+    const double day_seed_scale =
+        SeedSeasonalScale(advanced.daily_prior_quality, safe_boost, config);
+    const double week_seed_scale =
+        SeedSeasonalScale(advanced.weekly_prior_quality, safe_boost, config);
     const double level_boost = 1.0 + safe_boost * config.max_level_boost;
     const double w_level =
         Clamp(base_update_weight * config.level_learning_scale * level_boost, 0.0, 1.0);
@@ -301,13 +381,13 @@ BaselineStatus UpdateRollingStateWithObservation(const ObservedModelPoint& point
     const double w_day =
         Clamp(base_update_weight *
                   (cold ? config.cold_day_learning_scale : config.day_learning_scale) *
-                  seasonal_drift_scale,
+                  seasonal_drift_scale * day_seed_scale,
               0.0,
               1.0);
     const double w_week =
         Clamp(base_update_weight *
                   (cold ? config.cold_week_learning_scale : config.week_learning_scale) *
-                  seasonal_drift_scale,
+                  seasonal_drift_scale * week_seed_scale,
               0.0,
               1.0);
 

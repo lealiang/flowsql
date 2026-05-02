@@ -34,7 +34,7 @@ constexpr int64_t kWeekMinutes = 7 * kDayMinutes;
 constexpr int64_t kShanghaiUtcOffsetSeconds = 8 * 60 * 60;
 constexpr double kConfidenceLevel = 0.95;
 constexpr double kBootstrapBandZ = 1.96;
-constexpr double kRollingBandZ = 3.0;
+constexpr double kRollingBandZ = 1.96;
 constexpr int32_t kDefaultDailyHarmonicOrder = 6;
 constexpr int32_t kDefaultWeeklyHarmonicOrder = 3;
 constexpr const char* kSeriesKey = "link-traffic-bps";
@@ -69,6 +69,13 @@ struct EvalSummary {
     double mean_band_width = 0.0;
 };
 
+struct SmoothnessSummary {
+    uint64_t adjacent_count = 0;
+    double mean_abs_delta_mu = 0.0;
+    double mean_abs_delta_upper = 0.0;
+    double mean_abs_delta_width = 0.0;
+};
+
 struct TransitionCheckpoint {
     int64_t minute_offset = 0;
     std::string timestamp;
@@ -78,12 +85,149 @@ struct TransitionCheckpoint {
     double drift_evidence = 0.0;
     double adapt_boost = 0.0;
     double update_weight = 0.0;
+    std::string maturity_status;
+    std::string score_trust_status;
+    std::string calibration_status;
+    bool can_alert = false;
 };
 
-struct BandCalibration {
+struct B3StatusSummary {
     uint64_t count = 0;
-    double p95_abs_z = 0.0;
-    double multiplier = 1.0;
+    uint64_t can_score_count = 0;
+    uint64_t can_alert_count = 0;
+    uint64_t score_untrusted_count = 0;
+    uint64_t score_warming_count = 0;
+    uint64_t score_ready_count = 0;
+    uint64_t drift_learning_count = 0;
+    uint64_t recalibrating_count = 0;
+    uint64_t daily_ready_or_above_count = 0;
+    uint64_t weekly_ready_or_above_count = 0;
+    uint64_t calibration_warming_count = 0;
+    uint64_t calibration_calibrated_count = 0;
+    uint64_t calibration_expanding_count = 0;
+    uint64_t calibration_recalibrating_count = 0;
+
+    void Add(const RollingBaselineResult& result) {
+        ++count;
+        if (result.can_score) ++can_score_count;
+        if (result.can_alert) ++can_alert_count;
+        if (result.score_trust_status == "score_untrusted") ++score_untrusted_count;
+        if (result.score_trust_status == "score_warming") ++score_warming_count;
+        if (result.score_trust_status == "score_ready") ++score_ready_count;
+        if (result.score_trust_status == "drift_learning") ++drift_learning_count;
+        if (result.score_trust_status == "recalibrating") ++recalibrating_count;
+        if (result.maturity_status == "daily_ready" ||
+            result.maturity_status == "weekly_warming" ||
+            result.maturity_status == "weekly_ready" ||
+            result.maturity_status == "monthly_warming" ||
+            result.maturity_status == "monthly_ready") {
+            ++daily_ready_or_above_count;
+        }
+        if (result.maturity_status == "weekly_ready" ||
+            result.maturity_status == "monthly_warming" ||
+            result.maturity_status == "monthly_ready") {
+            ++weekly_ready_or_above_count;
+        }
+        if (result.calibration_status == "warming") ++calibration_warming_count;
+        if (result.calibration_status == "calibrated") ++calibration_calibrated_count;
+        if (result.calibration_status == "expanding") ++calibration_expanding_count;
+        if (result.calibration_status == "recalibrating") ++calibration_recalibrating_count;
+    }
+};
+
+bool TryGetDiagnosticValue(const std::string& diagnostics,
+                           const std::string& key,
+                           double* out) {
+    if (!out) return false;
+    const std::string needle = key + "=";
+    std::size_t pos = diagnostics.find(needle);
+    while (pos != std::string::npos && pos > 0 && diagnostics[pos - 1] != ';') {
+        pos = diagnostics.find(needle, pos + 1);
+    }
+    if (pos == std::string::npos) return false;
+
+    const std::size_t begin = pos + needle.size();
+    const std::size_t end = diagnostics.find(';', begin);
+    const std::string text =
+        diagnostics.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    char* parse_end = nullptr;
+    const double value = std::strtod(text.c_str(), &parse_end);
+    if (parse_end == text.c_str() || !std::isfinite(value)) return false;
+    *out = value;
+    return true;
+}
+
+struct RollingObservabilitySummary {
+    uint64_t count = 0;
+    uint64_t diagnostics_count = 0;
+    uint64_t cap_applied_count = 0;
+    double sum_std_log = 0.0;
+    double sum_raw_std_log = 0.0;
+    double sum_pred_var = 0.0;
+    double sum_calibrated_sigma_var = 0.0;
+    double sum_extra_obs_var = 0.0;
+    double sum_maturity_var = 0.0;
+    double sum_missing_component_var = 0.0;
+    double sum_multiplier = 0.0;
+    double sum_abs_level_shift_evidence = 0.0;
+    double max_abs_level_shift_evidence = 0.0;
+    double max_combined_drift_evidence = 0.0;
+
+    void Add(const RollingBaselineResult& result) {
+        ++count;
+        double std_log = 0.0;
+        double raw_std_log = 0.0;
+        double pred_var = 0.0;
+        double calibrated_sigma_var = 0.0;
+        double extra_obs_var = 0.0;
+        double maturity_var = 0.0;
+        double missing_component_var = 0.0;
+        double multiplier = 0.0;
+        double cap_applied = 0.0;
+        double level_shift_evidence = 0.0;
+        double combined_drift_evidence = 0.0;
+        if (!TryGetDiagnosticValue(result.diagnostics, "std_log", &std_log) ||
+            !TryGetDiagnosticValue(result.diagnostics, "raw_std_log", &raw_std_log) ||
+            !TryGetDiagnosticValue(result.diagnostics, "pred_var", &pred_var) ||
+            !TryGetDiagnosticValue(result.diagnostics,
+                                   "calibrated_sigma_var",
+                                   &calibrated_sigma_var) ||
+            !TryGetDiagnosticValue(result.diagnostics, "extra_obs_var", &extra_obs_var) ||
+            !TryGetDiagnosticValue(result.diagnostics, "maturity_var", &maturity_var) ||
+            !TryGetDiagnosticValue(result.diagnostics,
+                                   "missing_component_var",
+                                   &missing_component_var) ||
+            !TryGetDiagnosticValue(result.diagnostics, "multiplier", &multiplier) ||
+            !TryGetDiagnosticValue(result.diagnostics, "cap_applied", &cap_applied)) {
+            return;
+        }
+
+        ++diagnostics_count;
+        sum_std_log += std_log;
+        sum_raw_std_log += raw_std_log;
+        sum_pred_var += pred_var;
+        sum_calibrated_sigma_var += calibrated_sigma_var;
+        sum_extra_obs_var += extra_obs_var;
+        sum_maturity_var += maturity_var;
+        sum_missing_component_var += missing_component_var;
+        sum_multiplier += multiplier;
+        if (cap_applied >= 0.5) ++cap_applied_count;
+
+        if (TryGetDiagnosticValue(result.diagnostics,
+                                  "level_shift_evidence",
+                                  &level_shift_evidence)) {
+            const double abs_value = std::fabs(level_shift_evidence);
+            sum_abs_level_shift_evidence += abs_value;
+            max_abs_level_shift_evidence =
+                std::max(max_abs_level_shift_evidence, abs_value);
+        }
+        if (TryGetDiagnosticValue(result.diagnostics,
+                                  "combined_drift_evidence",
+                                  &combined_drift_evidence)) {
+            max_combined_drift_evidence =
+                std::max(max_combined_drift_evidence, std::fabs(combined_drift_evidence));
+        }
+    }
 };
 
 struct EvalAccumulator {
@@ -157,6 +301,43 @@ struct EvalAccumulator {
             sigma = lower_sigma;
         }
         return (actual - baseline_mu) / sigma;
+    }
+};
+
+struct SmoothnessAccumulator {
+    uint64_t adjacent_count = 0;
+    bool has_previous = false;
+    double previous_mu = 0.0;
+    double previous_upper = 0.0;
+    double previous_width = 0.0;
+    double sum_abs_delta_mu = 0.0;
+    double sum_abs_delta_upper = 0.0;
+    double sum_abs_delta_width = 0.0;
+
+    void Add(double baseline_mu, double baseline_lower, double baseline_upper) {
+        const double width = std::max(0.0, baseline_upper - baseline_lower);
+        if (has_previous) {
+            sum_abs_delta_mu += std::fabs(baseline_mu - previous_mu);
+            sum_abs_delta_upper += std::fabs(baseline_upper - previous_upper);
+            sum_abs_delta_width += std::fabs(width - previous_width);
+            ++adjacent_count;
+        }
+        previous_mu = baseline_mu;
+        previous_upper = baseline_upper;
+        previous_width = width;
+        has_previous = true;
+    }
+
+    SmoothnessSummary Finish() const {
+        SmoothnessSummary summary;
+        summary.adjacent_count = adjacent_count;
+        if (adjacent_count > 0) {
+            const double n = static_cast<double>(adjacent_count);
+            summary.mean_abs_delta_mu = sum_abs_delta_mu / n;
+            summary.mean_abs_delta_upper = sum_abs_delta_upper / n;
+            summary.mean_abs_delta_width = sum_abs_delta_width / n;
+        }
+        return summary;
     }
 };
 
@@ -362,18 +543,91 @@ void AppendMetricsJson(std::ostringstream* out,
     *out << indent << "\"mean_band_width_mbps\": " << summary.mean_band_width << "\n";
 }
 
+void AppendSmoothnessJson(std::ostringstream* out,
+                          const SmoothnessSummary& summary,
+                          const std::string& indent) {
+    *out << indent << "\"adjacent_count\": " << summary.adjacent_count << ",\n";
+    *out << indent << "\"mean_abs_delta_mu_mbps\": " << std::fixed << std::setprecision(6)
+         << summary.mean_abs_delta_mu << ",\n";
+    *out << indent << "\"mean_abs_delta_upper_mbps\": " << summary.mean_abs_delta_upper << ",\n";
+    *out << indent << "\"mean_abs_delta_width_mbps\": " << summary.mean_abs_delta_width << "\n";
+}
+
+void AppendB3StatusJson(std::ostringstream* out,
+                        const B3StatusSummary& summary,
+                        const std::string& indent) {
+    *out << indent << "\"count\": " << summary.count << ",\n";
+    *out << indent << "\"can_score_count\": " << summary.can_score_count << ",\n";
+    *out << indent << "\"can_alert_count\": " << summary.can_alert_count << ",\n";
+    *out << indent << "\"score_untrusted_count\": " << summary.score_untrusted_count << ",\n";
+    *out << indent << "\"score_warming_count\": " << summary.score_warming_count << ",\n";
+    *out << indent << "\"score_ready_count\": " << summary.score_ready_count << ",\n";
+    *out << indent << "\"drift_learning_count\": " << summary.drift_learning_count << ",\n";
+    *out << indent << "\"recalibrating_count\": " << summary.recalibrating_count << ",\n";
+    *out << indent << "\"daily_ready_or_above_count\": "
+         << summary.daily_ready_or_above_count << ",\n";
+    *out << indent << "\"weekly_ready_or_above_count\": "
+         << summary.weekly_ready_or_above_count << ",\n";
+    *out << indent << "\"calibration_warming_count\": "
+         << summary.calibration_warming_count << ",\n";
+    *out << indent << "\"calibration_calibrated_count\": "
+         << summary.calibration_calibrated_count << ",\n";
+    *out << indent << "\"calibration_expanding_count\": "
+         << summary.calibration_expanding_count << ",\n";
+    *out << indent << "\"calibration_recalibrating_count\": "
+         << summary.calibration_recalibrating_count << "\n";
+}
+
+void AppendObservabilityJson(std::ostringstream* out,
+                             const RollingObservabilitySummary& summary,
+                             const std::string& indent) {
+    const double n = summary.diagnostics_count > 0
+                         ? static_cast<double>(summary.diagnostics_count)
+                         : 1.0;
+    *out << indent << "\"count\": " << summary.count << ",\n";
+    *out << indent << "\"diagnostics_count\": " << summary.diagnostics_count << ",\n";
+    *out << indent << "\"mean_std_log\": " << std::fixed << std::setprecision(6)
+         << summary.sum_std_log / n << ",\n";
+    *out << indent << "\"mean_raw_std_log\": " << summary.sum_raw_std_log / n << ",\n";
+    *out << indent << "\"mean_pred_var\": " << summary.sum_pred_var / n << ",\n";
+    *out << indent << "\"mean_calibrated_sigma_var\": "
+         << summary.sum_calibrated_sigma_var / n << ",\n";
+    *out << indent << "\"mean_extra_obs_var\": " << summary.sum_extra_obs_var / n << ",\n";
+    *out << indent << "\"mean_maturity_var\": " << summary.sum_maturity_var / n << ",\n";
+    *out << indent << "\"mean_missing_component_var\": "
+         << summary.sum_missing_component_var / n << ",\n";
+    *out << indent << "\"mean_band_multiplier\": " << summary.sum_multiplier / n << ",\n";
+    *out << indent << "\"cap_applied_count\": " << summary.cap_applied_count << ",\n";
+    *out << indent << "\"cap_applied_ratio\": "
+         << (summary.diagnostics_count > 0
+                 ? static_cast<double>(summary.cap_applied_count) /
+                       static_cast<double>(summary.diagnostics_count)
+                 : 0.0)
+         << ",\n";
+    *out << indent << "\"mean_abs_level_shift_evidence\": "
+         << summary.sum_abs_level_shift_evidence / n << ",\n";
+    *out << indent << "\"max_abs_level_shift_evidence\": "
+         << summary.max_abs_level_shift_evidence << ",\n";
+    *out << indent << "\"max_combined_drift_evidence\": "
+         << summary.max_combined_drift_evidence << "\n";
+}
+
 bool WriteWeek4ComparisonAndTrainRolling(const std::filesystem::path& path,
                                          IBaselineValueTask* task,
                                          const std::vector<LinkPoint>& points,
                                          std::size_t begin,
                                          std::size_t end,
                                          EvalSummary* bootstrap_summary,
-                                         EvalSummary* rolling_summary) {
+                                         EvalSummary* rolling_summary,
+                                         B3StatusSummary* rolling_b3_summary,
+                                         RollingObservabilitySummary* rolling_observability) {
     std::ofstream file(path);
     if (!file.is_open()) return false;
     file << "timestamp,bucket_id,actual_mbps,bootstrap_mu,bootstrap_lower,"
             "bootstrap_upper,bootstrap_abs_z,rolling_mu,rolling_lower,rolling_upper,"
-            "rolling_abs_z\n";
+            "rolling_abs_z,maturity_status,score_trust_status,calibration_status,"
+            "learning_confidence,score_confidence,effective_confidence,can_alert,"
+            "rolling_diagnostics\n";
 
     BootstrapPredictionOptions bootstrap_options;
     bootstrap_options.confidence_level = kConfidenceLevel;
@@ -399,6 +653,8 @@ bool WriteWeek4ComparisonAndTrainRolling(const std::filesystem::path& path,
                         rr.baseline_lower,
                         rr.baseline_upper,
                         kRollingBandZ);
+        if (rolling_b3_summary) rolling_b3_summary->Add(rr);
+        if (rolling_observability) rolling_observability->Add(rr);
         const double bz = EvalAccumulator::DirectionalZ(point.mbps,
                                                         bp.baseline_mu,
                                                         bp.baseline_lower,
@@ -413,11 +669,207 @@ bool WriteWeek4ComparisonAndTrainRolling(const std::filesystem::path& path,
              << std::setprecision(6) << point.mbps << ',' << bp.baseline_mu << ','
              << bp.baseline_lower << ',' << bp.baseline_upper << ',' << std::fabs(bz) << ','
              << rr.baseline_mu << ',' << rr.baseline_lower << ',' << rr.baseline_upper << ','
-             << std::fabs(rz) << '\n';
+             << std::fabs(rz) << ',' << rr.maturity_status << ',' << rr.score_trust_status
+             << ',' << rr.calibration_status << ',' << rr.learning_confidence << ','
+             << rr.score_confidence << ',' << rr.effective_confidence << ','
+             << (rr.can_alert ? 1 : 0) << ',' << rr.diagnostics << '\n';
     }
     *bootstrap_summary = bootstrap_acc.Finish();
     *rolling_summary = rolling_acc.Finish();
     return file.good();
+}
+
+bool WriteWeek4FrozenPredictComparison(const std::filesystem::path& path,
+                                       IBaselineValueTask* task,
+                                       const std::vector<LinkPoint>& points,
+                                       std::size_t begin,
+                                       std::size_t end,
+                                       EvalSummary* bootstrap_summary,
+                                       EvalSummary* rolling_forecast_summary,
+                                       SmoothnessSummary* bootstrap_smoothness,
+                                       SmoothnessSummary* rolling_forecast_smoothness) {
+    std::ofstream file(path);
+    if (!file.is_open()) return false;
+    file << "timestamp,bucket_id,actual_mbps,bootstrap_mu,bootstrap_lower,"
+            "bootstrap_upper,bootstrap_abs_z,rolling_frozen_mu,"
+            "rolling_frozen_lower,rolling_frozen_upper,rolling_frozen_abs_z\n";
+
+    BootstrapPredictionOptions bootstrap_options;
+    bootstrap_options.confidence_level = kConfidenceLevel;
+    EvalAccumulator bootstrap_acc;
+    EvalAccumulator rolling_acc;
+    SmoothnessAccumulator bootstrap_smooth_acc;
+    SmoothnessAccumulator rolling_smooth_acc;
+    for (std::size_t i = begin; i < end; ++i) {
+        const LinkPoint& point = points[i];
+        const BootstrapPrediction bp =
+            task->PredictBootstrap(kSeriesKey, point.bucket_id, bootstrap_options);
+        const RollingPrediction rp = task->PredictRolling(kSeriesKey, point.bucket_id);
+        if (bp.status != BaselineStatus::kOk || rp.status != BaselineStatus::kOk) {
+            std::cerr << "week4 frozen predict failed at " << point.timestamp
+                      << ", bootstrap_status=" << static_cast<int>(bp.status)
+                      << ", rolling_status=" << static_cast<int>(rp.status) << "\n";
+            return false;
+        }
+        bootstrap_acc.Add(point.mbps,
+                          bp.baseline_mu,
+                          bp.baseline_lower,
+                          bp.baseline_upper,
+                          kBootstrapBandZ);
+        rolling_acc.Add(point.mbps,
+                        rp.baseline_mu,
+                        rp.baseline_lower,
+                        rp.baseline_upper,
+                        rp.band_z);
+        bootstrap_smooth_acc.Add(bp.baseline_mu, bp.baseline_lower, bp.baseline_upper);
+        rolling_smooth_acc.Add(rp.baseline_mu, rp.baseline_lower, rp.baseline_upper);
+        const double bz = EvalAccumulator::DirectionalZ(point.mbps,
+                                                        bp.baseline_mu,
+                                                        bp.baseline_lower,
+                                                        bp.baseline_upper,
+                                                        kBootstrapBandZ);
+        const double rz = EvalAccumulator::DirectionalZ(point.mbps,
+                                                        rp.baseline_mu,
+                                                        rp.baseline_lower,
+                                                        rp.baseline_upper,
+                                                        rp.band_z);
+        file << point.timestamp << ',' << point.bucket_id << ',' << std::fixed
+             << std::setprecision(6) << point.mbps << ',' << bp.baseline_mu << ','
+             << bp.baseline_lower << ',' << bp.baseline_upper << ',' << std::fabs(bz)
+             << ',' << rp.baseline_mu << ',' << rp.baseline_lower << ','
+             << rp.baseline_upper << ',' << std::fabs(rz) << '\n';
+    }
+    *bootstrap_summary = bootstrap_acc.Finish();
+    *rolling_forecast_summary = rolling_acc.Finish();
+    *bootstrap_smoothness = bootstrap_smooth_acc.Finish();
+    *rolling_forecast_smoothness = rolling_smooth_acc.Finish();
+    return file.good();
+}
+
+bool WriteWeek4RollingPredictAndTrainComparison(
+    const std::filesystem::path& detection_path,
+    const std::filesystem::path& forecast_path,
+    IBaselineValueTask* task,
+    const std::vector<LinkPoint>& points,
+    std::size_t begin,
+    std::size_t end,
+    EvalSummary* bootstrap_summary,
+    EvalSummary* rolling_summary,
+    EvalSummary* forecast_bootstrap_summary,
+    EvalSummary* rolling_forecast_summary,
+    SmoothnessSummary* bootstrap_smoothness,
+    SmoothnessSummary* rolling_forecast_smoothness,
+    B3StatusSummary* rolling_b3_summary,
+    RollingObservabilitySummary* rolling_observability) {
+    std::ofstream detection_file(detection_path);
+    std::ofstream forecast_file(forecast_path);
+    if (!detection_file.is_open() || !forecast_file.is_open()) return false;
+
+    detection_file << "timestamp,bucket_id,actual_mbps,bootstrap_mu,bootstrap_lower,"
+                      "bootstrap_upper,bootstrap_abs_z,rolling_mu,rolling_lower,rolling_upper,"
+                      "rolling_abs_z,maturity_status,score_trust_status,calibration_status,"
+                      "learning_confidence,score_confidence,effective_confidence,can_alert,"
+                      "rolling_diagnostics\n";
+    forecast_file << "timestamp,bucket_id,actual_mbps,bootstrap_mu,bootstrap_lower,"
+                     "bootstrap_upper,bootstrap_abs_z,rolling_predict_mu,"
+                     "rolling_predict_lower,rolling_predict_upper,rolling_predict_abs_z\n";
+
+    BootstrapPredictionOptions bootstrap_options;
+    bootstrap_options.confidence_level = kConfidenceLevel;
+    EvalAccumulator bootstrap_acc;
+    EvalAccumulator rolling_acc;
+    EvalAccumulator forecast_bootstrap_acc;
+    EvalAccumulator rolling_forecast_acc;
+    SmoothnessAccumulator bootstrap_smooth_acc;
+    SmoothnessAccumulator rolling_smooth_acc;
+    for (std::size_t i = begin; i < end; ++i) {
+        const LinkPoint& point = points[i];
+        const BootstrapPrediction bp =
+            task->PredictBootstrap(kSeriesKey, point.bucket_id, bootstrap_options);
+        const RollingPrediction rp = task->PredictRolling(kSeriesKey, point.bucket_id);
+        if (bp.status != BaselineStatus::kOk || rp.status != BaselineStatus::kOk) {
+            std::cerr << "week4 rolling predict failed at " << point.timestamp
+                      << ", bootstrap_status=" << static_cast<int>(bp.status)
+                      << ", rolling_status=" << static_cast<int>(rp.status) << "\n";
+            return false;
+        }
+
+        forecast_bootstrap_acc.Add(point.mbps,
+                                   bp.baseline_mu,
+                                   bp.baseline_lower,
+                                   bp.baseline_upper,
+                                   kBootstrapBandZ);
+        rolling_forecast_acc.Add(point.mbps,
+                                 rp.baseline_mu,
+                                 rp.baseline_lower,
+                                 rp.baseline_upper,
+                                 rp.band_z);
+        bootstrap_smooth_acc.Add(bp.baseline_mu, bp.baseline_lower, bp.baseline_upper);
+        rolling_smooth_acc.Add(rp.baseline_mu, rp.baseline_lower, rp.baseline_upper);
+        const double forecast_bz = EvalAccumulator::DirectionalZ(point.mbps,
+                                                                 bp.baseline_mu,
+                                                                 bp.baseline_lower,
+                                                                 bp.baseline_upper,
+                                                                 kBootstrapBandZ);
+        const double forecast_rz = EvalAccumulator::DirectionalZ(point.mbps,
+                                                                 rp.baseline_mu,
+                                                                 rp.baseline_lower,
+                                                                 rp.baseline_upper,
+                                                                 rp.band_z);
+        forecast_file << point.timestamp << ',' << point.bucket_id << ',' << std::fixed
+                      << std::setprecision(6) << point.mbps << ',' << bp.baseline_mu << ','
+                      << bp.baseline_lower << ',' << bp.baseline_upper << ','
+                      << std::fabs(forecast_bz) << ',' << rp.baseline_mu << ','
+                      << rp.baseline_lower << ',' << rp.baseline_upper << ','
+                      << std::fabs(forecast_rz) << '\n';
+
+        const RollingBaselineResult rr =
+            task->SubmitObservation(ToObservation(point), RollingSubmitOptions{});
+        if (rr.status != BaselineStatus::kOk) {
+            std::cerr << "week4 rolling update failed at " << point.timestamp
+                      << ", status=" << static_cast<int>(rr.status) << "\n";
+            return false;
+        }
+        bootstrap_acc.Add(point.mbps,
+                          bp.baseline_mu,
+                          bp.baseline_lower,
+                          bp.baseline_upper,
+                          kBootstrapBandZ);
+        rolling_acc.Add(point.mbps,
+                        rr.baseline_mu,
+                        rr.baseline_lower,
+                        rr.baseline_upper,
+                        kRollingBandZ);
+        if (rolling_b3_summary) rolling_b3_summary->Add(rr);
+        if (rolling_observability) rolling_observability->Add(rr);
+        const double detection_bz = EvalAccumulator::DirectionalZ(point.mbps,
+                                                                  bp.baseline_mu,
+                                                                  bp.baseline_lower,
+                                                                  bp.baseline_upper,
+                                                                  kBootstrapBandZ);
+        const double detection_rz = EvalAccumulator::DirectionalZ(point.mbps,
+                                                                  rr.baseline_mu,
+                                                                  rr.baseline_lower,
+                                                                  rr.baseline_upper,
+                                                                  kRollingBandZ);
+        detection_file << point.timestamp << ',' << point.bucket_id << ',' << std::fixed
+                       << std::setprecision(6) << point.mbps << ',' << bp.baseline_mu << ','
+                       << bp.baseline_lower << ',' << bp.baseline_upper << ','
+                       << std::fabs(detection_bz) << ',' << rr.baseline_mu << ','
+                       << rr.baseline_lower << ',' << rr.baseline_upper << ','
+                       << std::fabs(detection_rz) << ',' << rr.maturity_status << ','
+                       << rr.score_trust_status << ',' << rr.calibration_status << ','
+                       << rr.learning_confidence << ',' << rr.score_confidence << ','
+                       << rr.effective_confidence << ',' << (rr.can_alert ? 1 : 0)
+                       << ',' << rr.diagnostics << '\n';
+    }
+    *bootstrap_summary = bootstrap_acc.Finish();
+    *rolling_summary = rolling_acc.Finish();
+    *forecast_bootstrap_summary = forecast_bootstrap_acc.Finish();
+    *rolling_forecast_summary = rolling_forecast_acc.Finish();
+    *bootstrap_smoothness = bootstrap_smooth_acc.Finish();
+    *rolling_forecast_smoothness = rolling_smooth_acc.Finish();
+    return detection_file.good() && forecast_file.good();
 }
 
 bool WriteTransitionLearning(const std::filesystem::path& path,
@@ -426,11 +878,15 @@ bool WriteTransitionLearning(const std::filesystem::path& path,
                              std::size_t begin,
                              std::size_t end,
                              EvalSummary* summary,
-                             std::vector<TransitionCheckpoint>* checkpoints) {
+                             std::vector<TransitionCheckpoint>* checkpoints,
+                             B3StatusSummary* b3_summary,
+                             RollingObservabilitySummary* observability) {
     std::ofstream file(path);
     if (!file.is_open()) return false;
     file << "timestamp,bucket_id,minute_offset,actual_mbps,baseline_mu,baseline_lower,"
-            "baseline_upper,z_score,abs_z,drift_evidence,adapt_boost,update_weight\n";
+            "baseline_upper,z_score,abs_z,drift_evidence,adapt_boost,update_weight,"
+            "maturity_status,score_trust_status,calibration_status,learning_confidence,"
+            "score_confidence,effective_confidence,can_alert\n";
 
     EvalAccumulator acc;
     for (std::size_t i = begin; i < end; ++i) {
@@ -447,6 +903,8 @@ bool WriteTransitionLearning(const std::filesystem::path& path,
                 result.baseline_lower,
                 result.baseline_upper,
                 3.0);
+        if (b3_summary) b3_summary->Add(result);
+        if (observability) observability->Add(result);
         const int64_t minute_offset = point.bucket_id - points[begin].bucket_id;
         if (checkpoints &&
             (minute_offset == 0 || minute_offset == 60 || minute_offset == 240 ||
@@ -460,6 +918,10 @@ bool WriteTransitionLearning(const std::filesystem::path& path,
             checkpoint.drift_evidence = result.drift_evidence;
             checkpoint.adapt_boost = result.adapt_boost;
             checkpoint.update_weight = result.update_weight;
+            checkpoint.maturity_status = result.maturity_status;
+            checkpoint.score_trust_status = result.score_trust_status;
+            checkpoint.calibration_status = result.calibration_status;
+            checkpoint.can_alert = result.can_alert;
             checkpoints->push_back(std::move(checkpoint));
         }
         file << point.timestamp << ',' << point.bucket_id << ',' << minute_offset << ','
@@ -467,206 +929,104 @@ bool WriteTransitionLearning(const std::filesystem::path& path,
              << result.baseline_mu << ',' << result.baseline_lower << ','
              << result.baseline_upper << ',' << result.z_score << ','
              << std::fabs(result.z_score) << ',' << result.drift_evidence << ','
-             << result.adapt_boost << ',' << result.update_weight << '\n';
+             << result.adapt_boost << ',' << result.update_weight << ','
+             << result.maturity_status << ',' << result.score_trust_status << ','
+             << result.calibration_status << ',' << result.learning_confidence << ','
+             << result.score_confidence << ',' << result.effective_confidence << ','
+             << (result.can_alert ? 1 : 0) << '\n';
     }
     *summary = acc.Finish();
     return file.good();
 }
 
-bool WriteRollingPredictions(const std::filesystem::path& path,
-                             IBaselineValueTask* task,
-                             const std::vector<LinkPoint>& points,
-                             std::size_t begin,
-                             std::size_t end,
-                             EvalSummary* summary) {
-    std::ofstream file(path);
-    if (!file.is_open()) return false;
-    file << "timestamp,bucket_id,actual_mbps,baseline_mu,baseline_lower,"
-            "baseline_upper,band_width,abs_z,in_band\n";
-
-    EvalAccumulator acc;
-    for (std::size_t i = begin; i < end; ++i) {
-        const LinkPoint& point = points[i];
-        const RollingPrediction prediction = task->PredictRolling(kSeriesKey, point.bucket_id);
-        if (prediction.status != BaselineStatus::kOk) {
-            std::cerr << "rolling prediction failed at " << point.timestamp
-                      << ", status=" << static_cast<int>(prediction.status) << "\n";
-            return false;
-        }
-        acc.Add(point.mbps,
-                prediction.baseline_mu,
-                prediction.baseline_lower,
-                prediction.baseline_upper,
-                prediction.band_z);
-        const double z = EvalAccumulator::DirectionalZ(point.mbps,
-                                                       prediction.baseline_mu,
-                                                       prediction.baseline_lower,
-                                                       prediction.baseline_upper,
-                                                       prediction.band_z);
-        const bool in_band =
-            point.mbps >= prediction.baseline_lower && point.mbps <= prediction.baseline_upper;
-        file << point.timestamp << ',' << point.bucket_id << ',' << std::fixed
-             << std::setprecision(6) << point.mbps << ',' << prediction.baseline_mu << ','
-             << prediction.baseline_lower << ',' << prediction.baseline_upper << ','
-             << (prediction.baseline_upper - prediction.baseline_lower) << ','
-             << std::fabs(z) << ',' << (in_band ? 1 : 0) << '\n';
-    }
-    *summary = acc.Finish();
-    return file.good();
-}
-
-bool WriteAdaptiveForecastPredictions(const std::filesystem::path& path,
+bool WriteRollingWalkForwardDetection(const std::filesystem::path& path,
                                       IBaselineValueTask* task,
                                       const std::vector<LinkPoint>& points,
                                       std::size_t begin,
                                       std::size_t end,
-                                      EvalSummary* summary) {
+                                      EvalSummary* summary,
+                                      B3StatusSummary* b3_summary,
+                                      RollingObservabilitySummary* observability) {
     std::ofstream file(path);
     if (!file.is_open()) return false;
-    file << "timestamp,bucket_id,actual_mbps,rolling_mu,bootstrap_mu,adaptive_lower,"
-            "adaptive_upper,adaptive_band_width,abs_z,in_band\n";
+    file << "timestamp,bucket_id,actual_mbps,baseline_mu,baseline_lower,"
+            "baseline_upper,band_width,z_score,abs_z,in_band,maturity_status,"
+            "score_trust_status,calibration_status,learning_confidence,score_confidence,"
+            "effective_confidence,can_alert,rolling_diagnostics\n";
 
-    BootstrapPredictionOptions bootstrap_options;
-    bootstrap_options.confidence_level = kConfidenceLevel;
     EvalAccumulator acc;
     for (std::size_t i = begin; i < end; ++i) {
         const LinkPoint& point = points[i];
-        const RollingPrediction rolling = task->PredictRolling(kSeriesKey, point.bucket_id);
-        const BootstrapPrediction bootstrap =
-            task->PredictBootstrap(kSeriesKey, point.bucket_id, bootstrap_options);
-        if (rolling.status != BaselineStatus::kOk ||
-            bootstrap.status != BaselineStatus::kOk) {
-            std::cerr << "adaptive forecast failed at " << point.timestamp << "\n";
+        const RollingBaselineResult result =
+            task->SubmitObservation(ToObservation(point), RollingSubmitOptions{});
+        if (result.status != BaselineStatus::kOk) {
+            std::cerr << "rolling walk-forward failed at " << point.timestamp
+                      << ", status=" << static_cast<int>(result.status) << "\n";
             return false;
         }
-
-        const double bootstrap_half_width =
-            std::max(0.0, bootstrap.baseline_upper - bootstrap.baseline_lower) * 0.5;
-        const double lower = std::max(0.0, rolling.baseline_mu - bootstrap_half_width);
-        const double upper = rolling.baseline_mu + bootstrap_half_width;
-        acc.Add(point.mbps, rolling.baseline_mu, lower, upper, kBootstrapBandZ);
-        const double z = EvalAccumulator::DirectionalZ(point.mbps,
-                                                       rolling.baseline_mu,
-                                                       lower,
-                                                       upper,
-                                                       kBootstrapBandZ);
-        const bool in_band = point.mbps >= lower && point.mbps <= upper;
+        acc.Add(point.mbps,
+                result.baseline_mu,
+                result.baseline_lower,
+                result.baseline_upper,
+                kRollingBandZ);
+        if (b3_summary) b3_summary->Add(result);
+        if (observability) observability->Add(result);
+        const bool in_band = point.mbps >= result.baseline_lower && point.mbps <= result.baseline_upper;
         file << point.timestamp << ',' << point.bucket_id << ',' << std::fixed
-             << std::setprecision(6) << point.mbps << ',' << rolling.baseline_mu << ','
-             << bootstrap.baseline_mu << ',' << lower << ',' << upper << ','
-             << (upper - lower) << ',' << std::fabs(z) << ',' << (in_band ? 1 : 0)
-             << '\n';
+             << std::setprecision(6) << point.mbps << ',' << result.baseline_mu << ','
+             << result.baseline_lower << ',' << result.baseline_upper << ','
+             << (result.baseline_upper - result.baseline_lower) << ',' << result.z_score << ','
+             << std::fabs(result.z_score) << ',' << (in_band ? 1 : 0) << ','
+             << result.maturity_status << ',' << result.score_trust_status << ','
+             << result.calibration_status << ',' << result.learning_confidence << ','
+             << result.score_confidence << ',' << result.effective_confidence << ','
+             << (result.can_alert ? 1 : 0) << ',' << result.diagnostics << '\n';
     }
     *summary = acc.Finish();
     return file.good();
 }
 
-double ClampDouble(double value, double lo, double hi) {
-    return std::max(lo, std::min(hi, value));
-}
-
-double Quantile(std::vector<double> values, double q) {
-    if (values.empty()) return 0.0;
-    std::sort(values.begin(), values.end());
-    const double pos = ClampDouble(q, 0.0, 1.0) *
-                       static_cast<double>(values.size() - 1);
-    const std::size_t lo = static_cast<std::size_t>(std::floor(pos));
-    const std::size_t hi = static_cast<std::size_t>(std::ceil(pos));
-    if (lo == hi) return values[lo];
-    const double w = pos - static_cast<double>(lo);
-    return values[lo] * (1.0 - w) + values[hi] * w;
-}
-
-BandCalibration TrainRollingRangeAndCalibrateLevelScaledBand(
-    IBaselineValueTask* task,
-    const std::vector<LinkPoint>& points,
-    std::size_t begin,
-    std::size_t end) {
-    BootstrapPredictionOptions bootstrap_options;
-    bootstrap_options.confidence_level = kConfidenceLevel;
-    std::vector<double> abs_z_values;
-    abs_z_values.reserve(end - begin);
-    for (std::size_t i = begin; i < end; ++i) {
-        const LinkPoint& point = points[i];
-        const BootstrapPrediction bootstrap =
-            task->PredictBootstrap(kSeriesKey, point.bucket_id, bootstrap_options);
-        const RollingBaselineResult rolling =
-            task->SubmitObservation(ToObservation(point), RollingSubmitOptions{});
-        if (bootstrap.status != BaselineStatus::kOk ||
-            rolling.status != BaselineStatus::kOk) {
-            std::cerr << "post-shift calibration failed at " << point.timestamp << "\n";
-            std::abort();
-        }
-        const double bootstrap_half_width =
-            std::max(0.0, bootstrap.baseline_upper - bootstrap.baseline_lower) * 0.5;
-        const double raw_scale =
-            bootstrap.baseline_mu > 1.0e-9 ? rolling.baseline_mu / bootstrap.baseline_mu : 1.0;
-        const double scale = ClampDouble(raw_scale, 0.05, 2.0);
-        const double half_width = bootstrap_half_width * scale;
-        const double lower = std::max(0.0, rolling.baseline_mu - half_width);
-        const double upper = rolling.baseline_mu + half_width;
-        const double z = EvalAccumulator::DirectionalZ(point.mbps,
-                                                       rolling.baseline_mu,
-                                                       lower,
-                                                       upper,
-                                                       kBootstrapBandZ);
-        abs_z_values.push_back(std::fabs(z));
-    }
-
-    BandCalibration calibration;
-    calibration.count = static_cast<uint64_t>(abs_z_values.size());
-    calibration.p95_abs_z = Quantile(abs_z_values, 0.95);
-    calibration.multiplier = std::max(1.0, calibration.p95_abs_z / kBootstrapBandZ);
-    return calibration;
-}
-
-bool WriteLevelScaledAdaptiveForecastPredictions(const std::filesystem::path& path,
-                                                 IBaselineValueTask* task,
-                                                 const std::vector<LinkPoint>& points,
-                                                 std::size_t begin,
-                                                 std::size_t end,
-                                                 double band_multiplier,
-                                                 EvalSummary* summary) {
+bool WritePostShiftTraining(const std::filesystem::path& path,
+                            IBaselineValueTask* task,
+                            const std::vector<LinkPoint>& points,
+                            std::size_t begin,
+                            std::size_t end,
+                            EvalSummary* summary,
+                            B3StatusSummary* b3_summary,
+                            RollingObservabilitySummary* observability) {
     std::ofstream file(path);
     if (!file.is_open()) return false;
-    file << "timestamp,bucket_id,actual_mbps,rolling_mu,bootstrap_mu,scale,"
-            "scaled_lower,scaled_upper,scaled_band_width,abs_z,in_band\n";
+    file << "timestamp,bucket_id,actual_mbps,baseline_mu,baseline_lower,"
+            "baseline_upper,z_score,abs_z,drift_evidence,adapt_boost,update_weight,"
+            "maturity_status,score_trust_status,calibration_status,learning_confidence,"
+            "score_confidence,effective_confidence,can_alert\n";
 
-    BootstrapPredictionOptions bootstrap_options;
-    bootstrap_options.confidence_level = kConfidenceLevel;
     EvalAccumulator acc;
     for (std::size_t i = begin; i < end; ++i) {
         const LinkPoint& point = points[i];
-        const RollingPrediction rolling = task->PredictRolling(kSeriesKey, point.bucket_id);
-        const BootstrapPrediction bootstrap =
-            task->PredictBootstrap(kSeriesKey, point.bucket_id, bootstrap_options);
-        if (rolling.status != BaselineStatus::kOk ||
-            bootstrap.status != BaselineStatus::kOk) {
-            std::cerr << "level-scaled adaptive forecast failed at "
-                      << point.timestamp << "\n";
+        const RollingBaselineResult result =
+            task->SubmitObservation(ToObservation(point), RollingSubmitOptions{});
+        if (result.status != BaselineStatus::kOk) {
+            std::cerr << "post-shift rolling train failed at " << point.timestamp
+                      << ", status=" << static_cast<int>(result.status) << "\n";
             return false;
         }
-
-        const double bootstrap_half_width =
-            std::max(0.0, bootstrap.baseline_upper - bootstrap.baseline_lower) * 0.5;
-        const double raw_scale =
-            bootstrap.baseline_mu > 1.0e-9 ? rolling.baseline_mu / bootstrap.baseline_mu : 1.0;
-        const double scale = ClampDouble(raw_scale, 0.05, 2.0);
-        const double scaled_half_width = bootstrap_half_width * scale * band_multiplier;
-        const double lower = std::max(0.0, rolling.baseline_mu - scaled_half_width);
-        const double upper = rolling.baseline_mu + scaled_half_width;
-        acc.Add(point.mbps, rolling.baseline_mu, lower, upper, kBootstrapBandZ);
-        const double z = EvalAccumulator::DirectionalZ(point.mbps,
-                                                       rolling.baseline_mu,
-                                                       lower,
-                                                       upper,
-                                                       kBootstrapBandZ);
-        const bool in_band = point.mbps >= lower && point.mbps <= upper;
+        acc.Add(point.mbps,
+                result.baseline_mu,
+                result.baseline_lower,
+                result.baseline_upper,
+                kRollingBandZ);
+        if (b3_summary) b3_summary->Add(result);
+        if (observability) observability->Add(result);
         file << point.timestamp << ',' << point.bucket_id << ',' << std::fixed
-             << std::setprecision(6) << point.mbps << ',' << rolling.baseline_mu << ','
-             << bootstrap.baseline_mu << ',' << scale << ',' << lower << ',' << upper << ','
-             << (upper - lower) << ',' << std::fabs(z) << ',' << (in_band ? 1 : 0)
-             << '\n';
+             << std::setprecision(6) << point.mbps << ',' << result.baseline_mu << ','
+             << result.baseline_lower << ',' << result.baseline_upper << ','
+             << result.z_score << ',' << std::fabs(result.z_score) << ','
+             << result.drift_evidence << ',' << result.adapt_boost << ','
+             << result.update_weight << ',' << result.maturity_status << ','
+             << result.score_trust_status << ',' << result.calibration_status << ','
+             << result.learning_confidence << ',' << result.score_confidence << ','
+             << result.effective_confidence << ',' << (result.can_alert ? 1 : 0) << '\n';
     }
     *summary = acc.Finish();
     return file.good();
@@ -674,12 +1034,24 @@ bool WriteLevelScaledAdaptiveForecastPredictions(const std::filesystem::path& pa
 
 std::string SummaryJson(const EvalSummary& week4_bootstrap,
                         const EvalSummary& week4_rolling,
+                        const EvalSummary& week4_frozen_bootstrap,
+                        const EvalSummary& week4_frozen_forecast,
+                        const EvalSummary& week4_forecast_bootstrap,
+                        const EvalSummary& week4_rolling_forecast,
                         const EvalSummary& transition,
+                        const EvalSummary& post_shift_training,
                         const EvalSummary& final7,
-                        const EvalSummary& final7_adaptive_forecast,
-                        const EvalSummary& final7_level_scaled_forecast,
-                        const EvalSummary& final7_calibrated_scaled_forecast,
-                        const BandCalibration& band_calibration,
+                        const SmoothnessSummary& week4_frozen_bootstrap_smoothness,
+                        const SmoothnessSummary& week4_frozen_forecast_smoothness,
+                        const SmoothnessSummary& week4_forecast_bootstrap_smoothness,
+                        const SmoothnessSummary& week4_rolling_forecast_smoothness,
+                        const B3StatusSummary& week4_b3,
+                        const B3StatusSummary& transition_b3,
+                        const B3StatusSummary& post_shift_b3,
+                        const RollingObservabilitySummary& week4_observability,
+                        const RollingObservabilitySummary& transition_observability,
+                        const RollingObservabilitySummary& post_shift_observability,
+                        const RollingObservabilitySummary& final7_observability,
                         const std::vector<LinkPoint>& points,
                         std::size_t bootstrap_begin,
                         std::size_t bootstrap_end,
@@ -695,11 +1067,12 @@ std::string SummaryJson(const EvalSummary& week4_bootstrap,
                         std::size_t final_end,
                         const std::vector<TransitionCheckpoint>& checkpoints,
                         const std::filesystem::path& week4_csv,
+                        const std::filesystem::path& week4_frozen_csv,
+                        const std::filesystem::path& week4_forecast_csv,
                         const std::filesystem::path& transition_csv,
+                        const std::filesystem::path& post_shift_csv,
                         const std::filesystem::path& final_csv,
-                        const std::filesystem::path& adaptive_csv,
-                        const std::filesystem::path& scaled_csv,
-                        const std::filesystem::path& calibrated_csv) {
+                        const std::filesystem::path& series_snapshot_json) {
     auto range = [&](std::size_t begin, std::size_t end) {
         std::ostringstream out;
         out << "\"start_time\": \"" << points[begin].timestamp << "\", ";
@@ -722,11 +1095,15 @@ std::string SummaryJson(const EvalSummary& week4_bootstrap,
     out << "    \"rolling_train_week3\": {" << range(week3_begin, week3_end) << "},\n";
     out << "    \"week4_compare_walk_forward\": {"
         << range(week4_begin, week4_end) << "},\n";
+    out << "    \"week4_compare_frozen_predict\": {"
+        << range(week4_begin, week4_end) << "},\n";
+    out << "    \"week4_compare_rolling_predict\": {"
+        << range(week4_begin, week4_end) << "},\n";
     out << "    \"transition_learning\": {"
         << range(transition_begin, transition_end) << "},\n";
     out << "    \"post_shift_train_4d\": {"
         << range(post_train_begin, post_train_end) << "},\n";
-    out << "    \"final7_predict\": {" << range(final_begin, final_end) << "}\n";
+    out << "    \"final7_walk_forward_detection\": {" << range(final_begin, final_end) << "}\n";
     out << "  },\n";
     out << "  \"metrics\": {\n";
     out << "    \"week4_bootstrap\": {\n";
@@ -735,27 +1112,66 @@ std::string SummaryJson(const EvalSummary& week4_bootstrap,
     out << "    \"week4_rolling\": {\n";
     AppendMetricsJson(&out, week4_rolling, "      ");
     out << "    },\n";
+    out << "    \"week4_frozen_forecast_bootstrap\": {\n";
+    AppendMetricsJson(&out, week4_frozen_bootstrap, "      ");
+    out << "    },\n";
+    out << "    \"week4_rolling_frozen_forecast\": {\n";
+    AppendMetricsJson(&out, week4_frozen_forecast, "      ");
+    out << "    },\n";
+    out << "    \"week4_forecast_bootstrap\": {\n";
+    AppendMetricsJson(&out, week4_forecast_bootstrap, "      ");
+    out << "    },\n";
+    out << "    \"week4_rolling_predict_forecast\": {\n";
+    AppendMetricsJson(&out, week4_rolling_forecast, "      ");
+    out << "    },\n";
     out << "    \"transition_learning\": {\n";
     AppendMetricsJson(&out, transition, "      ");
     out << "    },\n";
+    out << "    \"post_shift_training\": {\n";
+    AppendMetricsJson(&out, post_shift_training, "      ");
+    out << "    },\n";
     out << "    \"final7_rolling\": {\n";
     AppendMetricsJson(&out, final7, "      ");
-    out << "    },\n";
-    out << "    \"final7_adaptive_forecast\": {\n";
-    AppendMetricsJson(&out, final7_adaptive_forecast, "      ");
-    out << "    },\n";
-    out << "    \"final7_level_scaled_forecast\": {\n";
-    AppendMetricsJson(&out, final7_level_scaled_forecast, "      ");
-    out << "    },\n";
-    out << "    \"final7_calibrated_scaled_forecast\": {\n";
-    AppendMetricsJson(&out, final7_calibrated_scaled_forecast, "      ");
     out << "    }\n";
     out << "  },\n";
-    out << "  \"band_calibration\": {\n";
-    out << "    \"source_window\": \"post_shift_train_4d\",\n";
-    out << "    \"count\": " << band_calibration.count << ",\n";
-    out << "    \"p95_abs_z_before_multiplier\": " << band_calibration.p95_abs_z << ",\n";
-    out << "    \"multiplier\": " << band_calibration.multiplier << "\n";
+    out << "  \"smoothness\": {\n";
+    out << "    \"week4_frozen_forecast_bootstrap\": {\n";
+    AppendSmoothnessJson(&out, week4_frozen_bootstrap_smoothness, "      ");
+    out << "    },\n";
+    out << "    \"week4_rolling_frozen_forecast\": {\n";
+    AppendSmoothnessJson(&out, week4_frozen_forecast_smoothness, "      ");
+    out << "    },\n";
+    out << "    \"week4_forecast_bootstrap\": {\n";
+    AppendSmoothnessJson(&out, week4_forecast_bootstrap_smoothness, "      ");
+    out << "    },\n";
+    out << "    \"week4_rolling_predict_forecast\": {\n";
+    AppendSmoothnessJson(&out, week4_rolling_forecast_smoothness, "      ");
+    out << "    }\n";
+    out << "  },\n";
+    out << "  \"b3_status\": {\n";
+    out << "    \"week4_walk_forward\": {\n";
+    AppendB3StatusJson(&out, week4_b3, "      ");
+    out << "    },\n";
+    out << "    \"transition_learning\": {\n";
+    AppendB3StatusJson(&out, transition_b3, "      ");
+    out << "    },\n";
+    out << "    \"post_shift_training\": {\n";
+    AppendB3StatusJson(&out, post_shift_b3, "      ");
+    out << "    }\n";
+    out << "  },\n";
+    out << "  \"observability\": {\n";
+    out << "    \"week4_walk_forward\": {\n";
+    AppendObservabilityJson(&out, week4_observability, "      ");
+    out << "    },\n";
+    out << "    \"transition_learning\": {\n";
+    AppendObservabilityJson(&out, transition_observability, "      ");
+    out << "    },\n";
+    out << "    \"post_shift_training\": {\n";
+    AppendObservabilityJson(&out, post_shift_observability, "      ");
+    out << "    },\n";
+    out << "    \"final7_walk_forward_detection\": {\n";
+    AppendObservabilityJson(&out, final7_observability, "      ");
+    out << "    }\n";
     out << "  },\n";
     out << "  \"transition_checkpoints\": [\n";
     for (std::size_t i = 0; i < checkpoints.size(); ++i) {
@@ -768,18 +1184,22 @@ std::string SummaryJson(const EvalSummary& week4_bootstrap,
         out << "      \"abs_z\": " << item.abs_z << ",\n";
         out << "      \"drift_evidence\": " << item.drift_evidence << ",\n";
         out << "      \"adapt_boost\": " << item.adapt_boost << ",\n";
-        out << "      \"update_weight\": " << item.update_weight << "\n";
+        out << "      \"update_weight\": " << item.update_weight << ",\n";
+        out << "      \"maturity_status\": \"" << item.maturity_status << "\",\n";
+        out << "      \"score_trust_status\": \"" << item.score_trust_status << "\",\n";
+        out << "      \"calibration_status\": \"" << item.calibration_status << "\",\n";
+        out << "      \"can_alert\": " << (item.can_alert ? "true" : "false") << "\n";
         out << "    }" << (i + 1 < checkpoints.size() ? "," : "") << "\n";
     }
     out << "  ],\n";
     out << "  \"outputs\": {\n";
     out << "    \"week4_comparison_csv\": \"" << week4_csv.string() << "\",\n";
+    out << "    \"week4_frozen_predict_csv\": \"" << week4_frozen_csv.string() << "\",\n";
+    out << "    \"week4_rolling_predict_csv\": \"" << week4_forecast_csv.string() << "\",\n";
     out << "    \"transition_learning_csv\": \"" << transition_csv.string() << "\",\n";
+    out << "    \"post_shift_training_csv\": \"" << post_shift_csv.string() << "\",\n";
     out << "    \"final7_rolling_csv\": \"" << final_csv.string() << "\",\n";
-    out << "    \"final7_adaptive_forecast_csv\": \"" << adaptive_csv.string() << "\",\n";
-    out << "    \"final7_level_scaled_forecast_csv\": \"" << scaled_csv.string() << "\",\n";
-    out << "    \"final7_calibrated_scaled_forecast_csv\": \""
-        << calibrated_csv.string() << "\"\n";
+    out << "    \"series_snapshot_json\": \"" << series_snapshot_json.string() << "\"\n";
     out << "  }\n";
     out << "}\n";
     return out.str();
@@ -863,29 +1283,64 @@ int main(int argc, char** argv) {
 
     EvalSummary week4_bootstrap;
     EvalSummary week4_rolling;
+    EvalSummary week4_frozen_bootstrap;
+    EvalSummary week4_frozen_forecast;
+    EvalSummary week4_forecast_bootstrap;
+    EvalSummary week4_rolling_forecast;
     EvalSummary transition;
+    EvalSummary post_shift_training;
     EvalSummary final7;
-    EvalSummary final7_adaptive_forecast;
-    EvalSummary final7_level_scaled_forecast;
-    EvalSummary final7_calibrated_scaled_forecast;
-    BandCalibration band_calibration;
+    SmoothnessSummary week4_frozen_bootstrap_smoothness;
+    SmoothnessSummary week4_frozen_forecast_smoothness;
+    SmoothnessSummary week4_forecast_bootstrap_smoothness;
+    SmoothnessSummary week4_rolling_forecast_smoothness;
+    B3StatusSummary week4_b3;
+    B3StatusSummary transition_b3;
+    B3StatusSummary post_shift_b3;
+    B3StatusSummary final7_b3;
+    RollingObservabilitySummary week4_observability;
+    RollingObservabilitySummary transition_observability;
+    RollingObservabilitySummary post_shift_observability;
+    RollingObservabilitySummary final7_observability;
     std::vector<TransitionCheckpoint> transition_checkpoints;
     const std::filesystem::path week4_csv = output_dir / "week4_comparison.csv";
+    const std::filesystem::path week4_frozen_csv =
+        output_dir / "week4_frozen_predict_comparison.csv";
+    const std::filesystem::path week4_forecast_csv =
+        output_dir / "week4_rolling_predict_comparison.csv";
     const std::filesystem::path transition_csv = output_dir / "transition_learning.csv";
-    const std::filesystem::path final_csv = output_dir / "final7_rolling_predictions.csv";
-    const std::filesystem::path adaptive_csv = output_dir / "final7_adaptive_forecast.csv";
-    const std::filesystem::path scaled_csv = output_dir / "final7_level_scaled_forecast.csv";
-    const std::filesystem::path calibrated_csv =
-        output_dir / "final7_calibrated_scaled_forecast.csv";
+    const std::filesystem::path post_shift_csv = output_dir / "post_shift_training.csv";
+    const std::filesystem::path final_csv =
+        output_dir / "final7_walk_forward_detection.csv";
+    const std::filesystem::path series_snapshot_path = output_dir / "rolling_series_snapshot.json";
     const std::filesystem::path summary_path = output_dir / "rolling_eval_summary.json";
 
-    if (!WriteWeek4ComparisonAndTrainRolling(week4_csv,
-                                             task.get(),
-                                             points,
-                                             week4_begin,
-                                             week4_end,
-                                             &week4_bootstrap,
-                                             &week4_rolling)) {
+    if (!WriteWeek4FrozenPredictComparison(week4_frozen_csv,
+                                           task.get(),
+                                           points,
+                                           week4_begin,
+                                           week4_end,
+                                           &week4_frozen_bootstrap,
+                                           &week4_frozen_forecast,
+                                           &week4_frozen_bootstrap_smoothness,
+                                           &week4_frozen_forecast_smoothness)) {
+        return 1;
+    }
+
+    if (!WriteWeek4RollingPredictAndTrainComparison(week4_csv,
+                                                    week4_forecast_csv,
+                                                    task.get(),
+                                                    points,
+                                                    week4_begin,
+                                                    week4_end,
+                                                    &week4_bootstrap,
+                                                    &week4_rolling,
+                                                    &week4_forecast_bootstrap,
+                                                    &week4_rolling_forecast,
+                                                    &week4_forecast_bootstrap_smoothness,
+                                                    &week4_rolling_forecast_smoothness,
+                                                    &week4_b3,
+                                                    &week4_observability)) {
         return 1;
     }
 
@@ -895,68 +1350,85 @@ int main(int argc, char** argv) {
                                  transition_begin,
                                  transition_end,
                                  &transition,
-                                 &transition_checkpoints)) {
+                                 &transition_checkpoints,
+                                 &transition_b3,
+                                 &transition_observability)) {
         return 1;
     }
-    band_calibration =
-        TrainRollingRangeAndCalibrateLevelScaledBand(task.get(),
-                                                     points,
-                                                     post_train_begin,
-                                                     post_train_end);
-    if (!WriteRollingPredictions(final_csv,
-                                 task.get(),
-                                 points,
-                                 final_begin,
-                                 final_end,
-                                 &final7)) {
+    if (!WritePostShiftTraining(post_shift_csv,
+                                task.get(),
+                                points,
+                                post_train_begin,
+                                post_train_end,
+                                &post_shift_training,
+                                &post_shift_b3,
+                                &post_shift_observability)) {
         return 1;
     }
-    if (!WriteAdaptiveForecastPredictions(adaptive_csv,
+    if (!WriteRollingWalkForwardDetection(final_csv,
                                           task.get(),
                                           points,
                                           final_begin,
                                           final_end,
-                                          &final7_adaptive_forecast)) {
+                                          &final7,
+                                          &final7_b3,
+                                          &final7_observability)) {
         return 1;
     }
-    if (!WriteLevelScaledAdaptiveForecastPredictions(scaled_csv,
-                                                     task.get(),
-                                                     points,
-                                                     final_begin,
-                                                     final_end,
-                                                     1.0,
-                                                     &final7_level_scaled_forecast)) {
-        return 1;
-    }
-    if (!WriteLevelScaledAdaptiveForecastPredictions(calibrated_csv,
-                                                     task.get(),
-                                                     points,
-                                                     final_begin,
-                                                     final_end,
-                                                     band_calibration.multiplier,
-                                                     &final7_calibrated_scaled_forecast)) {
+    auto [snapshot_status, snapshot_json] =
+        task->QuerySeriesSnapshot(kSeriesKey, BaselineSerializationFormat::kJson);
+    if (snapshot_status != BaselineStatus::kOk ||
+        !WriteTextFile(series_snapshot_path, snapshot_json)) {
         return 1;
     }
 
     assert(week4_bootstrap.count == week4_rolling.count);
     assert(week4_bootstrap.count == static_cast<uint64_t>(kWeekMinutes));
+    assert(week4_frozen_bootstrap.count == week4_frozen_forecast.count);
+    assert(week4_frozen_forecast.count == static_cast<uint64_t>(kWeekMinutes));
+    assert(week4_frozen_forecast_smoothness.adjacent_count ==
+           static_cast<uint64_t>(kWeekMinutes - 1));
+    assert(week4_forecast_bootstrap.count == week4_rolling_forecast.count);
+    assert(week4_rolling_forecast.count == static_cast<uint64_t>(kWeekMinutes));
+    assert(week4_rolling_forecast_smoothness.adjacent_count ==
+           static_cast<uint64_t>(kWeekMinutes - 1));
+    assert(week4_rolling_forecast.rmse < week4_forecast_bootstrap.rmse);
+    assert(week4_rolling_forecast.coverage_ratio >= 0.80);
     assert(transition.count == static_cast<uint64_t>(kDayMinutes));
     assert(transition_checkpoints.size() == 5);
+    assert(post_shift_training.count == static_cast<uint64_t>(4 * kDayMinutes));
     assert(final7.count == static_cast<uint64_t>(kWeekMinutes));
-    assert(final7_adaptive_forecast.count == static_cast<uint64_t>(kWeekMinutes));
-    assert(final7_level_scaled_forecast.count == static_cast<uint64_t>(kWeekMinutes));
-    assert(final7_calibrated_scaled_forecast.count == static_cast<uint64_t>(kWeekMinutes));
-    assert(band_calibration.count == static_cast<uint64_t>(4 * kDayMinutes));
+    assert(week4_b3.count == week4_rolling.count);
+    assert(transition_b3.count == transition.count);
+    assert(post_shift_b3.count == post_shift_training.count);
+    assert(final7_b3.count == final7.count);
+    assert(week4_observability.diagnostics_count == week4_rolling.count);
+    assert(transition_observability.diagnostics_count == transition.count);
+    assert(post_shift_observability.diagnostics_count == post_shift_training.count);
+    assert(final7_observability.diagnostics_count == final7.count);
+    assert(final7.mean_band_width < 1.0e9);
 
     if (!WriteTextFile(summary_path,
                        SummaryJson(week4_bootstrap,
                                    week4_rolling,
+                                   week4_frozen_bootstrap,
+                                   week4_frozen_forecast,
+                                   week4_forecast_bootstrap,
+                                   week4_rolling_forecast,
                                    transition,
+                                   post_shift_training,
                                    final7,
-                                   final7_adaptive_forecast,
-                                   final7_level_scaled_forecast,
-                                   final7_calibrated_scaled_forecast,
-                                   band_calibration,
+                                   week4_frozen_bootstrap_smoothness,
+                                   week4_frozen_forecast_smoothness,
+                                   week4_forecast_bootstrap_smoothness,
+                                   week4_rolling_forecast_smoothness,
+                                   week4_b3,
+                                   transition_b3,
+                                   post_shift_b3,
+                                   week4_observability,
+                                   transition_observability,
+                                   post_shift_observability,
+                                   final7_observability,
                                    points,
                                    bootstrap_begin,
                                    bootstrap_end,
@@ -972,11 +1444,12 @@ int main(int argc, char** argv) {
                                    final_end,
                                    transition_checkpoints,
                                    week4_csv,
+                                   week4_frozen_csv,
+                                   week4_forecast_csv,
                                    transition_csv,
+                                   post_shift_csv,
                                    final_csv,
-                                   adaptive_csv,
-                                   scaled_csv,
-                                   calibrated_csv))) {
+                                   series_snapshot_path))) {
         return 1;
     }
 
@@ -990,27 +1463,44 @@ int main(int argc, char** argv) {
               << ", rmse_mbps=" << week4_rolling.rmse
               << ", abs_z_gt_3=" << week4_rolling.abs_z_gt_3_count
               << ", abs_z_gt_5=" << week4_rolling.abs_z_gt_5_count << "\n";
+    std::cout << "week4_rolling_frozen_forecast_count=" << week4_frozen_forecast.count
+              << ", rmse_mbps=" << week4_frozen_forecast.rmse
+              << ", mean_band_width_mbps=" << week4_frozen_forecast.mean_band_width
+              << ", smooth_upper_delta_mbps="
+              << week4_frozen_forecast_smoothness.mean_abs_delta_upper << "\n";
+    std::cout << "week4_rolling_predict_forecast_count=" << week4_rolling_forecast.count
+              << ", rmse_mbps=" << week4_rolling_forecast.rmse
+              << ", mean_band_width_mbps=" << week4_rolling_forecast.mean_band_width
+              << ", smooth_upper_delta_mbps="
+              << week4_rolling_forecast_smoothness.mean_abs_delta_upper << "\n";
     std::cout << "transition_count=" << transition.count
               << ", rmse_mbps=" << transition.rmse
               << ", abs_z_gt_3=" << transition.abs_z_gt_3_count
               << ", abs_z_gt_5=" << transition.abs_z_gt_5_count << "\n";
+    std::cout << "post_shift_training_count=" << post_shift_training.count
+              << ", rmse_mbps=" << post_shift_training.rmse
+              << ", abs_z_gt_3=" << post_shift_training.abs_z_gt_3_count
+              << ", abs_z_gt_5=" << post_shift_training.abs_z_gt_5_count << "\n";
     std::cout << "final7_rolling_count=" << final7.count
               << ", rmse_mbps=" << final7.rmse
               << ", abs_z_gt_3=" << final7.abs_z_gt_3_count
-              << ", abs_z_gt_5=" << final7.abs_z_gt_5_count << "\n";
-    std::cout << "final7_adaptive_forecast_count=" << final7_adaptive_forecast.count
-              << ", rmse_mbps=" << final7_adaptive_forecast.rmse
-              << ", abs_z_gt_3=" << final7_adaptive_forecast.abs_z_gt_3_count
-              << ", abs_z_gt_5=" << final7_adaptive_forecast.abs_z_gt_5_count << "\n";
-    std::cout << "final7_level_scaled_forecast_count=" << final7_level_scaled_forecast.count
-              << ", rmse_mbps=" << final7_level_scaled_forecast.rmse
-              << ", abs_z_gt_3=" << final7_level_scaled_forecast.abs_z_gt_3_count
-              << ", abs_z_gt_5=" << final7_level_scaled_forecast.abs_z_gt_5_count << "\n";
-    std::cout << "final7_calibrated_scaled_forecast_count="
-              << final7_calibrated_scaled_forecast.count
-              << ", rmse_mbps=" << final7_calibrated_scaled_forecast.rmse
-              << ", abs_z_gt_3=" << final7_calibrated_scaled_forecast.abs_z_gt_3_count
-              << ", abs_z_gt_5=" << final7_calibrated_scaled_forecast.abs_z_gt_5_count
-              << ", calibration_multiplier=" << band_calibration.multiplier << "\n";
+              << ", abs_z_gt_5=" << final7.abs_z_gt_5_count
+              << ", mean_band_width_mbps=" << final7.mean_band_width << "\n";
+    std::cout << "week4_b3_can_alert=" << week4_b3.can_alert_count
+              << ", score_ready=" << week4_b3.score_ready_count
+              << ", score_warming=" << week4_b3.score_warming_count << "\n";
+    std::cout << "transition_b3_drift_learning=" << transition_b3.drift_learning_count
+              << ", recalibrating=" << transition_b3.recalibrating_count
+              << ", can_alert=" << transition_b3.can_alert_count << "\n";
+    std::cout << "post_shift_b3_score_ready=" << post_shift_b3.score_ready_count
+              << ", can_alert=" << post_shift_b3.can_alert_count << "\n";
+    std::cout << "final7_b3_score_ready=" << final7_b3.score_ready_count
+              << ", can_alert=" << final7_b3.can_alert_count << "\n";
+    std::cout << "transition_observability_diagnostics="
+              << transition_observability.diagnostics_count
+              << ", max_level_shift_evidence="
+              << transition_observability.max_abs_level_shift_evidence
+              << ", max_combined_drift_evidence="
+              << transition_observability.max_combined_drift_evidence << "\n";
     return 0;
 }

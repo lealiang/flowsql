@@ -13,6 +13,8 @@
 #include <sstream>
 #include <string>
 
+#include "plugins/baseline/rolling/monthpos_state.h"
+
 namespace flowsql {
 namespace baseline {
 namespace {
@@ -115,6 +117,92 @@ double CoverageScale(double coverage_ratio) {
     return std::max(1.0, std::min(4.0, scale));
 }
 
+double ClampMultiplier(double value, const BaselineRollingConfig& config) {
+    if (!std::isfinite(value)) return 1.0;
+    return std::max(config.calibration_multiplier_min,
+                    std::min(config.calibration_multiplier_max, value));
+}
+
+bool HasEnabledComponent(const BootstrapSeed& seed, const char* name) {
+    return std::find(seed.enabled_components.begin(), seed.enabled_components.end(), name) !=
+           seed.enabled_components.end();
+}
+
+RollingSeasonalPriorQuality SeasonalPriorQuality(const BootstrapSeed& seed,
+                                                 const char* component) {
+    if (!HasEnabledComponent(seed, component)) return RollingSeasonalPriorQuality::kEmpty;
+    switch (seed.seed_status) {
+        case BootstrapSeedStatus::kFull:
+            return RollingSeasonalPriorQuality::kFull;
+        case BootstrapSeedStatus::kPartial:
+            return RollingSeasonalPriorQuality::kPartial;
+        case BootstrapSeedStatus::kWeak:
+            return RollingSeasonalPriorQuality::kWeak;
+        case BootstrapSeedStatus::kNone:
+            break;
+    }
+    return RollingSeasonalPriorQuality::kEmpty;
+}
+
+RollingMaturityStatus SeedMaturityStatus(const BootstrapSeed& seed,
+                                         const BaselineRollingConfig& config) {
+    const uint64_t accepted = seed.maturity_init.accepted_count;
+    const double coverage = std::max(seed.maturity_init.coverage_ratio,
+                                     seed.coverage_report.coverage_ratio);
+    if (accepted >= config.weekly_ready_min_weeks * config.week_buckets &&
+        coverage >= config.weekly_ready_coverage_ratio &&
+        (HasEnabledComponent(seed, "weekly") || HasEnabledComponent(seed, "daily"))) {
+        return RollingMaturityStatus::kWeeklyReady;
+    }
+    if (accepted >= config.daily_ready_min_days * config.day_buckets &&
+        coverage >= config.daily_ready_coverage_ratio &&
+        (HasEnabledComponent(seed, "daily") || HasEnabledComponent(seed, "weekly"))) {
+        return RollingMaturityStatus::kDailyReady;
+    }
+    if (accepted >= config.level_ready_min_updates) {
+        return RollingMaturityStatus::kLevelReady;
+    }
+    return RollingMaturityStatus::kColdLearning;
+}
+
+void InitializeB3Defaults(const BaselineRollingConfig& config, RollingState* state) {
+    if (!state) return;
+    state->maturity_status = RollingMaturityStatus::kColdLearning;
+    state->score_trust_status = ScoreTrustStatus::kScoreUntrusted;
+    state->calibration_status = RollingCalibrationStatus::kUncalibrated;
+    state->monthpos_status = RollingMonthposStatus::kDisabled;
+    state->learning_confidence = config.confidence_cold;
+    state->score_confidence = 0.0;
+    state->effective_confidence = 0.0;
+    state->detection_band_multiplier = 1.0;
+    state->residual_scale_ewma = 1.0;
+    state->coverage_ewma = 1.0;
+    state->tail3_ewma = 0.0;
+    state->tail5_ewma = 0.0;
+    state->abs_z_ewma = 0.0;
+    state->calibration_update_count = 0;
+    state->stable_score_count = 0;
+    state->score_ready_count = 0;
+    state->last_degradation_bucket = 0;
+    state->degradation_reason.clear();
+    state->daily_bin_count.assign(std::max<uint32_t>(1, config.daily_coverage_bins), 0);
+    state->weekly_bin_count.assign(std::max<uint32_t>(1, config.weekly_coverage_bins), 0);
+    state->monthpos_count.fill(0);
+    state->monthpos_dme_count.assign(8, 0);
+    state->monthpos_lwd_count.fill(0);
+    state->monthpos_lwd_update_count = 0;
+    state->month_transition_count = 0;
+    state->last_seen_month_id = 0;
+    state->monthpos_dom_coeff.assign(31, 0.0);
+    state->monthpos_dom_center.assign(31, 0.0);
+    state->monthpos_dme_coeff.assign(8, 0.0);
+    state->monthpos_dme_center.assign(8, 0.0);
+    state->monthpos_lwd_coeff.assign(7, 0.0);
+    state->monthpos_lwd_center.assign(7, 0.0);
+    state->monthpos_update_count = 0;
+    state->monthpos_ready_count = 0;
+}
+
 double SeedCovariance(double init_scale,
                       double component_scale,
                       double sigma,
@@ -207,6 +295,76 @@ const char* RollingStateStatusName(RollingStateStatus status) {
     return "cold_learning";
 }
 
+const char* RollingMaturityStatusName(RollingMaturityStatus status) {
+    switch (status) {
+        case RollingMaturityStatus::kColdLearning:
+            return "cold_learning";
+        case RollingMaturityStatus::kLevelReady:
+            return "level_ready";
+        case RollingMaturityStatus::kDailyWarming:
+            return "daily_warming";
+        case RollingMaturityStatus::kDailyReady:
+            return "daily_ready";
+        case RollingMaturityStatus::kWeeklyWarming:
+            return "weekly_warming";
+        case RollingMaturityStatus::kWeeklyReady:
+            return "weekly_ready";
+        case RollingMaturityStatus::kMonthlyWarming:
+            return "monthly_warming";
+        case RollingMaturityStatus::kMonthlyReady:
+            return "monthly_ready";
+    }
+    return "cold_learning";
+}
+
+const char* ScoreTrustStatusName(ScoreTrustStatus status) {
+    switch (status) {
+        case ScoreTrustStatus::kScoreUntrusted:
+            return "score_untrusted";
+        case ScoreTrustStatus::kScoreWarming:
+            return "score_warming";
+        case ScoreTrustStatus::kScoreReady:
+            return "score_ready";
+        case ScoreTrustStatus::kDriftLearning:
+            return "drift_learning";
+        case ScoreTrustStatus::kRecalibrating:
+            return "recalibrating";
+    }
+    return "score_untrusted";
+}
+
+const char* RollingCalibrationStatusName(RollingCalibrationStatus status) {
+    switch (status) {
+        case RollingCalibrationStatus::kUncalibrated:
+            return "uncalibrated";
+        case RollingCalibrationStatus::kWarming:
+            return "warming";
+        case RollingCalibrationStatus::kCalibrated:
+            return "calibrated";
+        case RollingCalibrationStatus::kExpanding:
+            return "expanding";
+        case RollingCalibrationStatus::kRecalibrating:
+            return "recalibrating";
+    }
+    return "uncalibrated";
+}
+
+const char* RollingMonthposStatusName(RollingMonthposStatus status) {
+    switch (status) {
+        case RollingMonthposStatus::kDisabled:
+            return "disabled";
+        case RollingMonthposStatus::kMonthlyWarming:
+            return "monthly_warming";
+        case RollingMonthposStatus::kMonthlyReady:
+            return "monthly_ready";
+    }
+    return "disabled";
+}
+
+bool MaturityAtLeast(RollingMaturityStatus actual, RollingMaturityStatus expected) {
+    return static_cast<int32_t>(actual) >= static_cast<int32_t>(expected);
+}
+
 RollingStateStatus StatusFromAcceptedUpdateCount(uint64_t accepted_update_count,
                                                  const BaselineRollingConfig& config) {
     if (accepted_update_count < config.min_warming_updates) {
@@ -227,6 +385,9 @@ BaselineStatus BuildEmptyRollingState(std::string_view series_key,
     state.series_key = std::string(series_key);
     state.sigma_init = config.sigma_floor;
     state.sigma = config.sigma_floor;
+    state.bootstrap_seed_status = BootstrapSeedStatus::kNone;
+    state.daily_prior_quality = RollingSeasonalPriorQuality::kEmpty;
+    state.weekly_prior_quality = RollingSeasonalPriorQuality::kEmpty;
     state.p_level =
         ClampCovariance(config.p_level_init_scale * config.sigma_floor * config.sigma_floor,
                         config);
@@ -242,6 +403,7 @@ BaselineStatus BuildEmptyRollingState(std::string_view series_key,
                         config);
     ResizeHarmonicState(config.daily_harmonic_order, p_day, &state.theta.daily);
     ResizeHarmonicState(config.weekly_harmonic_order, p_week, &state.theta.weekly);
+    InitializeB3Defaults(config, &state);
     state.confidence = config.confidence_cold;
     state.state_status = RollingStateStatus::kColdLearning;
     *out = std::move(state);
@@ -264,8 +426,12 @@ BaselineStatus InitializeEmptyRollingStateFromObservation(const ObservedModelPoi
     next.has_seen_observation = true;
     next.last_seen_bucket = point.bucket_id;
     next.accepted_update_count = 1;
+    next.maturity_prior_update_count = 0;
     next.confidence = config.confidence_cold;
     next.state_status = StatusFromAcceptedUpdateCount(next.accepted_update_count, config);
+    next.maturity_status = RollingMaturityStatus::kColdLearning;
+    next.learning_confidence = config.confidence_cold;
+    next.effective_confidence = 0.0;
     next.diagnostics = "cold_start;first_observation";
     *state = std::move(next);
     return BaselineStatus::kOk;
@@ -288,6 +454,7 @@ BaselineStatus InitializeRollingStateFromBootstrapSeed(const BaselineTaskSpec& s
 
     RollingState state;
     state.series_key = std::string(series_key);
+    InitializeB3Defaults(config, &state);
     const int64_t anchor_bucket =
         std::max(seed.theta_init.reference_bucket_id, seed.coverage_report.train_end_bucket);
     state.theta.level =
@@ -297,6 +464,9 @@ BaselineStatus InitializeRollingStateFromBootstrapSeed(const BaselineTaskSpec& s
     state.theta.trend = seed.theta_init.trend;
     state.sigma_init = sigma;
     state.sigma = sigma;
+    state.bootstrap_seed_status = seed.seed_status;
+    state.daily_prior_quality = SeasonalPriorQuality(seed, "daily");
+    state.weekly_prior_quality = SeasonalPriorQuality(seed, "weekly");
     state.p_level = SeedCovariance(config.p_level_init_scale,
                                    component.level_scale,
                                    sigma,
@@ -342,8 +512,50 @@ BaselineStatus InitializeRollingStateFromBootstrapSeed(const BaselineTaskSpec& s
     state.last_seen_bucket = anchor_bucket;
     state.accepted_update_count =
         std::min(seed.maturity_init.accepted_count, ReadyHintThreshold(config));
+    state.maturity_prior_update_count =
+        seed.maturity_init.accepted_count > state.accepted_update_count
+            ? seed.maturity_init.accepted_count - state.accepted_update_count
+            : 0;
     state.state_status = StatusFromAcceptedUpdateCount(state.accepted_update_count, config);
     state.confidence = std::min(seed.maturity_init.confidence, config.confidence_ready_hint_cap);
+    state.maturity_status = SeedMaturityStatus(seed, config);
+    state.learning_confidence = state.confidence;
+    state.score_trust_status =
+        MaturityAtLeast(state.maturity_status, RollingMaturityStatus::kLevelReady)
+            ? ScoreTrustStatus::kScoreWarming
+            : ScoreTrustStatus::kScoreUntrusted;
+    state.score_confidence =
+        state.score_trust_status == ScoreTrustStatus::kScoreWarming ? config.confidence_warming
+                                                                    : 0.0;
+    state.effective_confidence = std::min(state.learning_confidence, state.score_confidence);
+    state.calibration_status = RollingCalibrationStatus::kWarming;
+    state.detection_band_multiplier =
+        ClampMultiplier(seed.uncertainty_init.band_z / std::max(config.band_z, 1.0e-12),
+                        config);
+    state.residual_scale_ewma =
+        state.detection_band_multiplier * state.detection_band_multiplier;
+    state.coverage_ewma = 1.0;
+    state.calibration_update_count = 0;
+    if (seed.coverage_report.coverage_ratio > 0.0) {
+        const auto daily_fill = static_cast<std::size_t>(
+            std::min<double>(state.daily_bin_count.size(),
+                             std::ceil(seed.coverage_report.coverage_ratio *
+                                       state.daily_bin_count.size())));
+        for (std::size_t i = 0; i < daily_fill; ++i) state.daily_bin_count[i] = 1;
+        const auto weekly_fill = static_cast<std::size_t>(
+            std::min<double>(state.weekly_bin_count.size(),
+                             std::ceil(seed.coverage_report.coverage_ratio *
+                                       state.weekly_bin_count.size())));
+        for (std::size_t i = 0; i < weekly_fill; ++i) state.weekly_bin_count[i] = 1;
+    }
+    if (seed.monthpos_hint.available) {
+        const BaselineStatus monthpos_status =
+            InitializeRollingMonthposFromSeed(seed, config, &state);
+        if (monthpos_status != BaselineStatus::kOk && diag.tellp() >= 0) {
+            if (diag.tellp() > 0) diag << ";";
+            diag << "monthpos_seed_ignored";
+        }
+    }
     state.short_ewma = 0.0;
     state.long_ewma = 0.0;
     state.drift_evidence = 0.0;

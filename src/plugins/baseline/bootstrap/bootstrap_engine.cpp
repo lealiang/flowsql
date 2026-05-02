@@ -22,6 +22,7 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
+#include "plugins/baseline/config/runtime_config.h"
 #include "plugins/baseline/model/profile_config.h"
 #include "plugins/baseline/model/formal_predictor.h"
 #include "plugins/baseline/bootstrap/formal_model_trainer.h"
@@ -535,6 +536,89 @@ std::vector<std::string> MakeEnabledComponents(
     if (monthpos_hint && monthpos_hint->available) components.push_back("monthpos");
     if (event_hint && event_hint->available) components.push_back("event");
     return components;
+}
+
+bool HasComponent(const std::vector<std::string>& components, const char* name) {
+    return std::find(components.begin(), components.end(), name) != components.end();
+}
+
+BootstrapSeedQualityConfig CurrentSeedQualityConfig() {
+    BootstrapSeedQualityConfig config;
+    (void)TryGetBootstrapSeedQualityConfigOverride(&config);
+    return config;
+}
+
+BootstrapSeedStatus EvaluateBootstrapSeedStatus(
+    BaselineStatus train_status,
+    BootstrapArtifactKind artifact_kind,
+    const BootstrapCoverageReport& coverage,
+    const BootstrapClockSpec& clock,
+    const BootstrapThetaInit* theta,
+    const BootstrapSigmaInit* sigma,
+    const std::vector<std::string>& enabled_components,
+    std::vector<std::string>* diagnostics = nullptr) {
+    const BootstrapSeedQualityConfig config = CurrentSeedQualityConfig();
+    auto add_diag = [diagnostics](const char* value) {
+        if (diagnostics && value) diagnostics->push_back(value);
+    };
+
+    if (train_status != BaselineStatus::kOk) {
+        add_diag("train_status_not_ok");
+        return BootstrapSeedStatus::kNone;
+    }
+
+    if (artifact_kind == BootstrapArtifactKind::kRelation && (!theta || !theta->available)) {
+        if (coverage.coverage_ratio >= config.full_min_coverage_ratio) {
+            return BootstrapSeedStatus::kFull;
+        }
+        if (coverage.coverage_ratio >= config.partial_min_coverage_ratio) {
+            return BootstrapSeedStatus::kPartial;
+        }
+        add_diag("low_coverage_ratio");
+        return BootstrapSeedStatus::kWeak;
+    }
+
+    if (!theta || !theta->available) {
+        add_diag("missing_theta_init");
+        return BootstrapSeedStatus::kNone;
+    }
+    if (!sigma || !sigma->available || !std::isfinite(sigma->value) || sigma->value <= 0.0) {
+        add_diag("missing_sigma_init");
+        return BootstrapSeedStatus::kNone;
+    }
+
+    if (coverage.coverage_ratio < config.partial_min_coverage_ratio) {
+        add_diag("low_coverage_ratio");
+        return BootstrapSeedStatus::kWeak;
+    }
+
+    const int64_t covered_seconds = CoveredSeconds(coverage, clock);
+    const bool requires_daily = !theta->daily_harmonic.empty();
+    const bool requires_weekly = !theta->weekly_harmonic.empty();
+    const bool daily_ready =
+        !requires_daily ||
+        (HasComponent(enabled_components, "daily") &&
+         covered_seconds >=
+             static_cast<int64_t>(config.daily_min_span_days) * 86400 &&
+         coverage.coverage_ratio >= config.daily_phase_coverage_ratio);
+    const bool weekly_ready =
+        !requires_weekly ||
+        (HasComponent(enabled_components, "weekly") &&
+         covered_seconds >=
+             static_cast<int64_t>(config.weekly_min_span_days) * 86400 &&
+         coverage.coverage_ratio >= config.weekly_phase_coverage_ratio);
+
+    if (coverage.coverage_ratio >= config.full_min_coverage_ratio &&
+        daily_ready &&
+        weekly_ready) {
+        return BootstrapSeedStatus::kFull;
+    }
+
+    if (requires_daily && !daily_ready) add_diag("insufficient_daily_coverage");
+    if (requires_weekly && !weekly_ready) add_diag("insufficient_weekly_coverage");
+    return (requires_daily && !HasComponent(enabled_components, "daily"))
+               ? BootstrapSeedStatus::kWeak
+               : BootstrapSeedStatus::kPartial;
 }
 
 BootstrapMaturityInit MakeMaturityInit(BootstrapSeedStatus seed_status,
@@ -1689,8 +1773,7 @@ BootstrapTrainResult BootstrapEngine::TrainValue(
                           result.train_end_bucket)
                 .coverage_ratio;
     }
-    result.seed_status = result.status == BaselineStatus::kOk ? BootstrapSeedStatus::kPartial
-                                                              : BootstrapSeedStatus::kNone;
+    result.seed_status = BootstrapSeedStatus::kNone;
     if (failure != FormalTrainFailureCode::kNone) {
         result.diagnostics = FormalTrainFailureCodeName(failure);
     } else {
@@ -1712,6 +1795,15 @@ BootstrapTrainResult BootstrapEngine::TrainValue(
                                : BootstrapEventHint{};
         result.enabled_components =
             MakeEnabledComponents(theta, coverage, MakeClockSpec(spec), &monthpos_hint, &event_hint);
+        const BootstrapSigmaInit sigma =
+            train_result.model ? MakeValueSigmaInit(*train_result.model) : BootstrapSigmaInit{};
+        result.seed_status = EvaluateBootstrapSeedStatus(result.status,
+                                                         BootstrapArtifactKind::kValue,
+                                                         coverage,
+                                                         MakeClockSpec(spec),
+                                                         &theta,
+                                                         &sigma,
+                                                         result.enabled_components);
         result.confidence = train_result.model ? train_result.model->confidence_base_at_train : 0.0;
     }
 
@@ -1852,8 +1944,7 @@ BootstrapTrainResult BootstrapEngine::TrainRatio(
                           result.train_end_bucket)
                 .coverage_ratio;
     }
-    result.seed_status = result.status == BaselineStatus::kOk ? BootstrapSeedStatus::kPartial
-                                                              : BootstrapSeedStatus::kNone;
+    result.seed_status = BootstrapSeedStatus::kNone;
     if (failure != FormalTrainFailureCode::kNone) {
         result.diagnostics = FormalTrainFailureCodeName(failure);
     } else {
@@ -1875,6 +1966,16 @@ BootstrapTrainResult BootstrapEngine::TrainRatio(
                                : BootstrapEventHint{};
         result.enabled_components =
             MakeEnabledComponents(theta, coverage, MakeClockSpec(spec), &monthpos_hint, &event_hint);
+        const BootstrapSigmaInit sigma =
+            train_result.model ? MakeRatioSigmaInit(*train_result.model, coverage)
+                               : BootstrapSigmaInit{};
+        result.seed_status = EvaluateBootstrapSeedStatus(result.status,
+                                                         BootstrapArtifactKind::kRatio,
+                                                         coverage,
+                                                         MakeClockSpec(spec),
+                                                         &theta,
+                                                         &sigma,
+                                                         result.enabled_components);
         result.confidence = train_result.model ? train_result.model->confidence_base_at_train : 0.0;
     }
 
@@ -2190,7 +2291,6 @@ BootstrapTrainResult BootstrapEngine::TrainRelation(
 
     BootstrapTrainResult result;
     result.status = BaselineStatus::kOk;
-    result.seed_status = BootstrapSeedStatus::kPartial;
     result.accepted_count = normalized_blocks.size();
     result.rejected_count = rejected_count;
     result.train_start_bucket = train_start_bucket;
@@ -2205,6 +2305,17 @@ BootstrapTrainResult BootstrapEngine::TrainRelation(
     if (!routed_artifacts.empty()) {
         result.enabled_components.push_back("relation_routed_summaries");
     }
+    result.seed_status =
+        EvaluateBootstrapSeedStatus(result.status,
+                                    BootstrapArtifactKind::kRelation,
+                                    BuildCoverage(result.accepted_count,
+                                                  result.rejected_count,
+                                                  result.train_start_bucket,
+                                                  result.train_end_bucket),
+                                    MakeClockSpec(spec),
+                                    nullptr,
+                                    nullptr,
+                                    result.enabled_components);
 
     if (out_artifact) {
         out_artifact->train_status = BaselineStatus::kOk;
@@ -2335,9 +2446,7 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
                                            BootstrapSeed* out_seed) const {
     if (!out_seed) return BaselineStatus::kInvalidArgument;
     *out_seed = BootstrapSeed{};
-    out_seed->seed_status = artifact.train_status == BaselineStatus::kOk
-                                ? BootstrapSeedStatus::kPartial
-                                : BootstrapSeedStatus::kNone;
+    out_seed->seed_status = BootstrapSeedStatus::kNone;
     out_seed->artifact_kind = artifact.artifact_kind;
     out_seed->source_artifact_version = artifact.model_version;
     out_seed->series_key = artifact.series_key;
@@ -2350,7 +2459,7 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
     if (artifact.value_model) {
         FillValueSeedInitializers(*artifact.value_model,
                                   artifact.coverage_report,
-                                  out_seed->seed_status,
+                                  BootstrapSeedStatus::kPartial,
                                   &out_seed->theta_init,
                                   &out_seed->monthpos_hint,
                                   &out_seed->event_hint,
@@ -2366,10 +2475,19 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
                                   out_seed->clock_spec,
                                   &out_seed->monthpos_hint,
                                   &out_seed->event_hint);
+        out_seed->seed_status =
+            EvaluateBootstrapSeedStatus(artifact.train_status,
+                                        artifact.artifact_kind,
+                                        out_seed->coverage_report,
+                                        out_seed->clock_spec,
+                                        &out_seed->theta_init,
+                                        &out_seed->sigma_init,
+                                        out_seed->enabled_components);
+        out_seed->maturity_init.seed_status = out_seed->seed_status;
     } else if (artifact.ratio_model) {
         FillRatioSeedInitializers(*artifact.ratio_model,
                                   artifact.coverage_report,
-                                  out_seed->seed_status,
+                                  BootstrapSeedStatus::kPartial,
                                   &out_seed->theta_init,
                                   &out_seed->monthpos_hint,
                                   &out_seed->event_hint,
@@ -2385,6 +2503,24 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
                                   out_seed->clock_spec,
                                   &out_seed->monthpos_hint,
                                   &out_seed->event_hint);
+        out_seed->seed_status =
+            EvaluateBootstrapSeedStatus(artifact.train_status,
+                                        artifact.artifact_kind,
+                                        out_seed->coverage_report,
+                                        out_seed->clock_spec,
+                                        &out_seed->theta_init,
+                                        &out_seed->sigma_init,
+                                        out_seed->enabled_components);
+        out_seed->maturity_init.seed_status = out_seed->seed_status;
+    } else {
+        out_seed->seed_status =
+            EvaluateBootstrapSeedStatus(artifact.train_status,
+                                        artifact.artifact_kind,
+                                        out_seed->coverage_report,
+                                        out_seed->clock_spec,
+                                        nullptr,
+                                        nullptr,
+                                        out_seed->enabled_components);
     }
     out_seed->relation_basis_by_metric.reserve(artifact.relation_basis_by_metric.size());
     for (const auto& basis : artifact.relation_basis_by_metric) {
@@ -2402,13 +2538,13 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
         routed_seed.clock_spec = routed_artifact.clock_spec;
         routed_seed.calendar_ref = routed_artifact.calendar_ref;
         routed_seed.coverage_report = routed_artifact.coverage_report;
-        routed_seed.seed_status = BootstrapSeedStatus::kPartial;
+        routed_seed.seed_status = BootstrapSeedStatus::kNone;
         routed_seed.seeded_components = routed_artifact.seeded_components;
         routed_seed.enabled_components = routed_artifact.enabled_components;
         if (routed_artifact.value_model) {
             FillValueSeedInitializers(*routed_artifact.value_model,
                                       routed_artifact.coverage_report,
-                                      routed_seed.seed_status,
+                                      BootstrapSeedStatus::kPartial,
                                       &routed_seed.theta_init,
                                       &routed_seed.monthpos_hint,
                                       &routed_seed.event_hint,
@@ -2424,10 +2560,19 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
                                       routed_seed.clock_spec,
                                       &routed_seed.monthpos_hint,
                                       &routed_seed.event_hint);
+            routed_seed.seed_status =
+                EvaluateBootstrapSeedStatus(BaselineStatus::kOk,
+                                            BootstrapArtifactKind::kValue,
+                                            routed_seed.coverage_report,
+                                            routed_seed.clock_spec,
+                                            &routed_seed.theta_init,
+                                            &routed_seed.sigma_init,
+                                            routed_seed.enabled_components);
+            routed_seed.maturity_init.seed_status = routed_seed.seed_status;
         } else if (routed_artifact.ratio_model) {
             FillRatioSeedInitializers(*routed_artifact.ratio_model,
                                       routed_artifact.coverage_report,
-                                      routed_seed.seed_status,
+                                      BootstrapSeedStatus::kPartial,
                                       &routed_seed.theta_init,
                                       &routed_seed.monthpos_hint,
                                       &routed_seed.event_hint,
@@ -2443,6 +2588,15 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
                                       routed_seed.clock_spec,
                                       &routed_seed.monthpos_hint,
                                       &routed_seed.event_hint);
+            routed_seed.seed_status =
+                EvaluateBootstrapSeedStatus(BaselineStatus::kOk,
+                                            BootstrapArtifactKind::kRatio,
+                                            routed_seed.coverage_report,
+                                            routed_seed.clock_spec,
+                                            &routed_seed.theta_init,
+                                            &routed_seed.sigma_init,
+                                            routed_seed.enabled_components);
+            routed_seed.maturity_init.seed_status = routed_seed.seed_status;
         }
         out_seed->relation_routed_summary_seeds.push_back(std::move(routed_seed));
     }

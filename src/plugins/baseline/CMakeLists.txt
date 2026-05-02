@@ -13,12 +13,16 @@ add_library(${PROJECT_NAME} SHARED
     bootstrap/formal_model_trainer.cpp
     relation/relation_basis.cpp
     rolling/drift_adapt.cpp
+    rolling/detection_calibration.cpp
+    rolling/maturity_gate.cpp
+    rolling/monthpos_state.cpp
     rolling/observation_adapter.cpp
     rolling/residual_scale.cpp
     rolling/rolling_estimator.cpp
     rolling/rolling_config.cpp
     rolling/rolling_state.cpp
     rolling/rolling_task_runner.cpp
+    rolling/score_trust.cpp
     rolling/update_gate.cpp
     solver/solver_backend.cpp
     task/baseline_task_base.cpp

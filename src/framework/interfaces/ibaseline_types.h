@@ -187,6 +187,15 @@ struct RollingBaselineResult {
     double score_weight = 0.0;
     double update_weight = 0.0;
     double confidence = 0.0;
+    std::string maturity_status;
+    std::string score_trust_status;
+    std::string calibration_status;
+    double learning_confidence = 0.0;
+    double score_confidence = 0.0;
+    double effective_confidence = 0.0;
+    bool can_alert = false;
+    std::vector<std::string> enabled_components;
+    std::vector<std::string> component_readiness;
     std::string state_status;
     std::vector<std::string> uncertainty_source;
     double drift_evidence = 0.0;

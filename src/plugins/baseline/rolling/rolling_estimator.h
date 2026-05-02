@@ -53,6 +53,11 @@ BaselineStatus PredictRollingState(const RollingState& state,
                                    const BaselineRollingConfig& config,
                                    RollingEstimatorResult* out);
 
+BaselineStatus PredictRollingForecastState(const RollingState& state,
+                                           int64_t bucket_id,
+                                           const BaselineRollingConfig& config,
+                                           RollingEstimatorResult* out);
+
 BaselineStatus UpdateRollingStateWithObservation(const ObservedModelPoint& point,
                                                  const BaselineRollingConfig& config,
                                                  RollingState* state,

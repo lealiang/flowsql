@@ -924,6 +924,15 @@ void TestB2ValueRollingEmptyStart() {
     assert(!first_result.can_score);
     assert(first_result.can_update);
     assert(first_result.state_status == "cold_learning");
+    assert(first_result.maturity_status == "cold_learning");
+    assert(first_result.score_trust_status == "score_untrusted");
+    assert(first_result.calibration_status == "uncalibrated");
+    assert(first_result.learning_confidence > 0.0);
+    assert(first_result.score_confidence == 0.0);
+    assert(first_result.effective_confidence == 0.0);
+    assert(!first_result.can_alert);
+    assert(first_result.enabled_components.empty());
+    assert(!first_result.component_readiness.empty());
     assert(first_result.band_width > 0.0);
     assert(first_result.baseline_lower >= 0.0);
 
@@ -935,6 +944,10 @@ void TestB2ValueRollingEmptyStart() {
     assert(second_result.status == BaselineStatus::kOk);
     assert(second_result.can_score);
     assert(second_result.can_update);
+    assert(!second_result.maturity_status.empty());
+    assert(!second_result.score_trust_status.empty());
+    assert(!second_result.calibration_status.empty());
+    assert(!second_result.can_alert);
     assert(second_result.update_weight > 0.0);
     assert(second_result.band_width > 0.0);
 
@@ -1025,6 +1038,9 @@ void TestB2RollingSnapshotAndBootstrapWarmup() {
     assert(std::string(task_doc["document_kind"].GetString()) == "rolling_task_snapshot");
     assert(task_doc["rolling_series_count"].GetUint64() == 1);
     assert(task_doc.HasMember("state_status_counts"));
+    assert(task_doc.HasMember("maturity_status_counts"));
+    assert(task_doc.HasMember("score_trust_status_counts"));
+    assert(task_doc.HasMember("calibration_status_counts"));
     assert(task_doc.HasMember("rolling_state_memory_estimate_bytes"));
 
     auto [series_snapshot_status, series_snapshot_json] =
@@ -1037,6 +1053,19 @@ void TestB2RollingSnapshotAndBootstrapWarmup() {
     assert(series_doc["series_identity"]["series_key"] == "svc-a");
     assert(series_doc.HasMember("band"));
     assert(series_doc.HasMember("control"));
+    assert(series_doc.HasMember("maturity"));
+    assert(series_doc["maturity"].HasMember("status"));
+    assert(series_doc["maturity"].HasMember("enabled_components"));
+    assert(series_doc["maturity"].HasMember("component_readiness"));
+    assert(series_doc["maturity"].HasMember("coverage"));
+    assert(series_doc.HasMember("score_trust"));
+    assert(series_doc["score_trust"].HasMember("status"));
+    assert(series_doc["score_trust"].HasMember("can_alert"));
+    assert(series_doc.HasMember("calibration"));
+    assert(series_doc["calibration"].HasMember("band_multiplier"));
+    assert(series_doc["calibration"].HasMember("calibration_update_count"));
+    assert(series_doc.HasMember("monthpos"));
+    assert(series_doc["monthpos"].HasMember("status"));
 
     ValueRollingObservation stream;
     stream.series_key = "svc-a";
@@ -1046,6 +1075,11 @@ void TestB2RollingSnapshotAndBootstrapWarmup() {
     assert(result.status == BaselineStatus::kOk);
     assert(result.can_score);
     assert(result.state_status == "warming");
+    assert(!result.maturity_status.empty());
+    assert(!result.score_trust_status.empty());
+    assert(!result.calibration_status.empty());
+    assert(result.score_trust_status != "score_ready");
+    assert(!result.can_alert);
 
     std::printf("[PASS] B2 rolling snapshot and bootstrap warm-up\n");
 }
@@ -1078,7 +1112,7 @@ void TestB2RollingPredict() {
     assert(prediction.baseline_lower <= prediction.baseline_mu);
     assert(prediction.baseline_upper >= prediction.baseline_mu);
     assert(prediction.baseline_upper > prediction.baseline_lower);
-    assert(prediction.band_z > 0.0);
+    assert(prediction.band_z == 3.0);
 
     ValueRollingObservation second = first;
     second.bucket_id = 101;
@@ -1106,7 +1140,7 @@ void TestB2RollingPredict() {
     assert(ratio_prediction.baseline_upper <= 1.0);
     assert(ratio_prediction.baseline_lower <= ratio_prediction.baseline_mu);
     assert(ratio_prediction.baseline_upper >= ratio_prediction.baseline_mu);
-    assert(ratio_prediction.band_z > 0.0);
+    assert(ratio_prediction.band_z == 3.0);
 
     std::printf("[PASS] B2 rolling predict\n");
 }
@@ -1183,6 +1217,58 @@ void TestB2RollingFailureSemantics() {
     std::printf("[PASS] B2 rolling failure semantics\n");
 }
 
+void TestB3RollingResultUsesPreUpdateTrustSnapshot() {
+    std::printf("[TEST] B3 rolling result uses pre-update trust snapshot...\n");
+
+    const std::string config_path = "/tmp/flowsql_baseline_b3_pre_update_test.yaml";
+    {
+        std::ofstream file(config_path);
+        file << R"(
+baseline:
+  rolling_config:
+    min_warming_updates: 1
+    min_ready_hint_updates: 3
+    level_ready_min_updates: 3
+    score_warming_min_updates: 4
+    score_ready_min_updates: 5
+    score_recovery_min_updates: 2
+    calibration_warmup_min_updates: 1
+)";
+        assert(file.good());
+    }
+
+    auto env = LoadBaselineService("config_file=" + config_path + ";strict=false");
+    auto [status, task] =
+        env.service->CreateValueTask(ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+
+    ValueRollingObservation obs;
+    obs.series_key = "pre-update-link";
+    obs.bucket_id = 100;
+    obs.value = 100.0;
+    assert(task->SubmitObservation(obs, RollingSubmitOptions{}).status == BaselineStatus::kOk);
+    obs.bucket_id = 101;
+    assert(task->SubmitObservation(obs, RollingSubmitOptions{}).status == BaselineStatus::kOk);
+
+    obs.bucket_id = 102;
+    RollingBaselineResult boundary = task->SubmitObservation(obs, RollingSubmitOptions{});
+    assert(boundary.status == BaselineStatus::kOk);
+    assert(boundary.maturity_status == "cold_learning");
+    assert(boundary.score_trust_status == "score_untrusted");
+    assert(!boundary.can_alert);
+
+    auto [snapshot_status, snapshot_json] =
+        task->QuerySeriesSnapshot("pre-update-link", BaselineSerializationFormat::kJson);
+    assert(snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document snapshot;
+    snapshot.Parse(snapshot_json.c_str());
+    assert(!snapshot.HasParseError());
+    assert(std::string(snapshot["maturity_status"].GetString()) != "cold_learning");
+
+    std::printf("[PASS] B3 rolling result uses pre-update trust snapshot\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1201,5 +1287,6 @@ int main() {
     TestB2RollingSnapshotAndBootstrapWarmup();
     TestB2RollingPredict();
     TestB2RollingFailureSemantics();
+    TestB3RollingResultUsesPreUpdateTrustSnapshot();
     return 0;
 }

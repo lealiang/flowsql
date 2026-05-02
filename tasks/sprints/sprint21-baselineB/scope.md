@@ -552,7 +552,8 @@ BaselineB 的在线状态会常驻在 `Series` 粒度上，必须严格控制状
 4. 老方案删除清单与代码落点  
    明确 `shadow/candidate/rebuild` 相关代码如何下线或隔离。
 
-5. `T3` stream-only basis 设计  
+5. `T3` routed rolling 与 stream-only basis 设计
+   阶段设计见 [B4 T3 Routed Rolling and Stream Basis 阶段设计](b4-t3-routed-rolling-and-stream-basis-design.md)。
    定义在线有界统计、低频刷新、warm-up handover 和版本语义。
 
 6. 状态持久化与恢复  

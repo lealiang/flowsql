@@ -9,18 +9,26 @@
 #include "plugins/baseline/rolling/rolling_task_runner.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
+#include "plugins/baseline/rolling/detection_calibration.h"
 #include "plugins/baseline/rolling/drift_adapt.h"
+#include "plugins/baseline/rolling/maturity_gate.h"
+#include "plugins/baseline/rolling/monthpos_state.h"
 #include "plugins/baseline/rolling/observation_adapter.h"
 #include "plugins/baseline/rolling/residual_scale.h"
 #include "plugins/baseline/rolling/rolling_config.h"
 #include "plugins/baseline/rolling/rolling_estimator.h"
+#include "plugins/baseline/rolling/score_trust.h"
 #include "plugins/baseline/rolling/update_gate.h"
 
 namespace flowsql {
@@ -51,6 +59,38 @@ double ModelToObservedMu(const BaselineTaskSpec& spec, double value) {
     return std::max(0.0, std::expm1(value));
 }
 
+std::string BuildBandDiagnostics(const DetectionBandResult& band,
+                                 const RollingState& state,
+                                 const BaselineRollingConfig& config) {
+    std::ostringstream out;
+    const double combined_drift_evidence =
+        std::fabs(state.drift_evidence) >= std::fabs(state.level_shift_evidence)
+            ? state.drift_evidence
+            : state.level_shift_evidence;
+    out << std::setprecision(12)
+        << "band_z=" << config.band_z
+        << ";std_log=" << band.band_std
+        << ";raw_std_log=" << band.raw_band_std
+        << ";raw_calibration_var=" << band.raw_calibration_var
+        << ";raw_z=" << band.raw_z
+        << ";sigma_log=" << state.sigma
+        << ";multiplier=" << state.detection_band_multiplier
+        << ";residual_scale_ewma=" << state.residual_scale_ewma
+        << ";pred_var=" << band.pred_var_component
+        << ";calibrated_sigma_var=" << band.calibrated_sigma_var
+        << ";extra_obs_var=" << band.extra_obs_var
+        << ";maturity_var=" << band.maturity_uncertainty_var
+        << ";missing_component_var=" << band.component_missing_uncertainty_var
+        << ";drift_evidence=" << state.drift_evidence
+        << ";level_shift_evidence=" << state.level_shift_evidence
+        << ";combined_drift_evidence=" << combined_drift_evidence
+        << ";level_shift_cusum_pos=" << state.level_shift_cusum_pos
+        << ";level_shift_cusum_neg=" << state.level_shift_cusum_neg
+        << ";cap_applied=" << (band.std_cap_applied ? 1 : 0)
+        << ";std_cap=" << config.detection_band_std_cap;
+    return out.str();
+}
+
 RollingBaselineResult BaseResultFromPoint(const ObservedModelPoint& point) {
     RollingBaselineResult result;
     result.status = point.status;
@@ -72,37 +112,53 @@ RollingBaselineResult BaseResultFromPoint(const ObservedModelPoint& point) {
     return result;
 }
 
-void FillResultFromEstimator(const BaselineTaskSpec& spec,
-                             const ObservedModelPoint& point,
-                             const RollingEstimatorResult& estimator,
-                             const RollingState& state,
-                             double adapt_boost,
-                             double update_weight,
-                             RollingBaselineResult* result) {
-    result->status = estimator.status;
-    result->model_mu = estimator.model_mu;
-    result->model_lower = estimator.model_lower;
-    result->model_upper = estimator.model_upper;
-    result->baseline_mu = ModelToObservedMu(spec, estimator.model_mu);
-    result->baseline_lower = ModelToObservedLower(spec, estimator.model_lower);
-    result->baseline_upper = ModelToObservedUpper(spec, estimator.model_upper);
+void FillB3StateFields(const RollingState& state, bool can_alert, RollingBaselineResult* result) {
+    if (!result) return;
+    result->maturity_status = RollingMaturityStatusName(state.maturity_status);
+    result->score_trust_status = ScoreTrustStatusName(state.score_trust_status);
+    result->calibration_status = RollingCalibrationStatusName(state.calibration_status);
+    result->learning_confidence = state.learning_confidence;
+    result->score_confidence = state.score_confidence;
+    result->effective_confidence = state.effective_confidence;
+    result->confidence = state.effective_confidence;
+    result->can_alert = can_alert;
+    result->enabled_components = BuildEnabledComponents(state);
+    result->component_readiness = BuildComponentReadiness(state);
+}
+
+void FillResultFromDetectionBand(const BaselineTaskSpec& spec,
+                                 const ObservedModelPoint& point,
+                                 const DetectionBandResult& band,
+                                 const RollingState& state,
+                                 const BaselineRollingConfig& config,
+                                 double adapt_boost,
+                                 double update_weight,
+                                 bool can_alert,
+                                 RollingBaselineResult* result) {
+    result->status = band.status;
+    result->model_mu = band.detection_mu;
+    result->model_lower = band.model_lower;
+    result->model_upper = band.model_upper;
+    result->baseline_mu = ModelToObservedMu(spec, band.detection_mu);
+    result->baseline_lower = ModelToObservedLower(spec, band.model_lower);
+    result->baseline_upper = ModelToObservedUpper(spec, band.model_upper);
     if (result->baseline_upper < result->baseline_lower) {
         std::swap(result->baseline_upper, result->baseline_lower);
     }
     result->band_width = result->baseline_upper - result->baseline_lower;
-    result->residual = estimator.residual;
-    result->band_std = estimator.band_std;
-    result->z_score = estimator.z_score;
-    result->is_outside_band = point.can_score &&
-        (point.y_model < estimator.model_lower || point.y_model > estimator.model_upper);
+    result->residual = band.residual;
+    result->band_std = band.band_std;
+    result->z_score = band.detection_z;
+    result->is_outside_band = band.is_outside_band;
     result->can_score = point.can_score;
     result->can_update = point.can_update && update_weight > 0.0;
     result->score_weight = point.score_weight;
     result->update_weight = update_weight;
-    result->confidence = state.confidence;
     result->state_status = RollingStateStatusName(state.state_status);
     result->drift_evidence = state.drift_evidence;
     result->adapt_boost = adapt_boost;
+    result->diagnostics = BuildBandDiagnostics(band, state, config);
+    FillB3StateFields(state, can_alert, result);
 }
 
 void FillColdStartBand(const BaselineTaskSpec& spec,
@@ -134,6 +190,7 @@ void FillColdStartBand(const BaselineTaskSpec& spec,
     result->update_weight = point.update_weight;
     result->confidence = state.confidence;
     result->state_status = RollingStateStatusName(state.state_status);
+    FillB3StateFields(state, false, result);
     result->uncertainty_source.push_back("cold_start");
     result->uncertainty_source.push_back("first_observation");
 }
@@ -178,6 +235,7 @@ uint64_t EstimateStateBytes(const RollingState& state) {
                           state.theta.weekly.cos_coeff.capacity() +
                           state.theta.weekly.sin_p.capacity() +
                           state.theta.weekly.cos_p.capacity()) +
+        sizeof(uint32_t) * state.monthpos_dme_count.capacity() +
         state.series_key.capacity() + state.diagnostics.capacity());
 }
 
@@ -185,6 +243,102 @@ uint64_t EstimateStatesBytes(const RollingStateMap& states) {
     uint64_t total = 0;
     for (const auto& entry : states) total += EstimateStateBytes(entry.second);
     return total;
+}
+
+double ForecastTrendSteps(int64_t dt, const BaselineRollingConfig& config) {
+    const uint64_t cap =
+        config.forecast_trend_cap_buckets == 0
+            ? std::max<uint64_t>(1, config.day_buckets)
+            : config.forecast_trend_cap_buckets;
+    return static_cast<double>(
+        std::min<uint64_t>(cap, static_cast<uint64_t>(std::max<int64_t>(1, dt))));
+}
+
+double EvaluateBootstrapHarmonic(const std::vector<BootstrapHarmonicInit>& harmonic,
+                                 const std::vector<double>& sin_feature,
+                                 const std::vector<double>& cos_feature) {
+    double value = 0.0;
+    for (const BootstrapHarmonicInit& item : harmonic) {
+        if (item.order <= 0) continue;
+        const std::size_t index = static_cast<std::size_t>(item.order - 1);
+        if (index < sin_feature.size()) value += item.sin * sin_feature[index];
+        if (index < cos_feature.size()) value += item.cos * cos_feature[index];
+    }
+    return value;
+}
+
+bool CanUseBootstrapForecastSeed(const BootstrapSeed& seed) {
+    return seed.theta_init.available &&
+           seed.sigma_init.available &&
+           std::isfinite(seed.sigma_init.value) &&
+           seed.sigma_init.value > 0.0 &&
+           seed.seed_status != BootstrapSeedStatus::kNone;
+}
+
+double ForecastCorrectionWeight(const RollingState& state) {
+    double weight = state.effective_confidence;
+    if (!std::isfinite(weight) || weight <= 0.0) weight = state.confidence;
+    if (!std::isfinite(weight)) return 0.0;
+    return std::max(0.0, std::min(1.0, weight));
+}
+
+BaselineStatus BuildFusionForecastEstimator(const RollingState& state,
+                                            const BootstrapSeed& seed,
+                                            int64_t bucket_id,
+                                            const BaselineRollingConfig& config,
+                                            RollingEstimatorResult* out) {
+    if (!out || !state.has_seen_observation || !CanUseBootstrapForecastSeed(seed)) {
+        return BaselineStatus::kInvalidArgument;
+    }
+    const int64_t dt = bucket_id - state.last_seen_bucket;
+    if (dt <= 0) return BaselineStatus::kInvalidArgument;
+
+    RollingFeatureVector feature;
+    const BaselineStatus feature_status =
+        BuildRollingFeatureVector(bucket_id, config, &feature);
+    if (feature_status != BaselineStatus::kOk) return feature_status;
+
+    const double bootstrap_level_at_anchor =
+        seed.theta_init.level +
+        seed.theta_init.trend *
+            static_cast<double>(state.last_seen_bucket - seed.theta_init.reference_bucket_id);
+    const double bootstrap_mu =
+        seed.theta_init.level +
+        seed.theta_init.trend *
+            static_cast<double>(bucket_id - seed.theta_init.reference_bucket_id) +
+        EvaluateBootstrapHarmonic(seed.theta_init.daily_harmonic,
+                                  feature.day_sin,
+                                  feature.day_cos) +
+        EvaluateBootstrapHarmonic(seed.theta_init.weekly_harmonic,
+                                  feature.week_sin,
+                                  feature.week_cos);
+    const double level_delta = state.theta.level - bootstrap_level_at_anchor;
+    const double trend_delta =
+        (state.theta.trend - seed.theta_init.trend) * ForecastTrendSteps(dt, config);
+    const double correction_weight = ForecastCorrectionWeight(state);
+    const double sigma =
+        std::max(config.sigma_floor,
+                 std::max(std::isfinite(state.sigma) ? state.sigma : config.sigma_floor,
+                          seed.sigma_init.value));
+    const double pred_var = std::max(0.0, state.p_level);
+    const double obs_var = pred_var + sigma * sigma + config.sigma_floor * config.sigma_floor;
+    if (!std::isfinite(obs_var) || obs_var <= 0.0) {
+        return BaselineStatus::kInvalidArgument;
+    }
+
+    RollingEstimatorResult result;
+    result.status = BaselineStatus::kOk;
+    result.bucket_id = bucket_id;
+    result.dt = dt;
+    result.model_mu = bootstrap_mu + correction_weight * (level_delta + trend_delta);
+    result.pred_var = pred_var;
+    result.obs_var = obs_var;
+    result.band_std = std::sqrt(obs_var);
+    result.model_lower = result.model_mu - config.band_z * result.band_std;
+    result.model_upper = result.model_mu + config.band_z * result.band_std;
+    result.pred_p_level = pred_var;
+    *out = result;
+    return BaselineStatus::kOk;
 }
 
 void CountStatuses(const RollingStateMap& states,
@@ -207,6 +361,46 @@ void CountStatuses(const RollingStateMap& states,
                 break;
         }
     }
+}
+
+void CountB3Statuses(const RollingStateMap& states,
+                     std::array<uint64_t, 8>* maturity,
+                     std::array<uint64_t, 5>* score,
+                     std::array<uint64_t, 5>* calibration) {
+    maturity->fill(0);
+    score->fill(0);
+    calibration->fill(0);
+    for (const auto& entry : states) {
+        ++(*maturity)[static_cast<std::size_t>(entry.second.maturity_status)];
+        ++(*score)[static_cast<std::size_t>(entry.second.score_trust_status)];
+        ++(*calibration)[static_cast<std::size_t>(entry.second.calibration_status)];
+    }
+}
+
+template <typename Writer>
+void WriteStringArray(Writer* writer, const char* name, const std::vector<std::string>& values) {
+    writer->Key(name);
+    writer->StartArray();
+    for (const std::string& value : values) {
+        writer->String(value.c_str());
+    }
+    writer->EndArray();
+}
+
+template <typename Writer>
+void WriteComponentReadinessObject(Writer* writer, const std::vector<std::string>& readiness) {
+    writer->Key("component_readiness");
+    writer->StartObject();
+    for (const std::string& item : readiness) {
+        const std::size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        const std::size_t colon = item.find(':', eq + 1);
+        const std::string key = item.substr(0, eq);
+        const std::string value =
+            colon == std::string::npos ? item.substr(eq + 1) : item.substr(eq + 1, colon - eq - 1);
+        WriteStringField(writer, key.c_str(), value);
+    }
+    writer->EndObject();
 }
 
 RollingBaselineResult SubmitObservedPoint(const BaselineTaskSpec& spec,
@@ -282,9 +476,20 @@ RollingBaselineResult SubmitObservedPoint(const BaselineTaskSpec& spec,
         return result;
     }
 
+    const bool monthpos_ready = state.monthpos_status == RollingMonthposStatus::kMonthlyReady;
+    const double active_monthpos_effect =
+        monthpos_ready ? EvaluateRollingMonthpos(state, point.bucket_id, config) : 0.0;
+    DetectionBandResult detection_band;
+    status = BuildDetectionBand(
+        state, point, estimator, config, active_monthpos_effect, &detection_band);
+    if (status != BaselineStatus::kOk) {
+        result.status = status;
+        return result;
+    }
+
     DriftAdaptResult drift;
     status = UpdateDriftEvidence(estimator.residual,
-                                 estimator.band_std,
+                                 detection_band.band_std,
                                  point.can_score,
                                  config,
                                  &state,
@@ -294,8 +499,26 @@ RollingBaselineResult SubmitObservedPoint(const BaselineTaskSpec& spec,
         return result;
     }
 
+    status = UpdateDetectionCalibration(point, detection_band, config, &state);
+    if (status != BaselineStatus::kOk) {
+        result.status = status;
+        return result;
+    }
+
+    ScoreTrustResult score_trust;
+    status =
+        UpdateScoreTrust(point, detection_band.detection_z, config, &state, &score_trust);
+    if (status != BaselineStatus::kOk) {
+        result.status = status;
+        return result;
+    }
+    const RollingState result_state = state;
+
     UpdateGateResult gate = ComputeUpdateGate(estimator.z_score, drift.adapt_boost, config);
     ObservedModelPoint weighted = point;
+    if (monthpos_ready) {
+        weighted.y_model -= active_monthpos_effect;
+    }
     weighted.update_weight *= gate.gate_update_weight;
     const double base_update_weight = weighted.can_update ? weighted.update_weight : 0.0;
 
@@ -314,10 +537,31 @@ RollingBaselineResult SubmitObservedPoint(const BaselineTaskSpec& spec,
             result.status = status;
             return result;
         }
+
+        status = UpdateMaturityEvidence(weighted, config, &state);
+        if (status != BaselineStatus::kOk) {
+            result.status = status;
+            return result;
+        }
+        if (state.score_trust_status != ScoreTrustStatus::kDriftLearning) {
+            status = UpdateRollingMonthpos(
+                point, estimator.residual, base_update_weight, config, &state);
+            if (status != BaselineStatus::kOk) {
+                result.status = status;
+                return result;
+            }
+        }
     }
 
-    FillResultFromEstimator(
-        spec, point, estimator, state, drift.adapt_boost, base_update_weight, &result);
+    FillResultFromDetectionBand(spec,
+                                point,
+                                detection_band,
+                                result_state,
+                                config,
+                                drift.adapt_boost,
+                                base_update_weight,
+                                score_trust.can_alert,
+                                &result);
     if (gate.skip_update) {
         result.uncertainty_source.push_back("anomaly_skip_update");
     } else if (gate.downweight_update) {
@@ -375,6 +619,7 @@ RollingBaselineResult RunRatioRollingSubmit(const BaselineTaskSpec& spec,
 }
 
 RollingPrediction PredictRollingForSeries(const BaselineTaskSpec& spec,
+                                          const BootstrapSeedStore& seeds,
                                           const RollingStateMap& states,
                                           std::string_view series_key,
                                           int64_t bucket_id) {
@@ -402,26 +647,36 @@ RollingPrediction PredictRollingForSeries(const BaselineTaskSpec& spec,
         return result;
     }
 
-    ObservedModelPoint point;
-    point.status = BaselineStatus::kOk;
-    point.series_key = key;
-    point.bucket_id = bucket_id;
-    point.y_model = 0.0;
-    point.can_score = false;
-    point.can_update = false;
-
     RollingEstimatorResult estimator;
-    const BaselineStatus predict_status =
-        PredictRollingState(it->second, point, config, &estimator);
+    BaselineStatus predict_status = BaselineStatus::kNotTrained;
+    const BootstrapSeed* seed = FindSeed(seeds, key);
+    if (seed && CanUseBootstrapForecastSeed(*seed)) {
+        predict_status =
+            BuildFusionForecastEstimator(it->second, *seed, bucket_id, config, &estimator);
+    }
+    if (predict_status != BaselineStatus::kOk) {
+        predict_status = PredictRollingForecastState(it->second, bucket_id, config, &estimator);
+    }
     if (predict_status != BaselineStatus::kOk) {
         result.status = predict_status;
         return result;
     }
 
-    result.baseline_mu = ModelToObservedMu(spec, estimator.model_mu);
-    result.baseline_lower = ModelToObservedLower(spec, estimator.model_lower);
-    result.baseline_upper = ModelToObservedUpper(spec, estimator.model_upper);
-    result.band_z = config.band_z;
+    const bool monthpos_ready =
+        it->second.monthpos_status == RollingMonthposStatus::kMonthlyReady;
+    const double active_monthpos_effect =
+        monthpos_ready ? EvaluateRollingMonthpos(it->second, bucket_id, config) : 0.0;
+    const double forecast_model_mu = estimator.model_mu + active_monthpos_effect;
+    const double forecast_model_lower =
+        forecast_model_mu - config.forecast_band_z * estimator.band_std;
+    const double forecast_model_upper =
+        forecast_model_mu + config.forecast_band_z * estimator.band_std;
+    result.baseline_mu = ModelToObservedMu(spec, forecast_model_mu);
+    result.baseline_lower =
+        ModelToObservedLower(spec, forecast_model_lower);
+    result.baseline_upper =
+        ModelToObservedUpper(spec, forecast_model_upper);
+    result.band_z = config.forecast_band_z;
     if (result.baseline_upper < result.baseline_lower) {
         std::swap(result.baseline_upper, result.baseline_lower);
     }
@@ -470,6 +725,10 @@ BaselineSerializationResult QueryRollingTaskSnapshot(const BaselineTaskSpec& spe
     uint64_t warming = 0;
     uint64_t ready = 0;
     CountStatuses(states, &cold, &warming, &ready);
+    std::array<uint64_t, 8> maturity_counts{};
+    std::array<uint64_t, 5> score_counts{};
+    std::array<uint64_t, 5> calibration_counts{};
+    CountB3Statuses(states, &maturity_counts, &score_counts, &calibration_counts);
 
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
@@ -488,6 +747,51 @@ BaselineSerializationResult QueryRollingTaskSnapshot(const BaselineTaskSpec& spe
     writer.Uint64(warming);
     writer.Key("ready_hint");
     writer.Uint64(ready);
+    writer.EndObject();
+    writer.Key("maturity_status_counts");
+    writer.StartObject();
+    writer.Key("cold_learning");
+    writer.Uint64(maturity_counts[static_cast<std::size_t>(RollingMaturityStatus::kColdLearning)]);
+    writer.Key("level_ready");
+    writer.Uint64(maturity_counts[static_cast<std::size_t>(RollingMaturityStatus::kLevelReady)]);
+    writer.Key("daily_warming");
+    writer.Uint64(maturity_counts[static_cast<std::size_t>(RollingMaturityStatus::kDailyWarming)]);
+    writer.Key("daily_ready");
+    writer.Uint64(maturity_counts[static_cast<std::size_t>(RollingMaturityStatus::kDailyReady)]);
+    writer.Key("weekly_warming");
+    writer.Uint64(maturity_counts[static_cast<std::size_t>(RollingMaturityStatus::kWeeklyWarming)]);
+    writer.Key("weekly_ready");
+    writer.Uint64(maturity_counts[static_cast<std::size_t>(RollingMaturityStatus::kWeeklyReady)]);
+    writer.Key("monthly_warming");
+    writer.Uint64(maturity_counts[static_cast<std::size_t>(RollingMaturityStatus::kMonthlyWarming)]);
+    writer.Key("monthly_ready");
+    writer.Uint64(maturity_counts[static_cast<std::size_t>(RollingMaturityStatus::kMonthlyReady)]);
+    writer.EndObject();
+    writer.Key("score_trust_status_counts");
+    writer.StartObject();
+    writer.Key("score_untrusted");
+    writer.Uint64(score_counts[static_cast<std::size_t>(ScoreTrustStatus::kScoreUntrusted)]);
+    writer.Key("score_warming");
+    writer.Uint64(score_counts[static_cast<std::size_t>(ScoreTrustStatus::kScoreWarming)]);
+    writer.Key("score_ready");
+    writer.Uint64(score_counts[static_cast<std::size_t>(ScoreTrustStatus::kScoreReady)]);
+    writer.Key("drift_learning");
+    writer.Uint64(score_counts[static_cast<std::size_t>(ScoreTrustStatus::kDriftLearning)]);
+    writer.Key("recalibrating");
+    writer.Uint64(score_counts[static_cast<std::size_t>(ScoreTrustStatus::kRecalibrating)]);
+    writer.EndObject();
+    writer.Key("calibration_status_counts");
+    writer.StartObject();
+    writer.Key("uncalibrated");
+    writer.Uint64(calibration_counts[static_cast<std::size_t>(RollingCalibrationStatus::kUncalibrated)]);
+    writer.Key("warming");
+    writer.Uint64(calibration_counts[static_cast<std::size_t>(RollingCalibrationStatus::kWarming)]);
+    writer.Key("calibrated");
+    writer.Uint64(calibration_counts[static_cast<std::size_t>(RollingCalibrationStatus::kCalibrated)]);
+    writer.Key("expanding");
+    writer.Uint64(calibration_counts[static_cast<std::size_t>(RollingCalibrationStatus::kExpanding)]);
+    writer.Key("recalibrating");
+    writer.Uint64(calibration_counts[static_cast<std::size_t>(RollingCalibrationStatus::kRecalibrating)]);
     writer.EndObject();
     writer.Key("rolling_state_created_total");
     writer.Uint64(static_cast<uint64_t>(states.size()));
@@ -533,6 +837,9 @@ BaselineSerializationResult QueryRollingSeriesSnapshot(const BaselineTaskSpec& s
     WriteStringField(&writer, "series_key", key);
     writer.EndObject();
     WriteStringField(&writer, "state_status", RollingStateStatusName(state.state_status));
+    WriteStringField(&writer, "maturity_status", RollingMaturityStatusName(state.maturity_status));
+    WriteStringField(&writer, "score_trust_status", ScoreTrustStatusName(state.score_trust_status));
+    WriteStringField(&writer, "calibration_status", RollingCalibrationStatusName(state.calibration_status));
     writer.Key("has_seen_observation");
     writer.Bool(state.has_seen_observation);
     writer.Key("last_seen_bucket");
@@ -540,7 +847,13 @@ BaselineSerializationResult QueryRollingSeriesSnapshot(const BaselineTaskSpec& s
     writer.Key("accepted_update_count");
     writer.Uint64(state.accepted_update_count);
     writer.Key("confidence");
-    writer.Double(state.confidence);
+    writer.Double(state.effective_confidence);
+    writer.Key("learning_confidence");
+    writer.Double(state.learning_confidence);
+    writer.Key("score_confidence");
+    writer.Double(state.score_confidence);
+    writer.Key("effective_confidence");
+    writer.Double(state.effective_confidence);
     writer.Key("band");
     writer.StartObject();
     writer.Key("baseline_mu");
@@ -562,6 +875,63 @@ BaselineSerializationResult QueryRollingSeriesSnapshot(const BaselineTaskSpec& s
     writer.Double(0.0);
     writer.Key("drift_evidence");
     writer.Double(state.drift_evidence);
+    writer.Key("level_shift_evidence");
+    writer.Double(state.level_shift_evidence);
+    writer.Key("combined_drift_evidence");
+    writer.Double(std::fabs(state.drift_evidence) >= std::fabs(state.level_shift_evidence)
+                     ? state.drift_evidence
+                     : state.level_shift_evidence);
+    writer.EndObject();
+    writer.Key("maturity");
+    writer.StartObject();
+    WriteStringField(&writer, "status", RollingMaturityStatusName(state.maturity_status));
+    writer.Key("learning_confidence");
+    writer.Double(state.learning_confidence);
+    WriteStringArray(&writer, "enabled_components", BuildEnabledComponents(state));
+    WriteComponentReadinessObject(&writer, BuildComponentReadiness(state));
+    writer.Key("coverage");
+    writer.StartObject();
+    writer.Key("daily_ratio");
+    writer.Double(DailyCoverageRatio(state));
+    writer.Key("weekly_ratio");
+    writer.Double(WeeklyCoverageRatio(state));
+    writer.Key("monthpos_ratio");
+    writer.Double(MonthposCoverageRatio(state));
+    writer.EndObject();
+    writer.EndObject();
+    writer.Key("score_trust");
+    writer.StartObject();
+    WriteStringField(&writer, "status", ScoreTrustStatusName(state.score_trust_status));
+    writer.Key("score_confidence");
+    writer.Double(state.score_confidence);
+    writer.Key("can_alert");
+    writer.Bool(state.score_trust_status == ScoreTrustStatus::kScoreReady &&
+                MaturityAtLeast(state.maturity_status, RollingMaturityStatus::kDailyReady));
+    WriteStringField(&writer, "reason", state.degradation_reason);
+    writer.EndObject();
+    writer.Key("calibration");
+    writer.StartObject();
+    WriteStringField(&writer, "status", RollingCalibrationStatusName(state.calibration_status));
+    writer.Key("band_multiplier");
+    writer.Double(state.detection_band_multiplier);
+    writer.Key("coverage_ewma");
+    writer.Double(state.coverage_ewma);
+    writer.Key("tail3_ewma");
+    writer.Double(state.tail3_ewma);
+    writer.Key("tail5_ewma");
+    writer.Double(state.tail5_ewma);
+    writer.Key("abs_z_ewma");
+    writer.Double(state.abs_z_ewma);
+    writer.Key("calibration_update_count");
+    writer.Uint64(state.calibration_update_count);
+    writer.EndObject();
+    writer.Key("monthpos");
+    writer.StartObject();
+    WriteStringField(&writer, "status", RollingMonthposStatusName(state.monthpos_status));
+    writer.Key("month_transition_count");
+    writer.Uint64(state.month_transition_count);
+    writer.Key("ready_count");
+    writer.Uint64(state.monthpos_ready_count);
     writer.EndObject();
     writer.Key("state_size_bytes");
     writer.Uint64(EstimateStateBytes(state));

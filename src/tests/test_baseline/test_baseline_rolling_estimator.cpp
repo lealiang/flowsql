@@ -135,6 +135,28 @@ void TestHarmonicPredictionUsesLocalPhase() {
     AssertNear(result.model_mu, 12.0, 1.0e-9);
 }
 
+void TestForecastViewCapsLocalTrendAndUsesSnapshotVariance() {
+    BaselineRollingConfig config = BuildConfig();
+    config.forecast_trend_cap_buckets = 3;
+    config.q_level_scale = 100.0;
+    config.q_trend_scale = 100.0;
+    RollingState state = BuildState(config);
+
+    RollingEstimatorResult one_step;
+    assert(PredictRollingForecastState(state, 11, config, &one_step) ==
+           BaselineStatus::kOk);
+    AssertNear(one_step.model_mu, 10.5);
+    AssertNear(one_step.pred_var, 0.01);
+
+    RollingEstimatorResult long_horizon;
+    assert(PredictRollingForecastState(state, 20, config, &long_horizon) ==
+           BaselineStatus::kOk);
+    AssertNear(long_horizon.model_mu, 11.5);
+    AssertNear(long_horizon.pred_var, 0.01);
+    AssertNear(long_horizon.obs_var, 0.0225);
+    AssertNear(long_horizon.band_std, std::sqrt(0.0225));
+}
+
 void TestCannotUpdateLowSupportPoint() {
     const BaselineRollingConfig config = BuildConfig();
     RollingState state = BuildState(config);
@@ -197,6 +219,95 @@ void TestAdaptBoostSpeedsLevelAndKeepsSeasonalityConservative() {
     assert(boosted_day_abs < normal_day_abs);
 }
 
+BaselineTaskSpec BuildSeededValueSpec() {
+    BaselineTaskSpec spec;
+    spec.task_id = "rolling-seeded-estimator";
+    spec.task_kind = "value";
+    spec.feature_type = "value_basic";
+    spec.feature_id = "bps";
+    spec.profile = "default";
+    spec.clock_spec.bucket_seconds = 60;
+    spec.clock_spec.timezone = "UTC";
+    return spec;
+}
+
+BootstrapSeed BuildFullDailySeed() {
+    BootstrapSeed seed;
+    seed.artifact_kind = BootstrapArtifactKind::kValue;
+    seed.seed_status = BootstrapSeedStatus::kFull;
+    seed.series_key = "link-a";
+    seed.task_identity.task_id = "rolling-seeded-estimator";
+    seed.task_identity.task_kind = "value";
+    seed.task_identity.feature_type = "value_basic";
+    seed.task_identity.feature_id = "bps";
+    seed.task_identity.profile = "default";
+    seed.clock_spec.bucket_seconds = 60;
+    seed.clock_spec.timezone = "UTC";
+    seed.coverage_report.accepted_count = 20160;
+    seed.coverage_report.train_start_bucket = 0;
+    seed.coverage_report.train_end_bucket = 20;
+    seed.coverage_report.coverage_ratio = 1.0;
+    seed.seeded_components = {"level", "trend", "daily"};
+    seed.enabled_components = {"level", "trend", "daily"};
+    seed.theta_init.available = true;
+    seed.theta_init.model_space = "log1p";
+    seed.theta_init.reference_bucket_id = 20;
+    seed.theta_init.level = 10.0;
+    seed.theta_init.trend = 0.0;
+    seed.theta_init.daily_harmonic.push_back(BootstrapHarmonicInit{1, 1.0, 0.5});
+    seed.sigma_init.available = true;
+    seed.sigma_init.model_space = "log1p";
+    seed.sigma_init.value = 0.2;
+    seed.uncertainty_init.available = true;
+    seed.uncertainty_init.coverage_ratio = 1.0;
+    seed.uncertainty_init.component_uncertainty.level_scale = 1.0;
+    seed.uncertainty_init.component_uncertainty.trend_scale = 1.0;
+    seed.uncertainty_init.component_uncertainty.daily_scale = 1.0;
+    seed.uncertainty_init.component_uncertainty.weekly_scale = 1.0;
+    seed.maturity_init.available = true;
+    seed.maturity_init.seed_status = BootstrapSeedStatus::kFull;
+    seed.maturity_init.confidence = 0.8;
+    seed.maturity_init.accepted_count = 20160;
+    seed.maturity_init.coverage_ratio = 1.0;
+    return seed;
+}
+
+void TestFullBootstrapSeedFreezesSeasonalityDuringDriftLearning() {
+    BaselineRollingConfig config = BuildConfig();
+    config.daily_harmonic_order = 1;
+    config.day_learning_scale = 1.0;
+    config.day_delta_coeff_max_scale = 100.0;
+    config.max_level_boost = 4.0;
+    config.seasonal_drift_min_scale = 0.1;
+
+    RollingState state;
+    std::string diagnostics;
+    assert(InitializeRollingStateFromBootstrapSeed(BuildSeededValueSpec(),
+                                                   "link-a",
+                                                   BuildFullDailySeed(),
+                                                   config,
+                                                   &state,
+                                                   &diagnostics) == BaselineStatus::kOk);
+    state.p_level = 0.01;
+    state.theta.daily.sin_p[0] = 0.01;
+    state.theta.daily.cos_p[0] = 0.01;
+
+    const double level_before = state.theta.level;
+    const double day_sin_before = state.theta.daily.sin_coeff[0];
+    const double day_cos_before = state.theta.daily.cos_coeff[0];
+
+    RollingEstimatorResult result;
+    assert(UpdateRollingStateWithObservation(BuildPoint(21, 13.0),
+                                             config,
+                                             &state,
+                                             &result,
+                                             1.0) == BaselineStatus::kOk);
+
+    assert(state.theta.level > level_before);
+    AssertNear(state.theta.daily.sin_coeff[0], day_sin_before);
+    AssertNear(state.theta.daily.cos_coeff[0], day_cos_before);
+}
+
 }  // namespace
 
 int main() {
@@ -204,7 +315,9 @@ int main() {
     TestUpdateMovesLevelAndStoresBucket();
     TestRejectsDuplicateAndOutOfOrderBucketWithoutMutation();
     TestHarmonicPredictionUsesLocalPhase();
+    TestForecastViewCapsLocalTrendAndUsesSnapshotVariance();
     TestCannotUpdateLowSupportPoint();
     TestAdaptBoostSpeedsLevelAndKeepsSeasonalityConservative();
+    TestFullBootstrapSeedFreezesSeasonalityDuringDriftLearning();
     return 0;
 }

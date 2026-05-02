@@ -23,6 +23,11 @@ UpdateGateResult ComputeUpdateGate(double z_score,
     UpdateGateResult result;
     result.skip_threshold = config.z_skip + safe_boost * config.skip_relax;
     if (safe_z >= result.skip_threshold) {
+        if (safe_boost >= 1.0) {
+            result.downweight_update = true;
+            result.gate_update_weight = config.small_update_weight;
+            return result;
+        }
         result.skip_update = true;
         result.gate_update_weight = 0.0;
         return result;

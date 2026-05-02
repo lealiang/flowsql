@@ -23,7 +23,7 @@
 b1-optional-bootstrap-design.md
 b2-online-rolling-core-design.md
 b3-detection-trust-and-maturity-design.md
-b4-t3-stream-basis-design.md
+b4-t3-routed-rolling-and-stream-basis-design.md
 ```
 
 阶段设计文档只覆盖当前阶段的接口、算法取舍、迁移步骤、测试矩阵和完成门禁。已关闭阶段的遗留语义不得继续写入后续阶段设计。
@@ -46,7 +46,7 @@ BaselineB 分 4 个阶段推进，每个阶段对应一个独立迭代。阶段�
 B1 Optional Bootstrap Engine
   -> B2 Online Rolling Core MVP
   -> B3 Detection Trust, Band Calibration and Monthly Readiness
-  -> B4 T3 Stream-Only Basis
+  -> B4 T3 Routed Rolling and Stream Basis
 ```
 
 关键约束：
@@ -54,7 +54,7 @@ B1 Optional Bootstrap Engine
 - `B1` 必须彻底闭合旧基线改造。`B2` 之后不得再处理旧 `shadow/candidate/rebuild` 主路径遗留问题。
 - `B2` 只消费同一 task 内部按 `series_key` 持有的内存态 `BootstrapSeed`，不把 seed JSON 或 bootstrap prediction 作为 rolling 初始化主路径，也不回头修改旧训练语义。
 - `B3` 只扩展 Online Rolling Core 的检测可信度、band 校准、成熟度和组件解锁，不回头改 bootstrap 训练链路。
-- `B4` 只做 `T3` 的 stream-only basis，不回头恢复旧重建链路。
+- `B4` 接入 `T3` relation block 的 routed summary rolling 训练，并实现 stream-only basis 成熟；不回头恢复旧重建链路。
 
 ---
 
@@ -109,11 +109,12 @@ uncertainty_source
 - Online Rolling 状态递推。
 - 无历史自学习。
 - 成熟度自动推进。
-- `T3` stream-only basis 刷新。
+- `T3` routed rolling 接入和 stream-only basis 刷新。
 
 ### 3.4 验收标准
 
 - [ ] 完整历史数据可训练出 bootstrap model / `BootstrapSeed`。
+- [ ] `BootstrapSeed.seed_status` 由 Bootstrap 自动评价，覆盖 `full/partial/weak/none`，调用方只声明 profile 目标，不直接写成熟度标签。
 - [ ] 可对未来 `bucket_id` 调用预测接口，返回 baseline band。
 - [ ] 合成数据验证：正常点大多落在 band 内，突刺点可穿出 band。
 - [ ] 测试证明 bootstrap 训练 / 预测路径不触发 `shadow/candidate/rebuild` 状态。
@@ -156,7 +157,7 @@ predict -> band -> score -> gate_update -> update_state
 
 - 月位置在线成熟。
 - 完整 `Maturity Gate`。
-- `T3` stream-only basis。
+- `T3` routed rolling 接入和 stream-only basis。
 - 任何旧 `shadow/candidate/rebuild` 逻辑。
 
 ### 4.4 验收标准
@@ -206,7 +207,7 @@ cold_learning
   - score trust 表示当前 `Z-score` / 异常判定是否可信。
   - 冷启动、warming、`drift_learning`、`recalibrating` 阶段不得输出高置信异常结论。
 - 实现检测 band 校准：
-  - residual scale 慢收缩、快扩张，避免 band 被短期平稳段压得过窄。
+  - 用 `raw_z` 的平方 EWMA 估计 residual scale，避免 band 被短期平稳段压得过窄。
   - 支持最小 band 宽度或等价 `sigma_floor`。
   - 基于近期 coverage / `|Z|` 分布做保守校准。
   - 区分检测评分 band 与预测展示 band，B3 只保证检测评分 band 的可信度。
@@ -222,8 +223,8 @@ cold_learning
 
 本阶段不实现：
 
-- `T3` stream-only basis 刷新。
-- 长周期自适应预测视图或正式 forecast 产品接口。
+- `T3` routed rolling 接入和 stream-only basis 刷新。
+- 长周期自适应 forecast 产品接口、批量 forecast API 或 Rolling 反向改写 Bootstrap artifact；`PredictRolling(series_key, bucket_id)` 只承担基础 Rolling/Bootstrap 融合 forecast view。
 - Rolling 反向改写 Bootstrap artifact。
 - 新的 batch 重建链路。
 - 旧 `shadow/candidate/rebuild` 逻辑。
@@ -241,37 +242,47 @@ cold_learning
 
 ---
 
-## 6. B4：T3 Stream-Only Basis
+## 6. B4：T3 Routed Rolling and Stream Basis
+
+阶段设计：[B4 T3 Routed Rolling and Stream Basis 阶段设计](b4-t3-routed-rolling-and-stream-basis-design.md)
 
 ### 6.1 阶段目标
 
-让关系分布类 `T3` 也符合 stream-first 目标：无历史时可逐步成熟，有历史时只作为初始 basis seed。
+让关系分布类 `T3` 也符合 stream-first 目标：Relation 流式 block 到达后，能够被投影为 routed summary observations，并复用 `T1/T2 Online Rolling Core` 完成预测、band、score、更新和 B3 检测可信度；同时，`T3` basis 在无历史时可在线保守成熟，有历史时只作为初始 basis seed。
 
 ### 6.2 范围
 
 必须完成：
 
-- `T3` routed 摘要继续复用 `T1/T2 Online Rolling Core`。
-- 无历史时先输出通用形状特征。
-- 在线维护有界 basis 统计。
+- 为 `IBaselineRelationTask` 设计并实现流式提交路径，输入 `RelationBootstrapBlock` 的在线等价结构，输出 routed summary 的 rolling 结果。
+- Relation block 基于当前 basis 投影为稳定的 routed summary observations，包括已在 B1 定义的 value summary 和 ratio summary。
+- routed summary 按明确的 `series_key` / `feature_id` / `feature_type` 路由到 `T1/T2 Online Rolling Core`，复用 B2/B3 的 rolling state、band、score trust、maturity 和 forecast 语义。
+- 无历史时先输出通用形状特征，并允许这些通用摘要进入 rolling 训练；stable head 相关摘要在 basis 未成熟前不得高置信启用。
+- 在线维护有界 basis 统计，不保存无界 group 历史。
 - 低频形成 / 刷新 `support_explicit`、`stable_head`、`head_proto_q`。
 - 实现 replacement cap、warm-up handover 和 `basis_version` evidence。
 - `B1` 导出的 `T3 basis seed` 只作为可选初始值。
+- `B1` 导出的 relation routed summary seed 可用于同 key routed summary 的 rolling 初始化；没有 seed 时必须 stream-only 空启动。
 
 ### 6.3 非目标
 
 本阶段不实现：
 
+- 为 `T3` 单独实现新的时间序列基线算法。
+- Relation 分布整体的长期 forecast 产品接口。
 - 旧 `candidate vs incumbent` 验证。
 - 基于 `HistoryReader.fetch` 的正式重建。
 - 每个 bucket 动态改变 support / stable head。
+- 每个 group 都单独建立无界 rolling baseline；B4 只对 routed summary 建模。
 
 ### 6.4 验收标准
 
-- [ ] 无 `T3` 历史时，任务可运行并输出通用形状特征。
-- [ ] 在线统计积累后，stable head 相关特征可进入 warming / ready。
+- [ ] 无 `T3` 历史时，Relation 任务可接收流式 block，并输出通用 routed summary 的 rolling band / score / trust。
+- [ ] 有 `B1` relation basis seed 和 routed summary seed 时，同 key routed summary 可从 seed warm-up，且不能绕过 B3 score trust。
+- [ ] 在线统计积累后，stable head 相关摘要可进入 warming / ready，并开始参与 routed rolling。
 - [ ] basis 切换有版本、有 evidence，不破坏摘要特征解释。
 - [ ] basis 统计有固定上限，不随 group 数无界增长。
+- [ ] routed summary 的 rolling state 可在 task / series snapshot 中观测到 `basis_version`、summary identity、maturity 和 score trust。
 - [ ] 旧 rebuild 链路不参与 `T3` basis 成熟。
 
 ---
@@ -284,7 +295,7 @@ cold_learning
 B1 输出内部 BootstrapSeed[series_key]（bootstrap prediction 仅用于 B1 验证）
   B2 在同一 task 内按 series_key 消费 BootstrapSeed，开发 Online Rolling Core
     B3 扩展 Online Rolling Core 的检测可信度、band 校准、成熟度与月位置能力
-      B4 扩展 T3 的 stream-only basis 能力
+      B4 接入 T3 routed summary rolling，并扩展 stream-only basis 能力
 ```
 
 ### 7.2 交付口径
@@ -304,7 +315,7 @@ B1 输出内部 BootstrapSeed[series_key]（bootstrap prediction 仅用于 B1 �
 - `B1` 不得遗留旧 `shadow/candidate/rebuild` 主路径。
 - `B2` 不得引入新的 batch 依赖。
 - `B3` 不得把检测可信度、band 校准或月位置成熟问题推给 `T3` 或 bootstrap。
-- `B4` 不得恢复 `HistoryReader` 作为 basis 刷新前置条件。
+- `B4` 不得恢复 `HistoryReader` 作为 basis 刷新前置条件，也不得绕过 B2/B3 另建 T3 专用时间基线。
 
 ---
 
@@ -312,7 +323,7 @@ B1 输出内部 BootstrapSeed[series_key]（bootstrap prediction 仅用于 B1 �
 
 当前执行进度：
 
-- `B2-T01：rolling public 类型与提交 / 预测接口` 已完成，`PredictRolling(series_key, bucket_id)` 为只读预测接口，不更新状态、不触发 lazy init，并返回 `band_z` 支持评估程序计算 `|Z|` 指标。
+- `B2-T01：rolling public 类型与提交 / 预测接口` 已完成，`PredictRolling(series_key, bucket_id)` 为只读预测接口，不更新状态、不触发 lazy init；进入 B3 后该接口作为基础 Rolling/Bootstrap 融合 forecast view，返回独立 `forecast_band_z` 支持评估程序计算 `|Z|` 指标。
 - `B2-T02：解析 rolling 配置与默认值` 已完成，rolling 默认值已同步到 `baseline-config-template.yaml`、strict schema 和测试。
 - `B2-T03：实现观测适配器` 已完成，`value_basic`、`value_sampled`、`ratio` 的模型空间转换和低支撑语义已有测试覆盖。
 - `B2-T04：建立 RollingState 与初始化` 已完成，空启动、首点初始化、bootstrap seed 初始化和 seed 兼容性校验已有测试覆盖。
@@ -321,11 +332,22 @@ B1 输出内部 BootstrapSeed[series_key]（bootstrap prediction 仅用于 B1 �
 - `B2-T07：接入 Value / Ratio task` 已完成，`SubmitObservation()` 已走 task 内部 lazy init / rolling update。
 - `B2-T08：实现状态管理与批量 warm-up` 已完成，snapshot 最小 schema 和 task 内存态 seed 批量 warm-up 已接入。
 - `B2-T09：补齐自动化测试` 已完成，覆盖 rolling 配置、观测适配、状态初始化、estimator、gate/scale/drift、task 接入、snapshot/warm-up、只读预测、link rolling 评估和失败语义。
-- 下一步进入 `B3：Detection Trust, Band Calibration and Monthly Readiness` 的阶段设计 / 实现准备。
+- `B2-T10：补充 seed 质量驱动的 seasonal 学习保护` 已完成，基于 `full/partial/weak/empty` seed 质量调节 day/week 学习倍率，并在 level shift 学习期暂停完整 seed 的已 seed seasonal 更新。
+- `B3-T01：扩展 public result 字段与兼容映射` 已完成，`RollingBaselineResult` 可输出 maturity、score trust、calibration、confidence、`can_alert` 和 component evidence。
+- `B3-T02：新增 B3 有界状态` 已完成，`RollingState` 持有 maturity / score trust / calibration / monthpos 状态，bootstrap seed 初始化可映射到 B3 状态。
+- `B3-T03：实现 detection band calibration` 已完成，calibrated detection band、coverage / tail EWMA、residual scale multiplier 已有单元测试覆盖。
+- `B3-T04：实现 score trust 状态机` 已完成，支持 `score_untrusted / score_warming / score_ready` 以及 `drift_learning / recalibrating` 降级恢复；已接入累计水平偏移证据，避免只依赖单点或短长 EWMA。
+- `B3-T05：实现 maturity 与 component readiness` 已完成，level / daily / weekly / monthpos readiness 使用固定 coverage 统计推进。
+- `B3-T06：实现 monthpos state 与慢更新` 已完成，支持 bootstrap hint 初始化、centered basis 预测和慢速在线更新。
+- `B3-T07：接入 Value / Ratio task 与 snapshot` 已完成，`SubmitObservation()` 输出 B3 evidence，task / series snapshot 输出 maturity、score trust、calibration 和 monthpos。
+- `B3-T08：补齐配置、模板、schema、CMake 和自动化测试` 已完成，B3 配置默认值、YAML 模板、strict schema、配置测试和 B3 测试目标已接入。
+- `B3-T09：真实链路数据评估与调试观测` 已完成，覆盖 week4 稳定窗口、水平下降过渡段、post-shift 训练段和 final7 稳定段；评估输出包含 band 方差拆分、score trust 状态分布、level shift evidence 和 forecast / detection 对比 CSV。
+- `B3-C00：收口审查问题修复` 已完成，修复完整 seed maturity 被流式计数降级、`can_score=false` stale score trust、monthpos DME/LWD 在线学习缺口，以及 public result 混用 post-update maturity 的问题。
 
-`B3` 编码前必须确认：
+当前暂停 B3 算法调试，临时评估代码暂不清理。
 
-1. B2 的 `cold_learning / warming / ready_hint` 只是粗粒度状态，不等价于 B3 完整 maturity gate。
-2. B3 不回头改 B1 bootstrap 训练链路，只消费 B2 rolling state 和 seed maturity。
-3. 月位置成熟必须保持保守，不因短期异常快速进入高置信 band。
-4. B3 必须承担 `Z-score` 可信度和检测 band 校准职责，不能只做组件成熟标签。
+下一步建议：
+
+1. 先做 `B3` 收口审查，确认哪些调试评估代码保留、删除或迁移为长期回归测试。
+2. 若确认清理，单独执行 `B3-C01：评估代码收口与诊断暴露面整理`，避免和算法改动混在一起。
+3. 已进入 `B4：T3 Routed Rolling and Stream Basis` 阶段设计；设计收口后再按 B4-T01 起顺序实施。

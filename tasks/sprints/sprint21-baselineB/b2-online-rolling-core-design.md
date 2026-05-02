@@ -19,7 +19,7 @@ stream observation -> rolling prediction band -> residual score -> gated update
 本阶段不做：
 
 - 完整 `Maturity Gate`、组件成熟度状态机和月位置在线成熟，这些归 `B3`。
-- `T3` stream-only basis 刷新，这归 `B4`。
+- `T3` routed rolling 接入和 stream-only basis 刷新，这归 `B4`。
 - 任何旧 `shadow/candidate/rebuild` 恢复链路。
 - `RollingState` 持久化格式；重启恢复后续单独设计。
 - relation 分布本身的在线 rolling 建模。
@@ -152,7 +152,7 @@ virtual RollingPrediction PredictRolling(
 输出边界：
 
 - B2 core 输出 `RollingBaselineResult`。
-- `PredictRolling()` 是测试与验收用的只读预测接口，只消费已有 rolling state，不更新状态、不触发 bootstrap / empty lazy init，不携带 `options` 或 `diagnostics`。`band_z` 用于评估程序根据实际观测值计算 directional z-score，并统计 `|Z| > 3` / `|Z| > 5`。
+- `PredictRolling()` 是测试与验收用的只读预测接口，只消费已有 rolling state，不更新状态、不触发 bootstrap / empty lazy init，不携带 `options` 或 `diagnostics`。进入 `B3` 后，该接口明确为基础 Rolling/Bootstrap 融合 forecast view：不复用在线检测 band，不输出异常判定；`RollingPrediction.band_z` 使用独立 `forecast_band_z`，仅用于评估程序根据实际观测值计算 directional z-score，并统计 `|Z| > 3` / `|Z| > 5`。
 - 旧 `DetectorResult` 映射只允许放在 task 层或兼容层，core 不直接依赖旧异常检测结果结构。
 - snapshot 可输出 band、state_status、update_weight、drift_evidence 和状态规模。
 
@@ -343,6 +343,7 @@ P_level_trend 2x2 block
 day harmonic coeffs + diagonal covariance
 week harmonic coeffs + diagonal covariance
 sigma
+bootstrap_seed_status / daily_prior_quality / weekly_prior_quality
 short_ewma / long_ewma / drift_evidence
 state_status
 has_seen_observation / last_seen_bucket / counters
@@ -390,6 +391,9 @@ MVP 默认值：
 | `cold_day_learning_scale` | `0.05` | 冷启动 day 学习速度 |
 | `cold_week_learning_scale` | `0.01` | 冷启动 week 学习速度 |
 | `seasonal_drift_min_scale` | `0.1` | drift 时 day/week 学习下限 |
+| `full_seed_seasonal_scale` | `0.1` | `full` seed 交接的 day/week 谐波学习倍率 |
+| `partial_seed_seasonal_scale` | `0.5` | `partial` seed 交接的 day/week 谐波学习倍率 |
+| `freeze_seeded_seasonal_on_drift` | `true` | level shift 学习期暂停已 seed 的 day/week 谐波更新 |
 | `day_delta_coeff_max` | `0.05 * sigma` | day 单系数单次更新上限 |
 | `week_delta_coeff_max` | `0.02 * sigma` | week 单系数单次更新上限 |
 | `Q_day` | `1e-4 * sigma^2` | day 过程噪声 |
@@ -419,7 +423,8 @@ MVP 默认值：
 | `c_sigma` | `3.0` | sigma 更新 residual 裁剪倍数 |
 | `sigma_floor` | `0.05` | `log1p/logit` 模型空间默认下限 |
 | `cold_start_band_scale` | `3.0` | 冷启动 band 放大倍数 |
-| `band_z` | `3.0` | 模型空间 band 倍数 |
+| `band_z` | `1.96` | 模型空间 95% band 倍数 |
+| `forecast_band_z` | `3.0` | `PredictRolling()` forecast/display lower-upper 的 Z 倍数，不影响在线检测 |
 | `confidence_cold` | `0.2` | 冷启动 confidence |
 | `confidence_warming` | `0.5` | warming confidence |
 | `confidence_ready_hint_cap` | `0.8` | B2 ready hint confidence 上限 |
@@ -569,7 +574,8 @@ Q_level_eff =
 skip_threshold_t = z_skip + adapt_boost_t * skip_relax
 
 if abs(z_t) >= skip_threshold_t:
-    gate_update_weight_t = 0
+    gate_update_weight_t =
+      small_update_weight if adapt_boost_t >= 1 else 0
 elif abs(z_t) >= z_downweight:
     gate_update_weight_t = small_update_weight
 else:
@@ -581,7 +587,7 @@ base_update_weight_t = adapter.update_weight_t * gate_update_weight_t
 原则：
 
 - 孤立突刺通常跳过或降权。
-- 持续偏移提高 `adapt_boost_t`，主要加快 level。
+- 持续偏移提高 `adapt_boost_t`，主要加快 level；当 `adapt_boost_t` 已满格时，强残差不再继续按孤立突刺跳过，而是进入有界降权更新。
 - drift 时不快速改写 day/week。
 
 ### 5.5 状态更新
@@ -605,25 +611,57 @@ K_week_j = P_week_j^- * h_week_j / S_t
 seasonal_drift_scale =
   max(seasonal_drift_min_scale, 1 - adapt_boost_t)
 
+seed_seasonal_scale(component) =
+  full_seed_seasonal_scale      if component prior quality is full
+  partial_seed_seasonal_scale   if component prior quality is partial
+  1.0                           if component prior quality is weak or empty
+
+if freeze_seeded_seasonal_on_drift
+   and adapt_boost_t > 0
+   and component prior quality is full:
+  seed_seasonal_scale(component) = 0
+
 level_boost_t = 1 + adapt_boost_t * max_level_boost
 
 W_level = min(1, base_update_weight_t * level_learning_scale * level_boost_t)
 W_trend = min(W_level, base_update_weight_t * trend_update_scale)
 
 W_day_i =
-  base_update_weight_t * day_learning_scale * seasonal_drift_scale
+  base_update_weight_t
+  * day_learning_scale
+  * seasonal_drift_scale
+  * seed_seasonal_scale(daily)
 
 W_week_j =
-  base_update_weight_t * week_learning_scale * seasonal_drift_scale
+  base_update_weight_t
+  * week_learning_scale
+  * seasonal_drift_scale
+  * seed_seasonal_scale(weekly)
 ```
 
 冷启动时：
 
 ```text
 W_trend = min(W_level, base_update_weight_t * cold_trend_update_scale)
-W_day_i = base_update_weight_t * cold_day_learning_scale * seasonal_drift_scale
-W_week_j = base_update_weight_t * cold_week_learning_scale * seasonal_drift_scale
+W_day_i =
+  base_update_weight_t
+  * cold_day_learning_scale
+  * seasonal_drift_scale
+  * seed_seasonal_scale(daily)
+
+W_week_j =
+  base_update_weight_t
+  * cold_week_learning_scale
+  * seasonal_drift_scale
+  * seed_seasonal_scale(weekly)
 ```
+
+解释：
+
+- `full` seed 的 day/week harmonic 来自完整历史周期，应视为稳定形状先验；Rolling 默认只允许慢修正。
+- `partial` seed 有一定参考价值，但不应像空启动一样快速改写。
+- `weak` 或空启动没有可靠形状先验，继续使用常规 rolling 学习速度。
+- level shift 期间 residual 主要反映水平变化，不能让 day/week 谐波吸收这类偏移；因此 `full` seed 的已 seed seasonal component 在 drift 学习期暂停更新。
 
 状态增量：
 
@@ -757,9 +795,32 @@ state.state_status = StatusFromAcceptedUpdateCount(state.accepted_update_count)
 state.short_ewma = 0
 state.long_ewma = 0
 state.drift_evidence = 0
+state.bootstrap_seed_status = seed.seed_status
+state.daily_prior_quality =
+  DeriveSeasonalPriorQuality(seed.seed_status, seed.enabled_components, "daily")
+state.weekly_prior_quality =
+  DeriveSeasonalPriorQuality(seed.seed_status, seed.enabled_components, "weekly")
 ```
 
 `theta_init.reference_bucket_id` 是 `theta.level` 的时间锚点。B2 初始化时必须把 `level` 平移到 `anchor_bucket`，否则长历史训练后第一次流式点会被误判为一个超大 gap。
+
+`daily_prior_quality` / `weekly_prior_quality` 是 B2 内部状态，不进入 public ABI。派生规则：
+
+```text
+empty:
+  seed 不存在，或该 component 不在 enabled_components。
+
+weak:
+  seed_status = weak，且该 component 已启用。
+
+partial:
+  seed_status = partial，且该 component 已启用。
+
+full:
+  seed_status = full，且该 component 已启用。
+```
+
+该字段只影响 seasonal 学习速度和 drift 期间保护，不改变 seed 兼容性判断；`enabled_components` 仍是组件能否初始化为非零 harmonic 的直接依据。
 
 兼容性必须校验：
 
@@ -907,7 +968,7 @@ Relation 边界：
 
 - B2 不提供 relation rolling 提交接口。
 - `T3 routed summary` 后续作为 `value_basic` / `value_sampled` / `ratio` series 复用 T1/T2 rolling core。
-- relation basis 在线刷新归 `B4`。
+- relation routed rolling 接入和 basis 在线刷新归 `B4`。
 
 ## 8. 实现任务与测试矩阵
 
@@ -926,6 +987,7 @@ Relation 边界：
 | `B2-T07` | 接入 Value / Ratio task | 第 2 节、第 6.3 节 | `task/value_task.*`、`task/ratio_task.*` | `SubmitObservation()` 返回 `RollingBaselineResult`；不触发 shadow / rebuild |
 | `B2-T08` | 实现状态管理与批量 warm-up | 第 7 节、第 6.4 节、第 2 节 snapshot 契约 | `rolling/rolling_state_store.*`、`task/*snapshot*` | 支持状态上限、TTL、LRU、批量 warm-up、snapshot schema、指标和 snapshot |
 | `B2-T09` | 补齐自动化测试 | 第 8.2 节 | `tests/test_baseline/*` | 覆盖下方测试矩阵 |
+| `B2-T10` | 补充 seed 质量驱动的 seasonal 学习保护 | 第 4 节、第 5.5 节、第 6.2 节、第 8.2 节 | `plugins/baseline/rolling/rolling_state.*`、`rolling_estimator.*`、`rolling_config.*`、`tests` | RollingState 保存 seed 质量派生信息；`full/partial/weak/empty` 控制 day/week 学习倍率；level shift 学习期暂停完整 seed 的已 seed seasonal 更新 |
 
 ### 8.2 测试矩阵
 
@@ -946,13 +1008,14 @@ Relation 边界：
 | bootstrap 已有 state 且强制 reset | 只重置该 `series_key` 的 state |
 | bootstrap 无 seed | `SubmitObservation()` 在 bootstrap 分支找不到 seed 时返回 `kNotTrained` |
 | bootstrap 不兼容 | 返回 `kIncompatibleArtifact`，已有 state 不变 |
+| seed 质量驱动 seasonal 保护 | `full/partial/weak/empty` seed 对 day/week 更新权重产生预期倍率；`full` seed 在 drift 学习期不更新已 seed harmonic；level 更新仍可加速 |
 | 自动初始化关闭 | `SubmitObservation()` 返回 `kNotTrained`，不创建 state |
 | 自动初始化不兼容 seed | `SubmitObservation()` 不回退空启动 |
 | 自动初始化低支撑首点 | 返回 `kInsufficientData`，不创建 state |
 | series snapshot schema | `schema_version`、`document_kind`、`task_identity`、`series_identity`、`state_status`、`band`、`control` 必填 |
 | task snapshot schema | `schema_version`、`document_kind`、`task_identity`、`rolling_series_count`、`state_status_counts` 必填 |
 | rolling 只读预测 | 已有 state 可预测未来 bucket，预测不更新 state；无 state 返回 `kNotTrained`；旧 bucket 返回 `kInvalidArgument` |
-| link rolling eval | 复用 `link_data_2_month.csv`，输出第 4 周 Bootstrap/Rolling walk-forward 对比、过渡带学习检查点、最后 7 天 rolling 预测评估，以及 absolute / level-scaled / calibrated level-scaled 三个临时 adaptive forecast prototype；指标包含 `RMSE`、`MAPE`、coverage、`|Z| > 3`、`|Z| > 5` |
+| link rolling eval | 复用 `link_data_2_month.csv`，输出第 4 周 Bootstrap/Rolling walk-forward detection 对比、第 3 周学完后冻结 state 预测第 4 周、第 4 周 rolling predict walk-forward forecast 对比、过渡带学习检查点、最后 7 天 rolling walk-forward detection 评估；指标包含 `RMSE`、`MAPE`、coverage、`|Z| > 3`、`|Z| > 5` 和 forecast smoothness |
 | 同 bucket 重复 | 返回 `kInvalidArgument`，状态不二次更新 |
 | 乱序旧 bucket | 返回 `kInvalidArgument`，状态不回滚 |
 | gap jump | 不补点，band 因过程噪声变宽 |

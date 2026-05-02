@@ -105,6 +105,15 @@ struct BootstrapEventHint {
     std::vector<double> coeff;
 };
 
+struct BootstrapSeedQualityConfig {
+    double full_min_coverage_ratio = 0.90;
+    double partial_min_coverage_ratio = 0.50;
+    uint32_t daily_min_span_days = 1;
+    uint32_t weekly_min_span_days = 14;
+    double daily_phase_coverage_ratio = 0.75;
+    double weekly_phase_coverage_ratio = 0.70;
+};
+
 struct BootstrapComponentUncertaintyInit {
     double level_scale = 1.0;
     double trend_scale = 4.0;

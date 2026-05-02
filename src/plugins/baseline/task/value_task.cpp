@@ -82,7 +82,7 @@ RollingPrediction BaselineValueTask::PredictRolling(std::string_view series_key,
         result.status = status;
         return result;
     }
-    return PredictRollingForSeries(spec_, rolling_states_, series_key, bucket_id);
+    return PredictRollingForSeries(spec_, seeds_by_series_, rolling_states_, series_key, bucket_id);
 }
 
 BootstrapTrainResult BaselineValueTask::Bootstrap(const ValueBootstrapInput& input) {

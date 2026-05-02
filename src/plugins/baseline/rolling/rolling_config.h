@@ -43,6 +43,9 @@ struct BaselineRollingConfig {
     double cold_day_learning_scale = 0.05;
     double cold_week_learning_scale = 0.01;
     double seasonal_drift_min_scale = 0.1;
+    double full_seed_seasonal_scale = 0.1;
+    double partial_seed_seasonal_scale = 0.5;
+    bool freeze_seeded_seasonal_on_drift = true;
 
     double day_delta_coeff_max_scale = 0.05;
     double week_delta_coeff_max_scale = 0.02;
@@ -69,6 +72,9 @@ struct BaselineRollingConfig {
     double z_cap = 5.0;
     double drift_start = 1.0;
     double drift_full = 2.0;
+    double level_shift_reference_z = 0.5;
+    double level_shift_cusum_decay = 0.98;
+    double level_shift_cusum_threshold = 16.0;
     double max_level_boost = 4.0;
     double max_q_boost = 9.0;
     double skip_relax = 2.0;
@@ -79,12 +85,49 @@ struct BaselineRollingConfig {
     double c_sigma = 3.0;
     double sigma_floor = 0.05;
     double cold_start_band_scale = 3.0;
-    double band_z = 3.0;
+    double band_z = 1.96;
+    double forecast_band_z = 3.0;
     double confidence_cold = 0.2;
     double confidence_warming = 0.5;
     double confidence_ready_hint_cap = 0.8;
     uint64_t min_warming_updates = 3;
     uint64_t min_ready_hint_updates = 0;
+
+    uint64_t level_ready_min_updates = 30;
+    uint64_t score_warming_min_updates = 60;
+    uint64_t score_ready_min_updates = 240;
+    uint64_t score_recovery_min_updates = 120;
+    double score_drift_degrade_start = 1.5;
+
+    double calibration_alpha = 0.02;
+    uint64_t calibration_warmup_min_updates = 60;
+    double calibration_coverage_floor = 0.98;
+    double calibration_tail3_limit = 0.02;
+    double calibration_tail5_limit = 0.002;
+    double calibration_multiplier_min = 1.0;
+    double calibration_multiplier_max = 6.0;
+
+    uint32_t daily_coverage_bins = 24;
+    uint32_t weekly_coverage_bins = 168;
+    uint64_t daily_ready_min_days = 2;
+    double daily_ready_coverage_ratio = 0.75;
+    uint64_t weekly_ready_min_weeks = 2;
+    double weekly_ready_coverage_ratio = 0.70;
+
+    double maturity_uncertainty_cold_scale = 9.0;
+    double maturity_uncertainty_warming_scale = 4.0;
+    double maturity_uncertainty_drift_scale = 4.0;
+    double maturity_uncertainty_recalibrating_scale = 2.0;
+    double missing_daily_uncertainty_scale = 9.0;
+    double missing_weekly_uncertainty_scale = 4.0;
+    double level_only_extreme_z = 8.0;
+    double detection_band_std_cap = 0.5;
+    uint64_t forecast_trend_cap_buckets = 0;
+
+    double monthpos_alpha = 0.005;
+    double monthpos_delta_max_scale = 0.5;
+    uint64_t monthpos_min_month_transitions = 2;
+    double monthpos_ready_coverage_ratio = 0.60;
 
     int64_t bucket_seconds = 60;
     std::string timezone = "UTC";

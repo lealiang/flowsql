@@ -25,6 +25,7 @@
 #include "plugins/baseline/model/event_calendar_spec.h"
 #include "plugins/baseline/model/profile_config.h"
 #include "plugins/baseline/model/task_spec.h"
+#include "plugins/baseline/bootstrap/bootstrap_types.h"
 #include "plugins/baseline/rolling/rolling_config.h"
 #include "plugins/baseline/solver/solver_backend.h"
 
@@ -46,6 +47,7 @@ struct RuntimeConfigState {
     std::unordered_map<std::string, ValueSampledProfileConfig> value_sampled_profiles;
     RatioGlobalNumericalConfig ratio_global;
     std::unordered_map<std::string, RatioProfileConfig> ratio_profiles;
+    BootstrapSeedQualityConfig seed_quality;
     BaselineRollingConfig rolling_config;
     BlockSolverConfig block_solver;
     std::unordered_map<std::string, std::shared_ptr<const CompiledEventCalendar>>
@@ -218,6 +220,24 @@ void ParseBlockSolverConfig(const YAML::Node& node, BlockSolverConfig* out) {
     ParseOptionalScalar(node, "cond_max", &out->cond_max);
 }
 
+void ParseBootstrapConfig(const YAML::Node& node, BootstrapSeedQualityConfig* out) {
+    if (!node || !out) return;
+    const YAML::Node seed_quality = node["seed_quality"];
+    if (!seed_quality) return;
+    ParseOptionalScalar(seed_quality, "full_min_coverage_ratio",
+                        &out->full_min_coverage_ratio);
+    ParseOptionalScalar(seed_quality, "partial_min_coverage_ratio",
+                        &out->partial_min_coverage_ratio);
+    ParseOptionalScalar(seed_quality, "daily_min_span_days",
+                        &out->daily_min_span_days);
+    ParseOptionalScalar(seed_quality, "weekly_min_span_days",
+                        &out->weekly_min_span_days);
+    ParseOptionalScalar(seed_quality, "daily_phase_coverage_ratio",
+                        &out->daily_phase_coverage_ratio);
+    ParseOptionalScalar(seed_quality, "weekly_phase_coverage_ratio",
+                        &out->weekly_phase_coverage_ratio);
+}
+
 void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
     if (!node || !out) return;
     ParseOptionalScalar(node, "n_min_score", &out->n_min_score);
@@ -239,6 +259,12 @@ void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
     ParseOptionalScalar(node, "cold_day_learning_scale", &out->cold_day_learning_scale);
     ParseOptionalScalar(node, "cold_week_learning_scale", &out->cold_week_learning_scale);
     ParseOptionalScalar(node, "seasonal_drift_min_scale", &out->seasonal_drift_min_scale);
+    ParseOptionalScalar(node, "full_seed_seasonal_scale",
+                        &out->full_seed_seasonal_scale);
+    ParseOptionalScalar(node, "partial_seed_seasonal_scale",
+                        &out->partial_seed_seasonal_scale);
+    ParseOptionalScalar(node, "freeze_seeded_seasonal_on_drift",
+                        &out->freeze_seeded_seasonal_on_drift);
     ParseOptionalScalar(node, "day_delta_coeff_max", &out->day_delta_coeff_max_scale);
     ParseOptionalScalar(node, "day_delta_coeff_max_scale", &out->day_delta_coeff_max_scale);
     ParseOptionalScalar(node, "week_delta_coeff_max", &out->week_delta_coeff_max_scale);
@@ -274,6 +300,10 @@ void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
     ParseOptionalScalar(node, "z_cap", &out->z_cap);
     ParseOptionalScalar(node, "drift_start", &out->drift_start);
     ParseOptionalScalar(node, "drift_full", &out->drift_full);
+    ParseOptionalScalar(node, "level_shift_reference_z", &out->level_shift_reference_z);
+    ParseOptionalScalar(node, "level_shift_cusum_decay", &out->level_shift_cusum_decay);
+    ParseOptionalScalar(node, "level_shift_cusum_threshold",
+                        &out->level_shift_cusum_threshold);
     ParseOptionalScalar(node, "max_level_boost", &out->max_level_boost);
     ParseOptionalScalar(node, "max_q_boost", &out->max_q_boost);
     ParseOptionalScalar(node, "skip_relax", &out->skip_relax);
@@ -284,12 +314,59 @@ void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
     ParseOptionalScalar(node, "sigma_floor", &out->sigma_floor);
     ParseOptionalScalar(node, "cold_start_band_scale", &out->cold_start_band_scale);
     ParseOptionalScalar(node, "band_z", &out->band_z);
+    ParseOptionalScalar(node, "forecast_band_z", &out->forecast_band_z);
     ParseOptionalScalar(node, "confidence_cold", &out->confidence_cold);
     ParseOptionalScalar(node, "confidence_warming", &out->confidence_warming);
     ParseOptionalScalar(node, "confidence_ready_hint_cap",
                         &out->confidence_ready_hint_cap);
     ParseOptionalScalar(node, "min_warming_updates", &out->min_warming_updates);
     ParseOptionalScalar(node, "min_ready_hint_updates", &out->min_ready_hint_updates);
+    ParseOptionalScalar(node, "level_ready_min_updates", &out->level_ready_min_updates);
+    ParseOptionalScalar(node, "score_warming_min_updates", &out->score_warming_min_updates);
+    ParseOptionalScalar(node, "score_ready_min_updates", &out->score_ready_min_updates);
+    ParseOptionalScalar(node, "score_recovery_min_updates", &out->score_recovery_min_updates);
+    ParseOptionalScalar(node, "score_drift_degrade_start", &out->score_drift_degrade_start);
+    ParseOptionalScalar(node, "calibration_alpha", &out->calibration_alpha);
+    ParseOptionalScalar(node, "calibration_warmup_min_updates",
+                        &out->calibration_warmup_min_updates);
+    ParseOptionalScalar(node, "calibration_coverage_floor",
+                        &out->calibration_coverage_floor);
+    ParseOptionalScalar(node, "calibration_tail3_limit", &out->calibration_tail3_limit);
+    ParseOptionalScalar(node, "calibration_tail5_limit", &out->calibration_tail5_limit);
+    ParseOptionalScalar(node, "calibration_multiplier_min",
+                        &out->calibration_multiplier_min);
+    ParseOptionalScalar(node, "calibration_multiplier_max",
+                        &out->calibration_multiplier_max);
+    ParseOptionalScalar(node, "daily_coverage_bins", &out->daily_coverage_bins);
+    ParseOptionalScalar(node, "weekly_coverage_bins", &out->weekly_coverage_bins);
+    ParseOptionalScalar(node, "daily_ready_min_days", &out->daily_ready_min_days);
+    ParseOptionalScalar(node, "daily_ready_coverage_ratio",
+                        &out->daily_ready_coverage_ratio);
+    ParseOptionalScalar(node, "weekly_ready_min_weeks", &out->weekly_ready_min_weeks);
+    ParseOptionalScalar(node, "weekly_ready_coverage_ratio",
+                        &out->weekly_ready_coverage_ratio);
+    ParseOptionalScalar(node, "maturity_uncertainty_cold_scale",
+                        &out->maturity_uncertainty_cold_scale);
+    ParseOptionalScalar(node, "maturity_uncertainty_warming_scale",
+                        &out->maturity_uncertainty_warming_scale);
+    ParseOptionalScalar(node, "maturity_uncertainty_drift_scale",
+                        &out->maturity_uncertainty_drift_scale);
+    ParseOptionalScalar(node, "maturity_uncertainty_recalibrating_scale",
+                        &out->maturity_uncertainty_recalibrating_scale);
+    ParseOptionalScalar(node, "missing_daily_uncertainty_scale",
+                        &out->missing_daily_uncertainty_scale);
+    ParseOptionalScalar(node, "missing_weekly_uncertainty_scale",
+                        &out->missing_weekly_uncertainty_scale);
+    ParseOptionalScalar(node, "level_only_extreme_z", &out->level_only_extreme_z);
+    ParseOptionalScalar(node, "detection_band_std_cap", &out->detection_band_std_cap);
+    ParseOptionalScalar(node, "forecast_trend_cap_buckets",
+                        &out->forecast_trend_cap_buckets);
+    ParseOptionalScalar(node, "monthpos_alpha", &out->monthpos_alpha);
+    ParseOptionalScalar(node, "monthpos_delta_max_scale", &out->monthpos_delta_max_scale);
+    ParseOptionalScalar(node, "monthpos_min_month_transitions",
+                        &out->monthpos_min_month_transitions);
+    ParseOptionalScalar(node, "monthpos_ready_coverage_ratio",
+                        &out->monthpos_ready_coverage_ratio);
 }
 
 void ParseCalendars(const YAML::Node& node, RuntimeConfigState* out) {
@@ -395,6 +472,7 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
     if (!ValidateAllowedKeys(defaults,
                              {"parser",
                               "shared_profile_config",
+                              "bootstrap",
                               "rolling_config",
                               "value_sampled_profiles",
                               "ratio_profiles",
@@ -423,6 +501,43 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                              err)) {
         return false;
     }
+    const YAML::Node bootstrap = defaults["bootstrap"];
+    if (bootstrap) {
+        if (!ValidateAllowedKeys(bootstrap,
+                                 {"seed_quality",
+                                  "prediction_band",
+                                  "export_seed",
+                                  "min_train_points"},
+                                 "bootstrap",
+                                 err)) {
+            return false;
+        }
+        if (!ValidateAllowedKeys(bootstrap["seed_quality"],
+                                 {"full_min_coverage_ratio",
+                                  "partial_min_coverage_ratio",
+                                  "daily_min_span_days",
+                                  "weekly_min_span_days",
+                                  "daily_phase_coverage_ratio",
+                                  "weekly_phase_coverage_ratio"},
+                                 "bootstrap.seed_quality",
+                                 err)) {
+            return false;
+        }
+        if (!ValidateAllowedKeys(bootstrap["prediction_band"],
+                                 {"z_value", "sigma_floor", "low_maturity_band_scale"},
+                                 "bootstrap.prediction_band",
+                                 err)) {
+            return false;
+        }
+        if (!ValidateAllowedKeys(bootstrap["export_seed"],
+                                 {"include_monthpos_when_ready",
+                                  "include_event_when_ready",
+                                  "include_t3_basis_when_ready"},
+                                 "bootstrap.export_seed",
+                                 err)) {
+            return false;
+        }
+    }
     if (!ValidateAllowedKeys(defaults["rolling_config"],
                              {"n_min_score",
                               "n_min_update",
@@ -443,6 +558,9 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                               "cold_day_learning_scale",
                               "cold_week_learning_scale",
                               "seasonal_drift_min_scale",
+                              "full_seed_seasonal_scale",
+                              "partial_seed_seasonal_scale",
+                              "freeze_seeded_seasonal_on_drift",
                               "day_delta_coeff_max",
                               "day_delta_coeff_max_scale",
                               "week_delta_coeff_max",
@@ -478,6 +596,9 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                               "z_cap",
                               "drift_start",
                               "drift_full",
+                              "level_shift_reference_z",
+                              "level_shift_cusum_decay",
+                              "level_shift_cusum_threshold",
                               "max_level_boost",
                               "max_q_boost",
                               "skip_relax",
@@ -487,11 +608,43 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                               "sigma_floor",
                               "cold_start_band_scale",
                               "band_z",
+                              "forecast_band_z",
                               "confidence_cold",
                               "confidence_warming",
                               "confidence_ready_hint_cap",
                               "min_warming_updates",
-                              "min_ready_hint_updates"},
+                              "min_ready_hint_updates",
+                              "level_ready_min_updates",
+                              "score_warming_min_updates",
+                              "score_ready_min_updates",
+                              "score_recovery_min_updates",
+                              "score_drift_degrade_start",
+                              "calibration_alpha",
+                              "calibration_warmup_min_updates",
+                              "calibration_coverage_floor",
+                              "calibration_tail3_limit",
+                              "calibration_tail5_limit",
+                              "calibration_multiplier_min",
+                              "calibration_multiplier_max",
+                              "daily_coverage_bins",
+                              "weekly_coverage_bins",
+                              "daily_ready_min_days",
+                              "daily_ready_coverage_ratio",
+                              "weekly_ready_min_weeks",
+                              "weekly_ready_coverage_ratio",
+                              "maturity_uncertainty_cold_scale",
+                              "maturity_uncertainty_warming_scale",
+                              "maturity_uncertainty_drift_scale",
+                              "maturity_uncertainty_recalibrating_scale",
+                              "missing_daily_uncertainty_scale",
+                              "missing_weekly_uncertainty_scale",
+                              "level_only_extreme_z",
+                              "detection_band_std_cap",
+                              "forecast_trend_cap_buckets",
+                              "monthpos_alpha",
+                              "monthpos_delta_max_scale",
+                              "monthpos_min_month_transitions",
+                              "monthpos_ready_coverage_ratio"},
                              "rolling_config",
                              err)) {
         return false;
@@ -648,6 +801,22 @@ bool ValidateRuntimeConfig(const RuntimeConfigState& cfg, std::string* err) {
     if (ValidateBaselineRollingConfig(cfg.rolling_config, err) != BaselineStatus::kOk) {
         return false;
     }
+    if (!(cfg.seed_quality.full_min_coverage_ratio > 0.0 &&
+          cfg.seed_quality.full_min_coverage_ratio <= 1.0) ||
+        !(cfg.seed_quality.partial_min_coverage_ratio > 0.0 &&
+          cfg.seed_quality.partial_min_coverage_ratio <= 1.0) ||
+        cfg.seed_quality.partial_min_coverage_ratio >
+            cfg.seed_quality.full_min_coverage_ratio ||
+        cfg.seed_quality.daily_min_span_days == 0 ||
+        cfg.seed_quality.weekly_min_span_days == 0 ||
+        cfg.seed_quality.weekly_min_span_days < cfg.seed_quality.daily_min_span_days ||
+        !(cfg.seed_quality.daily_phase_coverage_ratio > 0.0 &&
+          cfg.seed_quality.daily_phase_coverage_ratio <= 1.0) ||
+        !(cfg.seed_quality.weekly_phase_coverage_ratio > 0.0 &&
+          cfg.seed_quality.weekly_phase_coverage_ratio <= 1.0)) {
+        if (err) *err = "bootstrap.seed_quality fields are invalid";
+        return false;
+    }
     for (const auto& entry : cfg.calendars) {
         if (!entry.second ||
             entry.second->calendar_id.empty() ||
@@ -693,6 +862,7 @@ bool ApplyYamlConfig(const YAML::Node& root,
     ParseSharedProfileConfig(defaults["shared_profile_config"], &out->shared_profile);
     ParseValueSampledProfiles(defaults["value_sampled_profiles"], out);
     ParseRatioProfiles(defaults["ratio_profiles"], out);
+    ParseBootstrapConfig(defaults["bootstrap"], &out->seed_quality);
     ParseRollingConfig(defaults["rolling_config"], &out->rolling_config);
     ParseBlockSolverConfig(defaults["solver_constants"], &out->block_solver);
     ParseCalendars(root["calendars"], out);
@@ -784,6 +954,13 @@ bool TryGetBaselineRollingConfigOverride(BaselineRollingConfig* out) {
     if (!out) return false;
     const auto snapshot = Snapshot();
     *out = snapshot->rolling_config;
+    return true;
+}
+
+bool TryGetBootstrapSeedQualityConfigOverride(BootstrapSeedQualityConfig* out) {
+    if (!out) return false;
+    const auto snapshot = Snapshot();
+    *out = snapshot->seed_quality;
     return true;
 }
 

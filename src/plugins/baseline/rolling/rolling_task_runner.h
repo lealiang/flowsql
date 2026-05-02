@@ -36,6 +36,7 @@ RollingBaselineResult RunRatioRollingSubmit(const BaselineTaskSpec& spec,
                                             const RollingSubmitOptions& options);
 
 RollingPrediction PredictRollingForSeries(const BaselineTaskSpec& spec,
+                                          const BootstrapSeedStore& seeds,
                                           const RollingStateMap& states,
                                           std::string_view series_key,
                                           int64_t bucket_id);

@@ -19,6 +19,8 @@ namespace baseline {
 struct DriftAdaptResult {
     double resid_norm = 0.0;
     double drift_evidence = 0.0;
+    double level_shift_evidence = 0.0;
+    double combined_drift_evidence = 0.0;
     double adapt_boost = 0.0;
 };
 
