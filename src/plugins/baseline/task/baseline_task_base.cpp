@@ -40,7 +40,6 @@ BaselineSerializationResult BaselineTaskBase::ExportConfig(
         return UnsupportedFormatResult(format);
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
     return {BaselineStatus::kOk, config_json_};
 }
 
@@ -49,7 +48,6 @@ BaselineSerializationResult BaselineTaskBase::QueryTaskSnapshot(
     if (format != BaselineSerializationFormat::kJson) {
         return UnsupportedFormatResult(format);
     }
-    std::lock_guard<std::mutex> lock(mutex_);
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
     writer.StartObject();
@@ -71,7 +69,6 @@ BaselineSerializationResult BaselineTaskBase::QuerySeriesSnapshot(
     if (format != BaselineSerializationFormat::kJson) {
         return UnsupportedFormatResult(format);
     }
-    std::lock_guard<std::mutex> lock(mutex_);
     rapidjson::StringBuffer buf;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
     writer.StartObject();
@@ -88,18 +85,15 @@ BaselineSerializationResult BaselineTaskBase::QuerySeriesSnapshot(
 
 BaselineStatus BaselineTaskBase::Close() {
     std::shared_ptr<BaselineTaskBase> self = shared_from_this();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (closed_) return BaselineStatus::kOk;
-        closed_ = true;
-        OnClosingLocked();
-    }
+    if (closed_) return BaselineStatus::kOk;
+    closed_ = true;
+    OnClosing();
 
     if (registry_) registry_->Unregister(task_id_, this);
     return BaselineStatus::kOk;
 }
 
-BaselineStatus BaselineTaskBase::EnsureOpenLocked() const {
+BaselineStatus BaselineTaskBase::EnsureOpen() const {
     return closed_ ? BaselineStatus::kInvalidArgument : BaselineStatus::kOk;
 }
 
@@ -108,7 +102,7 @@ BaselineSerializationResult BaselineTaskBase::UnsupportedFormatResult(
     return {BaselineStatus::kUnsupportedFormat, ""};
 }
 
-void BaselineTaskBase::OnClosingLocked() {}
+void BaselineTaskBase::OnClosing() {}
 
 const char* BaselineTaskBase::KindName(BaselineTaskKind kind) {
     switch (kind) {

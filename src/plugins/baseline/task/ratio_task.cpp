@@ -40,8 +40,7 @@ BaselineSerializationResult BaselineRatioTask::ExportConfig(
 
 BaselineSerializationResult BaselineRatioTask::QueryTaskSnapshot(
     BaselineSerializationFormat format) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return {status, ""};
     return QueryRollingTaskSnapshot(spec_, rolling_states_, format);
 }
@@ -49,8 +48,7 @@ BaselineSerializationResult BaselineRatioTask::QueryTaskSnapshot(
 BaselineSerializationResult BaselineRatioTask::QuerySeriesSnapshot(
     std::string_view series_key,
     BaselineSerializationFormat format) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return {status, ""};
     return QueryRollingSeriesSnapshot(spec_, rolling_states_, series_key, format);
 }
@@ -60,11 +58,10 @@ BaselineStatus BaselineRatioTask::Close() { return BaselineTaskBase::Close(); }
 RollingBaselineResult BaselineRatioTask::SubmitObservation(
     const RatioRollingObservation& obs,
     const RollingSubmitOptions& options) {
-    std::lock_guard<std::mutex> lock(mutex_);
     RollingBaselineResult result;
     result.series_key = obs.series_key;
     result.bucket_id = obs.bucket_id;
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) {
         result.status = status;
         result.numerator = obs.numerator;
@@ -77,9 +74,8 @@ RollingBaselineResult BaselineRatioTask::SubmitObservation(
 
 RollingPrediction BaselineRatioTask::PredictRolling(std::string_view series_key,
                                                     int64_t bucket_id) const {
-    std::lock_guard<std::mutex> lock(mutex_);
     RollingPrediction result;
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) {
         result.status = status;
         return result;
@@ -88,9 +84,8 @@ RollingPrediction BaselineRatioTask::PredictRolling(std::string_view series_key,
 }
 
 BootstrapTrainResult BaselineRatioTask::Bootstrap(const RatioBootstrapInput& input) {
-    std::lock_guard<std::mutex> lock(mutex_);
     BootstrapTrainResult result;
-    result.status = EnsureOpenLocked();
+    result.status = EnsureOpen();
     if (result.status != BaselineStatus::kOk) return result;
     if (!input.options.force_replace_existing_artifact &&
         FindBootstrapArtifact(artifacts_by_series_, input.series_key)) {
@@ -123,9 +118,8 @@ BootstrapPrediction BaselineRatioTask::PredictBootstrap(
     std::string_view series_key,
     int64_t bucket_id,
     const BootstrapPredictionOptions& options) const {
-    std::lock_guard<std::mutex> lock(mutex_);
     const std::string key(series_key);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) {
         BootstrapPrediction prediction;
         prediction.status = status;
@@ -148,8 +142,7 @@ BootstrapPrediction BaselineRatioTask::PredictBootstrap(
 
 BaselineSerializationResult BaselineRatioTask::ExportBootstrapArtifact(
     BaselineSerializationFormat format) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return {status, ""};
     return ExportBootstrapArtifactStore(artifacts_by_series_, bootstrap_engine_, format);
 }
@@ -157,8 +150,7 @@ BaselineSerializationResult BaselineRatioTask::ExportBootstrapArtifact(
 BaselineStatus BaselineRatioTask::LoadBootstrapArtifact(
     std::string_view content,
     BaselineSerializationFormat format) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return status;
     const BaselineStatus load_status =
         LoadBootstrapArtifactStore(content,
@@ -176,8 +168,7 @@ BaselineStatus BaselineRatioTask::LoadBootstrapArtifact(
 
 BaselineSerializationResult BaselineRatioTask::ExportBootstrapSeed(
     BaselineSerializationFormat format) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return {status, ""};
     return ExportBootstrapSeedStore(seeds_by_series_, bootstrap_engine_, format);
 }

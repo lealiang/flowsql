@@ -154,6 +154,11 @@ IPlugin（生命周期）
 └── IOperator（数据算子：Work(in, out)）
 ```
 
+IPlugin 生命周期由宿主框架串行推进。框架不得在同一插件实例的
+`Option()` / `Load()` / `Start()` / `Stop()` / `Unload()` 回调之间制造并发，
+也不得让 `Stop()` / `Unload()` 与该插件已经暴露出去的业务接口调用并发执行。
+插件业务接口自身的并发能力由各接口文档单独声明。
+
 ### URI 设计约束
 
 详见 [架构设计](docs/framework.md)。

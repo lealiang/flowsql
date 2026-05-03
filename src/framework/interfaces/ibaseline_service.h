@@ -24,6 +24,20 @@ const Guid IID_BASELINE_SERVICE = {
     0xf27073e4, 0x98c7, 0x4749, {0xbd, 0x3d, 0x83, 0xbd, 0x1b, 0x0d, 0x3a, 0x20}
 };
 
+// Threading contract:
+// Baseline task instances are not internally synchronized for concurrent
+// access. The caller or upstream scheduler must ensure that calls for the
+// same task instance do not run concurrently.
+// If calls for the same task instance are executed by different physical
+// threads, the upstream scheduler must establish a happens-before relation
+// between the end of one call and the beginning of the next call.
+// Id(), Name() and Kind() are immutable identity getters and may be read
+// across threads during the task instance lifetime.
+// Calls for different task instances may run concurrently. The same task
+// instance does not require a stable physical thread between calls.
+// Overlapping calls on the same task instance are outside this interface
+// contract unless a future implementation explicitly documents stronger
+// guarantees.
 interface IBaselineTask {
     virtual ~IBaselineTask() = default;
 
@@ -44,6 +58,7 @@ interface IBaselineTask {
     virtual BaselineStatus Close() = 0;
 };
 
+// Inherits the IBaselineTask same-task non-concurrent call contract.
 interface IBaselineValueTask : public IBaselineTask {
     virtual RollingBaselineResult SubmitObservation(
         const ValueRollingObservation& obs,
@@ -66,6 +81,7 @@ interface IBaselineValueTask : public IBaselineTask {
         BaselineSerializationFormat format) const = 0;
 };
 
+// Inherits the IBaselineTask same-task non-concurrent call contract.
 interface IBaselineRatioTask : public IBaselineTask {
     virtual RollingBaselineResult SubmitObservation(
         const RatioRollingObservation& obs,
@@ -88,6 +104,7 @@ interface IBaselineRatioTask : public IBaselineTask {
         BaselineSerializationFormat format) const = 0;
 };
 
+// Inherits the IBaselineTask same-task non-concurrent call contract.
 interface IBaselineRelationTask : public IBaselineTask {
     virtual RelationRollingResult SubmitObservation(
         const RelationRollingObservation& obs,

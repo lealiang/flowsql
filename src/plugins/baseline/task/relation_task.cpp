@@ -302,10 +302,8 @@ BaselineRelationTask::BaselineRelationTask(TaskRegistry* registry,
     relation_rolling_config_ = ResolveRelationRollingConfigForSpec(spec_);
     runtime_shard_count_ =
         NormalizeRuntimeShardCount(relation_rolling_config_.routed_state_shard_count);
-    source_ordered_locks_.reserve(runtime_shard_count_);
     routed_shards_.reserve(runtime_shard_count_);
     for (std::size_t i = 0; i < runtime_shard_count_; ++i) {
-        source_ordered_locks_.push_back(std::make_unique<std::mutex>());
         routed_shards_.push_back(std::make_unique<RelationRoutedRuntimeShard>());
     }
 }
@@ -330,30 +328,20 @@ BaselineSerializationResult BaselineRelationTask::QueryTaskSnapshot(
     uint64_t routed_state_count = 0;
     uint64_t fusion_source_state_count = 0;
     uint64_t fusion_persistence_state_count = 0;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const BaselineStatus status = EnsureOpenLocked();
-        if (status != BaselineStatus::kOk) return {status, ""};
-        {
-            std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
-            source_state_count = static_cast<uint64_t>(basis_states_.size());
-        }
-        for (const auto& shard_ptr : routed_shards_) {
-            const RelationRoutedRuntimeShard& shard = *shard_ptr;
-            std::lock_guard<std::mutex> shard_lock(shard.mutex);
-            routed_seed_count +=
-                static_cast<uint64_t>(shard.routed_seeds_by_series.size());
-            routed_state_count +=
-                static_cast<uint64_t>(shard.routed_rolling_states.size());
-        }
-        {
-            std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
-            fusion_source_state_count = static_cast<uint64_t>(fusion_states_.size());
-            for (const auto& entry : fusion_states_) {
-                fusion_persistence_state_count += static_cast<uint64_t>(
-                    entry.second.persistence_by_evidence_dir.size());
-            }
-        }
+    const BaselineStatus status = EnsureOpen();
+    if (status != BaselineStatus::kOk) return {status, ""};
+    source_state_count = static_cast<uint64_t>(basis_states_.size());
+    for (const auto& shard_ptr : routed_shards_) {
+        const RelationRoutedRuntimeShard& shard = *shard_ptr;
+        routed_seed_count +=
+            static_cast<uint64_t>(shard.routed_seeds_by_series.size());
+        routed_state_count +=
+            static_cast<uint64_t>(shard.routed_rolling_states.size());
+    }
+    fusion_source_state_count = static_cast<uint64_t>(fusion_states_.size());
+    for (const auto& entry : fusion_states_) {
+        fusion_persistence_state_count += static_cast<uint64_t>(
+            entry.second.persistence_by_evidence_dir.size());
     }
 
     rapidjson::StringBuffer buf;
@@ -398,11 +386,8 @@ BaselineSerializationResult BaselineRelationTask::QuerySeriesSnapshot(
         return {BaselineStatus::kUnsupportedFormat, ""};
     }
     if (series_key.empty()) return {BaselineStatus::kInvalidArgument, ""};
-    {
-        std::lock_guard<std::mutex> task_lock(mutex_);
-        const BaselineStatus status = EnsureOpenLocked();
-        if (status != BaselineStatus::kOk) return {status, ""};
-    }
+    const BaselineStatus status = EnsureOpen();
+    if (status != BaselineStatus::kOk) return {status, ""};
 
     struct BasisSnapshotEntry {
         std::string metric;
@@ -430,30 +415,26 @@ BaselineSerializationResult BaselineRelationTask::QuerySeriesSnapshot(
     uint64_t routed_state_count = 0;
     bool has_fusion_snapshot = false;
     RelationFusionResult fusion_snapshot;
-    {
-        std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
-        for (const auto& entry : basis_states_) {
-            if (!KeyBelongsToSource(entry.first, series_key)) continue;
+    for (const auto& entry : basis_states_) {
+        if (!KeyBelongsToSource(entry.first, series_key)) continue;
 
-            BasisSnapshotEntry snapshot;
-            const std::string prefix = key + "::";
-            snapshot.metric = entry.first.substr(prefix.size());
-            snapshot.status = entry.second.basis_status();
-            snapshot.handover_active =
-                snapshot.status == RelationBasisStatus::kHandoverWarming;
-            snapshot.stats_group_count =
-                static_cast<uint64_t>(entry.second.accumulator().group_count());
-            if (const RelationServiceBasis* basis = entry.second.active_basis()) {
-                snapshot.basis_version = basis->basis_version;
-                snapshot.support_size = static_cast<uint64_t>(basis->support_explicit.size());
-                snapshot.stable_head_size = static_cast<uint64_t>(basis->stable_head.size());
-            }
-            basis_entries.push_back(std::move(snapshot));
+        BasisSnapshotEntry snapshot;
+        const std::string prefix = key + "::";
+        snapshot.metric = entry.first.substr(prefix.size());
+        snapshot.status = entry.second.basis_status();
+        snapshot.handover_active =
+            snapshot.status == RelationBasisStatus::kHandoverWarming;
+        snapshot.stats_group_count =
+            static_cast<uint64_t>(entry.second.accumulator().group_count());
+        if (const RelationServiceBasis* basis = entry.second.active_basis()) {
+            snapshot.basis_version = basis->basis_version;
+            snapshot.support_size = static_cast<uint64_t>(basis->support_explicit.size());
+            snapshot.stable_head_size = static_cast<uint64_t>(basis->stable_head.size());
         }
+        basis_entries.push_back(std::move(snapshot));
     }
     for (const auto& shard_ptr : routed_shards_) {
         const RelationRoutedRuntimeShard& shard = *shard_ptr;
-        std::lock_guard<std::mutex> shard_lock(shard.mutex);
         if (shard.routed_specs_by_series.find(key) != shard.routed_specs_by_series.end() ||
             shard.routed_seeds_by_series.find(key) != shard.routed_seeds_by_series.end() ||
             shard.routed_rolling_states.find(key) != shard.routed_rolling_states.end()) {
@@ -500,14 +481,11 @@ BaselineSerializationResult BaselineRelationTask::QuerySeriesSnapshot(
             routed_entries.push_back(std::move(snapshot));
         }
     }
-    {
-        std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
-        const auto fusion_it = fusion_states_.find(key);
-        if (fusion_it != fusion_states_.end() &&
-            fusion_it->second.last_result.status == BaselineStatus::kOk) {
-            fusion_snapshot = fusion_it->second.last_result;
-            has_fusion_snapshot = true;
-        }
+    const auto fusion_it = fusion_states_.find(key);
+    if (fusion_it != fusion_states_.end() &&
+        fusion_it->second.last_result.status == BaselineStatus::kOk) {
+        fusion_snapshot = fusion_it->second.last_result;
+        has_fusion_snapshot = true;
     }
     if (basis_entries.empty() && routed_entries.empty() && !has_fusion_snapshot) {
         return {BaselineStatus::kNotTrained, ""};
@@ -576,32 +554,20 @@ BaselineSerializationResult BaselineRelationTask::QuerySeriesSnapshot(
 
 BaselineStatus BaselineRelationTask::Close() { return BaselineTaskBase::Close(); }
 
-std::size_t BaselineRelationTask::SourceLockIndex(
-    std::string_view source_series_key) const {
-    return std::hash<std::string_view>{}(source_series_key) % runtime_shard_count_;
-}
-
 std::size_t BaselineRelationTask::RoutedShardIndex(
     std::string_view routed_series_key) const {
     return std::hash<std::string_view>{}(routed_series_key) % runtime_shard_count_;
 }
 
-void BaselineRelationTask::RebuildRuntimeFromRelationSeedsLocked() {
-    {
-        std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
-        basis_states_.clear();
-    }
+void BaselineRelationTask::RebuildRuntimeFromRelationSeeds() {
+    basis_states_.clear();
     for (auto& shard_ptr : routed_shards_) {
         RelationRoutedRuntimeShard& shard = *shard_ptr;
-        std::lock_guard<std::mutex> shard_lock(shard.mutex);
         shard.routed_seeds_by_series.clear();
         shard.routed_specs_by_series.clear();
         shard.routed_rolling_states.clear();
     }
-    {
-        std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
-        fusion_states_.clear();
-    }
+    fusion_states_.clear();
 
     for (const auto& entry : seeds_by_series_) {
         const BootstrapSeed& seed = entry.second;
@@ -609,7 +575,6 @@ void BaselineRelationTask::RebuildRuntimeFromRelationSeedsLocked() {
             RelationBasisRuntimeState runtime(MakeBasisRuntimeConfig());
             (void)runtime.LoadSeedBasis(BasisFromSeed(basis_seed),
                                         BasisStatusFromSeedStatus(seed.seed_status));
-            std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
             basis_states_.insert_or_assign(BasisStateKey(seed.series_key, basis_seed.metric_name),
                                            std::move(runtime));
         }
@@ -630,7 +595,6 @@ void BaselineRelationTask::RebuildRuntimeFromRelationSeedsLocked() {
 
             RelationRoutedRuntimeShard& shard =
                 *routed_shards_[RoutedShardIndex(materialized.routed_series_key)];
-            std::lock_guard<std::mutex> shard_lock(shard.mutex);
             shard.routed_seeds_by_series.insert_or_assign(
                 materialized.routed_series_key, std::move(materialized.seed));
             shard.routed_specs_by_series.insert_or_assign(
@@ -698,14 +662,9 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
         result.status = BaselineStatus::kInvalidArgument;
         return result;
     }
-    {
-        std::lock_guard<std::mutex> task_lock(mutex_);
-        result.status = EnsureOpenLocked();
-        if (result.status != BaselineStatus::kOk) return result;
-    }
+    result.status = EnsureOpen();
+    if (result.status != BaselineStatus::kOk) return result;
 
-    std::lock_guard<std::mutex> source_lock(
-        *source_ordered_locks_[SourceLockIndex(obs.series_key)]);
     const RelationBasisRuntimeConfig runtime_config = MakeBasisRuntimeConfig();
     const bool routed_enabled = relation_rolling_config_.enable_routed_rolling;
     const bool stream_basis_enabled =
@@ -755,15 +714,12 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
         std::optional<RelationServiceBasis> active_basis;
         RelationBasisStatus basis_status = RelationBasisStatus::kCollecting;
         uint64_t active_basis_version = 0;
-        {
-            std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
-            const auto basis_it = basis_states_.find(BasisStateKey(obs.series_key, metric_name));
-            if (basis_it != basis_states_.end()) {
-                basis_status = basis_it->second.basis_status();
-                if (const RelationServiceBasis* basis = basis_it->second.active_basis()) {
-                    active_basis = *basis;
-                    active_basis_version = basis->basis_version;
-                }
+        const auto basis_it = basis_states_.find(BasisStateKey(obs.series_key, metric_name));
+        if (basis_it != basis_states_.end()) {
+            basis_status = basis_it->second.basis_status();
+            if (const RelationServiceBasis* basis = basis_it->second.active_basis()) {
+                active_basis = *basis;
+                active_basis_version = basis->basis_version;
             }
         }
         fusion_metric.has_active_basis = active_basis.has_value();
@@ -807,7 +763,6 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
                                                       summary.basis_version);
                 RelationRoutedRuntimeShard& shard =
                     *routed_shards_[RoutedShardIndex(identity.routed_series_key)];
-                std::lock_guard<std::mutex> shard_lock(shard.mutex);
                 auto spec_it = shard.routed_specs_by_series.find(identity.routed_series_key);
                 if (spec_it == shard.routed_specs_by_series.end()) {
                     spec_it = shard.routed_specs_by_series
@@ -883,7 +838,6 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
         }
 
         if (stream_basis_enabled) {
-            std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
             const std::string state_key = BasisStateKey(obs.series_key, metric_name);
             auto basis_it = basis_states_.find(state_key);
             if (basis_it == basis_states_.end()) {
@@ -925,7 +879,6 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
     const RelationFusionRuntimeConfig fusion_config = MakeFusionRuntimeConfig();
     bool has_existing_fusion_state = false;
     if (routed_enabled && fusion_config.enable_relation_fusion && !has_fusion_routed_inputs) {
-        std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
         has_existing_fusion_state = fusion_states_.find(obs.series_key) != fusion_states_.end();
     }
     if (routed_enabled && fusion_config.enable_relation_fusion &&
@@ -940,16 +893,13 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
         fusion_update.routed_inputs = std::move(fusion_inputs);
 
         RelationFusionResult fusion_result;
-        {
-            std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
-            RelationFusionRuntimeState& fusion_state = fusion_states_[obs.series_key];
-            const BaselineStatus fusion_status =
-                UpdateRelationFusion(fusion_update, &fusion_state, &fusion_result);
-            if (fusion_status != BaselineStatus::kOk) {
-                AppendDiagnostic(options.include_diagnostics,
-                                 "relation_fusion_update_failed",
-                                 &result.diagnostics);
-            }
+        RelationFusionRuntimeState& fusion_state = fusion_states_[obs.series_key];
+        const BaselineStatus fusion_status =
+            UpdateRelationFusion(fusion_update, &fusion_state, &fusion_result);
+        if (fusion_status != BaselineStatus::kOk) {
+            AppendDiagnostic(options.include_diagnostics,
+                             "relation_fusion_update_failed",
+                             &result.diagnostics);
         }
         if (options.include_fusion_result &&
             has_fusion_routed_inputs &&
@@ -975,15 +925,11 @@ RollingPrediction BaselineRelationTask::PredictRoutedSummary(
         prediction.status = BaselineStatus::kInvalidArgument;
         return prediction;
     }
-    {
-        std::lock_guard<std::mutex> task_lock(mutex_);
-        prediction.status = EnsureOpenLocked();
-        if (prediction.status != BaselineStatus::kOk) return prediction;
-    }
+    prediction.status = EnsureOpen();
+    if (prediction.status != BaselineStatus::kOk) return prediction;
 
     uint64_t basis_version = query.basis_version;
     if (IsBasisScopedRelationSummary(query.summary) && basis_version == 0) {
-        std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
         const auto it = basis_states_.find(BasisStateKey(query.source_series_key, query.metric));
         if (it == basis_states_.end() || !it->second.active_basis()) {
             prediction.status = BaselineStatus::kNotTrained;
@@ -1001,7 +947,6 @@ RollingPrediction BaselineRelationTask::PredictRoutedSummary(
                                           basis_version);
     const RelationRoutedRuntimeShard& shard =
         *routed_shards_[RoutedShardIndex(identity.routed_series_key)];
-    std::lock_guard<std::mutex> shard_lock(shard.mutex);
     const auto spec_it = shard.routed_specs_by_series.find(identity.routed_series_key);
     if (spec_it == shard.routed_specs_by_series.end()) {
         prediction.status = BaselineStatus::kNotTrained;
@@ -1023,15 +968,11 @@ BaselineSerializationResult BaselineRelationTask::QueryRoutedSummarySnapshot(
     if (query.source_series_key.empty() || query.metric.empty() || query.summary.empty()) {
         return {BaselineStatus::kInvalidArgument, ""};
     }
-    {
-        std::lock_guard<std::mutex> task_lock(mutex_);
-        const BaselineStatus status = EnsureOpenLocked();
-        if (status != BaselineStatus::kOk) return {status, ""};
-    }
+    const BaselineStatus status = EnsureOpen();
+    if (status != BaselineStatus::kOk) return {status, ""};
 
     uint64_t basis_version = query.basis_version;
     if (IsBasisScopedRelationSummary(query.summary) && basis_version == 0) {
-        std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
         const auto it = basis_states_.find(BasisStateKey(query.source_series_key, query.metric));
         if (it == basis_states_.end() || !it->second.active_basis()) {
             return {BaselineStatus::kNotTrained, ""};
@@ -1048,7 +989,6 @@ BaselineSerializationResult BaselineRelationTask::QueryRoutedSummarySnapshot(
                                           basis_version);
     const RelationRoutedRuntimeShard& shard =
         *routed_shards_[RoutedShardIndex(identity.routed_series_key)];
-    std::lock_guard<std::mutex> shard_lock(shard.mutex);
     const auto spec_it = shard.routed_specs_by_series.find(identity.routed_series_key);
     if (spec_it == shard.routed_specs_by_series.end()) {
         return {BaselineStatus::kNotTrained, ""};
@@ -1060,9 +1000,8 @@ BaselineSerializationResult BaselineRelationTask::QueryRoutedSummarySnapshot(
 }
 
 BootstrapTrainResult BaselineRelationTask::Bootstrap(const RelationBootstrapInput& input) {
-    std::lock_guard<std::mutex> lock(mutex_);
     BootstrapTrainResult result;
-    result.status = EnsureOpenLocked();
+    result.status = EnsureOpen();
     if (result.status != BaselineStatus::kOk) return result;
     if (!input.options.force_replace_existing_artifact &&
         FindBootstrapArtifact(artifacts_by_series_, input.series_key)) {
@@ -1086,15 +1025,14 @@ BootstrapTrainResult BaselineRelationTask::Bootstrap(const RelationBootstrapInpu
             result.status = seed_status;
             return result;
         }
-        RebuildRuntimeFromRelationSeedsLocked();
+        RebuildRuntimeFromRelationSeeds();
     }
     return result;
 }
 
 BaselineSerializationResult BaselineRelationTask::ExportBootstrapArtifact(
     BaselineSerializationFormat format) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return {status, ""};
     return ExportBootstrapArtifactStore(artifacts_by_series_, bootstrap_engine_, format);
 }
@@ -1102,8 +1040,7 @@ BaselineSerializationResult BaselineRelationTask::ExportBootstrapArtifact(
 BaselineStatus BaselineRelationTask::LoadBootstrapArtifact(
     std::string_view content,
     BaselineSerializationFormat format) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return status;
     const BaselineStatus load_status =
         LoadRelationBootstrapArtifactStore(content,
@@ -1113,23 +1050,21 @@ BaselineStatus BaselineRelationTask::LoadBootstrapArtifact(
                                            &artifacts_by_series_,
                                            &seeds_by_series_);
     if (load_status == BaselineStatus::kOk) {
-        RebuildRuntimeFromRelationSeedsLocked();
+        RebuildRuntimeFromRelationSeeds();
     }
     return load_status;
 }
 
 BaselineSerializationResult BaselineRelationTask::ExportBootstrapSeed(
     BaselineSerializationFormat format) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return {status, ""};
     return ExportBootstrapSeedStore(seeds_by_series_, bootstrap_engine_, format);
 }
 
 BaselineSerializationResult BaselineRelationTask::QueryBootstrapBasis(
     BaselineSerializationFormat format) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const BaselineStatus status = EnsureOpenLocked();
+    const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) return {status, ""};
     if (format != BaselineSerializationFormat::kJson) {
         return {BaselineStatus::kUnsupportedFormat, ""};

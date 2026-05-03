@@ -106,7 +106,7 @@ Baseline task 实例按外部串行化状态机理解。调用方 / 上游调度
 3. 同一个 task 不要求固定物理线程，Baseline 也不做线程身份检查。
 4. 不同 task 可以并行调用。
 
-当前实现可能仍保留内部锁作为过渡，但调用方不得依赖这些锁来直接并发访问同一个 task。后续锁优化会按上述契约收敛 task 内部 mutex。
+当前实现按上述契约收敛 task 内部 runtime 锁。调用方不得直接并发访问同一个 task，也不得依赖 Baseline 在 task 内部为重叠调用提供互斥保护。
 
 ### 3.3 Immutable identity getter
 

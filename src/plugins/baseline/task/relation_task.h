@@ -10,7 +10,6 @@
 #define _FLOWSQL_PLUGINS_BASELINE_TASK_RELATION_TASK_H_
 
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -76,7 +75,6 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
 
  private:
     struct RelationRoutedRuntimeShard {
-        mutable std::mutex mutex;
         BootstrapSeedStore routed_seeds_by_series;
         std::unordered_map<std::string, BaselineTaskSpec> routed_specs_by_series;
         RollingStateMap routed_rolling_states;
@@ -85,9 +83,8 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
     using RelationBasisStateMap =
         std::unordered_map<std::string, RelationBasisRuntimeState>;
 
-    std::size_t SourceLockIndex(std::string_view source_series_key) const;
     std::size_t RoutedShardIndex(std::string_view routed_series_key) const;
-    void RebuildRuntimeFromRelationSeedsLocked();
+    void RebuildRuntimeFromRelationSeeds();
     RelationBasisRuntimeConfig MakeBasisRuntimeConfig() const;
     RelationFusionRuntimeConfig MakeFusionRuntimeConfig() const;
 
@@ -98,11 +95,8 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
     BootstrapEngine bootstrap_engine_;
     BaselineRelationRollingConfig relation_rolling_config_;
     std::size_t runtime_shard_count_ = 16;
-    mutable std::vector<std::unique_ptr<std::mutex>> source_ordered_locks_;
     std::vector<std::unique_ptr<RelationRoutedRuntimeShard>> routed_shards_;
-    mutable std::mutex basis_states_mutex_;
     RelationBasisStateMap basis_states_;
-    mutable std::mutex fusion_states_mutex_;
     std::unordered_map<std::string, RelationFusionRuntimeState> fusion_states_;
 };
 

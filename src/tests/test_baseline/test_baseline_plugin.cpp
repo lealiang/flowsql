@@ -7,9 +7,11 @@
  */
 
 #include <cassert>
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <thread>
 
 #include <common/loader.hpp>
 #include <common/error_code.h>
@@ -1758,6 +1760,238 @@ baseline:
     std::printf("[PASS] B3 rolling result uses pre-update trust snapshot\n");
 }
 
+void TestB6SameTaskSerializedCrossThreadHandoff() {
+    std::printf("[TEST] B6 same task serialized cross-thread handoff...\n");
+
+    auto env = LoadBaselineService();
+    auto [status, task] =
+        env.service->CreateValueTask(ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+
+    std::string task_id;
+    std::string task_name;
+    BaselineTaskKind task_kind = BaselineTaskKind::kRelation;
+    std::thread identity_thread([&]() {
+        task_id = task->Id();
+        task_name = task->Name();
+        task_kind = task->Kind();
+    });
+    identity_thread.join();
+    assert(task_id == "baseline_task_bps");
+    assert(task_name == "link bps baseline");
+    assert(task_kind == BaselineTaskKind::kValue);
+
+    BootstrapTrainResult train;
+    std::thread bootstrap_thread([&]() { train = task->Bootstrap(BuildValueHistory()); });
+    bootstrap_thread.join();
+    assert(train.status == BaselineStatus::kOk);
+
+    BaselineSerializationResult exported_artifact;
+    std::thread export_thread([&]() {
+        exported_artifact =
+            task->ExportBootstrapArtifact(BaselineSerializationFormat::kJson);
+    });
+    export_thread.join();
+    assert(exported_artifact.first == BaselineStatus::kOk);
+    assert(!exported_artifact.second.empty());
+
+    BaselineStatus load_status = BaselineStatus::kParseFailed;
+    std::thread load_thread([&]() {
+        load_status = task->LoadBootstrapArtifact(
+            exported_artifact.second, BaselineSerializationFormat::kJson);
+    });
+    load_thread.join();
+    assert(load_status == BaselineStatus::kOk);
+
+    RollingBaselineResult submit_result;
+    std::thread submit_thread([&]() {
+        ValueRollingObservation obs;
+        obs.series_key = "svc-a";
+        obs.bucket_id = 220;
+        obs.value = 110.0;
+        submit_result = task->SubmitObservation(obs, RollingSubmitOptions{});
+    });
+    submit_thread.join();
+    assert(submit_result.status == BaselineStatus::kOk);
+    assert(submit_result.series_key == "svc-a");
+    assert(submit_result.bucket_id == 220);
+
+    BaselineSerializationResult series_snapshot;
+    std::thread query_thread([&]() {
+        series_snapshot =
+            task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+    });
+    query_thread.join();
+    assert(series_snapshot.first == BaselineStatus::kOk);
+    assert(series_snapshot.second.find("\"series_key\":\"svc-a\"") != std::string::npos);
+
+    BaselineSerializationResult config_export;
+    std::thread config_thread([&]() {
+        config_export = task->ExportConfig(BaselineSerializationFormat::kJson);
+    });
+    config_thread.join();
+    assert(config_export.first == BaselineStatus::kOk);
+    assert(config_export.second.find("baseline_task_bps") != std::string::npos);
+
+    BaselineStatus close_status = BaselineStatus::kParseFailed;
+    std::thread close_thread([&]() { close_status = task->Close(); });
+    close_thread.join();
+    assert(close_status == BaselineStatus::kOk);
+
+    RollingPrediction after_close_prediction;
+    std::thread after_close_thread([&]() {
+        after_close_prediction = task->PredictRolling("svc-a", 221);
+    });
+    after_close_thread.join();
+    assert(after_close_prediction.status == BaselineStatus::kInvalidArgument);
+
+    std::printf("[PASS] B6 same task serialized cross-thread handoff\n");
+}
+
+void TestB6RelationSerializedLifecycleSequence() {
+    std::printf("[TEST] B6 relation serialized lifecycle sequence...\n");
+
+    auto env = LoadBaselineService();
+    auto [status, task] =
+        env.service->CreateRelationTask(RelationTaskConfig(),
+                                        BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(task != nullptr);
+
+    RelationRollingSubmitOptions options;
+    RelationRollingResult cold_submit;
+    std::thread cold_submit_thread([&]() {
+        cold_submit =
+            task->SubmitObservation(BuildRelationObservation(100, 60, 30, 10), options);
+    });
+    cold_submit_thread.join();
+    assert(cold_submit.status == BaselineStatus::kOk);
+    assert(cold_submit.series_key == "svc-a");
+    assert(!cold_submit.routed_results.empty());
+
+    BootstrapTrainResult train;
+    std::thread bootstrap_thread([&]() { train = task->Bootstrap(BuildRelationHistory()); });
+    bootstrap_thread.join();
+    assert(train.status == BaselineStatus::kOk);
+
+    BaselineSerializationResult artifact;
+    std::thread export_thread([&]() {
+        artifact = task->ExportBootstrapArtifact(BaselineSerializationFormat::kJson);
+    });
+    export_thread.join();
+    assert(artifact.first == BaselineStatus::kOk);
+    assert(artifact.second.find("\"document_kind\":\"bootstrap_artifact\"") !=
+           std::string::npos);
+
+    BaselineStatus load_status = BaselineStatus::kParseFailed;
+    std::thread load_thread([&]() {
+        load_status = task->LoadBootstrapArtifact(
+            artifact.second, BaselineSerializationFormat::kJson);
+    });
+    load_thread.join();
+    assert(load_status == BaselineStatus::kOk);
+
+    RelationRollingResult seeded_submit;
+    std::thread seeded_submit_thread([&]() {
+        seeded_submit =
+            task->SubmitObservation(BuildRelationObservation(20, 50, 25, 25), options);
+    });
+    seeded_submit_thread.join();
+    assert(seeded_submit.status == BaselineStatus::kOk);
+    bool has_basis_scoped_routed = false;
+    for (const auto& routed : seeded_submit.routed_results) {
+        if (routed.basis_scoped) has_basis_scoped_routed = true;
+    }
+    assert(has_basis_scoped_routed);
+
+    BaselineSerializationResult series_snapshot;
+    std::thread snapshot_thread([&]() {
+        series_snapshot =
+            task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+    });
+    snapshot_thread.join();
+    assert(series_snapshot.first == BaselineStatus::kOk);
+    rapidjson::Document snapshot_doc;
+    snapshot_doc.Parse(series_snapshot.second.c_str());
+    assert(!snapshot_doc.HasParseError());
+    assert(std::string(snapshot_doc["document_kind"].GetString()) ==
+           "relation_series_snapshot");
+    assert(snapshot_doc["routed_summaries"].Size() > 0);
+
+    BaselineStatus close_status = BaselineStatus::kParseFailed;
+    std::thread close_thread([&]() { close_status = task->Close(); });
+    close_thread.join();
+    assert(close_status == BaselineStatus::kOk);
+
+    RelationRollingResult after_close;
+    std::thread after_close_thread([&]() {
+        after_close =
+            task->SubmitObservation(BuildRelationObservation(21, 50, 25, 25), options);
+    });
+    after_close_thread.join();
+    assert(after_close.status == BaselineStatus::kInvalidArgument);
+
+    std::printf("[PASS] B6 relation serialized lifecycle sequence\n");
+}
+
+void TestB6DifferentTasksMayRunInParallel() {
+    std::printf("[TEST] B6 different tasks may run in parallel...\n");
+
+    auto env = LoadBaselineService();
+    auto [value_status, value_task] =
+        env.service->CreateValueTask(ValueTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(value_status == BaselineStatus::kOk);
+    assert(value_task != nullptr);
+    auto [relation_status, relation_task] =
+        env.service->CreateRelationTask(RelationTaskConfig(),
+                                        BaselineSerializationFormat::kJson);
+    assert(relation_status == BaselineStatus::kOk);
+    assert(relation_task != nullptr);
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    RollingBaselineResult value_result;
+    RelationRollingResult relation_result;
+
+    std::thread value_thread([&]() {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        ValueRollingObservation obs;
+        obs.series_key = "parallel-value";
+        obs.bucket_id = 100;
+        obs.value = 100.0;
+        value_result = value_task->SubmitObservation(obs, RollingSubmitOptions{});
+    });
+    std::thread relation_thread([&]() {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        RelationRollingSubmitOptions options;
+        relation_result = relation_task->SubmitObservation(
+            BuildRelationObservation(100, 60, 30, 10), options);
+    });
+
+    while (ready.load(std::memory_order_acquire) < 2) std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    value_thread.join();
+    relation_thread.join();
+
+    assert(value_result.status == BaselineStatus::kOk);
+    assert(value_result.series_key == "parallel-value");
+    assert(relation_result.status == BaselineStatus::kOk);
+    assert(relation_result.series_key == "svc-a");
+
+    auto [snapshot_status, snapshot_json] =
+        env.service->QueryServiceSnapshot(BaselineSerializationFormat::kJson);
+    assert(snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document snapshot;
+    snapshot.Parse(snapshot_json.c_str());
+    assert(!snapshot.HasParseError());
+    assert(snapshot["task_count"].GetUint64() == 2);
+
+    std::printf("[PASS] B6 different tasks may run in parallel\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1777,6 +2011,9 @@ int main() {
     TestB2RollingPredict();
     TestB2RollingFailureSemantics();
     TestB3RollingResultUsesPreUpdateTrustSnapshot();
+    TestB6SameTaskSerializedCrossThreadHandoff();
+    TestB6RelationSerializedLifecycleSequence();
+    TestB6DifferentTasksMayRunInParallel();
     TestB4RelationSubmitObservation();
     TestB4RelationRollingConfigSwitches();
     TestB5RelationFusionSubmitAndSnapshot();

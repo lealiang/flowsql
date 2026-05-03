@@ -217,12 +217,25 @@ template <typename T>
 struct HasQueryBootstrapSeed<T, std::void_t<decltype(&T::QueryBootstrapSeed)>>
     : std::true_type {};
 
+template <typename T>
+struct CanDerivedAccessTaskMutex : public T {
+ private:
+    template <typename U>
+    static auto Test(int) -> decltype(std::declval<U&>().mutex_, std::true_type{});
+    template <typename U>
+    static std::false_type Test(...);
+
+ public:
+    static constexpr bool value = decltype(Test<CanDerivedAccessTaskMutex>(0))::value;
+};
+
 void TestTaskHeaderContracts() {
     std::printf("[TEST] Task header contracts...\n");
 
     static_assert(std::is_base_of_v<BaselineTaskBase, BaselineValueTask>);
     static_assert(std::is_base_of_v<BaselineTaskBase, BaselineRatioTask>);
     static_assert(std::is_base_of_v<BaselineTaskBase, BaselineRelationTask>);
+    static_assert(!CanDerivedAccessTaskMutex<BaselineTaskBase>::value);
 
     using ExpectedCreateValueTask =
         std::pair<BaselineStatus, std::shared_ptr<IBaselineValueTask>> (

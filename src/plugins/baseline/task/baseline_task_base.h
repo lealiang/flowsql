@@ -12,7 +12,6 @@
 #include <framework/interfaces/ibaseline_service.h>
 
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -42,12 +41,10 @@ class BaselineTaskBase : public std::enable_shared_from_this<BaselineTaskBase> {
     BaselineStatus Close();
 
  protected:
-    BaselineStatus EnsureOpenLocked() const;
+    BaselineStatus EnsureOpen() const;
     static BaselineSerializationResult UnsupportedFormatResult(
         BaselineSerializationFormat format);
-    virtual void OnClosingLocked();
-
-    mutable std::mutex mutex_;
+    virtual void OnClosing();
 
  private:
     static const char* KindName(BaselineTaskKind kind);
