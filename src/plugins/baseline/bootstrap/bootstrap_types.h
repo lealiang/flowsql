@@ -176,6 +176,31 @@ struct RelationRoutedBootstrapSeed {
     BootstrapMaturityInit maturity_init;
 };
 
+struct RelationFusionSummaryMetadata {
+    std::string metric_name;
+    std::string summary_name;
+    BaselineTaskKind task_kind = BaselineTaskKind::kValue;
+    bool basis_scoped = false;
+    uint64_t basis_version = 0;
+};
+
+struct RelationFusionPatternMetadata {
+    std::string pattern;
+    std::string scope = "relation_local";
+    double pattern_weight = 1.0;
+    std::vector<std::string> required_summaries;
+    std::vector<std::string> optional_summaries;
+    std::vector<std::string> oppose_summaries;
+    std::vector<std::string> metrics;
+};
+
+struct RelationFusionBootstrapMetadata {
+    uint32_t metadata_version = 1;
+    std::string feature_base;
+    std::vector<RelationFusionSummaryMetadata> summary_metadata;
+    std::vector<RelationFusionPatternMetadata> pattern_metadata;
+};
+
 struct BootstrapSeed {
     BootstrapArtifactKind artifact_kind = BootstrapArtifactKind::kNone;
     BootstrapSeedStatus seed_status = BootstrapSeedStatus::kNone;
@@ -196,6 +221,7 @@ struct BootstrapSeed {
     BootstrapMaturityInit maturity_init;
     std::vector<BootstrapRelationBasisSeed> relation_basis_by_metric;
     std::vector<RelationRoutedBootstrapSeed> relation_routed_summary_seeds;
+    RelationFusionBootstrapMetadata relation_fusion_metadata;
     std::string diagnostics;
 };
 
@@ -231,6 +257,7 @@ struct BootstrapArtifact {
     std::shared_ptr<RatioFormalModel> ratio_model;
     std::vector<RelationServiceBasis> relation_basis_by_metric;
     std::vector<RelationRoutedBootstrapArtifact> relation_routed_summary_artifacts;
+    RelationFusionBootstrapMetadata relation_fusion_metadata;
     std::string diagnostics;
 };
 

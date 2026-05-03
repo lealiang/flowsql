@@ -28,6 +28,7 @@ struct RelationProjectedSummary {
     std::string feature_type;
     uint64_t basis_version = 0;
     bool basis_scoped = false;
+    bool active_count_from_upstream = false;
     double value = 0.0;
     double numerator = 0.0;
     double denominator = 0.0;

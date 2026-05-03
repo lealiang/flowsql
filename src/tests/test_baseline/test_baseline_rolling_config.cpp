@@ -88,6 +88,14 @@ void TestRollingConfigDefaultsAndDerivedBuckets() {
     assert(config.relation_rolling.basis_collect_min_buckets == 0);
     assert(config.relation_rolling.basis_replacement_cap_max == 2);
     assert(config.relation_rolling.routed_state_shard_count == 16);
+    assert(config.relation_rolling.relation_fusion.enable_relation_fusion);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_z_score_cap, 5.0);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_min_evidence_score, 0.20);
+    assert(config.relation_rolling.relation_fusion.fusion_persistence_window == 2);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_warming_weight, 0.25);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_degraded_weight, 0.25);
+    assert(config.relation_rolling.relation_fusion.dominant_single_cap == 3);
+    assert(config.relation_rolling.relation_fusion.dominant_pattern_cap == 2);
 
     BootstrapSeedQualityConfig seed_quality;
     assert(TryGetBootstrapSeedQualityConfigOverride(&seed_quality));
@@ -189,6 +197,19 @@ baseline:
       basis_threshold_margin: 1.30
       basis_min_stable_refresh_count: 3
       routed_state_shard_count: 32
+      relation_fusion:
+        enable_relation_fusion: false
+        fusion_z_score_cap: 4.0
+        fusion_min_evidence_score: 0.30
+        fusion_persistence_window: 3
+        fusion_warming_weight: 0.20
+        fusion_degraded_weight: 0.10
+        fusion_support_weight: 0.40
+        fusion_oppose_weight: 0.60
+        basic_pattern_weight: 0.65
+        stable_head_pattern_weight: 0.80
+        dominant_single_cap: 4
+        dominant_pattern_cap: 3
   value_sampled_profiles:
     cont_core:
       n_train_min: 50
@@ -283,6 +304,18 @@ baseline:
     AssertNear(config.relation_rolling.basis_threshold_margin, 1.30);
     assert(config.relation_rolling.basis_min_stable_refresh_count == 3);
     assert(config.relation_rolling.routed_state_shard_count == 32);
+    assert(!config.relation_rolling.relation_fusion.enable_relation_fusion);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_z_score_cap, 4.0);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_min_evidence_score, 0.30);
+    assert(config.relation_rolling.relation_fusion.fusion_persistence_window == 3);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_warming_weight, 0.20);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_degraded_weight, 0.10);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_support_weight, 0.40);
+    AssertNear(config.relation_rolling.relation_fusion.fusion_oppose_weight, 0.60);
+    AssertNear(config.relation_rolling.relation_fusion.basic_pattern_weight, 0.65);
+    AssertNear(config.relation_rolling.relation_fusion.stable_head_pattern_weight, 0.80);
+    assert(config.relation_rolling.relation_fusion.dominant_single_cap == 4);
+    assert(config.relation_rolling.relation_fusion.dominant_pattern_cap == 3);
     BootstrapSeedQualityConfig seed_quality;
     assert(TryGetBootstrapSeedQualityConfigOverride(&seed_quality));
     AssertNear(seed_quality.full_min_coverage_ratio, 0.85);

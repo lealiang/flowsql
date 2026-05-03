@@ -74,6 +74,10 @@ struct RatioBootstrapPoint {
 };
 
 struct RelationBootstrapMetric {
+    // Optional name guard for positional relation metric arrays.
+    // In relation bootstrap/rolling inputs, metrics[i] is interpreted as the
+    // task config metrics[i]. Unordered name-based submission is not supported.
+    // When non-empty, metric must equal the configured metric at the same index.
     std::string metric;
     double total = 0.0;
     uint32_t active_count = 0;
@@ -83,6 +87,7 @@ struct RelationBootstrapMetric {
 struct RelationBootstrapBlock {
     int64_t bucket_id = 0;
     std::vector<uint32_t> group_idx;
+    // Positional array aligned with the relation task config metrics list.
     std::vector<RelationBootstrapMetric> metrics;
 };
 
@@ -212,6 +217,9 @@ struct RelationRollingObservation {
     std::string series_key;
     int64_t bucket_id = 0;
     std::vector<uint32_t> group_idx;
+    // Positional array aligned with the relation task config metrics list.
+    // Missing trailing entries are treated as missing metrics; callers must not
+    // reorder entries by RelationBootstrapMetric.metric name.
     std::vector<RelationBootstrapMetric> metrics;
 };
 
@@ -220,6 +228,7 @@ struct RelationRollingSubmitOptions {
     bool allow_basis_update = true;
     bool include_routed_results = true;
     bool include_diagnostics = false;
+    bool include_fusion_result = true;
 };
 
 struct RelationRoutedSummaryResult {
@@ -233,6 +242,57 @@ struct RelationRoutedSummaryResult {
     RollingBaselineResult rolling;
 };
 
+struct RelationFusionSingleEvidence {
+    std::string source_series_key;
+    std::string routed_series_key;
+    std::string feature_base;
+    std::string metric;
+    std::string summary;
+    std::string feature_type;
+    uint64_t basis_version = 0;
+    bool basis_scoped = false;
+
+    std::string direction;
+    double normalized_score = 0.0;
+    double confidence = 0.0;
+    uint32_t persistence = 0;
+    double evidence_strength = 0.0;
+
+    bool available = false;
+    bool can_alert = false;
+    std::string score_trust_status;
+    std::string metric_basis_status;
+    std::string unavailable_reason;
+};
+
+struct RelationFusionPatternScore {
+    std::string source_series_key;
+    std::string feature_base;
+    std::string pattern;
+    double score = 0.0;
+    double weighted_score = 0.0;
+    double pattern_weight = 1.0;
+    std::vector<std::string> metrics_hit;
+    std::vector<std::string> supporting_features;
+    std::string diagnostics;
+};
+
+struct RelationFusionResult {
+    BaselineStatus status = BaselineStatus::kOk;
+    std::string source_series_key;
+    std::string feature_base;
+    int64_t bucket_id = 0;
+
+    double relation_risk = 0.0;
+    double single_risk = 0.0;
+    double pattern_risk = 0.0;
+
+    std::vector<RelationFusionSingleEvidence> dominant_single;
+    std::vector<RelationFusionPatternScore> dominant_pattern;
+    std::vector<RelationFusionPatternScore> pattern_scores;
+    std::string diagnostics;
+};
+
 struct RelationRollingResult {
     BaselineStatus status = BaselineStatus::kOk;
     std::string series_key;
@@ -242,6 +302,8 @@ struct RelationRollingResult {
     bool basis_updated = false;
     bool handover_active = false;
     std::vector<RelationRoutedSummaryResult> routed_results;
+    bool has_fusion_result = false;
+    RelationFusionResult fusion_result;
     std::string diagnostics;
 
     bool ok() const { return status == BaselineStatus::kOk; }

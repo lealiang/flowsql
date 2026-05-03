@@ -413,6 +413,46 @@ void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
         ParseOptionalScalar(relation,
                             "routed_state_shard_count",
                             &out->relation_rolling.routed_state_shard_count);
+        const YAML::Node fusion = relation["relation_fusion"];
+        if (fusion) {
+            auto& relation_fusion = out->relation_rolling.relation_fusion;
+            ParseOptionalScalar(fusion,
+                                "enable_relation_fusion",
+                                &relation_fusion.enable_relation_fusion);
+            ParseOptionalScalar(fusion,
+                                "fusion_z_score_cap",
+                                &relation_fusion.fusion_z_score_cap);
+            ParseOptionalScalar(fusion,
+                                "fusion_min_evidence_score",
+                                &relation_fusion.fusion_min_evidence_score);
+            ParseOptionalScalar(fusion,
+                                "fusion_persistence_window",
+                                &relation_fusion.fusion_persistence_window);
+            ParseOptionalScalar(fusion,
+                                "fusion_warming_weight",
+                                &relation_fusion.fusion_warming_weight);
+            ParseOptionalScalar(fusion,
+                                "fusion_degraded_weight",
+                                &relation_fusion.fusion_degraded_weight);
+            ParseOptionalScalar(fusion,
+                                "fusion_support_weight",
+                                &relation_fusion.fusion_support_weight);
+            ParseOptionalScalar(fusion,
+                                "fusion_oppose_weight",
+                                &relation_fusion.fusion_oppose_weight);
+            ParseOptionalScalar(fusion,
+                                "basic_pattern_weight",
+                                &relation_fusion.basic_pattern_weight);
+            ParseOptionalScalar(fusion,
+                                "stable_head_pattern_weight",
+                                &relation_fusion.stable_head_pattern_weight);
+            ParseOptionalScalar(fusion,
+                                "dominant_single_cap",
+                                &relation_fusion.dominant_single_cap);
+            ParseOptionalScalar(fusion,
+                                "dominant_pattern_cap",
+                                &relation_fusion.dominant_pattern_cap);
+        }
     }
 }
 
@@ -600,9 +640,28 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                                   "basis_handover_warmup_buckets",
                                   "basis_threshold_margin",
                                   "basis_min_stable_refresh_count",
-                                  "routed_state_shard_count"},
+                                  "routed_state_shard_count",
+                                  "relation_fusion"},
                                  "rolling_config.relation_rolling",
                                  err)) {
+            return false;
+        }
+        if (!ValidateAllowedKeys(
+                defaults["rolling_config"]["relation_rolling"]["relation_fusion"],
+                {"enable_relation_fusion",
+                 "fusion_z_score_cap",
+                 "fusion_min_evidence_score",
+                 "fusion_persistence_window",
+                 "fusion_warming_weight",
+                 "fusion_degraded_weight",
+                 "fusion_support_weight",
+                 "fusion_oppose_weight",
+                 "basic_pattern_weight",
+                 "stable_head_pattern_weight",
+                 "dominant_single_cap",
+                 "dominant_pattern_cap"},
+                "rolling_config.relation_rolling.relation_fusion",
+                err)) {
             return false;
         }
     }

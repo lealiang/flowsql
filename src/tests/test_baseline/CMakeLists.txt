@@ -16,6 +16,10 @@ add_executable(test_baseline_relation_basis_state
     ${CMAKE_SOURCE_DIR}/plugins/baseline/relation/relation_basis.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/relation/relation_basis_state.cpp
 )
+add_executable(test_baseline_relation_fusion
+    test_baseline_relation_fusion.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/relation/relation_fusion.cpp
+)
 add_executable(test_baseline_observation_adapter
     test_baseline_observation_adapter.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/observation_adapter.cpp
@@ -57,6 +61,7 @@ target_include_directories(test_baseline_link_rolling_eval PUBLIC ${CMAKE_SOURCE
 target_include_directories(test_baseline_rolling_config PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_relation_summary PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_relation_basis_state PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_relation_fusion PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_observation_adapter PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_rolling_state PUBLIC
     ${CMAKE_SOURCE_DIR}
@@ -83,6 +88,7 @@ add_dependencies(test_baseline_link_rolling_eval flowsql_common flowsql_baseline
 add_dependencies(test_baseline_rolling_config flowsql_common flowsql_baseline)
 add_dependencies(test_baseline_relation_summary flowsql_common)
 add_dependencies(test_baseline_relation_basis_state flowsql_common)
+add_dependencies(test_baseline_relation_fusion flowsql_common)
 add_dependencies(test_baseline_observation_adapter flowsql_common)
 add_dependencies(test_baseline_rolling_state flowsql_common)
 add_dependencies(test_baseline_rolling_estimator flowsql_common)
@@ -96,6 +102,7 @@ target_link_libraries(test_baseline_link_rolling_eval flowsql_common flowsql_bas
 target_link_libraries(test_baseline_rolling_config flowsql_common flowsql_baseline)
 target_link_libraries(test_baseline_relation_summary flowsql_common)
 target_link_libraries(test_baseline_relation_basis_state flowsql_common)
+target_link_libraries(test_baseline_relation_fusion flowsql_common)
 target_link_libraries(test_baseline_observation_adapter flowsql_common)
 target_link_libraries(test_baseline_rolling_state flowsql_common ${ICU_LIBRARIES})
 target_link_libraries(test_baseline_rolling_estimator flowsql_common ${ICU_LIBRARIES})
@@ -109,6 +116,7 @@ target_compile_options(test_baseline_link_rolling_eval PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rolling_config PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_relation_summary PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_relation_basis_state PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_relation_fusion PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_observation_adapter PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rolling_state PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rolling_estimator PRIVATE -UNDEBUG)
@@ -137,6 +145,9 @@ set_target_properties(test_baseline_relation_summary PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 set_target_properties(test_baseline_relation_basis_state PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_relation_fusion PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 set_target_properties(test_baseline_observation_adapter PROPERTIES

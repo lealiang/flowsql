@@ -25,6 +25,7 @@ b2-online-rolling-core-design.md
 b3-detection-trust-and-maturity-design.md
 b4-relation-routed-rolling-and-stream-basis-design.md
 b5-relation-pattern-fusion-design.md
+b6-baseline-task-serialization-lock-optimization-design.md
 ```
 
 阶段设计文档只覆盖当前阶段的接口、算法取舍、迁移步骤、测试矩阵和完成门禁。已关闭阶段的遗留语义不得继续写入后续阶段设计。
@@ -281,13 +282,13 @@ cold_learning
 
 ### 6.4 验收标准
 
-- [ ] 无 Relation 历史时，Relation 任务可接收流式 block，并输出通用 routed summary 的 rolling band / score / trust。
-- [ ] 有 `B1` relation basis seed 和 routed summary seed 时，同 key routed summary 可从 seed warm-up，且不能绕过 B3 score trust。
-- [ ] 在线统计积累后，stable head 相关摘要可进入 warming / ready，并开始参与 routed rolling。
-- [ ] basis 切换有版本、有 evidence，不破坏摘要特征解释。
-- [ ] basis 统计有固定上限，不随 group 数无界增长。
-- [ ] routed summary 的 rolling state 可在 task / series snapshot 中观测到 `basis_version`、summary identity、maturity 和 score trust。
-- [ ] 旧 rebuild 链路不参与 Relation basis 成熟。
+- [x] 无 Relation 历史时，Relation 任务可接收流式 block，并输出通用 routed summary 的 rolling band / score / trust。
+- [x] 有 `B1` relation basis seed 和 routed summary seed 时，同 key routed summary 可从 seed warm-up，且不能绕过 B3 score trust。
+- [x] 在线统计积累后，stable head 相关摘要可进入 warming / ready，并开始参与 routed rolling。
+- [x] basis 切换有版本、有 evidence，不破坏摘要特征解释。
+- [x] basis 统计有固定上限，不随 group 数无界增长。
+- [x] routed summary 的 rolling state 可在 task / series snapshot 中观测到 `basis_version`、summary identity、maturity 和 score trust。
+- [x] 旧 rebuild 链路不参与 Relation basis 成熟。
 
 ---
 
@@ -349,13 +350,13 @@ pattern_scores
 
 ### 7.4 验收标准
 
-- [ ] 单个 routed summary 弱异常不会被机械放大为高风险。
-- [ ] 多个 summary 对同一结构模式给出一致证据时，pattern score 可显式提级。
-- [ ] `support_escape`、`head_concentration`、`legacy_head_dilution`、`stable_head_mix_shift` 均有单元测试覆盖。
-- [ ] `can_alert = false`、`score_untrusted`、basis 未 ready 或 summary 缺测时，fusion evidence 被降权或视为不可用。
-- [ ] 跨 metric 合成遵循饱和型公式，不因 metric 数量线性无界增长。
-- [ ] Bootstrap artifact / seed 中包含 B5 所需 fusion metadata，导出 / 导入后语义一致。
-- [ ] B5 输出可在 Relation source snapshot 中观测，且不替代 routed summary 的原始 rolling result。
+- [x] 单个 routed summary 弱异常不会被机械放大为高风险。
+- [x] 多个 summary 对同一结构模式给出一致证据时，pattern score 可显式提级。
+- [x] `support_escape`、`head_concentration`、`legacy_head_dilution`、`stable_head_mix_shift` 均有单元测试覆盖。
+- [x] `can_alert = false`、`score_untrusted`、basis 未 ready 或 summary 缺测时，fusion evidence 被降权或视为不可用。
+- [x] 跨 metric 合成遵循饱和型公式，不因 metric 数量线性无界增长。
+- [x] Bootstrap artifact / seed 中包含 B5 所需 fusion metadata，导出 / 导入后语义一致。
+- [x] B5 输出可在 Relation source snapshot 中观测，且不替代 routed summary 的原始 rolling result。
 
 ---
 
@@ -395,33 +396,32 @@ B1 输出内部 BootstrapSeed[series_key]（bootstrap prediction 仅用于 B1 �
 
 ## 9. 当前下一步
 
-当前执行进度：
+当前执行进度（更新时间：2026-05-03）：
 
-- `B2-T01：rolling public 类型与提交 / 预测接口` 已完成，`PredictRolling(series_key, bucket_id)` 为只读预测接口，不更新状态、不触发 lazy init；进入 B3 后该接口作为基础 Rolling/Bootstrap 融合 forecast view，返回独立 `forecast_band_z` 支持评估程序计算 `|Z|` 指标。
-- `B2-T02：解析 rolling 配置与默认值` 已完成，rolling 默认值已同步到 `baseline-config-template.yaml`、strict schema 和测试。
-- `B2-T03：实现观测适配器` 已完成，`value_basic`、`value_sampled`、`ratio` 的模型空间转换和低支撑语义已有测试覆盖。
-- `B2-T04：建立 RollingState 与初始化` 已完成，空启动、首点初始化、bootstrap seed 初始化和 seed 兼容性校验已有测试覆盖。
-- `B2-T05：实现 RollingStateEstimator` 已完成，预测、band、residual、时间推进、harmonic phase、Kalman/RLS 更新，以及 `adapt_boost` 接入 `Q_level` / level 更新权重已有测试覆盖。
-- `B2-T06：实现 gate、scale、drift` 已完成，异常跳过 / 降权、短长 EWMA drift evidence、level shift 加速学习和 sigma EWMA 已有测试覆盖。
-- `B2-T07：接入 Value / Ratio task` 已完成，`SubmitObservation()` 已走 task 内部 lazy init / rolling update。
-- `B2-T08：实现状态管理与批量 warm-up` 已完成，snapshot 最小 schema 和 task 内存态 seed 批量 warm-up 已接入。
-- `B2-T09：补齐自动化测试` 已完成，覆盖 rolling 配置、观测适配、状态初始化、estimator、gate/scale/drift、task 接入、snapshot/warm-up、只读预测、link rolling 评估和失败语义。
-- `B2-T10：补充 seed 质量驱动的 seasonal 学习保护` 已完成，基于 `full/partial/weak/empty` seed 质量调节 day/week 学习倍率，并在 level shift 学习期暂停完整 seed 的已 seed seasonal 更新。
-- `B3-T01：扩展 public result 字段与兼容映射` 已完成，`RollingBaselineResult` 可输出 maturity、score trust、calibration、confidence、`can_alert` 和 component evidence。
-- `B3-T02：新增 B3 有界状态` 已完成，`RollingState` 持有 maturity / score trust / calibration / monthpos 状态，bootstrap seed 初始化可映射到 B3 状态。
-- `B3-T03：实现 detection band calibration` 已完成，calibrated detection band、coverage / tail EWMA、residual scale multiplier 已有单元测试覆盖。
-- `B3-T04：实现 score trust 状态机` 已完成，支持 `score_untrusted / score_warming / score_ready` 以及 `drift_learning / recalibrating` 降级恢复；已接入累计水平偏移证据，避免只依赖单点或短长 EWMA。
-- `B3-T05：实现 maturity 与 component readiness` 已完成，level / daily / weekly / monthpos readiness 使用固定 coverage 统计推进。
-- `B3-T06：实现 monthpos state 与慢更新` 已完成，支持 bootstrap hint 初始化、centered basis 预测和慢速在线更新。
-- `B3-T07：接入 Value / Ratio task 与 snapshot` 已完成，`SubmitObservation()` 输出 B3 evidence，task / series snapshot 输出 maturity、score trust、calibration 和 monthpos。
-- `B3-T08：补齐配置、模板、schema、CMake 和自动化测试` 已完成，B3 配置默认值、YAML 模板、strict schema、配置测试和 B3 测试目标已接入。
-- `B3-T09：真实链路数据评估与调试观测` 已完成，覆盖 week4 稳定窗口、水平下降过渡段、post-shift 训练段和 final7 稳定段；评估输出包含 band 方差拆分、score trust 状态分布、level shift evidence 和 forecast / detection 对比 CSV。
-- `B3-C00：收口审查问题修复` 已完成，修复完整 seed maturity 被流式计数降级、`can_score=false` stale score trust、monthpos DME/LWD 在线学习缺口，以及 public result 混用 post-update maturity 的问题。
+- `B2：Online Rolling Core MVP` 已完成，Value / Ratio 的 rolling submit、预测、band、gate、状态管理、seed warm-up 和回归测试已接入。
+- `B3：Detection Trust, Band Calibration and Monthly Readiness` 已完成，score trust、maturity、detection band calibration、monthpos、snapshot 和配置测试已接入。
+- `B4：Relation Routed Rolling and Stream Basis` 已完成，Relation routed summary rolling、stream basis accumulator、basis refresh / handover、routed forecast、source / routed snapshot、配置解析和回归测试已接入。
+- `B5-T01：补齐 Relation fusion public ABI` 已完成，public fusion 结果、evidence、pattern、metadata 和 submit / snapshot 字段已接入。
+- `B5-T02：实现 relation fusion 核心模块` 已完成，覆盖 evidence 标准化、expected evidence universe、persistence、4 个 Relation v1 pattern、跨 metric 饱和合成和 relation risk 输出。
+- `B5-T03：接入 RelationTask submit 热路径` 已完成，fan-out 后更新 fusion，按 task spec metric universe 收集上下文，并在无 routed result / metric 缺测时清理旧 persistence。
+- `B5-T04：补齐 Bootstrap fusion metadata` 已完成，artifact / seed JSON 导出导入包含 `relation_fusion_metadata`，旧 artifact 可降级加载。
+- `B5-T05：接入 task / series snapshot` 已完成，Relation source snapshot 可观测 `relation_fusion`，routed snapshot 保持底层 rolling 语义。
+- `B5-T06：补齐配置模板与解析` 已完成，`relation_fusion` 默认值、strict schema、非法配置校验和配置模板已接入。
+- `B5-T07：自动化测试与回归验证` 已完成，覆盖 pattern、trust gate、basis gate、cross metric、snapshot、metadata、缺测清理、负向 evidence 和 metric 同序契约。
+- `B5-C00：审查问题修复` 已完成，修复负向 evidence 被过滤、全 metric 缺失时 persistence 不清零、task spec 外 metric 进入 fusion，以及关键负向模式测试缺口。
+- `B5-C01：RelationRollingObservation metric 同序契约收口` 已完成，public ABI 注释、B4 / B5 设计文档和错序 metric 回归测试已补齐。
+- `B6：Baseline 同 task 串行调用与锁优化` 已进入设计阶段，阶段设计见 [B6 Baseline 同 task 串行调用与锁优化方案](b6-baseline-task-serialization-lock-optimization-design.md)。
 
-当前暂停 B3 算法调试，临时评估代码暂不清理。
+当前状态：
+
+- B5 代码实现、设计文档补充和回归测试已完成，当前工作区尚未提交。
+- 最近验证命令：
+  - `git diff --check`
+  - `cmake --build /mnt/d/working/flowSQL/build --target test_baseline`
+  - `/mnt/d/working/flowSQL/build/output/test_baseline`
 
 下一步建议：
 
-1. 先做 `B3` 收口审查，确认哪些调试评估代码保留、删除或迁移为长期回归测试。
-2. 若确认清理，单独执行 `B3-C01：评估代码收口与诊断暴露面整理`，避免和算法改动混在一起。
-3. 已进入 `B4：Relation Routed Rolling and Stream Basis` 阶段设计；设计收口后再按 B4-T01 起顺序实施。
+1. 对当前 B5 diff 做一次最终代码审查，重点看 fusion 输出 schema、metadata 兼容和 RelationTask 热路径锁边界。
+2. 审查通过后提交 B5 实现与文档状态更新。
+3. B6 实施前先审查上游同 task 串行调度边界，确认同一 task 不并发调用的契约可落地；不要求同一 task 固定线程。

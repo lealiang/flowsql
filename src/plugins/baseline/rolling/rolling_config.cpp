@@ -185,6 +185,21 @@ BaselineStatus ValidateBaselineRollingConfig(const BaselineRollingConfig& config
         relation.routed_state_shard_count == 0) {
         return Invalid(err, "rolling_config.relation_rolling fields are invalid");
     }
+    const auto& fusion = relation.relation_fusion;
+    if (!Positive(fusion.fusion_z_score_cap) ||
+        !UnitClosed(fusion.fusion_min_evidence_score) ||
+        fusion.fusion_persistence_window == 0 ||
+        !UnitClosed(fusion.fusion_warming_weight) ||
+        !UnitClosed(fusion.fusion_degraded_weight) ||
+        !UnitClosed(fusion.fusion_support_weight) ||
+        !UnitClosed(fusion.fusion_oppose_weight) ||
+        !UnitClosed(fusion.basic_pattern_weight) ||
+        !UnitClosed(fusion.stable_head_pattern_weight) ||
+        fusion.dominant_single_cap == 0 ||
+        fusion.dominant_pattern_cap == 0) {
+        return Invalid(err,
+                       "rolling_config.relation_rolling.relation_fusion fields are invalid");
+    }
     if (config.bucket_seconds <= 0 ||
         config.timezone.empty() ||
         config.day_buckets == 0 ||

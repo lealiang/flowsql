@@ -224,6 +224,38 @@ const char* RelationTaskConfig() {
     })";
 }
 
+const char* MultiMetricRelationTaskConfig() {
+    return R"({
+        "schema_version": 1,
+        "task_id": "baseline_task_multi_metric_client_mix",
+        "task_name": "multi metric client mix basis",
+        "task_kind": "relation",
+        "feature_id": "client_mix_multi",
+        "feature_type": "relation",
+        "profile": "default",
+        "group_space_id": "client_group",
+        "group_space_version": "v1",
+        "metrics": ["bps", "pps"],
+        "support_policy": {
+            "k_support": 2,
+            "min_hist_share": 0.01,
+            "min_active_ratio": 0.1
+        },
+        "summary_policy": {
+            "k_head": 2,
+            "k_stable": 1
+        },
+        "clock_spec": {
+            "bucket_seconds": 60,
+            "timezone": "Asia/Shanghai"
+        },
+        "calendar_ref": {
+            "calendar_id": "cn-holiday",
+            "calendar_version": "2026.1"
+        }
+    })";
+}
+
 void TestEventCalendarSchemaRejectsTaskScopedFields() {
     std::printf("[TEST] B1 calendar schema rejects task-scoped fields...\n");
 
@@ -449,6 +481,28 @@ RelationRollingObservation BuildRelationObservation(int64_t bucket,
     metric.active_count = 3;
     metric.values_by_group = {g1, g2, g3};
     obs.metrics.push_back(metric);
+    return obs;
+}
+
+RelationRollingObservation BuildMismatchedRelationMetricOrderObservation() {
+    RelationRollingObservation obs;
+    obs.series_key = "svc-multi";
+    obs.bucket_id = 100;
+    obs.group_idx = {1, 2, 3};
+
+    RelationBootstrapMetric pps;
+    pps.metric = "pps";
+    pps.total = 100.0;
+    pps.active_count = 3;
+    pps.values_by_group = {60.0, 30.0, 10.0};
+    obs.metrics.push_back(pps);
+
+    RelationBootstrapMetric bps;
+    bps.metric = "bps";
+    bps.total = 100.0;
+    bps.active_count = 3;
+    bps.values_by_group = {50.0, 30.0, 20.0};
+    obs.metrics.push_back(bps);
     return obs;
 }
 
@@ -760,6 +814,17 @@ void TestB4RelationSubmitObservation() {
            "rolling_series_snapshot");
     assert(routed_snapshot_doc["last_seen_bucket"].GetInt64() == 100);
 
+    auto [multi_status, multi_task] = env.service->CreateRelationTask(
+        MultiMetricRelationTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(multi_status == BaselineStatus::kOk);
+    assert(multi_task != nullptr);
+    RelationRollingSubmitOptions mismatch_options;
+    mismatch_options.include_diagnostics = true;
+    RelationRollingResult mismatch_result = multi_task->SubmitObservation(
+        BuildMismatchedRelationMetricOrderObservation(), mismatch_options);
+    assert(mismatch_result.status == BaselineStatus::kInvalidArgument);
+    assert(mismatch_result.routed_results.empty());
+
     std::string seeded_config = RelationTaskConfig();
     const std::string old_task_id = "baseline_task_client_mix";
     const std::size_t task_id_pos = seeded_config.find(old_task_id);
@@ -922,6 +987,144 @@ baseline:
     flowsql::baseline::ResetBaselineRuntimeConfig();
 
     std::printf("[PASS] B4 relation rolling config switches close design contract\n");
+}
+
+void TestB5RelationFusionSubmitAndSnapshot() {
+    std::printf("[TEST] B5 relation fusion submit and snapshot...\n");
+
+    {
+        auto env = LoadBaselineService();
+        auto [status, relation_task] = env.service->CreateRelationTask(
+            RelationTaskConfig(), BaselineSerializationFormat::kJson);
+        assert(status == BaselineStatus::kOk);
+        assert(relation_task != nullptr);
+        assert(relation_task->Bootstrap(BuildRelationHistory()).status == BaselineStatus::kOk);
+
+        RelationRollingSubmitOptions options;
+        options.include_routed_results = false;
+        options.include_fusion_result = true;
+        RelationRollingResult result =
+            relation_task->SubmitObservation(BuildRelationObservation(20, 5, 5, 90), options);
+        assert(result.status == BaselineStatus::kOk);
+        assert(result.routed_results.empty());
+        assert(result.has_fusion_result);
+        assert(result.fusion_result.status == BaselineStatus::kOk);
+        assert(result.fusion_result.source_series_key == "svc-a");
+        assert(result.fusion_result.feature_base == "client_mix");
+        assert(result.fusion_result.bucket_id == 20);
+        assert(!result.fusion_result.dominant_single.empty());
+
+        auto [source_status, source_snapshot] =
+            relation_task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+        assert(source_status == BaselineStatus::kOk);
+        rapidjson::Document source_doc;
+        source_doc.Parse(source_snapshot.c_str());
+        assert(!source_doc.HasParseError());
+        assert(source_doc.HasMember("relation_fusion"));
+        assert(source_doc["relation_fusion"].IsObject());
+        assert(source_doc["relation_fusion"]["enabled"].GetBool());
+        assert(source_doc["relation_fusion"]["bucket_id"].GetInt64() == 20);
+        assert(source_doc["relation_fusion"].HasMember("dominant_single"));
+        assert(source_doc["relation_fusion"]["dominant_single"].IsArray());
+        assert(!source_doc["relation_fusion"]["dominant_single"].Empty());
+
+        RelationRollingObservation missing_metric_obs;
+        missing_metric_obs.series_key = "svc-a";
+        missing_metric_obs.bucket_id = 21;
+        missing_metric_obs.group_idx = {1, 2, 3};
+        RelationRollingResult missing_metric_result =
+            relation_task->SubmitObservation(missing_metric_obs, options);
+        assert(!missing_metric_result.has_fusion_result);
+        auto [missing_metric_status, missing_metric_snapshot] =
+            relation_task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+        assert(missing_metric_status == BaselineStatus::kOk);
+        rapidjson::Document missing_metric_doc;
+        missing_metric_doc.Parse(missing_metric_snapshot.c_str());
+        assert(!missing_metric_doc.HasParseError());
+        assert(missing_metric_doc["relation_fusion"]["bucket_id"].GetInt64() == 21);
+        assert(missing_metric_doc["relation_fusion"]["relation_risk"].GetDouble() == 0.0);
+        assert(missing_metric_doc["relation_fusion"].HasMember("diagnostics"));
+        assert(std::string(missing_metric_doc["relation_fusion"]["diagnostics"].GetString())
+                   .find("relation_fusion_no_available_evidence") != std::string::npos);
+
+        auto [task_snapshot_status, task_snapshot] =
+            relation_task->QueryTaskSnapshot(BaselineSerializationFormat::kJson);
+        assert(task_snapshot_status == BaselineStatus::kOk);
+        rapidjson::Document task_doc;
+        task_doc.Parse(task_snapshot.c_str());
+        assert(!task_doc.HasParseError());
+        assert(task_doc.HasMember("relation_fusion"));
+        assert(task_doc["relation_fusion"]["enabled"].GetBool());
+        assert(task_doc["relation_fusion"]["source_state_count"].GetUint64() == 1);
+        assert(task_doc["relation_fusion"]["pattern_count"].GetUint() == 4);
+
+        RelationRoutedSummaryQuery routed_query;
+        routed_query.source_series_key = "svc-a";
+        routed_query.metric = "bps";
+        routed_query.summary = "top1_share";
+        routed_query.feature_type = "ratio";
+        auto [routed_status, routed_snapshot] =
+            relation_task->QueryRoutedSummarySnapshot(routed_query,
+                                                      BaselineSerializationFormat::kJson);
+        assert(routed_status == BaselineStatus::kOk);
+        rapidjson::Document routed_doc;
+        routed_doc.Parse(routed_snapshot.c_str());
+        assert(!routed_doc.HasParseError());
+        assert(!routed_doc.HasMember("relation_fusion"));
+
+        assert(relation_task->Bootstrap(BuildRelationHistory()).status == BaselineStatus::kOk);
+        auto [rebuilt_status, rebuilt_snapshot] =
+            relation_task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+        assert(rebuilt_status == BaselineStatus::kOk);
+        rapidjson::Document rebuilt_doc;
+        rebuilt_doc.Parse(rebuilt_snapshot.c_str());
+        assert(!rebuilt_doc.HasParseError());
+        assert(rebuilt_doc.HasMember("relation_fusion"));
+        assert(rebuilt_doc["relation_fusion"]["enabled"].GetBool());
+        assert(!rebuilt_doc["relation_fusion"].HasMember("bucket_id"));
+    }
+
+    const std::string fusion_disabled_config =
+        "/tmp/flowsql_b5_relation_fusion_disabled.yaml";
+    {
+        std::ofstream file(fusion_disabled_config);
+        file << R"(
+baseline:
+  rolling_config:
+    relation_rolling:
+      relation_fusion:
+        enable_relation_fusion: false
+)";
+        assert(file.good());
+    }
+    {
+        auto disabled_env =
+            LoadBaselineService("config_file=" + fusion_disabled_config + ";strict=false");
+        auto [disabled_status, disabled_task] =
+            disabled_env.service->CreateRelationTask(
+                RelationTaskConfig(), BaselineSerializationFormat::kJson);
+        assert(disabled_status == BaselineStatus::kOk);
+        assert(disabled_task != nullptr);
+        assert(disabled_task->Bootstrap(BuildRelationHistory()).status == BaselineStatus::kOk);
+        RelationRollingSubmitOptions disabled_options;
+        disabled_options.include_fusion_result = true;
+        RelationRollingResult disabled_result = disabled_task->SubmitObservation(
+            BuildRelationObservation(20, 5, 5, 90), disabled_options);
+        assert(disabled_result.status == BaselineStatus::kOk);
+        assert(!disabled_result.has_fusion_result);
+        auto [disabled_snapshot_status, disabled_snapshot] =
+            disabled_task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+        assert(disabled_snapshot_status == BaselineStatus::kOk);
+        rapidjson::Document disabled_doc;
+        disabled_doc.Parse(disabled_snapshot.c_str());
+        assert(!disabled_doc.HasParseError());
+        assert(disabled_doc.HasMember("relation_fusion"));
+        assert(!disabled_doc["relation_fusion"]["enabled"].GetBool());
+        assert(!disabled_doc["relation_fusion"].HasMember("bucket_id"));
+    }
+    flowsql::baseline::ResetBaselineRuntimeConfig();
+
+    std::printf("[PASS] B5 relation fusion submit and snapshot\n");
 }
 
 void TestBootstrapUsesConfiguredEventCalendar() {
@@ -1576,5 +1779,6 @@ int main() {
     TestB3RollingResultUsesPreUpdateTrustSnapshot();
     TestB4RelationSubmitObservation();
     TestB4RelationRollingConfigSwitches();
+    TestB5RelationFusionSubmitAndSnapshot();
     return 0;
 }

@@ -7,6 +7,7 @@
  */
 
 #include <cassert>
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -21,6 +22,8 @@
 #include <plugins/baseline/task/ratio_task.h>
 #include <plugins/baseline/task/value_task.h>
 #include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
 
 using namespace flowsql;
 using namespace flowsql::baseline;
@@ -30,6 +33,69 @@ namespace {
 void AssertNear(double actual, double expected) {
     const double diff = actual > expected ? actual - expected : expected - actual;
     assert(diff < 1.0e-9);
+}
+
+bool ContainsString(const std::vector<std::string>& values, const std::string& expected) {
+    return std::find(values.begin(), values.end(), expected) != values.end();
+}
+
+const RelationFusionPatternMetadata* FindPatternMetadata(
+    const RelationFusionBootstrapMetadata& metadata,
+    const std::string& pattern) {
+    for (const auto& item : metadata.pattern_metadata) {
+        if (item.pattern == pattern) return &item;
+    }
+    return nullptr;
+}
+
+void AssertRelationFusionMetadata(const RelationFusionBootstrapMetadata& metadata) {
+    assert(metadata.metadata_version == 1);
+    assert(metadata.feature_base == "client_mix");
+    assert(!metadata.summary_metadata.empty());
+    assert(metadata.pattern_metadata.size() == 4);
+
+    bool has_support_summary = false;
+    bool has_top1_summary = false;
+    for (const auto& summary : metadata.summary_metadata) {
+        if (summary.metric_name == "bps" &&
+            summary.summary_name == "out_of_support_share") {
+            has_support_summary = true;
+            assert(summary.task_kind == BaselineTaskKind::kRatio);
+            assert(summary.basis_scoped);
+            assert(summary.basis_version == 1);
+        }
+        if (summary.metric_name == "bps" && summary.summary_name == "top1_share") {
+            has_top1_summary = true;
+            assert(summary.task_kind == BaselineTaskKind::kRatio);
+            assert(!summary.basis_scoped);
+            assert(summary.basis_version == 0);
+        }
+    }
+    assert(has_support_summary);
+    assert(has_top1_summary);
+
+    const RelationFusionPatternMetadata* support_escape =
+        FindPatternMetadata(metadata, "support_escape");
+    assert(support_escape != nullptr);
+    assert(support_escape->scope == "relation_local");
+    AssertNear(support_escape->pattern_weight, 0.70);
+    assert(ContainsString(support_escape->required_summaries,
+                          "out_of_support_share:up"));
+    assert(ContainsString(support_escape->optional_summaries,
+                          "stable_headk_coverage:down"));
+    assert(ContainsString(support_escape->oppose_summaries, "top1_share:up"));
+    assert(ContainsString(support_escape->metrics, "bps"));
+
+    const RelationFusionPatternMetadata* stable_head_mix_shift =
+        FindPatternMetadata(metadata, "stable_head_mix_shift");
+    assert(stable_head_mix_shift != nullptr);
+    assert(stable_head_mix_shift->scope == "relation_local");
+    AssertNear(stable_head_mix_shift->pattern_weight, 0.85);
+    assert(ContainsString(stable_head_mix_shift->required_summaries,
+                          "stable_headk_mix_drift:up"));
+    assert(ContainsString(stable_head_mix_shift->oppose_summaries,
+                          "out_of_support_share:up"));
+    assert(ContainsString(stable_head_mix_shift->metrics, "bps"));
 }
 
 template <typename T, typename = void>
@@ -780,6 +846,7 @@ void TestBootstrapEngineTrainsRelationBasis() {
     assert(artifact.relation_basis_by_metric[0].support_explicit.size() == 2);
     assert(artifact.relation_basis_by_metric[0].stable_head.size() == 1);
     assert(!artifact.relation_routed_summary_artifacts.empty());
+    AssertRelationFusionMetadata(artifact.relation_fusion_metadata);
 
     bool has_value_summary = false;
     bool has_ratio_summary = false;
@@ -799,6 +866,7 @@ void TestBootstrapEngineTrainsRelationBasis() {
     BootstrapSeed relation_seed;
     assert(engine.ExportSeed(artifact, &relation_seed) == BaselineStatus::kOk);
     assert(!relation_seed.relation_routed_summary_seeds.empty());
+    AssertRelationFusionMetadata(relation_seed.relation_fusion_metadata);
     bool has_universal_seed_scope = false;
     bool has_basis_scoped_seed_scope = false;
     const uint64_t relation_basis_version =
@@ -831,6 +899,9 @@ void TestBootstrapEngineTrainsRelationBasis() {
     assert(seed_json.find("\"relation_basis\"") != std::string::npos);
     assert(seed_json.find("\"relation_routed_summary_seeds\"") != std::string::npos);
     assert(seed_json.find("\"relation_basis_by_metric\"") != std::string::npos);
+    assert(seed_json.find("\"relation_fusion_metadata\"") != std::string::npos);
+    assert(seed_json.find("\"pattern\":\"support_escape\"") != std::string::npos);
+    assert(seed_json.find("\"required_summaries\"") != std::string::npos);
     assert(seed_json.find("\"summary\":\"entropy_shannon\"") != std::string::npos);
     assert(seed_json.find("\"summary\":\"top1_share\"") != std::string::npos);
     assert(seed_json.find("\"theta_init\"") != std::string::npos);
@@ -844,6 +915,7 @@ void TestBootstrapEngineTrainsRelationBasis() {
     auto [artifact_status, artifact_json] =
         engine.ExportArtifact(artifact, BaselineSerializationFormat::kJson);
     assert(artifact_status == BaselineStatus::kOk);
+    assert(artifact_json.find("\"relation_fusion_metadata\"") != std::string::npos);
     BootstrapArtifact loaded_artifact;
     assert(engine.LoadArtifact(
                artifact_json, BaselineSerializationFormat::kJson, &loaded_artifact) ==
@@ -851,9 +923,26 @@ void TestBootstrapEngineTrainsRelationBasis() {
     assert(loaded_artifact.artifact_kind == BootstrapArtifactKind::kRelation);
     assert(loaded_artifact.relation_basis_by_metric.size() == 1);
     assert(!loaded_artifact.relation_routed_summary_artifacts.empty());
+    AssertRelationFusionMetadata(loaded_artifact.relation_fusion_metadata);
     BootstrapSeed loaded_seed;
     assert(engine.ExportSeed(loaded_artifact, &loaded_seed) == BaselineStatus::kOk);
     assert(!loaded_seed.relation_routed_summary_seeds.empty());
+    AssertRelationFusionMetadata(loaded_seed.relation_fusion_metadata);
+
+    rapidjson::Document legacy_doc;
+    legacy_doc.Parse(artifact_json.c_str());
+    assert(!legacy_doc.HasParseError());
+    assert(legacy_doc.RemoveMember("relation_fusion_metadata"));
+    rapidjson::StringBuffer legacy_buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> legacy_writer(legacy_buffer);
+    legacy_doc.Accept(legacy_writer);
+    BootstrapArtifact legacy_loaded_artifact;
+    assert(engine.LoadArtifact(legacy_buffer.GetString(),
+                               BaselineSerializationFormat::kJson,
+                               &legacy_loaded_artifact) == BaselineStatus::kOk);
+    AssertRelationFusionMetadata(legacy_loaded_artifact.relation_fusion_metadata);
+    assert(legacy_loaded_artifact.diagnostics.find("relation_fusion_metadata_defaulted") !=
+           std::string::npos);
 
     std::printf("[PASS] Bootstrap engine trains relation basis\n");
 }

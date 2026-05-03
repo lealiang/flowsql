@@ -374,6 +374,7 @@ flowSQL/
 │   │   ├── binaddon/       # BinAddonHostPlugin（C++ 算子插件管理）
 │   │   └── bridge/         # BridgePlugin（C++ ↔ Python 桥接）
 │   ├── plugins/
+│   │   ├── baseline/       # Baseline 插件（在线基线、bootstrap、relation rolling/fusion）
 │   │   └── npi/            # NPI 协议识别
 │   ├── python/             # Python Worker（FastAPI）
 │   ├── frontend/           # Vue.js 前端
@@ -387,6 +388,7 @@ flowSQL/
 
 - [项目愿景](docs/vision.md)
 - [架构设计](docs/framework.md)
+- [Baseline 插件说明](src/plugins/baseline/README.md)
 - [C++ 算子插件 Sample](samples/cpp_operator/README.md)
 
 ## 许可证

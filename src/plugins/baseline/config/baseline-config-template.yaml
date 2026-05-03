@@ -251,6 +251,19 @@ baseline:
       basis_threshold_margin: 1.20
       basis_min_stable_refresh_count: 2
       routed_state_shard_count: 16
+      relation_fusion:
+        enable_relation_fusion: true
+        fusion_z_score_cap: 5.0
+        fusion_min_evidence_score: 0.20
+        fusion_persistence_window: 2
+        fusion_warming_weight: 0.25
+        fusion_degraded_weight: 0.25
+        fusion_support_weight: 0.50
+        fusion_oppose_weight: 0.50
+        basic_pattern_weight: 0.70
+        stable_head_pattern_weight: 0.85
+        dominant_single_cap: 3
+        dominant_pattern_cap: 2
 
   value_sampled_profiles:
     cont_core:

@@ -45,7 +45,8 @@ RelationProjectedSummary MakeValueSummary(const std::string& metric_name,
                                           const std::string& summary_name,
                                           double value,
                                           bool basis_scoped,
-                                          uint64_t basis_version) {
+                                          uint64_t basis_version,
+                                          bool active_count_from_upstream = false) {
     RelationProjectedSummary summary;
     summary.metric_name = metric_name;
     summary.summary_name = summary_name;
@@ -53,6 +54,7 @@ RelationProjectedSummary MakeValueSummary(const std::string& metric_name,
     summary.feature_type = "value_basic";
     summary.basis_scoped = basis_scoped;
     summary.basis_version = basis_version;
+    summary.active_count_from_upstream = active_count_from_upstream;
     summary.value = value;
     return summary;
 }
@@ -128,7 +130,8 @@ bool ProjectRelationMetricSummariesImpl(
                                                   "distinct_group_count",
                                                   static_cast<double>(distinct_count),
                                                   false,
-                                                  0));
+                                                  0,
+                                                  metric.active_count > 0));
     }
 
     out_summaries->push_back(MakeRatioSummary(

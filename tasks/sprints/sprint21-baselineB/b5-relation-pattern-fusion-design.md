@@ -306,6 +306,7 @@ ExpectedEvidence(source_series_key, feature_base, bucket_id)
 构造规则：
 
 - 外层必须以 task spec 的 metric 列表为准，而不是以当前 bucket 成功投影出的 summaries 为准。
+- `RelationRollingObservation.metrics` 必须与 task spec `metrics` 同序对齐。Fusion 的 expected universe 不按 `RelationBootstrapMetric.metric` 做无序名称匹配；若提交项名称非空且与同下标 task metric 不一致，该 metric 视为非法并使用 `metric_name_mismatch` / `metric_invalid` 路径清理旧 evidence。
 - metric 缺失或非法时，生成该 metric 下 expected evidence 的 unavailable 事件，重置对应 persistence；不调用 routed rolling，不参与 pattern 输入。
 - 通用摘要：`entropy_shannon`、`top1_share`、`headk_share` 在 metric 有效时进入 expected set。
 - `distinct_group_count`：只有 `active_count_from_upstream = true` 时进入可用 expected set；否则仍可记录 unavailable reason，但不得参与 persistence 和 pattern。

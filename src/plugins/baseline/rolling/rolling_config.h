@@ -19,6 +19,21 @@
 namespace flowsql {
 namespace baseline {
 
+struct BaselineRelationFusionConfig {
+    bool enable_relation_fusion = true;
+    double fusion_z_score_cap = 5.0;
+    double fusion_min_evidence_score = 0.20;
+    uint32_t fusion_persistence_window = 2;
+    double fusion_warming_weight = 0.25;
+    double fusion_degraded_weight = 0.25;
+    double fusion_support_weight = 0.50;
+    double fusion_oppose_weight = 0.50;
+    double basic_pattern_weight = 0.70;
+    double stable_head_pattern_weight = 0.85;
+    uint32_t dominant_single_cap = 3;
+    uint32_t dominant_pattern_cap = 2;
+};
+
 struct BaselineRelationRollingConfig {
     bool enable_routed_rolling = true;
     bool enable_stream_basis = true;
@@ -34,6 +49,7 @@ struct BaselineRelationRollingConfig {
     double basis_threshold_margin = 1.20;
     uint64_t basis_min_stable_refresh_count = 2;
     uint32_t routed_state_shard_count = 16;
+    BaselineRelationFusionConfig relation_fusion;
 };
 
 struct BaselineRollingConfig {

@@ -128,6 +128,8 @@ struct RelationRoutedSummaryQuery {
 
 - `RelationRollingObservation` 使用与 `RelationBootstrapBlock` 同构的字段，但补齐 `series_key`，表示单个在线 bucket。
 - `RelationBootstrapMetric` 首版复用已有 public 类型，避免 B4 为指标数组引入重复结构。后续若要清理命名，可单独做兼容迁移。
+- `RelationRollingObservation.metrics` 是与 task config `metrics` 同序对齐的数组：`metrics[i]` 必须对应 task config 中的 `metrics[i]`。调用方不得按 `RelationBootstrapMetric.metric` 名称无序提交。
+- `RelationBootstrapMetric.metric` 是可选的名称校验字段。若为空，系统按下标解释；若非空，必须等于同下标的 task metric。错序且名称非空时，该 metric 视为 `metric_name_mismatch` / invalid；错序且名称为空会造成语义错配，因此不受 public contract 支持。
 - `RelationRollingSubmitOptions.routed_options` 直接传给 B2/B3 rolling core。
 - `include_diagnostics` 默认关闭，避免 Relation fan-out 热路径无条件拼接大 diagnostics。
 - `RelationRoutedSummaryResult.rolling` 复用已有 `RollingBaselineResult`，避免为 Relation 复制 band / score / trust 字段。
@@ -551,7 +553,7 @@ artifact_kind = value 或 ratio
 
 ## 8. 热路径锁与 fan-out
 
-B4 的 Relation submit 比 Value / Ratio submit 多一层 fan-out：一个 source block 会生成多个 routed observations，并可能触发 basis accumulator 更新和低频 refresh。若沿用一把 `BaselineTaskBase::mutex_` 包住完整过程，会放大 `baseline-locking-analysis.md` 中已经记录的 task 级锁问题。
+B4 的 Relation submit 比 Value / Ratio submit 多一层 fan-out：一个 source block 会生成多个 routed observations，并可能触发 basis accumulator 更新和低频 refresh。若沿用一把 `BaselineTaskBase::mutex_` 包住完整过程，会放大 `b6-baseline-task-serialization-lock-optimization-design.md` 中已经记录的 task 级锁问题。
 
 ### 8.1 锁边界
 

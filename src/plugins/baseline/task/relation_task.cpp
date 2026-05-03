@@ -39,6 +39,98 @@ void AppendDiagnostic(bool enabled, const std::string& item, std::string* diagno
     *diagnostics += item;
 }
 
+template <typename Writer>
+void WriteFusionSingleEvidence(Writer* writer, const RelationFusionSingleEvidence& evidence) {
+    writer->StartObject();
+    WriteStringField(writer, "metric", evidence.metric);
+    WriteStringField(writer, "summary", evidence.summary);
+    WriteStringField(writer, "direction", evidence.direction);
+    writer->Key("basis_version");
+    writer->Uint64(evidence.basis_version);
+    writer->Key("basis_scoped");
+    writer->Bool(evidence.basis_scoped);
+    writer->Key("normalized_score");
+    writer->Double(evidence.normalized_score);
+    writer->Key("confidence");
+    writer->Double(evidence.confidence);
+    writer->Key("persistence");
+    writer->Uint(evidence.persistence);
+    writer->Key("evidence_strength");
+    writer->Double(evidence.evidence_strength);
+    writer->Key("available");
+    writer->Bool(evidence.available);
+    writer->Key("can_alert");
+    writer->Bool(evidence.can_alert);
+    WriteStringField(writer, "score_trust_status", evidence.score_trust_status);
+    WriteStringField(writer, "metric_basis_status", evidence.metric_basis_status);
+    if (!evidence.unavailable_reason.empty()) {
+        WriteStringField(writer, "unavailable_reason", evidence.unavailable_reason);
+    }
+    WriteStringField(writer, "routed_series_key", evidence.routed_series_key);
+    writer->EndObject();
+}
+
+template <typename Writer>
+void WriteFusionPatternScore(Writer* writer, const RelationFusionPatternScore& pattern) {
+    writer->StartObject();
+    WriteStringField(writer, "pattern", pattern.pattern);
+    writer->Key("score");
+    writer->Double(pattern.score);
+    writer->Key("weighted_score");
+    writer->Double(pattern.weighted_score);
+    writer->Key("pattern_weight");
+    writer->Double(pattern.pattern_weight);
+    writer->Key("metrics_hit");
+    writer->StartArray();
+    for (const auto& metric : pattern.metrics_hit) writer->String(metric.c_str());
+    writer->EndArray();
+    writer->Key("supporting_features");
+    writer->StartArray();
+    for (const auto& feature : pattern.supporting_features) writer->String(feature.c_str());
+    writer->EndArray();
+    if (!pattern.diagnostics.empty()) {
+        WriteStringField(writer, "diagnostics", pattern.diagnostics);
+    }
+    writer->EndObject();
+}
+
+template <typename Writer>
+void WriteFusionResult(Writer* writer, const RelationFusionResult& fusion) {
+    writer->StartObject();
+    writer->Key("enabled");
+    writer->Bool(true);
+    writer->Key("bucket_id");
+    writer->Int64(fusion.bucket_id);
+    writer->Key("relation_risk");
+    writer->Double(fusion.relation_risk);
+    writer->Key("single_risk");
+    writer->Double(fusion.single_risk);
+    writer->Key("pattern_risk");
+    writer->Double(fusion.pattern_risk);
+    writer->Key("dominant_single");
+    writer->StartArray();
+    for (const auto& evidence : fusion.dominant_single) {
+        WriteFusionSingleEvidence(writer, evidence);
+    }
+    writer->EndArray();
+    writer->Key("dominant_pattern");
+    writer->StartArray();
+    for (const auto& pattern : fusion.dominant_pattern) {
+        WriteFusionPatternScore(writer, pattern);
+    }
+    writer->EndArray();
+    writer->Key("pattern_scores");
+    writer->StartArray();
+    for (const auto& pattern : fusion.pattern_scores) {
+        WriteFusionPatternScore(writer, pattern);
+    }
+    writer->EndArray();
+    if (!fusion.diagnostics.empty()) {
+        WriteStringField(writer, "diagnostics", fusion.diagnostics);
+    }
+    writer->EndObject();
+}
+
 BaselineTaskSpec MakeRelationRollingConfigSpec(const RelationTaskCreateSpec& spec) {
     BaselineTaskSpec rolling_spec;
     rolling_spec.task_id = spec.task_spec.task_id;
@@ -170,9 +262,7 @@ const char* RelationBasisStatusName(RelationBasisStatus status) {
 }
 
 std::string MetricNameForIndex(const RelationTaskCreateSpec& spec,
-                               const RelationBootstrapMetric& metric,
                                std::size_t metric_index) {
-    if (!metric.metric.empty()) return metric.metric;
     if (metric_index < spec.task_spec.metrics.size()) return spec.task_spec.metrics[metric_index];
     return "";
 }
@@ -238,6 +328,8 @@ BaselineSerializationResult BaselineRelationTask::QueryTaskSnapshot(
     uint64_t source_state_count = 0;
     uint64_t routed_seed_count = 0;
     uint64_t routed_state_count = 0;
+    uint64_t fusion_source_state_count = 0;
+    uint64_t fusion_persistence_state_count = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const BaselineStatus status = EnsureOpenLocked();
@@ -253,6 +345,14 @@ BaselineSerializationResult BaselineRelationTask::QueryTaskSnapshot(
                 static_cast<uint64_t>(shard.routed_seeds_by_series.size());
             routed_state_count +=
                 static_cast<uint64_t>(shard.routed_rolling_states.size());
+        }
+        {
+            std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
+            fusion_source_state_count = static_cast<uint64_t>(fusion_states_.size());
+            for (const auto& entry : fusion_states_) {
+                fusion_persistence_state_count += static_cast<uint64_t>(
+                    entry.second.persistence_by_evidence_dir.size());
+            }
         }
     }
 
@@ -275,6 +375,17 @@ BaselineSerializationResult BaselineRelationTask::QueryTaskSnapshot(
     writer.Uint64(routed_seed_count);
     writer.Key("routed_state_count");
     writer.Uint64(routed_state_count);
+    writer.EndObject();
+    writer.Key("relation_fusion");
+    writer.StartObject();
+    writer.Key("enabled");
+    writer.Bool(MakeFusionRuntimeConfig().enable_relation_fusion);
+    writer.Key("source_state_count");
+    writer.Uint64(fusion_source_state_count);
+    writer.Key("persistence_state_count");
+    writer.Uint64(fusion_persistence_state_count);
+    writer.Key("pattern_count");
+    writer.Uint(4);
     writer.EndObject();
     writer.EndObject();
     return {BaselineStatus::kOk, buf.GetString()};
@@ -317,6 +428,8 @@ BaselineSerializationResult BaselineRelationTask::QuerySeriesSnapshot(
     std::vector<RoutedSnapshotEntry> routed_entries;
     uint64_t routed_seed_count = 0;
     uint64_t routed_state_count = 0;
+    bool has_fusion_snapshot = false;
+    RelationFusionResult fusion_snapshot;
     {
         std::lock_guard<std::mutex> basis_lock(basis_states_mutex_);
         for (const auto& entry : basis_states_) {
@@ -387,7 +500,16 @@ BaselineSerializationResult BaselineRelationTask::QuerySeriesSnapshot(
             routed_entries.push_back(std::move(snapshot));
         }
     }
-    if (basis_entries.empty() && routed_entries.empty()) {
+    {
+        std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
+        const auto fusion_it = fusion_states_.find(key);
+        if (fusion_it != fusion_states_.end() &&
+            fusion_it->second.last_result.status == BaselineStatus::kOk) {
+            fusion_snapshot = fusion_it->second.last_result;
+            has_fusion_snapshot = true;
+        }
+    }
+    if (basis_entries.empty() && routed_entries.empty() && !has_fusion_snapshot) {
         return {BaselineStatus::kNotTrained, ""};
     }
 
@@ -439,6 +561,15 @@ BaselineSerializationResult BaselineRelationTask::QuerySeriesSnapshot(
         writer.EndObject();
     }
     writer.EndArray();
+    writer.Key("relation_fusion");
+    if (has_fusion_snapshot && MakeFusionRuntimeConfig().enable_relation_fusion) {
+        WriteFusionResult(&writer, fusion_snapshot);
+    } else {
+        writer.StartObject();
+        writer.Key("enabled");
+        writer.Bool(MakeFusionRuntimeConfig().enable_relation_fusion);
+        writer.EndObject();
+    }
     writer.EndObject();
     return {BaselineStatus::kOk, buf.GetString()};
 }
@@ -466,6 +597,10 @@ void BaselineRelationTask::RebuildRuntimeFromRelationSeedsLocked() {
         shard.routed_seeds_by_series.clear();
         shard.routed_specs_by_series.clear();
         shard.routed_rolling_states.clear();
+    }
+    {
+        std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
+        fusion_states_.clear();
     }
 
     for (const auto& entry : seeds_by_series_) {
@@ -535,6 +670,24 @@ RelationBasisRuntimeConfig BaselineRelationTask::MakeBasisRuntimeConfig() const 
     return config;
 }
 
+RelationFusionRuntimeConfig BaselineRelationTask::MakeFusionRuntimeConfig() const {
+    RelationFusionRuntimeConfig config;
+    const auto& fusion = relation_rolling_config_.relation_fusion;
+    config.enable_relation_fusion = fusion.enable_relation_fusion;
+    config.fusion_z_score_cap = fusion.fusion_z_score_cap;
+    config.fusion_min_evidence_score = fusion.fusion_min_evidence_score;
+    config.fusion_persistence_window = fusion.fusion_persistence_window;
+    config.fusion_warming_weight = fusion.fusion_warming_weight;
+    config.fusion_degraded_weight = fusion.fusion_degraded_weight;
+    config.fusion_support_weight = fusion.fusion_support_weight;
+    config.fusion_oppose_weight = fusion.fusion_oppose_weight;
+    config.basic_pattern_weight = fusion.basic_pattern_weight;
+    config.stable_head_pattern_weight = fusion.stable_head_pattern_weight;
+    config.dominant_single_cap = fusion.dominant_single_cap;
+    config.dominant_pattern_cap = fusion.dominant_pattern_cap;
+    return config;
+}
+
 RelationRollingResult BaselineRelationTask::SubmitObservation(
     const RelationRollingObservation& obs,
     const RelationRollingSubmitOptions& options) {
@@ -560,12 +713,41 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
     bool saw_ok_routed_result = false;
     bool saw_ok_basis_result = false;
     bool saw_valid_metric = false;
+    const std::string feature_base = spec_.task_spec.feature_base.empty()
+                                         ? spec_.task_spec.feature_id
+                                         : spec_.task_spec.feature_base;
+    std::vector<RelationFusionMetricContext> fusion_metric_contexts;
+    std::vector<RelationFusionRoutedInput> fusion_inputs;
 
-    for (std::size_t metric_index = 0; metric_index < obs.metrics.size(); ++metric_index) {
-        const RelationBootstrapMetric& metric = obs.metrics[metric_index];
-        const std::string metric_name = MetricNameForIndex(spec_, metric, metric_index);
+    const std::size_t metric_count = spec_.task_spec.metrics.size();
+    fusion_metric_contexts.reserve(metric_count);
+    for (std::size_t metric_index = 0; metric_index < metric_count; ++metric_index) {
+        const bool metric_present = metric_index < obs.metrics.size();
+        const RelationBootstrapMetric* metric =
+            metric_present ? &obs.metrics[metric_index] : nullptr;
+        const std::string metric_name = MetricNameForIndex(spec_, metric_index);
         if (metric_name.empty()) continue;
-        if (metric.total <= 0.0 || metric.values_by_group.size() < obs.group_idx.size()) {
+
+        RelationFusionMetricContext fusion_metric;
+        fusion_metric.metric = metric_name;
+        fusion_metric.present = metric_present;
+        fusion_metric.valid =
+            metric_present && metric->total > 0.0 &&
+            metric->values_by_group.size() >= obs.group_idx.size() &&
+            (metric->metric.empty() || metric->metric == metric_name);
+        fusion_metric.active_count_from_upstream =
+            metric_present && metric->active_count > 0;
+        if (!fusion_metric.present) {
+            fusion_metric.unavailable_reason = "metric_missing";
+            fusion_metric_contexts.push_back(std::move(fusion_metric));
+            continue;
+        }
+        if (!fusion_metric.valid) {
+            fusion_metric.unavailable_reason =
+                metric && !metric->metric.empty() && metric->metric != metric_name
+                    ? "metric_name_mismatch"
+                    : "metric_invalid";
+            fusion_metric_contexts.push_back(std::move(fusion_metric));
             continue;
         }
         saw_valid_metric = true;
@@ -584,6 +766,16 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
                 }
             }
         }
+        fusion_metric.has_active_basis = active_basis.has_value();
+        fusion_metric.basis_version = active_basis_version;
+        if (active_basis) {
+            fusion_metric.stable_head_size =
+                static_cast<uint32_t>(active_basis->stable_head.size());
+            fusion_metric.stable_head_mix_drift_expected =
+                active_basis->stable_head.size() >= 2 &&
+                active_basis->head_proto_q.size() == active_basis->stable_head.size();
+        }
+        fusion_metric_contexts.push_back(fusion_metric);
         if (result.basis_status.empty()) {
             result.basis_status = RelationBasisStatusName(basis_status);
             result.basis_version = active_basis_version;
@@ -662,16 +854,25 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
                 }
                 if (rolling.status == BaselineStatus::kOk) saw_ok_routed_result = true;
 
+                RelationRoutedSummaryResult routed_result;
+                routed_result.source_series_key = obs.series_key;
+                routed_result.routed_series_key = identity.routed_series_key;
+                routed_result.metric = metric_name;
+                routed_result.summary = summary.summary_name;
+                routed_result.feature_type = identity.feature_type;
+                routed_result.basis_version = identity.basis_version;
+                routed_result.basis_scoped = identity.basis_scoped;
+                routed_result.rolling = rolling;
+
+                RelationFusionRoutedInput fusion_input;
+                fusion_input.routed = routed_result;
+                fusion_input.feature_base = feature_base;
+                fusion_input.metric_basis_status = RelationBasisStatusName(basis_status);
+                fusion_input.active_count_from_upstream =
+                    summary.active_count_from_upstream;
+                fusion_inputs.push_back(std::move(fusion_input));
+
                 if (options.include_routed_results) {
-                    RelationRoutedSummaryResult routed_result;
-                    routed_result.source_series_key = obs.series_key;
-                    routed_result.routed_series_key = identity.routed_series_key;
-                    routed_result.metric = metric_name;
-                    routed_result.summary = summary.summary_name;
-                    routed_result.feature_type = identity.feature_type;
-                    routed_result.basis_version = identity.basis_version;
-                    routed_result.basis_scoped = identity.basis_scoped;
-                    routed_result.rolling = std::move(rolling);
                     result.routed_results.push_back(std::move(routed_result));
                 }
             }
@@ -717,6 +918,44 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
             AppendDiagnostic(options.include_diagnostics,
                              "relation_stream_basis_disabled",
                              &result.diagnostics);
+        }
+    }
+
+    const bool has_fusion_routed_inputs = !fusion_inputs.empty();
+    const RelationFusionRuntimeConfig fusion_config = MakeFusionRuntimeConfig();
+    bool has_existing_fusion_state = false;
+    if (routed_enabled && fusion_config.enable_relation_fusion && !has_fusion_routed_inputs) {
+        std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
+        has_existing_fusion_state = fusion_states_.find(obs.series_key) != fusion_states_.end();
+    }
+    if (routed_enabled && fusion_config.enable_relation_fusion &&
+        !fusion_metric_contexts.empty() &&
+        (has_fusion_routed_inputs || !saw_valid_metric || has_existing_fusion_state)) {
+        RelationFusionUpdateInput fusion_update;
+        fusion_update.source_series_key = obs.series_key;
+        fusion_update.feature_base = feature_base;
+        fusion_update.bucket_id = obs.bucket_id;
+        fusion_update.config = fusion_config;
+        fusion_update.metrics = std::move(fusion_metric_contexts);
+        fusion_update.routed_inputs = std::move(fusion_inputs);
+
+        RelationFusionResult fusion_result;
+        {
+            std::lock_guard<std::mutex> fusion_lock(fusion_states_mutex_);
+            RelationFusionRuntimeState& fusion_state = fusion_states_[obs.series_key];
+            const BaselineStatus fusion_status =
+                UpdateRelationFusion(fusion_update, &fusion_state, &fusion_result);
+            if (fusion_status != BaselineStatus::kOk) {
+                AppendDiagnostic(options.include_diagnostics,
+                                 "relation_fusion_update_failed",
+                                 &result.diagnostics);
+            }
+        }
+        if (options.include_fusion_result &&
+            has_fusion_routed_inputs &&
+            fusion_result.status == BaselineStatus::kOk) {
+            result.has_fusion_result = true;
+            result.fusion_result = std::move(fusion_result);
         }
     }
 

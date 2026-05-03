@@ -21,6 +21,7 @@
 #include "plugins/baseline/model/event_calendar_matcher.h"
 #include "plugins/baseline/model/task_spec.h"
 #include "plugins/baseline/relation/relation_basis_state.h"
+#include "plugins/baseline/relation/relation_fusion.h"
 #include "plugins/baseline/relation/relation_summary.h"
 #include "plugins/baseline/rolling/rolling_config.h"
 #include "plugins/baseline/rolling/rolling_task_runner.h"
@@ -88,6 +89,7 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
     std::size_t RoutedShardIndex(std::string_view routed_series_key) const;
     void RebuildRuntimeFromRelationSeedsLocked();
     RelationBasisRuntimeConfig MakeBasisRuntimeConfig() const;
+    RelationFusionRuntimeConfig MakeFusionRuntimeConfig() const;
 
     RelationTaskCreateSpec spec_;
     std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar_;
@@ -100,6 +102,8 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
     std::vector<std::unique_ptr<RelationRoutedRuntimeShard>> routed_shards_;
     mutable std::mutex basis_states_mutex_;
     RelationBasisStateMap basis_states_;
+    mutable std::mutex fusion_states_mutex_;
+    std::unordered_map<std::string, RelationFusionRuntimeState> fusion_states_;
 };
 
 }  // namespace baseline

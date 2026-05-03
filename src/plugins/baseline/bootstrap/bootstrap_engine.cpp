@@ -29,6 +29,7 @@
 #include "plugins/baseline/relation/relation_basis.h"
 #include "plugins/baseline/relation/relation_summary.h"
 #include "plugins/baseline/relation/routed_summary.h"
+#include "plugins/baseline/rolling/rolling_config.h"
 
 namespace flowsql {
 namespace baseline {
@@ -193,11 +194,34 @@ const char* TaskKindName(BaselineTaskKind kind) {
     return "unknown";
 }
 
+bool ParseTaskKindName(const std::string& name, BaselineTaskKind* out) {
+    if (!out) return false;
+    if (name == "value") {
+        *out = BaselineTaskKind::kValue;
+        return true;
+    }
+    if (name == "ratio") {
+        *out = BaselineTaskKind::kRatio;
+        return true;
+    }
+    if (name == "relation") {
+        *out = BaselineTaskKind::kRelation;
+        return true;
+    }
+    return false;
+}
+
 BootstrapArtifactKind ParseArtifactKind(const std::string& name) {
     if (name == "value") return BootstrapArtifactKind::kValue;
     if (name == "ratio") return BootstrapArtifactKind::kRatio;
     if (name == "relation") return BootstrapArtifactKind::kRelation;
     return BootstrapArtifactKind::kNone;
+}
+
+void AppendDiagnostic(std::string* diagnostics, const char* token) {
+    if (!diagnostics || !token || token[0] == '\0') return;
+    if (!diagnostics->empty()) diagnostics->append("; ");
+    diagnostics->append(token);
 }
 
 template <typename Writer>
@@ -1062,13 +1086,8 @@ bool ReadRoutedSummaryArtifact(const rapidjson::Value& obj,
         !ReadCalendarRef(obj, &artifact.calendar_ref)) {
         return false;
     }
-    if (task_kind == "value") {
-        artifact.task_kind = BaselineTaskKind::kValue;
-    } else if (task_kind == "ratio") {
-        artifact.task_kind = BaselineTaskKind::kRatio;
-    } else {
-        return false;
-    }
+    if (!ParseTaskKindName(task_kind, &artifact.task_kind) ||
+        artifact.task_kind == BaselineTaskKind::kRelation) return false;
     artifact.basis_scoped = IsBasisScopedRelationSummary(artifact.summary_name);
     if (obj.HasMember("basis_scoped")) {
         if (!obj["basis_scoped"].IsBool() ||
@@ -1094,6 +1113,74 @@ bool ReadRoutedSummaryArtifact(const rapidjson::Value& obj,
         }
     }
     *out = std::move(artifact);
+    return true;
+}
+
+bool ReadRelationFusionSummaryMetadata(const rapidjson::Value& obj,
+                                       RelationFusionSummaryMetadata* out) {
+    if (!out || !obj.IsObject()) return false;
+    RelationFusionSummaryMetadata metadata;
+    std::string task_kind;
+    if (!ReadString(obj, "metric_name", &metadata.metric_name) ||
+        !ReadString(obj, "summary_name", &metadata.summary_name) ||
+        !ReadString(obj, "task_kind", &task_kind)) {
+        return false;
+    }
+    if (!ParseTaskKindName(task_kind, &metadata.task_kind) ||
+        metadata.task_kind == BaselineTaskKind::kRelation) {
+        return false;
+    }
+    if (!obj.HasMember("basis_scoped") || !obj["basis_scoped"].IsBool() ||
+        !obj.HasMember("basis_version") || !obj["basis_version"].IsUint64()) {
+        return false;
+    }
+    metadata.basis_scoped = obj["basis_scoped"].GetBool();
+    metadata.basis_version = metadata.basis_scoped ? obj["basis_version"].GetUint64() : 0;
+    *out = std::move(metadata);
+    return true;
+}
+
+bool ReadRelationFusionPatternMetadata(const rapidjson::Value& obj,
+                                       RelationFusionPatternMetadata* out) {
+    if (!out || !obj.IsObject()) return false;
+    RelationFusionPatternMetadata metadata;
+    if (!ReadString(obj, "pattern", &metadata.pattern) ||
+        !ReadString(obj, "scope", &metadata.scope) ||
+        !obj.HasMember("pattern_weight") || !obj["pattern_weight"].IsNumber() ||
+        !ReadStringVector(obj, "required_summaries", &metadata.required_summaries) ||
+        !ReadStringVector(obj, "optional_summaries", &metadata.optional_summaries) ||
+        !ReadStringVector(obj, "oppose_summaries", &metadata.oppose_summaries) ||
+        !ReadStringVector(obj, "metrics", &metadata.metrics)) {
+        return false;
+    }
+    metadata.pattern_weight = obj["pattern_weight"].GetDouble();
+    *out = std::move(metadata);
+    return true;
+}
+
+bool ReadRelationFusionMetadata(const rapidjson::Value& obj,
+                                RelationFusionBootstrapMetadata* out) {
+    if (!out || !obj.IsObject()) return false;
+    RelationFusionBootstrapMetadata metadata;
+    if (!obj.HasMember("metadata_version") || !obj["metadata_version"].IsUint() ||
+        !ReadString(obj, "feature_base", &metadata.feature_base) ||
+        !obj.HasMember("summary_metadata") || !obj["summary_metadata"].IsArray() ||
+        !obj.HasMember("pattern_metadata") || !obj["pattern_metadata"].IsArray()) {
+        return false;
+    }
+    metadata.metadata_version = obj["metadata_version"].GetUint();
+    if (metadata.metadata_version == 0) return false;
+    for (const auto& item : obj["summary_metadata"].GetArray()) {
+        RelationFusionSummaryMetadata summary;
+        if (!ReadRelationFusionSummaryMetadata(item, &summary)) return false;
+        metadata.summary_metadata.push_back(std::move(summary));
+    }
+    for (const auto& item : obj["pattern_metadata"].GetArray()) {
+        RelationFusionPatternMetadata pattern;
+        if (!ReadRelationFusionPatternMetadata(item, &pattern)) return false;
+        metadata.pattern_metadata.push_back(std::move(pattern));
+    }
+    *out = std::move(metadata);
     return true;
 }
 
@@ -1462,6 +1549,111 @@ void NormalizeRoutedSummaryScope(const std::vector<RelationServiceBasis>& bases,
     }
 }
 
+BaselineRelationFusionConfig CurrentRelationFusionConfig() {
+    BaselineRollingConfig rolling_config;
+    (void)TryGetBaselineRollingConfigOverride(&rolling_config);
+    return rolling_config.relation_rolling.relation_fusion;
+}
+
+bool HasRelationFusionMetadata(const RelationFusionBootstrapMetadata& metadata) {
+    return !metadata.feature_base.empty() ||
+           !metadata.summary_metadata.empty() ||
+           !metadata.pattern_metadata.empty();
+}
+
+std::vector<std::string> UniqueSortedMetrics(std::vector<std::string> metrics) {
+    std::sort(metrics.begin(), metrics.end());
+    metrics.erase(std::unique(metrics.begin(), metrics.end()), metrics.end());
+    return metrics;
+}
+
+RelationFusionPatternMetadata MakeRelationFusionPatternMetadata(
+    const std::string& pattern,
+    double pattern_weight,
+    std::vector<std::string> required_summaries,
+    std::vector<std::string> optional_summaries,
+    std::vector<std::string> oppose_summaries,
+    const std::vector<std::string>& metrics) {
+    RelationFusionPatternMetadata metadata;
+    metadata.pattern = pattern;
+    metadata.scope = "relation_local";
+    metadata.pattern_weight = pattern_weight;
+    metadata.required_summaries = std::move(required_summaries);
+    metadata.optional_summaries = std::move(optional_summaries);
+    metadata.oppose_summaries = std::move(oppose_summaries);
+    metadata.metrics = metrics;
+    return metadata;
+}
+
+std::vector<RelationFusionPatternMetadata> MakeRelationFusionPatternMetadata(
+    const std::vector<std::string>& metrics) {
+    const BaselineRelationFusionConfig config = CurrentRelationFusionConfig();
+    std::vector<RelationFusionPatternMetadata> patterns;
+    patterns.push_back(MakeRelationFusionPatternMetadata(
+        "support_escape",
+        config.basic_pattern_weight,
+        {"out_of_support_share:up"},
+        {"entropy_shannon:up", "distinct_group_count:up", "stable_headk_coverage:down"},
+        {"top1_share:up", "headk_share:up", "entropy_shannon:down"},
+        metrics));
+    patterns.push_back(MakeRelationFusionPatternMetadata(
+        "head_concentration",
+        config.basic_pattern_weight,
+        {"top1_share:up"},
+        {"headk_share:up", "entropy_shannon:down"},
+        {"out_of_support_share:up", "entropy_shannon:up"},
+        metrics));
+    patterns.push_back(MakeRelationFusionPatternMetadata(
+        "legacy_head_dilution",
+        config.stable_head_pattern_weight,
+        {"stable_headk_coverage:down"},
+        {"out_of_support_share:up", "entropy_shannon:up"},
+        {"stable_headk_coverage:up"},
+        metrics));
+    patterns.push_back(MakeRelationFusionPatternMetadata(
+        "stable_head_mix_shift",
+        config.stable_head_pattern_weight,
+        {"stable_headk_mix_drift:up"},
+        {},
+        {"stable_headk_coverage:down", "out_of_support_share:up"},
+        metrics));
+    return patterns;
+}
+
+RelationFusionBootstrapMetadata MakeRelationFusionMetadata(
+    const std::string& fallback_feature_base,
+    const std::vector<RelationServiceBasis>& bases,
+    const std::vector<RelationRoutedBootstrapArtifact>& routed_artifacts) {
+    RelationFusionBootstrapMetadata metadata;
+    metadata.metadata_version = 1;
+    metadata.feature_base = fallback_feature_base;
+    std::vector<std::string> metrics;
+    metrics.reserve(bases.size() + routed_artifacts.size());
+    for (const auto& basis : bases) {
+        if (metadata.feature_base.empty()) metadata.feature_base = basis.feature_base;
+        if (!basis.metric_name.empty()) metrics.push_back(basis.metric_name);
+    }
+    for (const auto& routed : routed_artifacts) {
+        RelationFusionSummaryMetadata summary;
+        summary.metric_name = routed.metric_name;
+        summary.summary_name = routed.summary_name;
+        summary.task_kind = routed.task_kind;
+        summary.basis_scoped = routed.basis_scoped;
+        summary.basis_version = routed.basis_scoped ? routed.basis_version : 0;
+        metadata.summary_metadata.push_back(std::move(summary));
+        if (!routed.metric_name.empty()) metrics.push_back(routed.metric_name);
+    }
+    metadata.pattern_metadata = MakeRelationFusionPatternMetadata(UniqueSortedMetrics(metrics));
+    return metadata;
+}
+
+RelationFusionBootstrapMetadata MakeRelationFusionMetadata(
+    const BootstrapArtifact& artifact) {
+    return MakeRelationFusionMetadata(artifact.task_identity.feature_id,
+                                      artifact.relation_basis_by_metric,
+                                      artifact.relation_routed_summary_artifacts);
+}
+
 template <typename BasisT>
 void WriteRelationBasis(rapidjson::Writer<rapidjson::StringBuffer>* writer,
                         const BasisT& basis) {
@@ -1534,6 +1726,55 @@ void WriteRoutedSummarySeed(rapidjson::Writer<rapidjson::StringBuffer>* writer,
     WriteRatioPriorInit(writer, seed.ratio_prior_init);
     WriteUncertaintyInit(writer, seed.uncertainty_init);
     WriteMaturityInit(writer, seed.maturity_init);
+    writer->EndObject();
+}
+
+void WriteFusionSummaryMetadata(rapidjson::Writer<rapidjson::StringBuffer>* writer,
+                                const RelationFusionSummaryMetadata& metadata) {
+    writer->StartObject();
+    WriteStringField(writer, "metric_name", metadata.metric_name);
+    WriteStringField(writer, "summary_name", metadata.summary_name);
+    WriteStringField(writer, "task_kind", TaskKindName(metadata.task_kind));
+    writer->Key("basis_scoped");
+    writer->Bool(metadata.basis_scoped);
+    writer->Key("basis_version");
+    writer->Uint64(metadata.basis_version);
+    writer->EndObject();
+}
+
+void WriteFusionPatternMetadata(rapidjson::Writer<rapidjson::StringBuffer>* writer,
+                                const RelationFusionPatternMetadata& metadata) {
+    writer->StartObject();
+    WriteStringField(writer, "pattern", metadata.pattern);
+    WriteStringField(writer, "scope", metadata.scope);
+    writer->Key("pattern_weight");
+    writer->Double(metadata.pattern_weight);
+    WriteStringVector(writer, "required_summaries", metadata.required_summaries);
+    WriteStringVector(writer, "optional_summaries", metadata.optional_summaries);
+    WriteStringVector(writer, "oppose_summaries", metadata.oppose_summaries);
+    WriteStringVector(writer, "metrics", metadata.metrics);
+    writer->EndObject();
+}
+
+void WriteRelationFusionMetadata(rapidjson::Writer<rapidjson::StringBuffer>* writer,
+                                 const RelationFusionBootstrapMetadata& metadata) {
+    writer->Key("relation_fusion_metadata");
+    writer->StartObject();
+    writer->Key("metadata_version");
+    writer->Uint(metadata.metadata_version);
+    WriteStringField(writer, "feature_base", metadata.feature_base);
+    writer->Key("summary_metadata");
+    writer->StartArray();
+    for (const auto& summary : metadata.summary_metadata) {
+        WriteFusionSummaryMetadata(writer, summary);
+    }
+    writer->EndArray();
+    writer->Key("pattern_metadata");
+    writer->StartArray();
+    for (const auto& pattern : metadata.pattern_metadata) {
+        WriteFusionPatternMetadata(writer, pattern);
+    }
+    writer->EndArray();
     writer->EndObject();
 }
 
@@ -2180,6 +2421,7 @@ BootstrapTrainResult BootstrapEngine::TrainRelation(
         out_artifact->seeded_components = result.enabled_components;
         out_artifact->relation_basis_by_metric = std::move(bases);
         out_artifact->relation_routed_summary_artifacts = std::move(routed_artifacts);
+        out_artifact->relation_fusion_metadata = MakeRelationFusionMetadata(*out_artifact);
     }
     ApplyDiagnosticsOption(input.options, &result, out_artifact);
     return result;
@@ -2378,6 +2620,12 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
     for (const auto& basis : artifact.relation_basis_by_metric) {
         out_seed->relation_basis_by_metric.push_back(MakeRelationBasisSeed(basis));
     }
+    if (artifact.artifact_kind == BootstrapArtifactKind::kRelation) {
+        out_seed->relation_fusion_metadata = artifact.relation_fusion_metadata;
+        if (!HasRelationFusionMetadata(out_seed->relation_fusion_metadata)) {
+            out_seed->relation_fusion_metadata = MakeRelationFusionMetadata(artifact);
+        }
+    }
     out_seed->diagnostics = artifact.diagnostics;
     out_seed->relation_routed_summary_seeds.reserve(
         artifact.relation_routed_summary_artifacts.size());
@@ -2507,6 +2755,11 @@ BaselineSerializationResult BootstrapEngine::ExportArtifact(
             WriteRoutedSummaryArtifact(&writer, routed_artifact);
         }
         writer.EndArray();
+        const RelationFusionBootstrapMetadata metadata =
+            HasRelationFusionMetadata(artifact.relation_fusion_metadata)
+                ? artifact.relation_fusion_metadata
+                : MakeRelationFusionMetadata(artifact);
+        WriteRelationFusionMetadata(&writer, metadata);
     }
     WriteStringField(&writer, "diagnostics", artifact.diagnostics);
     writer.EndObject();
@@ -2555,6 +2808,7 @@ BaselineStatus BootstrapEngine::LoadArtifact(std::string_view content,
     ReadCoverage(doc, &artifact.coverage_report);
     (void)ReadStringVector(doc, "seeded_components", &artifact.seeded_components);
     (void)ReadStringVector(doc, "enabled_components", &artifact.enabled_components);
+    (void)ReadString(doc, "diagnostics", &artifact.diagnostics);
 
     const auto& model = doc["model"];
     if (artifact.artifact_kind == BootstrapArtifactKind::kValue) {
@@ -2586,6 +2840,15 @@ BaselineStatus BootstrapEngine::LoadArtifact(std::string_view content,
         }
         for (auto& routed : artifact.relation_routed_summary_artifacts) {
             NormalizeRoutedSummaryScope(artifact.relation_basis_by_metric, &routed);
+        }
+        if (doc.HasMember("relation_fusion_metadata")) {
+            if (!ReadRelationFusionMetadata(doc["relation_fusion_metadata"],
+                                            &artifact.relation_fusion_metadata)) {
+                return BaselineStatus::kParseFailed;
+            }
+        } else {
+            artifact.relation_fusion_metadata = MakeRelationFusionMetadata(artifact);
+            AppendDiagnostic(&artifact.diagnostics, "relation_fusion_metadata_defaulted");
         }
     } else {
         return BaselineStatus::kIncompatibleArtifact;
@@ -2698,6 +2961,10 @@ BaselineSerializationResult BootstrapEngine::ExportSeed(
             WriteRoutedSummarySeed(&writer, routed_seed);
         }
         writer.EndArray();
+    }
+    if (seed.artifact_kind == BootstrapArtifactKind::kRelation &&
+        HasRelationFusionMetadata(seed.relation_fusion_metadata)) {
+        WriteRelationFusionMetadata(&writer, seed.relation_fusion_metadata);
     }
     WriteStringField(&writer, "diagnostics", seed.diagnostics);
     writer.EndObject();
