@@ -521,6 +521,19 @@ void TestTaskBootstrapPredictAndExport() {
     const BootstrapPrediction value_prediction =
         value_task->PredictBootstrap("svc-a", 220, BootstrapPredictionOptions{});
     assert(value_prediction.status == BaselineStatus::kOk);
+    const BootstrapPredictionSequence value_sequence =
+        value_task->PredictBootstrap("svc-a", 220, 3, BootstrapPredictionOptions{});
+    assert(value_sequence.status == BaselineStatus::kOk);
+    assert(value_sequence.series_key == "svc-a");
+    assert(value_sequence.start_bucket_id == 220);
+    assert(value_sequence.point_count == 3);
+    assert(value_sequence.predictions.size() == 3);
+    assert(value_sequence.predictions[0].bucket_id == 220);
+    assert(value_sequence.predictions[1].bucket_id == 221);
+    assert(value_sequence.predictions[2].bucket_id == 222);
+    assert(value_sequence.predictions[0].status == BaselineStatus::kOk);
+    assert(value_sequence.predictions[1].status == BaselineStatus::kOk);
+    assert(value_sequence.predictions[2].status == BaselineStatus::kOk);
     auto [value_artifact_status, value_artifact] =
         value_task->ExportBootstrapArtifact(BaselineSerializationFormat::kJson);
     assert(value_artifact_status == BaselineStatus::kOk);
@@ -570,6 +583,14 @@ void TestTaskBootstrapPredictAndExport() {
     assert(ratio_prediction.status == BaselineStatus::kOk);
     assert(ratio_prediction.baseline_mu >= 0.0);
     assert(ratio_prediction.baseline_mu <= 1.0);
+    const BootstrapPredictionSequence ratio_sequence =
+        ratio_task->PredictBootstrap("svc-a", 220, 2, BootstrapPredictionOptions{});
+    assert(ratio_sequence.status == BaselineStatus::kOk);
+    assert(ratio_sequence.predictions.size() == 2);
+    assert(ratio_sequence.predictions[0].bucket_id == 220);
+    assert(ratio_sequence.predictions[1].bucket_id == 221);
+    assert(ratio_sequence.predictions[0].baseline_mu >= 0.0);
+    assert(ratio_sequence.predictions[0].baseline_mu <= 1.0);
     auto [ratio_seed_status, ratio_seed] =
         ratio_task->ExportBootstrapSeed(BaselineSerializationFormat::kJson);
     assert(ratio_seed_status == BaselineStatus::kOk);
@@ -1129,6 +1150,160 @@ baseline:
     std::printf("[PASS] B5 relation fusion submit and snapshot\n");
 }
 
+void TestB7RelationFusionStateCleanup() {
+    std::printf("[TEST] B7 relation fusion state cleanup...\n");
+
+    const std::string cleanup_config =
+        "/tmp/flowsql_b7_relation_fusion_cleanup.yaml";
+    {
+        std::ofstream file(cleanup_config);
+        file << R"(
+baseline:
+  rolling_config:
+    relation_rolling:
+      relation_fusion:
+        fusion_state_ttl_buckets: 5
+        fusion_state_max_sources: 2
+        fusion_state_cleanup_interval_updates: 1
+        fusion_state_cleanup_scan_limit: 2
+        fusion_persistence_max_keys_per_source: 32
+)";
+        assert(file.good());
+    }
+
+    auto env = LoadBaselineService("config_file=" + cleanup_config + ";strict=false");
+    auto [status, relation_task] = env.service->CreateRelationTask(
+        RelationTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(relation_task != nullptr);
+
+    RelationRollingSubmitOptions options;
+    options.include_routed_results = false;
+    options.include_fusion_result = true;
+
+    RelationRollingObservation old_a = BuildRelationObservation(10, 5, 5, 90);
+    old_a.series_key = "svc-old-a";
+    RelationRollingResult old_a_result =
+        relation_task->SubmitObservation(old_a, options);
+    assert(old_a_result.status == BaselineStatus::kOk);
+
+    RelationRollingObservation old_b = BuildRelationObservation(11, 5, 5, 90);
+    old_b.series_key = "svc-old-b";
+    RelationRollingResult old_b_result =
+        relation_task->SubmitObservation(old_b, options);
+    assert(old_b_result.status == BaselineStatus::kOk);
+
+    auto [before_status, before_snapshot] =
+        relation_task->QueryTaskSnapshot(BaselineSerializationFormat::kJson);
+    assert(before_status == BaselineStatus::kOk);
+    rapidjson::Document before_doc;
+    before_doc.Parse(before_snapshot.c_str());
+    assert(!before_doc.HasParseError());
+    assert(before_doc["relation_fusion"]["source_state_count"].GetUint64() == 2);
+
+    RelationRollingObservation current = BuildRelationObservation(100, 5, 5, 90);
+    current.series_key = "svc-current";
+    RelationRollingResult current_result =
+        relation_task->SubmitObservation(current, options);
+    assert(current_result.status == BaselineStatus::kOk);
+
+    auto [after_status, after_snapshot] =
+        relation_task->QueryTaskSnapshot(BaselineSerializationFormat::kJson);
+    assert(after_status == BaselineStatus::kOk);
+    rapidjson::Document after_doc;
+    after_doc.Parse(after_snapshot.c_str());
+    assert(!after_doc.HasParseError());
+    const auto& fusion = after_doc["relation_fusion"];
+    assert(fusion["source_state_count"].GetUint64() <= 2);
+    assert(fusion["source_state_max"].GetUint64() == 2);
+    assert(fusion["state_evicted_total"].GetUint64() > 0);
+    assert(fusion["state_evicted_ttl_total"].GetUint64() > 0);
+    assert(fusion["cleanup_last_scan_count"].GetUint64() > 0);
+    assert(fusion["cleanup_last_evicted_count"].GetUint64() > 0);
+    assert(fusion["cleanup_watermark_bucket_id"].GetInt64() == 100);
+    assert(fusion["cleanup_ttl_buckets"].GetUint64() == 5);
+    assert(fusion["cleanup_scan_limit"].GetUint64() == 2);
+    assert(fusion["persistence_key_max_per_source"].GetUint64() == 32);
+
+    auto [current_source_status, current_source_snapshot] =
+        relation_task->QuerySeriesSnapshot("svc-current", BaselineSerializationFormat::kJson);
+    assert(current_source_status == BaselineStatus::kOk);
+    rapidjson::Document current_source_doc;
+    current_source_doc.Parse(current_source_snapshot.c_str());
+    assert(!current_source_doc.HasParseError());
+    assert(current_source_doc["relation_fusion"]["enabled"].GetBool());
+    assert(current_source_doc["relation_fusion"]["bucket_id"].GetInt64() == 100);
+
+    flowsql::baseline::ResetBaselineRuntimeConfig();
+    std::printf("[PASS] B7 relation fusion state cleanup\n");
+}
+
+void TestB7RelationFusionStateCapacityCleanup() {
+    std::printf("[TEST] B7 relation fusion capacity cleanup...\n");
+
+    const std::string cleanup_config =
+        "/tmp/flowsql_b7_relation_fusion_capacity_cleanup.yaml";
+    {
+        std::ofstream file(cleanup_config);
+        file << R"(
+baseline:
+  rolling_config:
+    relation_rolling:
+      relation_fusion:
+        fusion_state_ttl_buckets: 1000
+        fusion_state_max_sources: 2
+        fusion_state_cleanup_interval_updates: 1000
+        fusion_state_cleanup_scan_limit: 2
+        fusion_persistence_max_keys_per_source: 32
+)";
+        assert(file.good());
+    }
+
+    auto env = LoadBaselineService("config_file=" + cleanup_config + ";strict=false");
+    auto [status, relation_task] = env.service->CreateRelationTask(
+        RelationTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(relation_task != nullptr);
+
+    RelationRollingSubmitOptions options;
+    options.include_routed_results = false;
+    options.include_fusion_result = true;
+
+    RelationRollingObservation first = BuildRelationObservation(10, 5, 5, 90);
+    first.series_key = "svc-capacity-a";
+    assert(relation_task->SubmitObservation(first, options).status ==
+           BaselineStatus::kOk);
+
+    RelationRollingObservation second = BuildRelationObservation(11, 5, 5, 90);
+    second.series_key = "svc-capacity-b";
+    assert(relation_task->SubmitObservation(second, options).status ==
+           BaselineStatus::kOk);
+
+    RelationRollingObservation third = BuildRelationObservation(12, 5, 5, 90);
+    third.series_key = "svc-capacity-c";
+    assert(relation_task->SubmitObservation(third, options).status ==
+           BaselineStatus::kOk);
+
+    auto [snapshot_status, snapshot_json] =
+        relation_task->QueryTaskSnapshot(BaselineSerializationFormat::kJson);
+    assert(snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document snapshot;
+    snapshot.Parse(snapshot_json.c_str());
+    assert(!snapshot.HasParseError());
+    const auto& fusion = snapshot["relation_fusion"];
+    assert(fusion["source_state_count"].GetUint64() <= 2);
+    assert(fusion["source_state_max"].GetUint64() == 2);
+    assert(fusion["state_evicted_total"].GetUint64() > 0);
+    assert(fusion["state_evicted_capacity_total"].GetUint64() > 0);
+    assert(fusion["state_evicted_ttl_total"].GetUint64() == 0);
+    assert(fusion["cleanup_last_scan_count"].GetUint64() > 0);
+    assert(fusion["cleanup_last_evicted_count"].GetUint64() > 0);
+    assert(fusion["cleanup_watermark_bucket_id"].GetInt64() == 12);
+
+    flowsql::baseline::ResetBaselineRuntimeConfig();
+    std::printf("[PASS] B7 relation fusion capacity cleanup\n");
+}
+
 void TestBootstrapUsesConfiguredEventCalendar() {
     std::printf("[TEST] B1 bootstrap uses configured event calendar...\n");
 
@@ -1604,6 +1779,22 @@ void TestB2RollingPredict() {
     assert(prediction.baseline_upper >= prediction.baseline_mu);
     assert(prediction.baseline_upper > prediction.baseline_lower);
     assert(prediction.band_z == 3.0);
+    const RollingPredictionSequence sequence =
+        task->PredictRolling("link-predict", 101, 3);
+    assert(sequence.status == BaselineStatus::kOk);
+    assert(sequence.series_key == "link-predict");
+    assert(sequence.start_bucket_id == 101);
+    assert(sequence.point_count == 3);
+    assert(sequence.predictions.size() == 3);
+    assert(sequence.predictions[0].bucket_id == 101);
+    assert(sequence.predictions[1].bucket_id == 102);
+    assert(sequence.predictions[2].bucket_id == 103);
+    assert(sequence.predictions[0].status == BaselineStatus::kOk);
+    assert(sequence.predictions[1].status == BaselineStatus::kOk);
+    assert(sequence.predictions[2].status == BaselineStatus::kOk);
+    const RollingPredictionSequence empty_sequence =
+        task->PredictRolling("link-predict", 101, 0);
+    assert(empty_sequence.status == BaselineStatus::kInvalidArgument);
 
     ValueRollingObservation second = first;
     second.bucket_id = 101;
@@ -1632,6 +1823,12 @@ void TestB2RollingPredict() {
     assert(ratio_prediction.baseline_lower <= ratio_prediction.baseline_mu);
     assert(ratio_prediction.baseline_upper >= ratio_prediction.baseline_mu);
     assert(ratio_prediction.band_z == 3.0);
+    const RollingPredictionSequence ratio_sequence =
+        ratio_task->PredictRolling("ratio-predict", 101, 2);
+    assert(ratio_sequence.status == BaselineStatus::kOk);
+    assert(ratio_sequence.predictions.size() == 2);
+    assert(ratio_sequence.predictions[0].bucket_id == 101);
+    assert(ratio_sequence.predictions[1].bucket_id == 102);
 
     std::printf("[PASS] B2 rolling predict\n");
 }
@@ -2017,5 +2214,7 @@ int main() {
     TestB4RelationSubmitObservation();
     TestB4RelationRollingConfigSwitches();
     TestB5RelationFusionSubmitAndSnapshot();
+    TestB7RelationFusionStateCleanup();
+    TestB7RelationFusionStateCapacityCleanup();
     return 0;
 }

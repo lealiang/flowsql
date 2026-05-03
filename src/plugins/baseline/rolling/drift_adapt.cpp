@@ -11,13 +11,11 @@
 #include <algorithm>
 #include <cmath>
 
+#include "plugins/baseline/rolling/math_utils.h"
+
 namespace flowsql {
 namespace baseline {
 namespace {
-
-double Clamp(double value, double lo, double hi) {
-    return std::max(lo, std::min(hi, value));
-}
 
 double PickSignedDominant(double signed_a, double signed_b) {
     return std::fabs(signed_a) >= std::fabs(signed_b) ? signed_a : signed_b;

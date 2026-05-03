@@ -53,11 +53,20 @@ class BaselineRatioTask final : public IBaselineRatioTask, public BaselineTaskBa
     RollingPrediction PredictRolling(
         std::string_view series_key,
         int64_t bucket_id) const override;
+    RollingPredictionSequence PredictRolling(
+        std::string_view series_key,
+        int64_t start_bucket_id,
+        uint32_t point_count) const override;
 
     BootstrapTrainResult Bootstrap(const RatioBootstrapInput& input) override;
     BootstrapPrediction PredictBootstrap(
         std::string_view series_key,
         int64_t bucket_id,
+        const BootstrapPredictionOptions& options) const override;
+    BootstrapPredictionSequence PredictBootstrap(
+        std::string_view series_key,
+        int64_t start_bucket_id,
+        uint32_t point_count,
         const BootstrapPredictionOptions& options) const override;
     BaselineSerializationResult ExportBootstrapArtifact(
         BaselineSerializationFormat format) const override;

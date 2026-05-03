@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cmath>
 #include <string>
+#include <type_traits>
 
 #include <plugins/baseline/rolling/observation_adapter.h>
 #include <plugins/baseline/rolling/rolling_state.h>
@@ -21,6 +22,13 @@ namespace {
 void AssertNear(double actual, double expected) {
     assert(std::fabs(actual - expected) < 1.0e-12);
 }
+
+template <typename T, typename = void>
+struct HasLegacyConfidenceField : std::false_type {};
+
+template <typename T>
+struct HasLegacyConfidenceField<T, std::void_t<decltype(std::declval<T>().confidence)>>
+    : std::true_type {};
 
 BaselineRollingConfig BuildConfig() {
     BaselineRollingConfig config;
@@ -90,6 +98,7 @@ BootstrapSeed BuildValueSeed() {
 }
 
 void TestBuildEmptyRollingState() {
+    static_assert(!HasLegacyConfidenceField<RollingState>::value);
     const BaselineRollingConfig config = BuildConfig();
     RollingState state;
     assert(BuildEmptyRollingState("link-a", config, &state) == BaselineStatus::kOk);
@@ -98,7 +107,7 @@ void TestBuildEmptyRollingState() {
     assert(state.state_status == RollingStateStatus::kColdLearning);
     AssertNear(state.sigma_init, config.sigma_floor);
     AssertNear(state.sigma, config.sigma_floor);
-    AssertNear(state.confidence, config.confidence_cold);
+    AssertNear(state.learning_confidence, config.confidence_cold);
     assert(state.theta.daily.sin_coeff.size() == 2);
     assert(state.theta.weekly.sin_coeff.size() == 1);
     AssertNear(state.p_level, 9.0 * config.sigma_floor * config.sigma_floor);
@@ -160,7 +169,7 @@ void TestBootstrapSeedInitialization() {
     assert(state.bootstrap_seed_status == BootstrapSeedStatus::kPartial);
     assert(state.daily_prior_quality == RollingSeasonalPriorQuality::kPartial);
     assert(state.weekly_prior_quality == RollingSeasonalPriorQuality::kPartial);
-    AssertNear(state.confidence, 0.8);
+    AssertNear(state.learning_confidence, 0.8);
     AssertNear(state.p_level, 0.72);
     AssertNear(state.p_trend, 1.92);
     AssertNear(state.theta.daily.sin_p[0], 0.64);

@@ -431,8 +431,6 @@ std::string BuildRuntimeConfigYaml(int32_t daily_harmonic_order,
     out << "    lambda_lwd: 1.0\n";
     out << "    lambda_event: 2.0\n";
     out << "  rolling_config:\n";
-    out << "    daily_harmonic_order: " << daily_harmonic_order << "\n";
-    out << "    weekly_harmonic_order: " << weekly_harmonic_order << "\n";
     out << "    band_z: " << kRollingBandZ << "\n";
     out << "  value_sampled_profiles:\n";
     out << "    cont_core:\n";

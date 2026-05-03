@@ -611,10 +611,12 @@ void AppendDiagnostic(const std::string& item, std::string* diagnostics) {
 
 BaselineStatus UpdateRelationFusion(const RelationFusionUpdateInput& input,
                                     RelationFusionRuntimeState* state,
-                                    RelationFusionResult* out) {
+                                    RelationFusionResult* out,
+                                    uint64_t* evicted_persistence_keys) {
     if (!state || !out || input.source_series_key.empty() || input.feature_base.empty()) {
         return BaselineStatus::kInvalidArgument;
     }
+    if (evicted_persistence_keys) *evicted_persistence_keys = 0;
 
     RelationFusionResult result;
     result.status = BaselineStatus::kOk;
@@ -633,9 +635,10 @@ BaselineStatus UpdateRelationFusion(const RelationFusionUpdateInput& input,
         return BaselineStatus::kOk;
     }
 
-    const std::unordered_map<std::string, uint32_t> previous =
-        state->persistence_by_evidence_dir;
+    uint64_t evicted_keys = 0;
     if (state->has_last_bucket && input.bucket_id > state->last_bucket_id + 1) {
+        evicted_keys +=
+            static_cast<uint64_t>(state->persistence_by_evidence_dir.size());
         state->persistence_by_evidence_dir.clear();
     }
 
@@ -669,6 +672,18 @@ BaselineStatus UpdateRelationFusion(const RelationFusionUpdateInput& input,
         expected.unavailable_reason = "summary_missing";
         expected_by_key.insert_or_assign(key, expected);
     }
+
+    for (auto it = state->persistence_by_evidence_dir.begin();
+         it != state->persistence_by_evidence_dir.end();) {
+        if (expected_by_key.find(it->first) == expected_by_key.end()) {
+            it = state->persistence_by_evidence_dir.erase(it);
+            ++evicted_keys;
+        } else {
+            ++it;
+        }
+    }
+    const std::unordered_map<std::string, uint32_t> previous =
+        state->persistence_by_evidence_dir;
 
     std::vector<RelationFusionSingleEvidence> evidence;
     evidence.reserve(expected_by_key.size());
@@ -716,10 +731,17 @@ BaselineStatus UpdateRelationFusion(const RelationFusionUpdateInput& input,
     if (result.single_risk == 0.0 && result.pattern_risk == 0.0) {
         AppendDiagnostic("relation_fusion_no_available_evidence", &result.diagnostics);
     }
+    if (input.config.fusion_persistence_max_keys_per_source > 0 &&
+        state->persistence_by_evidence_dir.size() >
+            input.config.fusion_persistence_max_keys_per_source) {
+        AppendDiagnostic("relation_fusion_persistence_key_cap_reached",
+                         &result.diagnostics);
+    }
 
     state->last_bucket_id = input.bucket_id;
     state->has_last_bucket = true;
     state->last_result = result;
+    if (evicted_persistence_keys) *evicted_persistence_keys = evicted_keys;
     *out = std::move(result);
     return BaselineStatus::kOk;
 }

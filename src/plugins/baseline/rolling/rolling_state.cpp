@@ -13,6 +13,7 @@
 #include <sstream>
 #include <string>
 
+#include "plugins/baseline/rolling/math_utils.h"
 #include "plugins/baseline/rolling/monthpos_state.h"
 
 namespace flowsql {
@@ -22,18 +23,6 @@ namespace {
 uint64_t ReadyHintThreshold(const BaselineRollingConfig& config) {
     return config.min_ready_hint_updates == 0 ? config.day_buckets
                                               : config.min_ready_hint_updates;
-}
-
-double CovarianceFloor(const BaselineRollingConfig& config) {
-    return config.p_floor_scale * config.sigma_floor * config.sigma_floor;
-}
-
-double CovarianceCap(const BaselineRollingConfig& config) {
-    return config.p_cap_scale * config.sigma_floor * config.sigma_floor;
-}
-
-double ClampCovariance(double value, const BaselineRollingConfig& config) {
-    return std::max(CovarianceFloor(config), std::min(CovarianceCap(config), value));
 }
 
 double SafeSigma(double sigma, const BaselineRollingConfig& config) {
@@ -115,12 +104,6 @@ double CoverageScale(double coverage_ratio) {
     const double denominator = std::max(coverage_ratio, 0.25);
     const double scale = denominator > 0.0 ? 1.0 / denominator : 4.0;
     return std::max(1.0, std::min(4.0, scale));
-}
-
-double ClampMultiplier(double value, const BaselineRollingConfig& config) {
-    if (!std::isfinite(value)) return 1.0;
-    return std::max(config.calibration_multiplier_min,
-                    std::min(config.calibration_multiplier_max, value));
 }
 
 bool HasEnabledComponent(const BootstrapSeed& seed, const char* name) {
@@ -404,7 +387,6 @@ BaselineStatus BuildEmptyRollingState(std::string_view series_key,
     ResizeHarmonicState(config.daily_harmonic_order, p_day, &state.theta.daily);
     ResizeHarmonicState(config.weekly_harmonic_order, p_week, &state.theta.weekly);
     InitializeB3Defaults(config, &state);
-    state.confidence = config.confidence_cold;
     state.state_status = RollingStateStatus::kColdLearning;
     *out = std::move(state);
     return BaselineStatus::kOk;
@@ -427,7 +409,6 @@ BaselineStatus InitializeEmptyRollingStateFromObservation(const ObservedModelPoi
     next.last_seen_bucket = point.bucket_id;
     next.accepted_update_count = 1;
     next.maturity_prior_update_count = 0;
-    next.confidence = config.confidence_cold;
     next.state_status = StatusFromAcceptedUpdateCount(next.accepted_update_count, config);
     next.maturity_status = RollingMaturityStatus::kColdLearning;
     next.learning_confidence = config.confidence_cold;
@@ -517,9 +498,9 @@ BaselineStatus InitializeRollingStateFromBootstrapSeed(const BaselineTaskSpec& s
             ? seed.maturity_init.accepted_count - state.accepted_update_count
             : 0;
     state.state_status = StatusFromAcceptedUpdateCount(state.accepted_update_count, config);
-    state.confidence = std::min(seed.maturity_init.confidence, config.confidence_ready_hint_cap);
     state.maturity_status = SeedMaturityStatus(seed, config);
-    state.learning_confidence = state.confidence;
+    state.learning_confidence =
+        std::min(seed.maturity_init.confidence, config.confidence_ready_hint_cap);
     state.score_trust_status =
         MaturityAtLeast(state.maturity_status, RollingMaturityStatus::kLevelReady)
             ? ScoreTrustStatus::kScoreWarming
@@ -531,7 +512,8 @@ BaselineStatus InitializeRollingStateFromBootstrapSeed(const BaselineTaskSpec& s
     state.calibration_status = RollingCalibrationStatus::kWarming;
     state.detection_band_multiplier =
         ClampMultiplier(seed.uncertainty_init.band_z / std::max(config.band_z, 1.0e-12),
-                        config);
+                        config,
+                        1.0);
     state.residual_scale_ewma =
         state.detection_band_multiplier * state.detection_band_multiplier;
     state.coverage_ewma = 1.0;

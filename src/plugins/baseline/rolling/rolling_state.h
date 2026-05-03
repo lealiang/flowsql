@@ -123,7 +123,6 @@ struct RollingState {
     int64_t last_seen_bucket = 0;
     uint64_t accepted_update_count = 0;
     uint64_t maturity_prior_update_count = 0;
-    double confidence = 0.0;
     double learning_confidence = 0.0;
     double score_confidence = 0.0;
     double effective_confidence = 0.0;

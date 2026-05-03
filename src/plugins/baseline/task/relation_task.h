@@ -87,6 +87,10 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
     void RebuildRuntimeFromRelationSeeds();
     RelationBasisRuntimeConfig MakeBasisRuntimeConfig() const;
     RelationFusionRuntimeConfig MakeFusionRuntimeConfig() const;
+    bool IsFusionStateExpired(const RelationFusionRuntimeState& state) const;
+    void MaybeCleanupFusionStates(std::string_view current_source,
+                                  bool make_room_for_current_source);
+    void ResetFusionCleanupRuntime();
 
     RelationTaskCreateSpec spec_;
     std::shared_ptr<const CompiledEventCalendar> compiled_event_calendar_;
@@ -98,6 +102,15 @@ class BaselineRelationTask final : public IBaselineRelationTask, public Baseline
     std::vector<std::unique_ptr<RelationRoutedRuntimeShard>> routed_shards_;
     RelationBasisStateMap basis_states_;
     std::unordered_map<std::string, RelationFusionRuntimeState> fusion_states_;
+    uint64_t fusion_update_seq_ = 0;
+    std::size_t fusion_cleanup_bucket_cursor_ = 0;
+    uint64_t fusion_state_evicted_total_ = 0;
+    uint64_t fusion_state_evicted_ttl_total_ = 0;
+    uint64_t fusion_state_evicted_capacity_total_ = 0;
+    uint64_t fusion_persistence_key_evicted_total_ = 0;
+    uint64_t fusion_cleanup_last_scan_count_ = 0;
+    uint64_t fusion_cleanup_last_evicted_count_ = 0;
+    int64_t fusion_cleanup_watermark_bucket_id_ = 0;
 };
 
 }  // namespace baseline

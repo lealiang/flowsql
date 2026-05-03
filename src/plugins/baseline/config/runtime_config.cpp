@@ -56,16 +56,6 @@ struct RuntimeConfigState {
 
 SharedProfileConfig BuildDefaultSharedProfileConfigRaw() {
     SharedProfileConfig config;
-    config.k_day = 6;
-    config.k_week = 3;
-    config.dme_max = 7;
-    config.m_month_enable = 4;
-    config.month_cov_min = 0.8;
-    config.lambda_season = 1.0;
-    config.lambda_dom = 4.0;
-    config.lambda_dme = 2.0;
-    config.lambda_lwd = 1.0;
-    config.lambda_event = 2.0;
     return config;
 }
 
@@ -149,8 +139,6 @@ void ParseOptionalScalar(const YAML::Node& node, const char* key, T* out) {
 
 void ParseSharedProfileConfig(const YAML::Node& node, SharedProfileConfig* out) {
     if (!node || !out) return;
-    ParseOptionalScalar(node, "k_day", &out->k_day);
-    ParseOptionalScalar(node, "k_week", &out->k_week);
     ParseOptionalScalar(node, "daily_harmonic_order", &out->k_day);
     ParseOptionalScalar(node, "weekly_harmonic_order", &out->k_week);
     ParseOptionalScalar(node, "dme_max", &out->dme_max);
@@ -251,8 +239,6 @@ void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
     ParseOptionalScalar(node, "z_downweight", &out->z_downweight);
     ParseOptionalScalar(node, "z_skip", &out->z_skip);
     ParseOptionalScalar(node, "small_update_weight", &out->small_update_weight);
-    ParseOptionalScalar(node, "daily_harmonic_order", &out->daily_harmonic_order);
-    ParseOptionalScalar(node, "weekly_harmonic_order", &out->weekly_harmonic_order);
     ParseOptionalScalar(node, "level_learning_scale", &out->level_learning_scale);
     ParseOptionalScalar(node, "day_learning_scale", &out->day_learning_scale);
     ParseOptionalScalar(node, "week_learning_scale", &out->week_learning_scale);
@@ -452,6 +438,21 @@ void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
             ParseOptionalScalar(fusion,
                                 "dominant_pattern_cap",
                                 &relation_fusion.dominant_pattern_cap);
+            ParseOptionalScalar(fusion,
+                                "fusion_state_ttl_buckets",
+                                &relation_fusion.fusion_state_ttl_buckets);
+            ParseOptionalScalar(fusion,
+                                "fusion_state_max_sources",
+                                &relation_fusion.fusion_state_max_sources);
+            ParseOptionalScalar(fusion,
+                                "fusion_state_cleanup_interval_updates",
+                                &relation_fusion.fusion_state_cleanup_interval_updates);
+            ParseOptionalScalar(fusion,
+                                "fusion_state_cleanup_scan_limit",
+                                &relation_fusion.fusion_state_cleanup_scan_limit);
+            ParseOptionalScalar(fusion,
+                                "fusion_persistence_max_keys_per_source",
+                                &relation_fusion.fusion_persistence_max_keys_per_source);
         }
     }
 }
@@ -572,9 +573,7 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
         return false;
     }
     if (!ValidateAllowedKeys(defaults["shared_profile_config"],
-                             {"k_day",
-                              "k_week",
-                              "daily_harmonic_order",
+                             {"daily_harmonic_order",
                               "weekly_harmonic_order",
                               "dme_max",
                               "m_month_enable",
@@ -659,7 +658,12 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                  "basic_pattern_weight",
                  "stable_head_pattern_weight",
                  "dominant_single_cap",
-                 "dominant_pattern_cap"},
+                 "dominant_pattern_cap",
+                 "fusion_state_ttl_buckets",
+                 "fusion_state_max_sources",
+                 "fusion_state_cleanup_interval_updates",
+                 "fusion_state_cleanup_scan_limit",
+                 "fusion_persistence_max_keys_per_source"},
                 "rolling_config.relation_rolling.relation_fusion",
                 err)) {
             return false;
@@ -677,8 +681,6 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                               "z_downweight",
                               "z_skip",
                               "small_update_weight",
-                              "daily_harmonic_order",
-                              "weekly_harmonic_order",
                               "level_learning_scale",
                               "day_learning_scale",
                               "week_learning_scale",
@@ -871,6 +873,45 @@ bool ValidateCalendarsSchema(const YAML::Node& calendars, std::string* err) {
     return true;
 }
 
+bool RejectLegacyHarmonicConfig(const YAML::Node& defaults, std::string* err) {
+    const YAML::Node shared = defaults["shared_profile_config"];
+    if (shared && shared.IsMap()) {
+        if (shared["k_day"]) {
+            if (err) {
+                *err = "shared_profile_config.k_day is no longer supported; "
+                       "use shared_profile_config.daily_harmonic_order";
+            }
+            return false;
+        }
+        if (shared["k_week"]) {
+            if (err) {
+                *err = "shared_profile_config.k_week is no longer supported; "
+                       "use shared_profile_config.weekly_harmonic_order";
+            }
+            return false;
+        }
+    }
+
+    const YAML::Node rolling = defaults["rolling_config"];
+    if (rolling && rolling.IsMap()) {
+        if (rolling["daily_harmonic_order"]) {
+            if (err) {
+                *err = "rolling_config.daily_harmonic_order is no longer supported; "
+                       "use shared_profile_config.daily_harmonic_order";
+            }
+            return false;
+        }
+        if (rolling["weekly_harmonic_order"]) {
+            if (err) {
+                *err = "rolling_config.weekly_harmonic_order is no longer supported; "
+                       "use shared_profile_config.weekly_harmonic_order";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ValidateRuntimeConfig(const RuntimeConfigState& cfg, std::string* err) {
     if (cfg.tz_default.empty()) {
         if (err) *err = "baseline.parser.tz_default must not be empty";
@@ -982,6 +1023,7 @@ bool ApplyYamlConfig(const YAML::Node& root,
         if (err) *err = "baseline must be an object";
         return false;
     }
+    if (!RejectLegacyHarmonicConfig(defaults, err)) return false;
     if (strict && !ValidateStrictDefaultsSchema(defaults, err)) return false;
 
     if (defaults["parser"]) {

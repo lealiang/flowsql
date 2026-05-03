@@ -21,17 +21,12 @@
 
 #include "plugins/baseline/relation/routed_summary.h"
 #include "plugins/baseline/rolling/rolling_config.h"
+#include "plugins/baseline/serialization/json_serialization.h"
 
 namespace flowsql {
 namespace baseline {
 
 namespace {
-
-template <typename Writer>
-void WriteStringField(Writer* writer, const char* name, const std::string& value) {
-    writer->Key(name);
-    writer->String(value.c_str());
-}
 
 void AppendDiagnostic(bool enabled, const std::string& item, std::string* diagnostics) {
     if (!enabled || !diagnostics || item.empty()) return;
@@ -370,8 +365,31 @@ BaselineSerializationResult BaselineRelationTask::QueryTaskSnapshot(
     writer.Bool(MakeFusionRuntimeConfig().enable_relation_fusion);
     writer.Key("source_state_count");
     writer.Uint64(fusion_source_state_count);
+    writer.Key("source_state_max");
+    writer.Uint64(relation_rolling_config_.relation_fusion.fusion_state_max_sources);
     writer.Key("persistence_state_count");
     writer.Uint64(fusion_persistence_state_count);
+    writer.Key("persistence_key_max_per_source");
+    writer.Uint64(
+        relation_rolling_config_.relation_fusion.fusion_persistence_max_keys_per_source);
+    writer.Key("state_evicted_total");
+    writer.Uint64(fusion_state_evicted_total_);
+    writer.Key("state_evicted_ttl_total");
+    writer.Uint64(fusion_state_evicted_ttl_total_);
+    writer.Key("state_evicted_capacity_total");
+    writer.Uint64(fusion_state_evicted_capacity_total_);
+    writer.Key("persistence_key_evicted_total");
+    writer.Uint64(fusion_persistence_key_evicted_total_);
+    writer.Key("cleanup_last_scan_count");
+    writer.Uint64(fusion_cleanup_last_scan_count_);
+    writer.Key("cleanup_last_evicted_count");
+    writer.Uint64(fusion_cleanup_last_evicted_count_);
+    writer.Key("cleanup_watermark_bucket_id");
+    writer.Int64(fusion_cleanup_watermark_bucket_id_);
+    writer.Key("cleanup_ttl_buckets");
+    writer.Uint64(relation_rolling_config_.relation_fusion.fusion_state_ttl_buckets);
+    writer.Key("cleanup_scan_limit");
+    writer.Uint64(relation_rolling_config_.relation_fusion.fusion_state_cleanup_scan_limit);
     writer.Key("pattern_count");
     writer.Uint(4);
     writer.EndObject();
@@ -568,6 +586,7 @@ void BaselineRelationTask::RebuildRuntimeFromRelationSeeds() {
         shard.routed_rolling_states.clear();
     }
     fusion_states_.clear();
+    ResetFusionCleanupRuntime();
 
     for (const auto& entry : seeds_by_series_) {
         const BootstrapSeed& seed = entry.second;
@@ -649,7 +668,99 @@ RelationFusionRuntimeConfig BaselineRelationTask::MakeFusionRuntimeConfig() cons
     config.stable_head_pattern_weight = fusion.stable_head_pattern_weight;
     config.dominant_single_cap = fusion.dominant_single_cap;
     config.dominant_pattern_cap = fusion.dominant_pattern_cap;
+    config.fusion_persistence_max_keys_per_source =
+        fusion.fusion_persistence_max_keys_per_source;
     return config;
+}
+
+bool BaselineRelationTask::IsFusionStateExpired(
+    const RelationFusionRuntimeState& state) const {
+    const uint64_t ttl = relation_rolling_config_.relation_fusion.fusion_state_ttl_buckets;
+    return state.has_last_bucket &&
+           fusion_cleanup_watermark_bucket_id_ > state.last_touched_bucket_id &&
+           static_cast<uint64_t>(fusion_cleanup_watermark_bucket_id_ -
+                                 state.last_touched_bucket_id) > ttl;
+}
+
+void BaselineRelationTask::MaybeCleanupFusionStates(
+    std::string_view current_source,
+    bool make_room_for_current_source) {
+    fusion_cleanup_last_scan_count_ = 0;
+    fusion_cleanup_last_evicted_count_ = 0;
+    if (fusion_states_.empty()) return;
+    const std::string current_key(current_source);
+
+    const auto& fusion_config = relation_rolling_config_.relation_fusion;
+    const uint64_t max_sources = fusion_config.fusion_state_max_sources;
+    const uint64_t target_size =
+        make_room_for_current_source && max_sources > 0 ? max_sources - 1 : max_sources;
+    const uint64_t scan_limit = fusion_config.fusion_state_cleanup_scan_limit;
+    const std::size_t bucket_count = fusion_states_.bucket_count();
+    if (bucket_count == 0 || scan_limit == 0) return;
+    if (fusion_cleanup_bucket_cursor_ >= bucket_count) {
+        fusion_cleanup_bucket_cursor_ = 0;
+    }
+
+    std::vector<std::string> expired_keys;
+    std::string oldest_key;
+    uint64_t oldest_update_seq = 0;
+    bool has_oldest = false;
+    std::size_t visited_buckets = 0;
+
+    while (fusion_cleanup_last_scan_count_ < scan_limit &&
+           visited_buckets < bucket_count) {
+        const std::size_t bucket = fusion_cleanup_bucket_cursor_;
+        fusion_cleanup_bucket_cursor_ = (fusion_cleanup_bucket_cursor_ + 1) % bucket_count;
+        ++visited_buckets;
+        for (auto it = fusion_states_.begin(bucket);
+             it != fusion_states_.end(bucket) &&
+             fusion_cleanup_last_scan_count_ < scan_limit;
+             ++it) {
+            ++fusion_cleanup_last_scan_count_;
+            if (it->first == current_key) continue;
+            if (IsFusionStateExpired(it->second)) {
+                expired_keys.push_back(it->first);
+                continue;
+            }
+            if (!has_oldest ||
+                it->second.last_touched_update_seq < oldest_update_seq) {
+                oldest_key = it->first;
+                oldest_update_seq = it->second.last_touched_update_seq;
+                has_oldest = true;
+            }
+        }
+    }
+
+    for (const std::string& key : expired_keys) {
+        const auto it = fusion_states_.find(key);
+        if (it == fusion_states_.end()) continue;
+        fusion_states_.erase(it);
+        ++fusion_state_evicted_total_;
+        ++fusion_state_evicted_ttl_total_;
+        ++fusion_cleanup_last_evicted_count_;
+    }
+
+    if (fusion_states_.size() > target_size && has_oldest) {
+        const auto it = fusion_states_.find(oldest_key);
+        if (it != fusion_states_.end() && it->first != current_key) {
+            fusion_states_.erase(it);
+            ++fusion_state_evicted_total_;
+            ++fusion_state_evicted_capacity_total_;
+            ++fusion_cleanup_last_evicted_count_;
+        }
+    }
+}
+
+void BaselineRelationTask::ResetFusionCleanupRuntime() {
+    fusion_update_seq_ = 0;
+    fusion_cleanup_bucket_cursor_ = 0;
+    fusion_state_evicted_total_ = 0;
+    fusion_state_evicted_ttl_total_ = 0;
+    fusion_state_evicted_capacity_total_ = 0;
+    fusion_persistence_key_evicted_total_ = 0;
+    fusion_cleanup_last_scan_count_ = 0;
+    fusion_cleanup_last_evicted_count_ = 0;
+    fusion_cleanup_watermark_bucket_id_ = 0;
 }
 
 RelationRollingResult BaselineRelationTask::SubmitObservation(
@@ -884,6 +995,19 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
     if (routed_enabled && fusion_config.enable_relation_fusion &&
         !fusion_metric_contexts.empty() &&
         (has_fusion_routed_inputs || !saw_valid_metric || has_existing_fusion_state)) {
+        if (obs.bucket_id > fusion_cleanup_watermark_bucket_id_) {
+            fusion_cleanup_watermark_bucket_id_ = obs.bucket_id;
+        }
+        const bool is_new_fusion_source =
+            fusion_states_.find(obs.series_key) == fusion_states_.end();
+        bool ran_pre_insert_cleanup = false;
+        if (is_new_fusion_source &&
+            fusion_states_.size() >=
+                relation_rolling_config_.relation_fusion.fusion_state_max_sources) {
+            MaybeCleanupFusionStates(obs.series_key, true);
+            ran_pre_insert_cleanup = true;
+        }
+
         RelationFusionUpdateInput fusion_update;
         fusion_update.source_series_key = obs.series_key;
         fusion_update.feature_base = feature_base;
@@ -894,12 +1018,37 @@ RelationRollingResult BaselineRelationTask::SubmitObservation(
 
         RelationFusionResult fusion_result;
         RelationFusionRuntimeState& fusion_state = fusion_states_[obs.series_key];
+        uint64_t evicted_persistence_keys = 0;
         const BaselineStatus fusion_status =
-            UpdateRelationFusion(fusion_update, &fusion_state, &fusion_result);
+            UpdateRelationFusion(fusion_update,
+                                 &fusion_state,
+                                 &fusion_result,
+                                 &evicted_persistence_keys);
+        fusion_persistence_key_evicted_total_ += evicted_persistence_keys;
         if (fusion_status != BaselineStatus::kOk) {
+            if (is_new_fusion_source && !fusion_state.has_last_bucket &&
+                fusion_state.persistence_by_evidence_dir.empty()) {
+                fusion_states_.erase(obs.series_key);
+            }
             AppendDiagnostic(options.include_diagnostics,
                              "relation_fusion_update_failed",
                              &result.diagnostics);
+        } else if (fusion_state.has_last_bucket &&
+                   fusion_state.last_bucket_id == obs.bucket_id) {
+            fusion_state.last_touched_bucket_id = obs.bucket_id;
+            fusion_state.last_touched_update_seq = ++fusion_update_seq_;
+            const bool over_capacity =
+                fusion_states_.size() >
+                relation_rolling_config_.relation_fusion.fusion_state_max_sources;
+            const bool interval_due =
+                fusion_update_seq_ %
+                    relation_rolling_config_.relation_fusion
+                        .fusion_state_cleanup_interval_updates ==
+                0;
+            if (over_capacity || (interval_due && !ran_pre_insert_cleanup)) {
+                MaybeCleanupFusionStates(obs.series_key,
+                                         over_capacity);
+            }
         }
         if (options.include_fusion_result &&
             has_fusion_routed_inputs &&

@@ -45,12 +45,14 @@ BaselineStatus ValidateBaselineRollingConfig(const BaselineRollingConfig& config
                                              std::string* err) {
     if (config.n_min_score == 0 ||
         config.n_min_update < config.n_min_score ||
-        config.n_ref == 0) {
+        config.n_ref == 0 ||
+        config.n_ref < config.n_min_score) {
         return Invalid(err, "rolling_config sampled value thresholds are invalid");
     }
     if (config.d_min_score == 0 ||
         config.d_min_update < config.d_min_score ||
-        config.d_ref == 0) {
+        config.d_ref == 0 ||
+        config.d_ref < config.d_min_score) {
         return Invalid(err, "rolling_config ratio denominator thresholds are invalid");
     }
     if (!Positive(config.sample_count_noise) ||
@@ -196,7 +198,14 @@ BaselineStatus ValidateBaselineRollingConfig(const BaselineRollingConfig& config
         !UnitClosed(fusion.basic_pattern_weight) ||
         !UnitClosed(fusion.stable_head_pattern_weight) ||
         fusion.dominant_single_cap == 0 ||
-        fusion.dominant_pattern_cap == 0) {
+        fusion.dominant_pattern_cap == 0 ||
+        fusion.fusion_state_ttl_buckets == 0 ||
+        fusion.fusion_state_max_sources == 0 ||
+        fusion.fusion_state_cleanup_interval_updates == 0 ||
+        fusion.fusion_state_cleanup_scan_limit == 0 ||
+        fusion.fusion_state_cleanup_scan_limit > fusion.fusion_state_max_sources ||
+        fusion.fusion_persistence_max_keys_per_source == 0 ||
+        fusion.fusion_persistence_max_keys_per_source < fusion.dominant_single_cap) {
         return Invalid(err,
                        "rolling_config.relation_rolling.relation_fusion fields are invalid");
     }
@@ -216,6 +225,9 @@ BaselineStatus ResolveBaselineRollingConfig(const BaselineTaskSpec& spec,
 
     BaselineRollingConfig config = DefaultBaselineRollingConfig();
     (void)TryGetBaselineRollingConfigOverride(&config);
+    const SharedProfileConfig shared_config = DefaultSharedProfileConfig();
+    config.daily_harmonic_order = shared_config.k_day;
+    config.weekly_harmonic_order = shared_config.k_week;
 
     config.bucket_seconds =
         spec.clock_spec.bucket_seconds > 0 ? spec.clock_spec.bucket_seconds : spec.delta;

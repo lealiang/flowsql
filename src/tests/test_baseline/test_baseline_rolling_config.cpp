@@ -67,6 +67,7 @@ void TestRollingConfigDefaultsAndDerivedBuckets() {
     AssertNear(config.level_shift_cusum_decay, 0.98);
     AssertNear(config.level_shift_cusum_threshold, 16.0);
     assert(config.level_ready_min_updates == 30);
+    assert(config.min_warming_updates == 10);
     assert(config.score_warming_min_updates == 60);
     assert(config.score_ready_min_updates == 240);
     assert(config.calibration_warmup_min_updates == 60);
@@ -96,6 +97,11 @@ void TestRollingConfigDefaultsAndDerivedBuckets() {
     AssertNear(config.relation_rolling.relation_fusion.fusion_degraded_weight, 0.25);
     assert(config.relation_rolling.relation_fusion.dominant_single_cap == 3);
     assert(config.relation_rolling.relation_fusion.dominant_pattern_cap == 2);
+    assert(config.relation_rolling.relation_fusion.fusion_state_ttl_buckets == 20160);
+    assert(config.relation_rolling.relation_fusion.fusion_state_max_sources == 4096);
+    assert(config.relation_rolling.relation_fusion.fusion_state_cleanup_interval_updates == 512);
+    assert(config.relation_rolling.relation_fusion.fusion_state_cleanup_scan_limit == 256);
+    assert(config.relation_rolling.relation_fusion.fusion_persistence_max_keys_per_source == 512);
 
     BootstrapSeedQualityConfig seed_quality;
     assert(TryGetBootstrapSeedQualityConfigOverride(&seed_quality));
@@ -114,8 +120,8 @@ baseline:
   parser:
     tz_default: "Asia/Shanghai"
   shared_profile_config:
-    daily_harmonic_order: 6
-    weekly_harmonic_order: 3
+    daily_harmonic_order: 4
+    weekly_harmonic_order: 2
     dme_max: 7
     m_month_enable: 4
     month_cov_min: 0.8
@@ -139,8 +145,6 @@ baseline:
     d_min_score: 12
     d_min_update: 120
     d_ref: 120
-    daily_harmonic_order: 4
-    weekly_harmonic_order: 2
     band_z: 2.5
     forecast_band_z: 3.5
     sigma_floor: 0.07
@@ -210,6 +214,11 @@ baseline:
         stable_head_pattern_weight: 0.80
         dominant_single_cap: 4
         dominant_pattern_cap: 3
+        fusion_state_ttl_buckets: 64
+        fusion_state_max_sources: 8
+        fusion_state_cleanup_interval_updates: 2
+        fusion_state_cleanup_scan_limit: 4
+        fusion_persistence_max_keys_per_source: 32
   value_sampled_profiles:
     cont_core:
       n_train_min: 50
@@ -316,6 +325,11 @@ baseline:
     AssertNear(config.relation_rolling.relation_fusion.stable_head_pattern_weight, 0.80);
     assert(config.relation_rolling.relation_fusion.dominant_single_cap == 4);
     assert(config.relation_rolling.relation_fusion.dominant_pattern_cap == 3);
+    assert(config.relation_rolling.relation_fusion.fusion_state_ttl_buckets == 64);
+    assert(config.relation_rolling.relation_fusion.fusion_state_max_sources == 8);
+    assert(config.relation_rolling.relation_fusion.fusion_state_cleanup_interval_updates == 2);
+    assert(config.relation_rolling.relation_fusion.fusion_state_cleanup_scan_limit == 4);
+    assert(config.relation_rolling.relation_fusion.fusion_persistence_max_keys_per_source == 32);
     BootstrapSeedQualityConfig seed_quality;
     assert(TryGetBootstrapSeedQualityConfigOverride(&seed_quality));
     AssertNear(seed_quality.full_min_coverage_ratio, 0.85);
@@ -323,6 +337,68 @@ baseline:
     assert(seed_quality.weekly_min_span_days == 10);
     AssertNear(seed_quality.weekly_phase_coverage_ratio, 0.55);
 
+    ResetBaselineRuntimeConfig();
+}
+
+void TestRollingConfigRejectsLegacyHarmonicOverride() {
+    const std::string rolling_config_path =
+        "/tmp/flowsql_baseline_rolling_config_legacy_rolling_harmonic.yaml";
+    {
+        std::ofstream file(rolling_config_path);
+        file << R"(
+baseline:
+  parser:
+    tz_default: "Asia/Shanghai"
+  shared_profile_config:
+    daily_harmonic_order: 6
+    weekly_harmonic_order: 3
+  rolling_config:
+    daily_harmonic_order: 4
+    weekly_harmonic_order: 2
+)";
+        assert(file.good());
+    }
+
+    ResetBaselineRuntimeConfig();
+    std::string err;
+    assert(LoadBaselineRuntimeConfigFromYaml(rolling_config_path, true, &err) ==
+           error::BAD_REQUEST);
+    assert(err.find("rolling_config.daily_harmonic_order") != std::string::npos ||
+           err.find("rolling_config.weekly_harmonic_order") != std::string::npos);
+    ResetBaselineRuntimeConfig();
+
+    err.clear();
+    assert(LoadBaselineRuntimeConfigFromYaml(rolling_config_path, false, &err) ==
+           error::BAD_REQUEST);
+    assert(err.find("rolling_config.daily_harmonic_order") != std::string::npos ||
+           err.find("rolling_config.weekly_harmonic_order") != std::string::npos);
+    ResetBaselineRuntimeConfig();
+
+    const std::string shared_config_path =
+        "/tmp/flowsql_baseline_rolling_config_legacy_shared_harmonic.yaml";
+    {
+        std::ofstream file(shared_config_path);
+        file << R"(
+baseline:
+  shared_profile_config:
+    k_day: 6
+    k_week: 3
+)";
+        assert(file.good());
+    }
+
+    err.clear();
+    assert(LoadBaselineRuntimeConfigFromYaml(shared_config_path, true, &err) ==
+           error::BAD_REQUEST);
+    assert(err.find("shared_profile_config.k_day") != std::string::npos ||
+           err.find("shared_profile_config.k_week") != std::string::npos);
+    ResetBaselineRuntimeConfig();
+
+    err.clear();
+    assert(LoadBaselineRuntimeConfigFromYaml(shared_config_path, false, &err) ==
+           error::BAD_REQUEST);
+    assert(err.find("shared_profile_config.k_day") != std::string::npos ||
+           err.find("shared_profile_config.k_week") != std::string::npos);
     ResetBaselineRuntimeConfig();
 }
 
@@ -377,6 +453,66 @@ baseline:
     assert(LoadBaselineRuntimeConfigFromYaml(config_path, true, &err) == error::BAD_REQUEST);
     assert(err.find("z_skip") != std::string::npos);
     ResetBaselineRuntimeConfig();
+
+    const std::string invalid_value_ref_path =
+        "/tmp/flowsql_baseline_rolling_config_invalid_value_ref.yaml";
+    {
+        std::ofstream file(invalid_value_ref_path);
+        file << R"(
+baseline:
+  rolling_config:
+    n_min_score: 10
+    n_ref: 5
+)";
+        assert(file.good());
+    }
+
+    err.clear();
+    assert(LoadBaselineRuntimeConfigFromYaml(invalid_value_ref_path, false, &err) ==
+           error::BAD_REQUEST);
+    assert(err.find("sampled value thresholds") != std::string::npos);
+    ResetBaselineRuntimeConfig();
+
+    const std::string invalid_ratio_ref_path =
+        "/tmp/flowsql_baseline_rolling_config_invalid_ratio_ref.yaml";
+    {
+        std::ofstream file(invalid_ratio_ref_path);
+        file << R"(
+baseline:
+  rolling_config:
+    d_min_score: 100
+    d_ref: 50
+)";
+        assert(file.good());
+    }
+
+    err.clear();
+    assert(LoadBaselineRuntimeConfigFromYaml(invalid_ratio_ref_path, false, &err) ==
+           error::BAD_REQUEST);
+    assert(err.find("ratio denominator thresholds") != std::string::npos);
+    ResetBaselineRuntimeConfig();
+}
+
+void TestRollingConfigRejectsInvalidRelationFusionCleanup() {
+    const std::string config_path =
+        "/tmp/flowsql_baseline_rolling_config_invalid_fusion_cleanup.yaml";
+    {
+        std::ofstream file(config_path);
+        file << R"(
+baseline:
+  rolling_config:
+    relation_rolling:
+      relation_fusion:
+        fusion_state_max_sources: 0
+)";
+        assert(file.good());
+    }
+
+    std::string err;
+    assert(LoadBaselineRuntimeConfigFromYaml(config_path, false, &err) ==
+           error::BAD_REQUEST);
+    assert(err.find("relation_fusion") != std::string::npos);
+    ResetBaselineRuntimeConfig();
 }
 
 void TestRollingConfigTemplateCanBeLoadedStrictly() {
@@ -414,6 +550,11 @@ void TestRollingConfigTemplateCanBeLoadedStrictly() {
     AssertNear(config.calibration_multiplier_max, 6.0);
     AssertNear(config.detection_band_std_cap, 0.5);
     AssertNear(config.monthpos_ready_coverage_ratio, 0.60);
+    assert(config.relation_rolling.relation_fusion.fusion_state_ttl_buckets == 20160);
+    assert(config.relation_rolling.relation_fusion.fusion_state_max_sources == 4096);
+    assert(config.relation_rolling.relation_fusion.fusion_state_cleanup_interval_updates == 512);
+    assert(config.relation_rolling.relation_fusion.fusion_state_cleanup_scan_limit == 256);
+    assert(config.relation_rolling.relation_fusion.fusion_persistence_max_keys_per_source == 512);
     BootstrapSeedQualityConfig seed_quality;
     assert(TryGetBootstrapSeedQualityConfigOverride(&seed_quality));
     AssertNear(seed_quality.full_min_coverage_ratio, 0.90);
@@ -428,7 +569,9 @@ void TestRollingConfigTemplateCanBeLoadedStrictly() {
 int main() {
     TestRollingConfigDefaultsAndDerivedBuckets();
     TestRollingConfigRuntimeOverride();
+    TestRollingConfigRejectsLegacyHarmonicOverride();
     TestRollingConfigRejectsInvalidThresholds();
+    TestRollingConfigRejectsInvalidRelationFusionCleanup();
     TestRollingConfigTemplateCanBeLoadedStrictly();
     return 0;
 }

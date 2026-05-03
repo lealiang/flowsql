@@ -130,7 +130,7 @@ RollingMaturityStatus ComputeMaturity(const RollingState& state,
     return status;
 }
 
-void UpdateLegacyConfidence(const BaselineRollingConfig& config, RollingState* state) {
+void UpdateLearningConfidence(const BaselineRollingConfig& config, RollingState* state) {
     if (!state) return;
     if (MaturityAtLeast(state->maturity_status, RollingMaturityStatus::kWeeklyReady)) {
         state->learning_confidence = config.confidence_ready_hint_cap;
@@ -139,7 +139,6 @@ void UpdateLegacyConfidence(const BaselineRollingConfig& config, RollingState* s
     } else {
         state->learning_confidence = config.confidence_cold;
     }
-    state->confidence = state->learning_confidence;
     state->effective_confidence =
         std::min(state->learning_confidence, state->score_confidence);
 }
@@ -196,7 +195,7 @@ BaselineStatus UpdateMaturityEvidence(const ObservedModelPoint& point,
     } else if (state->monthpos_status == RollingMonthposStatus::kMonthlyReady) {
         state->monthpos_status = RollingMonthposStatus::kMonthlyWarming;
     }
-    UpdateLegacyConfidence(config, state);
+    UpdateLearningConfidence(config, state);
     return BaselineStatus::kOk;
 }
 

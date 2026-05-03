@@ -32,6 +32,11 @@ struct BaselineRelationFusionConfig {
     double stable_head_pattern_weight = 0.85;
     uint32_t dominant_single_cap = 3;
     uint32_t dominant_pattern_cap = 2;
+    uint64_t fusion_state_ttl_buckets = 20160;
+    uint64_t fusion_state_max_sources = 4096;
+    uint64_t fusion_state_cleanup_interval_updates = 512;
+    uint64_t fusion_state_cleanup_scan_limit = 256;
+    uint64_t fusion_persistence_max_keys_per_source = 512;
 };
 
 struct BaselineRelationRollingConfig {
@@ -53,11 +58,13 @@ struct BaselineRelationRollingConfig {
 };
 
 struct BaselineRollingConfig {
+    // n_min_score 是最低可评分样本量；n_ref 是达到满权重的样本量，必须 >= n_min_score。
     uint32_t n_min_score = 3;
     uint32_t n_min_update = 10;
     uint32_t n_ref = 10;
     double sample_count_noise = 1.0;
 
+    // d_min_score 是 ratio 最低可评分分母；d_ref 是达到满权重的分母，必须 >= d_min_score。
     uint32_t d_min_score = 10;
     uint32_t d_min_update = 100;
     uint32_t d_ref = 100;
@@ -67,8 +74,9 @@ struct BaselineRollingConfig {
     double z_skip = 5.0;
     double small_update_weight = 0.2;
 
-    int32_t daily_harmonic_order = 6;
-    int32_t weekly_harmonic_order = 3;
+    // Resolved from shared_profile_config by ResolveBaselineRollingConfig().
+    int32_t daily_harmonic_order = 0;
+    int32_t weekly_harmonic_order = 0;
 
     double level_learning_scale = 1.0;
     double day_learning_scale = 0.2;
@@ -97,6 +105,7 @@ struct BaselineRollingConfig {
     double p_trend_init_scale = 16.0;
     double p_day_init_scale = 4.0;
     double p_week_init_scale = 9.0;
+    // P floor/cap 的缩放基准是 sigma_floor^2，不随当前 sigma 动态变化。
     double p_floor_scale = 1.0e-6;
     double p_cap_scale = 1.0e6;
 
@@ -112,6 +121,7 @@ struct BaselineRollingConfig {
     double max_q_boost = 9.0;
     double skip_relax = 2.0;
 
+    // 0 表示自动派生；Resolve 后为 7 * day_buckets。
     uint64_t process_noise_gap_cap_buckets = 0;
 
     double alpha_sigma = 0.02;
@@ -123,7 +133,8 @@ struct BaselineRollingConfig {
     double confidence_cold = 0.2;
     double confidence_warming = 0.5;
     double confidence_ready_hint_cap = 0.8;
-    uint64_t min_warming_updates = 3;
+    uint64_t min_warming_updates = 10;
+    // 0 表示自动派生；Resolve 后为 day_buckets。
     uint64_t min_ready_hint_updates = 0;
 
     uint64_t level_ready_min_updates = 30;
@@ -140,6 +151,7 @@ struct BaselineRollingConfig {
     double calibration_multiplier_min = 1.0;
     double calibration_multiplier_max = 6.0;
 
+    // 覆盖率 bin 是周期覆盖统计的聚合粒度，默认等价于按小时统计日/周覆盖。
     uint32_t daily_coverage_bins = 24;
     uint32_t weekly_coverage_bins = 168;
     uint64_t daily_ready_min_days = 2;
@@ -147,6 +159,8 @@ struct BaselineRollingConfig {
     uint64_t weekly_ready_min_weeks = 2;
     double weekly_ready_coverage_ratio = 0.70;
 
+    // uncertainty scale 会以 sigma^2 为基准形成诊断方差，成熟度和缺失组件两类可叠加；
+    // 当前只进入 diagnostics/result 字段，不直接进入 detection band 方差。
     double maturity_uncertainty_cold_scale = 9.0;
     double maturity_uncertainty_warming_scale = 4.0;
     double maturity_uncertainty_drift_scale = 4.0;
@@ -155,6 +169,7 @@ struct BaselineRollingConfig {
     double missing_weekly_uncertainty_scale = 4.0;
     double level_only_extreme_z = 8.0;
     double detection_band_std_cap = 0.5;
+    // 0 表示自动派生；Resolve 后为 day_buckets。
     uint64_t forecast_trend_cap_buckets = 0;
 
     double monthpos_alpha = 0.005;

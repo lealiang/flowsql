@@ -1,5 +1,10 @@
 # Baseline config template
-# Source snapshot date: 2026-04-29
+# Source snapshot date: 2026-05-03
+#
+# This template lists the current baseline runtime configuration surface and
+# the default values still backed by C++ defaults. Task-derived runtime fields
+# such as bucket_seconds, timezone, day_buckets and week_buckets are intentionally
+# omitted because they come from each task clock_spec.
 #
 # Plugin load options:
 #   --option "config_file=/abs/path/to/baseline-config-template.yaml;strict=true"
@@ -82,6 +87,7 @@ baseline:
     tz_default: "Asia/Shanghai"
 
   shared_profile_config:
+    # Formal model shape. These are the business-level day/week harmonic orders.
     daily_harmonic_order: 6
     weekly_harmonic_order: 3
     dme_max: 7
@@ -94,6 +100,9 @@ baseline:
     lambda_event: 2.0
 
   bootstrap:
+    # Schema-reserved today. The current runtime parser consumes seed_quality;
+    # min_train_points, prediction_band and export_seed are kept visible here
+    # for the upcoming config ownership cleanup.
     min_train_points: 2
     seed_quality:
       full_min_coverage_ratio: 0.90
@@ -113,12 +122,14 @@ baseline:
 
   rolling_config:
     # value_sampled observation reliability
+    # n_min_score 是最低可评分样本量；n_ref 是达到满权重的样本量，必须 >= n_min_score。
     n_min_score: 3
     n_min_update: 10
     n_ref: 10
     sample_count_noise: 1.0
 
     # ratio observation reliability
+    # d_min_score 是最低可评分分母；d_ref 是达到满权重的分母，必须 >= d_min_score。
     d_min_score: 10
     d_min_update: 100
     d_ref: 100
@@ -128,10 +139,6 @@ baseline:
     z_downweight: 3.0
     z_skip: 5.0
     small_update_weight: 0.2
-
-    # harmonic model shape
-    daily_harmonic_order: 6
-    weekly_harmonic_order: 3
 
     # learning rate scales
     level_learning_scale: 1.0
@@ -143,29 +150,31 @@ baseline:
     full_seed_seasonal_scale: 0.1
     partial_seed_seasonal_scale: 0.5
     freeze_seeded_seasonal_on_drift: true
-    day_delta_coeff_max: 0.05
-    week_delta_coeff_max: 0.02
+    day_delta_coeff_max_scale: 0.05
+    week_delta_coeff_max_scale: 0.02
 
     # process noise scales in model space
-    Q_day: 1.0e-4
-    Q_week: 2.0e-5
-    Q_level: 1.0e-3
-    Q_trend: 1.0e-5
+    q_day_scale: 1.0e-4
+    q_week_scale: 2.0e-5
+    q_level_scale: 1.0e-3
+    q_trend_scale: 1.0e-5
+    # 0 表示自动派生为 7 * day_buckets。
     process_noise_gap_cap_buckets: 0
 
     # trend update controls
     trend_update_scale: 0.05
     cold_trend_update_scale: 0.0
-    trend_delta_max: 0.01
-    trend_abs_max: 0.1
+    trend_delta_max_scale: 0.01
+    trend_abs_max_scale: 0.1
 
     # covariance initialization and bounds
-    P_level_init: 9.0
-    P_trend_init: 16.0
-    P_day_init: 4.0
-    P_week_init: 9.0
-    P_floor: 1.0e-6
-    P_cap: 1.0e6
+    p_level_init_scale: 9.0
+    p_trend_init_scale: 16.0
+    p_day_init_scale: 4.0
+    p_week_init_scale: 9.0
+    # P floor/cap 的缩放基准是 sigma_floor^2，不随当前 sigma 动态变化。
+    p_floor_scale: 1.0e-6
+    p_cap_scale: 1.0e6
 
     # drift evidence
     # alpha_short = 0.05 is about 20 buckets effective length;
@@ -195,7 +204,8 @@ baseline:
     confidence_cold: 0.2
     confidence_warming: 0.5
     confidence_ready_hint_cap: 0.8
-    min_warming_updates: 3
+    min_warming_updates: 10
+    # 0 表示自动派生为 day_buckets。
     min_ready_hint_updates: 0
     level_ready_min_updates: 30
 
@@ -212,13 +222,16 @@ baseline:
     calibration_multiplier_min: 1.0
     calibration_multiplier_max: 6.0
 
-    # component readiness and conservative detection band
+    # component readiness and diagnostic uncertainty
+    # daily/weekly coverage bins 默认按小时统计周期覆盖；分钟级覆盖可按 day_buckets/week_buckets 调大。
     daily_coverage_bins: 24
     weekly_coverage_bins: 168
     daily_ready_min_days: 2
     daily_ready_coverage_ratio: 0.75
     weekly_ready_min_weeks: 2
     weekly_ready_coverage_ratio: 0.70
+    # uncertainty scale 以 sigma^2 为基准形成诊断方差，成熟度和缺失组件两类可加法叠加；
+    # 当前只进入 diagnostics/result 字段，不直接进入 detection band 方差。
     maturity_uncertainty_cold_scale: 9.0
     maturity_uncertainty_warming_scale: 4.0
     maturity_uncertainty_drift_scale: 4.0
@@ -227,6 +240,7 @@ baseline:
     missing_weekly_uncertainty_scale: 4.0
     level_only_extreme_z: 8.0
     detection_band_std_cap: 0.5
+    # 0 表示自动派生为 day_buckets。
     forecast_trend_cap_buckets: 0
 
     # month position slow learning
@@ -264,6 +278,11 @@ baseline:
         stable_head_pattern_weight: 0.85
         dominant_single_cap: 3
         dominant_pattern_cap: 2
+        fusion_state_ttl_buckets: 20160
+        fusion_state_max_sources: 4096
+        fusion_state_cleanup_interval_updates: 512
+        fusion_state_cleanup_scan_limit: 256
+        fusion_persistence_max_keys_per_source: 512
 
   value_sampled_profiles:
     cont_core:

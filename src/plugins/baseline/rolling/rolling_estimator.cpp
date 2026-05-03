@@ -13,28 +13,13 @@
 #include <utility>
 
 #include "plugins/baseline/model/calendar_feature_helper.h"
+#include "plugins/baseline/rolling/math_utils.h"
 
 namespace flowsql {
 namespace baseline {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-
-double Clamp(double value, double lo, double hi) {
-    return std::max(lo, std::min(hi, value));
-}
-
-double CovarianceFloor(const BaselineRollingConfig& config) {
-    return config.p_floor_scale * config.sigma_floor * config.sigma_floor;
-}
-
-double CovarianceCap(const BaselineRollingConfig& config) {
-    return config.p_cap_scale * config.sigma_floor * config.sigma_floor;
-}
-
-double ClampCovariance(double value, const BaselineRollingConfig& config) {
-    return Clamp(value, CovarianceFloor(config), CovarianceCap(config));
-}
 
 double ProcessVariance(double q_scale,
                        double sigma,

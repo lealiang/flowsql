@@ -118,7 +118,19 @@ template <typename T, typename = void>
 struct HasValuePredictRolling : std::false_type {};
 
 template <typename T>
-struct HasValuePredictRolling<T, std::void_t<decltype(&T::PredictRolling)>>
+struct HasValuePredictRolling<
+    T,
+    std::void_t<decltype(static_cast<RollingPrediction (T::*)(
+        std::string_view, int64_t) const>(&T::PredictRolling))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasValuePredictRollingSequence : std::false_type {};
+
+template <typename T>
+struct HasValuePredictRollingSequence<
+    T,
+    std::void_t<decltype(static_cast<RollingPredictionSequence (T::*)(
+        std::string_view, int64_t, uint32_t) const>(&T::PredictRolling))>>
     : std::true_type {};
 
 template <typename T, typename = void>
@@ -151,7 +163,19 @@ template <typename T, typename = void>
 struct HasRatioPredictRolling : std::false_type {};
 
 template <typename T>
-struct HasRatioPredictRolling<T, std::void_t<decltype(&T::PredictRolling)>>
+struct HasRatioPredictRolling<
+    T,
+    std::void_t<decltype(static_cast<RollingPrediction (T::*)(
+        std::string_view, int64_t) const>(&T::PredictRolling))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasRatioPredictRollingSequence : std::false_type {};
+
+template <typename T>
+struct HasRatioPredictRollingSequence<
+    T,
+    std::void_t<decltype(static_cast<RollingPredictionSequence (T::*)(
+        std::string_view, int64_t, uint32_t) const>(&T::PredictRolling))>>
     : std::true_type {};
 
 template <typename T, typename = void>
@@ -248,8 +272,32 @@ void TestTaskHeaderContracts() {
             IBaselineService::*)(std::string_view, BaselineSerializationFormat);
     using ExpectedValuePredictRolling =
         RollingPrediction (IBaselineValueTask::*)(std::string_view, int64_t) const;
+    using ExpectedValuePredictRollingSequence =
+        RollingPredictionSequence (IBaselineValueTask::*)(
+            std::string_view, int64_t, uint32_t) const;
+    using ExpectedValuePredictBootstrap =
+        BootstrapPrediction (IBaselineValueTask::*)(
+            std::string_view, int64_t, const BootstrapPredictionOptions&) const;
+    using ExpectedValuePredictBootstrapSequence =
+        BootstrapPredictionSequence (IBaselineValueTask::*)(
+            std::string_view,
+            int64_t,
+            uint32_t,
+            const BootstrapPredictionOptions&) const;
     using ExpectedRatioPredictRolling =
         RollingPrediction (IBaselineRatioTask::*)(std::string_view, int64_t) const;
+    using ExpectedRatioPredictRollingSequence =
+        RollingPredictionSequence (IBaselineRatioTask::*)(
+            std::string_view, int64_t, uint32_t) const;
+    using ExpectedRatioPredictBootstrap =
+        BootstrapPrediction (IBaselineRatioTask::*)(
+            std::string_view, int64_t, const BootstrapPredictionOptions&) const;
+    using ExpectedRatioPredictBootstrapSequence =
+        BootstrapPredictionSequence (IBaselineRatioTask::*)(
+            std::string_view,
+            int64_t,
+            uint32_t,
+            const BootstrapPredictionOptions&) const;
     using ExpectedRelationSubmitObservation =
         RelationRollingResult (IBaselineRelationTask::*)(
             const RelationRollingObservation&, const RelationRollingSubmitOptions&);
@@ -266,10 +314,38 @@ void TestTaskHeaderContracts() {
                                  ExpectedCreateRatioTask>);
     static_assert(std::is_same_v<decltype(&IBaselineService::CreateRelationTask),
                                  ExpectedCreateRelationTask>);
-    static_assert(std::is_same_v<decltype(&IBaselineValueTask::PredictRolling),
-                                 ExpectedValuePredictRolling>);
-    static_assert(std::is_same_v<decltype(&IBaselineRatioTask::PredictRolling),
-                                 ExpectedRatioPredictRolling>);
+    static_assert(std::is_same_v<
+                  decltype(static_cast<ExpectedValuePredictRolling>(
+                      &IBaselineValueTask::PredictRolling)),
+                  ExpectedValuePredictRolling>);
+    static_assert(std::is_same_v<
+                  decltype(static_cast<ExpectedValuePredictRollingSequence>(
+                      &IBaselineValueTask::PredictRolling)),
+                  ExpectedValuePredictRollingSequence>);
+    static_assert(std::is_same_v<
+                  decltype(static_cast<ExpectedValuePredictBootstrap>(
+                      &IBaselineValueTask::PredictBootstrap)),
+                  ExpectedValuePredictBootstrap>);
+    static_assert(std::is_same_v<
+                  decltype(static_cast<ExpectedValuePredictBootstrapSequence>(
+                      &IBaselineValueTask::PredictBootstrap)),
+                  ExpectedValuePredictBootstrapSequence>);
+    static_assert(std::is_same_v<
+                  decltype(static_cast<ExpectedRatioPredictRolling>(
+                      &IBaselineRatioTask::PredictRolling)),
+                  ExpectedRatioPredictRolling>);
+    static_assert(std::is_same_v<
+                  decltype(static_cast<ExpectedRatioPredictRollingSequence>(
+                      &IBaselineRatioTask::PredictRolling)),
+                  ExpectedRatioPredictRollingSequence>);
+    static_assert(std::is_same_v<
+                  decltype(static_cast<ExpectedRatioPredictBootstrap>(
+                      &IBaselineRatioTask::PredictBootstrap)),
+                  ExpectedRatioPredictBootstrap>);
+    static_assert(std::is_same_v<
+                  decltype(static_cast<ExpectedRatioPredictBootstrapSequence>(
+                      &IBaselineRatioTask::PredictBootstrap)),
+                  ExpectedRatioPredictBootstrapSequence>);
     static_assert(std::is_same_v<decltype(&IBaselineRelationTask::SubmitObservation),
                                  ExpectedRelationSubmitObservation>);
     static_assert(std::is_same_v<decltype(&IBaselineRelationTask::PredictRoutedSummary),
@@ -285,18 +361,22 @@ void TestTaskHeaderContracts() {
     static_assert(!HasValueInitRollingFromBootstrap<IBaselineValueTask>::value);
     static_assert(HasValueSubmitObservation<IBaselineValueTask>::value);
     static_assert(HasValuePredictRolling<IBaselineValueTask>::value);
+    static_assert(HasValuePredictRollingSequence<IBaselineValueTask>::value);
     static_assert(!HasRatioInitRollingFromEmpty<IBaselineRatioTask>::value);
     static_assert(!HasRatioInitRollingFromBootstrap<IBaselineRatioTask>::value);
     static_assert(HasRatioSubmitObservation<IBaselineRatioTask>::value);
     static_assert(HasRatioPredictRolling<IBaselineRatioTask>::value);
+    static_assert(HasRatioPredictRollingSequence<IBaselineRatioTask>::value);
     static_assert(!HasValueInitRollingFromEmpty<IBaselineRelationTask>::value);
     static_assert(!HasValueInitRollingFromBootstrap<IBaselineRelationTask>::value);
     static_assert(!HasValueSubmitObservation<IBaselineRelationTask>::value);
     static_assert(!HasValuePredictRolling<IBaselineRelationTask>::value);
+    static_assert(!HasValuePredictRollingSequence<IBaselineRelationTask>::value);
     static_assert(!HasRatioInitRollingFromEmpty<IBaselineRelationTask>::value);
     static_assert(!HasRatioInitRollingFromBootstrap<IBaselineRelationTask>::value);
     static_assert(!HasRatioSubmitObservation<IBaselineRelationTask>::value);
     static_assert(!HasRatioPredictRolling<IBaselineRelationTask>::value);
+    static_assert(!HasRatioPredictRollingSequence<IBaselineRelationTask>::value);
     static_assert(!HasRelationSubmitBlock<IBaselineRelationTask>::value);
     static_assert(HasRelationSubmitObservation<IBaselineRelationTask>::value);
     static_assert(HasRelationPredictRoutedSummary<IBaselineRelationTask>::value);
@@ -318,6 +398,8 @@ void TestTaskHeaderContracts() {
     RelationRoutedSummaryQuery relation_query;
     RollingBaselineResult rolling_result;
     RollingPrediction rolling_prediction;
+    RollingPredictionSequence rolling_prediction_sequence;
+    BootstrapPredictionSequence bootstrap_prediction_sequence;
     assert(rolling_submit_options.allow_auto_init_from_bootstrap);
     assert(rolling_submit_options.allow_auto_init_from_empty);
     assert(value_obs.sample_count == 0);
@@ -333,6 +415,8 @@ void TestTaskHeaderContracts() {
     assert(relation_result.status == BaselineStatus::kOk);
     assert(relation_result.basis_version == 0);
     assert(!relation_result.basis_updated);
+    assert(rolling_prediction_sequence.point_count == 0);
+    assert(bootstrap_prediction_sequence.point_count == 0);
     assert(!relation_result.handover_active);
     assert(relation_result.routed_results.empty());
     assert(relation_query.basis_version == 0);

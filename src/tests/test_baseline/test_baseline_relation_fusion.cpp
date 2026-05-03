@@ -419,6 +419,78 @@ void TestRoutedInputsOutsideMetricUniverseAreIgnored() {
     std::printf("[PASS] Relation fusion ignores routed inputs outside metric universe\n");
 }
 
+void TestPersistencePrunesStaleEvidenceUniverse() {
+    std::printf("[TEST] Relation fusion prunes stale evidence universe...\n");
+
+    RelationFusionRuntimeConfig config;
+    config.dominant_single_cap = 20;
+    RelationFusionRuntimeState state;
+
+    RelationFusionUpdateInput first = BaseUpdate(100);
+    first.config = config;
+    first.metrics[0] = BasisMetricContext("bps");
+    first.routed_inputs.push_back(RoutedInput(first.source_series_key,
+                                             first.feature_base,
+                                             "bps",
+                                             "stable_headk_coverage",
+                                             5.0,
+                                             5.0,
+                                             "score_ready",
+                                             true,
+                                             0.8,
+                                             0.8,
+                                             true,
+                                             true,
+                                             1));
+    RelationFusionResult result;
+    uint64_t evicted = 0;
+    assert(UpdateRelationFusion(first, &state, &result, &evicted) ==
+           BaselineStatus::kOk);
+    assert(evicted == 0);
+    bool has_basis_one = false;
+    for (const auto& entry : state.persistence_by_evidence_dir) {
+        if (entry.first.find("::basis:1") != std::string::npos) {
+            has_basis_one = true;
+        }
+    }
+    assert(has_basis_one);
+
+    RelationFusionUpdateInput second = first;
+    second.bucket_id = 101;
+    second.metrics[0].basis_version = 2;
+    second.routed_inputs.clear();
+    second.routed_inputs.push_back(RoutedInput(second.source_series_key,
+                                              second.feature_base,
+                                              "bps",
+                                              "stable_headk_coverage",
+                                              5.0,
+                                              5.0,
+                                              "score_ready",
+                                              true,
+                                              0.8,
+                                              0.8,
+                                              true,
+                                              true,
+                                              2));
+    assert(UpdateRelationFusion(second, &state, &result, &evicted) ==
+           BaselineStatus::kOk);
+    assert(evicted > 0);
+    bool still_has_basis_one = false;
+    bool has_basis_two = false;
+    for (const auto& entry : state.persistence_by_evidence_dir) {
+        if (entry.first.find("::basis:1") != std::string::npos) {
+            still_has_basis_one = true;
+        }
+        if (entry.first.find("::basis:2") != std::string::npos) {
+            has_basis_two = true;
+        }
+    }
+    assert(!still_has_basis_one);
+    assert(has_basis_two);
+
+    std::printf("[PASS] Relation fusion prunes stale evidence universe\n");
+}
+
 }  // namespace
 
 int main() {
@@ -428,5 +500,6 @@ int main() {
     TestCrossMetricPatternUsesSaturatingUnion();
     TestNegativeEvidenceDrivesLegacyAndHeadPatterns();
     TestRoutedInputsOutsideMetricUniverseAreIgnored();
+    TestPersistencePrunesStaleEvidenceUniverse();
     return 0;
 }

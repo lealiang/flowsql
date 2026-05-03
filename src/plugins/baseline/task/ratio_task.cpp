@@ -8,6 +8,7 @@
 
 #include "ratio_task.h"
 
+#include <limits>
 #include <utility>
 
 #include "plugins/baseline/rolling/rolling_task_runner.h"
@@ -75,12 +76,45 @@ RollingBaselineResult BaselineRatioTask::SubmitObservation(
 RollingPrediction BaselineRatioTask::PredictRolling(std::string_view series_key,
                                                     int64_t bucket_id) const {
     RollingPrediction result;
+    result.series_key = std::string(series_key);
+    result.bucket_id = bucket_id;
     const BaselineStatus status = EnsureOpen();
     if (status != BaselineStatus::kOk) {
         result.status = status;
         return result;
     }
     return PredictRollingForSeries(spec_, seeds_by_series_, rolling_states_, series_key, bucket_id);
+}
+
+RollingPredictionSequence BaselineRatioTask::PredictRolling(
+    std::string_view series_key,
+    int64_t start_bucket_id,
+    uint32_t point_count) const {
+    RollingPredictionSequence sequence;
+    sequence.series_key = std::string(series_key);
+    sequence.start_bucket_id = start_bucket_id;
+    sequence.point_count = point_count;
+    if (point_count == 0) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
+    }
+    if (start_bucket_id > std::numeric_limits<int64_t>::max() -
+                              static_cast<int64_t>(point_count - 1)) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
+    }
+
+    sequence.predictions.reserve(point_count);
+    for (uint32_t i = 0; i < point_count; ++i) {
+        RollingPrediction prediction =
+            PredictRolling(series_key, start_bucket_id + static_cast<int64_t>(i));
+        if (sequence.status == BaselineStatus::kOk &&
+            prediction.status != BaselineStatus::kOk) {
+            sequence.status = prediction.status;
+        }
+        sequence.predictions.push_back(std::move(prediction));
+    }
+    return sequence;
 }
 
 BootstrapTrainResult BaselineRatioTask::Bootstrap(const RatioBootstrapInput& input) {
@@ -138,6 +172,40 @@ BootstrapPrediction BaselineRatioTask::PredictBootstrap(
     }
     return bootstrap_engine_.PredictRatio(
         *artifact, bucket_id, options, &spec_, compiled_event_calendar_.get());
+}
+
+BootstrapPredictionSequence BaselineRatioTask::PredictBootstrap(
+    std::string_view series_key,
+    int64_t start_bucket_id,
+    uint32_t point_count,
+    const BootstrapPredictionOptions& options) const {
+    BootstrapPredictionSequence sequence;
+    sequence.series_key = std::string(series_key);
+    sequence.start_bucket_id = start_bucket_id;
+    sequence.point_count = point_count;
+    if (point_count == 0) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
+    }
+    if (start_bucket_id > std::numeric_limits<int64_t>::max() -
+                              static_cast<int64_t>(point_count - 1)) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
+    }
+
+    sequence.predictions.reserve(point_count);
+    for (uint32_t i = 0; i < point_count; ++i) {
+        BootstrapPrediction prediction =
+            PredictBootstrap(series_key,
+                             start_bucket_id + static_cast<int64_t>(i),
+                             options);
+        if (sequence.status == BaselineStatus::kOk &&
+            prediction.status != BaselineStatus::kOk) {
+            sequence.status = prediction.status;
+        }
+        sequence.predictions.push_back(std::move(prediction));
+    }
+    return sequence;
 }
 
 BaselineSerializationResult BaselineRatioTask::ExportBootstrapArtifact(

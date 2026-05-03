@@ -30,6 +30,7 @@
 #include "plugins/baseline/rolling/rolling_estimator.h"
 #include "plugins/baseline/rolling/score_trust.h"
 #include "plugins/baseline/rolling/update_gate.h"
+#include "plugins/baseline/serialization/json_serialization.h"
 
 namespace flowsql {
 namespace baseline {
@@ -44,17 +45,7 @@ double Sigmoid(double value) {
     return e / (1.0 + e);
 }
 
-double ModelToObservedLower(const BaselineTaskSpec& spec, double value) {
-    if (spec.feature_type == "ratio") return Sigmoid(value);
-    return std::max(0.0, std::expm1(value));
-}
-
-double ModelToObservedUpper(const BaselineTaskSpec& spec, double value) {
-    if (spec.feature_type == "ratio") return Sigmoid(value);
-    return std::max(0.0, std::expm1(value));
-}
-
-double ModelToObservedMu(const BaselineTaskSpec& spec, double value) {
+double ModelToObservedValue(const BaselineTaskSpec& spec, double value) {
     if (spec.feature_type == "ratio") return Sigmoid(value);
     return std::max(0.0, std::expm1(value));
 }
@@ -139,9 +130,9 @@ void FillResultFromDetectionBand(const BaselineTaskSpec& spec,
     result->model_mu = band.detection_mu;
     result->model_lower = band.model_lower;
     result->model_upper = band.model_upper;
-    result->baseline_mu = ModelToObservedMu(spec, band.detection_mu);
-    result->baseline_lower = ModelToObservedLower(spec, band.model_lower);
-    result->baseline_upper = ModelToObservedUpper(spec, band.model_upper);
+    result->baseline_mu = ModelToObservedValue(spec, band.detection_mu);
+    result->baseline_lower = ModelToObservedValue(spec, band.model_lower);
+    result->baseline_upper = ModelToObservedValue(spec, band.model_upper);
     if (result->baseline_upper < result->baseline_lower) {
         std::swap(result->baseline_upper, result->baseline_lower);
     }
@@ -173,9 +164,9 @@ void FillColdStartBand(const BaselineTaskSpec& spec,
     result->model_mu = point.y_model;
     result->model_lower = model_lower;
     result->model_upper = model_upper;
-    result->baseline_mu = ModelToObservedMu(spec, point.y_model);
-    result->baseline_lower = ModelToObservedLower(spec, model_lower);
-    result->baseline_upper = ModelToObservedUpper(spec, model_upper);
+    result->baseline_mu = ModelToObservedValue(spec, point.y_model);
+    result->baseline_lower = ModelToObservedValue(spec, model_lower);
+    result->baseline_upper = ModelToObservedValue(spec, model_upper);
     if (result->baseline_upper < result->baseline_lower) {
         std::swap(result->baseline_upper, result->baseline_lower);
     }
@@ -188,7 +179,6 @@ void FillColdStartBand(const BaselineTaskSpec& spec,
     result->can_update = true;
     result->score_weight = 0.0;
     result->update_weight = point.update_weight;
-    result->confidence = state.confidence;
     result->state_status = RollingStateStatusName(state.state_status);
     FillB3StateFields(state, false, result);
     result->uncertainty_source.push_back("cold_start");
@@ -204,24 +194,6 @@ BaselineStatus ResolveConfigOrStatus(const BaselineTaskSpec& spec,
 const BootstrapSeed* FindSeed(const BootstrapSeedStore& seeds, const std::string& series_key) {
     const auto it = seeds.find(series_key);
     return it == seeds.end() ? nullptr : &it->second;
-}
-
-template <typename Writer>
-void WriteStringField(Writer* writer, const char* name, const std::string& value) {
-    writer->Key(name);
-    writer->String(value.c_str());
-}
-
-template <typename Writer>
-void WriteTaskIdentity(Writer* writer, const BaselineTaskSpec& spec) {
-    writer->Key("task_identity");
-    writer->StartObject();
-    WriteStringField(writer, "task_id", spec.task_id);
-    WriteStringField(writer, "task_kind", spec.task_kind);
-    WriteStringField(writer, "feature_id", spec.feature_id);
-    WriteStringField(writer, "feature_type", spec.feature_type);
-    WriteStringField(writer, "profile", spec.profile);
-    writer->EndObject();
 }
 
 uint64_t EstimateStateBytes(const RollingState& state) {
@@ -277,7 +249,7 @@ bool CanUseBootstrapForecastSeed(const BootstrapSeed& seed) {
 
 double ForecastCorrectionWeight(const RollingState& state) {
     double weight = state.effective_confidence;
-    if (!std::isfinite(weight) || weight <= 0.0) weight = state.confidence;
+    if (!std::isfinite(weight) || weight <= 0.0) weight = state.learning_confidence;
     if (!std::isfinite(weight)) return 0.0;
     return std::max(0.0, std::min(1.0, weight));
 }
@@ -625,6 +597,8 @@ RollingPrediction PredictRollingForSeries(const BaselineTaskSpec& spec,
                                           int64_t bucket_id) {
     RollingPrediction result;
     const std::string key(series_key);
+    result.series_key = key;
+    result.bucket_id = bucket_id;
     if (key.empty()) {
         result.status = BaselineStatus::kInvalidArgument;
         return result;
@@ -671,11 +645,9 @@ RollingPrediction PredictRollingForSeries(const BaselineTaskSpec& spec,
         forecast_model_mu - config.forecast_band_z * estimator.band_std;
     const double forecast_model_upper =
         forecast_model_mu + config.forecast_band_z * estimator.band_std;
-    result.baseline_mu = ModelToObservedMu(spec, forecast_model_mu);
-    result.baseline_lower =
-        ModelToObservedLower(spec, forecast_model_lower);
-    result.baseline_upper =
-        ModelToObservedUpper(spec, forecast_model_upper);
+    result.baseline_mu = ModelToObservedValue(spec, forecast_model_mu);
+    result.baseline_lower = ModelToObservedValue(spec, forecast_model_lower);
+    result.baseline_upper = ModelToObservedValue(spec, forecast_model_upper);
     result.band_z = config.forecast_band_z;
     if (result.baseline_upper < result.baseline_lower) {
         std::swap(result.baseline_upper, result.baseline_lower);
@@ -820,9 +792,9 @@ BaselineSerializationResult QueryRollingSeriesSnapshot(const BaselineTaskSpec& s
     const double band_std = std::max(state.sigma, 0.0);
     const double model_lower = state.theta.level - 3.0 * band_std;
     const double model_upper = state.theta.level + 3.0 * band_std;
-    const double baseline_mu = ModelToObservedMu(spec, state.theta.level);
-    double baseline_lower = ModelToObservedLower(spec, model_lower);
-    double baseline_upper = ModelToObservedUpper(spec, model_upper);
+    const double baseline_mu = ModelToObservedValue(spec, state.theta.level);
+    double baseline_lower = ModelToObservedValue(spec, model_lower);
+    double baseline_upper = ModelToObservedValue(spec, model_upper);
     if (baseline_upper < baseline_lower) std::swap(baseline_upper, baseline_lower);
 
     rapidjson::StringBuffer buf;

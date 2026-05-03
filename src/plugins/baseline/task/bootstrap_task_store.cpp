@@ -17,6 +17,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "plugins/baseline/serialization/json_serialization.h"
+
 namespace flowsql {
 namespace baseline {
 namespace {
@@ -43,96 +45,6 @@ std::vector<std::string> SortedBootstrapSeedKeys(const BootstrapSeedStore& store
     for (const auto& entry : store) keys.push_back(entry.first);
     std::sort(keys.begin(), keys.end());
     return keys;
-}
-
-const char* ArtifactKindName(BootstrapArtifactKind kind) {
-    switch (kind) {
-        case BootstrapArtifactKind::kValue:
-            return "value";
-        case BootstrapArtifactKind::kRatio:
-            return "ratio";
-        case BootstrapArtifactKind::kRelation:
-            return "relation";
-        case BootstrapArtifactKind::kNone:
-            break;
-    }
-    return "none";
-}
-
-template <typename Writer>
-void WriteStringField(Writer* writer, const char* name, const std::string& value) {
-    writer->Key(name);
-    writer->String(value.c_str());
-}
-
-template <typename Writer>
-void WriteTaskIdentity(Writer* writer, const BootstrapTaskIdentity& identity) {
-    writer->Key("task_identity");
-    writer->StartObject();
-    WriteStringField(writer, "task_id", identity.task_id);
-    WriteStringField(writer, "task_kind", identity.task_kind);
-    WriteStringField(writer, "feature_type", identity.feature_type);
-    WriteStringField(writer, "feature_id", identity.feature_id);
-    WriteStringField(writer, "profile", identity.profile);
-    writer->EndObject();
-}
-
-template <typename Writer>
-void WriteClockSpec(Writer* writer, const BootstrapClockSpec& clock) {
-    writer->Key("clock_spec");
-    writer->StartObject();
-    writer->Key("bucket_seconds");
-    writer->Int64(clock.bucket_seconds);
-    WriteStringField(writer, "timezone", clock.timezone);
-    writer->EndObject();
-}
-
-template <typename Writer>
-void WriteCalendarRef(Writer* writer, const BootstrapCalendarRef& calendar) {
-    writer->Key("calendar_ref");
-    writer->StartObject();
-    WriteStringField(writer, "calendar_id", calendar.calendar_id);
-    WriteStringField(writer, "calendar_version", calendar.calendar_version);
-    writer->EndObject();
-}
-
-bool ReadString(const rapidjson::Value& obj, const char* name, std::string* out) {
-    if (!out || !obj.HasMember(name) || !obj[name].IsString()) return false;
-    *out = obj[name].GetString();
-    return true;
-}
-
-bool ReadTaskIdentity(const rapidjson::Value& obj, BootstrapTaskIdentity* out) {
-    if (!out || !obj.HasMember("task_identity") || !obj["task_identity"].IsObject()) {
-        return false;
-    }
-    const auto& identity = obj["task_identity"];
-    return ReadString(identity, "task_id", &out->task_id) &&
-           ReadString(identity, "task_kind", &out->task_kind) &&
-           ReadString(identity, "feature_type", &out->feature_type) &&
-           ReadString(identity, "feature_id", &out->feature_id) &&
-           ReadString(identity, "profile", &out->profile);
-}
-
-bool ReadClockSpec(const rapidjson::Value& obj, BootstrapClockSpec* out) {
-    if (!out || !obj.HasMember("clock_spec") || !obj["clock_spec"].IsObject()) {
-        return false;
-    }
-    const auto& clock = obj["clock_spec"];
-    if (!clock.HasMember("bucket_seconds") || !clock["bucket_seconds"].IsInt64()) {
-        return false;
-    }
-    out->bucket_seconds = clock["bucket_seconds"].GetInt64();
-    return ReadString(clock, "timezone", &out->timezone);
-}
-
-bool ReadCalendarRef(const rapidjson::Value& obj, BootstrapCalendarRef* out) {
-    if (!out || !obj.HasMember("calendar_ref") || !obj["calendar_ref"].IsObject()) {
-        return false;
-    }
-    const auto& calendar = obj["calendar_ref"];
-    return ReadString(calendar, "calendar_id", &out->calendar_id) &&
-           ReadString(calendar, "calendar_version", &out->calendar_version);
 }
 
 bool SameTaskIdentity(const BootstrapTaskIdentity& lhs,

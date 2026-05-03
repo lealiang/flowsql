@@ -151,6 +151,16 @@ struct BootstrapPrediction {
     bool ok() const { return status == BaselineStatus::kOk; }
 };
 
+struct BootstrapPredictionSequence {
+    BaselineStatus status = BaselineStatus::kOk;
+    std::string series_key;
+    int64_t start_bucket_id = 0;
+    uint32_t point_count = 0;
+    std::vector<BootstrapPrediction> predictions;
+
+    bool ok() const { return status == BaselineStatus::kOk; }
+};
+
 struct RollingSubmitOptions {
     bool allow_auto_init_from_bootstrap = true;
     bool allow_auto_init_from_empty = true;
@@ -319,10 +329,22 @@ struct RelationRoutedSummaryQuery {
 
 struct RollingPrediction {
     BaselineStatus status = BaselineStatus::kOk;
+    std::string series_key;
+    int64_t bucket_id = 0;
     double baseline_mu = 0.0;
     double baseline_lower = 0.0;
     double baseline_upper = 0.0;
     double band_z = 0.0;
+
+    bool ok() const { return status == BaselineStatus::kOk; }
+};
+
+struct RollingPredictionSequence {
+    BaselineStatus status = BaselineStatus::kOk;
+    std::string series_key;
+    int64_t start_bucket_id = 0;
+    uint32_t point_count = 0;
+    std::vector<RollingPrediction> predictions;
 
     bool ok() const { return status == BaselineStatus::kOk; }
 };

@@ -11,21 +11,15 @@
 #include <algorithm>
 #include <cmath>
 
+#include "plugins/baseline/rolling/math_utils.h"
+
 namespace flowsql {
 namespace baseline {
 namespace {
 
-double Square(double value) { return value * value; }
-
 double SafeSigma(const RollingState& state, const BaselineRollingConfig& config) {
     return std::max(config.sigma_floor, std::isfinite(state.sigma) ? state.sigma
                                                                    : config.sigma_floor);
-}
-
-double ClampMultiplier(double value, const BaselineRollingConfig& config) {
-    if (!std::isfinite(value)) return config.calibration_multiplier_min;
-    return std::max(config.calibration_multiplier_min,
-                    std::min(config.calibration_multiplier_max, value));
 }
 
 double MaturityUncertainty(const RollingState& state, const BaselineRollingConfig& config) {

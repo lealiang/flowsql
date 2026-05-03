@@ -32,6 +32,7 @@ struct RelationFusionRuntimeConfig {
     double stable_head_pattern_weight = 0.85;
     uint32_t dominant_single_cap = 3;
     uint32_t dominant_pattern_cap = 2;
+    uint64_t fusion_persistence_max_keys_per_source = 512;
 };
 
 struct RelationFusionMetricContext {
@@ -65,13 +66,16 @@ struct RelationFusionUpdateInput {
 struct RelationFusionRuntimeState {
     int64_t last_bucket_id = 0;
     bool has_last_bucket = false;
+    int64_t last_touched_bucket_id = 0;
+    uint64_t last_touched_update_seq = 0;
     std::unordered_map<std::string, uint32_t> persistence_by_evidence_dir;
     RelationFusionResult last_result;
 };
 
 BaselineStatus UpdateRelationFusion(const RelationFusionUpdateInput& input,
                                     RelationFusionRuntimeState* state,
-                                    RelationFusionResult* out);
+                                    RelationFusionResult* out,
+                                    uint64_t* evicted_persistence_keys = nullptr);
 
 }  // namespace baseline
 }  // namespace flowsql

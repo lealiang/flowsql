@@ -30,6 +30,7 @@
 #include "plugins/baseline/relation/relation_summary.h"
 #include "plugins/baseline/relation/routed_summary.h"
 #include "plugins/baseline/rolling/rolling_config.h"
+#include "plugins/baseline/serialization/json_serialization.h"
 
 namespace flowsql {
 namespace baseline {
@@ -168,66 +169,10 @@ double Clamp01(double value) {
     return std::max(0.0, std::min(1.0, value));
 }
 
-const char* ArtifactKindName(BootstrapArtifactKind kind) {
-    switch (kind) {
-        case BootstrapArtifactKind::kValue:
-            return "value";
-        case BootstrapArtifactKind::kRatio:
-            return "ratio";
-        case BootstrapArtifactKind::kRelation:
-            return "relation";
-        case BootstrapArtifactKind::kNone:
-            break;
-    }
-    return "none";
-}
-
-const char* TaskKindName(BaselineTaskKind kind) {
-    switch (kind) {
-        case BaselineTaskKind::kValue:
-            return "value";
-        case BaselineTaskKind::kRatio:
-            return "ratio";
-        case BaselineTaskKind::kRelation:
-            return "relation";
-    }
-    return "unknown";
-}
-
-bool ParseTaskKindName(const std::string& name, BaselineTaskKind* out) {
-    if (!out) return false;
-    if (name == "value") {
-        *out = BaselineTaskKind::kValue;
-        return true;
-    }
-    if (name == "ratio") {
-        *out = BaselineTaskKind::kRatio;
-        return true;
-    }
-    if (name == "relation") {
-        *out = BaselineTaskKind::kRelation;
-        return true;
-    }
-    return false;
-}
-
-BootstrapArtifactKind ParseArtifactKind(const std::string& name) {
-    if (name == "value") return BootstrapArtifactKind::kValue;
-    if (name == "ratio") return BootstrapArtifactKind::kRatio;
-    if (name == "relation") return BootstrapArtifactKind::kRelation;
-    return BootstrapArtifactKind::kNone;
-}
-
 void AppendDiagnostic(std::string* diagnostics, const char* token) {
     if (!diagnostics || !token || token[0] == '\0') return;
     if (!diagnostics->empty()) diagnostics->append("; ");
     diagnostics->append(token);
-}
-
-template <typename Writer>
-void WriteStringField(Writer* writer, const char* name, const std::string& value) {
-    writer->Key(name);
-    writer->String(value.c_str());
 }
 
 template <typename Writer>
@@ -317,41 +262,10 @@ void WriteCoverage(Writer* writer, const BootstrapCoverageReport& coverage) {
 }
 
 template <typename Writer>
-void WriteTaskIdentity(Writer* writer, const BootstrapTaskIdentity& identity) {
-    writer->Key("task_identity");
-    writer->StartObject();
-    WriteStringField(writer, "task_id", identity.task_id);
-    WriteStringField(writer, "task_kind", identity.task_kind);
-    WriteStringField(writer, "feature_type", identity.feature_type);
-    WriteStringField(writer, "feature_id", identity.feature_id);
-    WriteStringField(writer, "profile", identity.profile);
-    writer->EndObject();
-}
-
-template <typename Writer>
 void WriteSeriesIdentity(Writer* writer, const std::string& series_key) {
     writer->Key("series_identity");
     writer->StartObject();
     WriteStringField(writer, "series_key", series_key);
-    writer->EndObject();
-}
-
-template <typename Writer>
-void WriteClockSpec(Writer* writer, const BootstrapClockSpec& clock) {
-    writer->Key("clock_spec");
-    writer->StartObject();
-    writer->Key("bucket_seconds");
-    writer->Int64(clock.bucket_seconds);
-    WriteStringField(writer, "timezone", clock.timezone);
-    writer->EndObject();
-}
-
-template <typename Writer>
-void WriteCalendarRef(Writer* writer, const BootstrapCalendarRef& calendar) {
-    writer->Key("calendar_ref");
-    writer->StartObject();
-    WriteStringField(writer, "calendar_id", calendar.calendar_id);
-    WriteStringField(writer, "calendar_version", calendar.calendar_version);
     writer->EndObject();
 }
 
@@ -856,12 +770,6 @@ void WriteEventHint(Writer* writer, const BootstrapEventHint& hint) {
     writer->EndObject();
 }
 
-bool ReadString(const rapidjson::Value& obj, const char* name, std::string* out) {
-    if (!out || !obj.HasMember(name) || !obj[name].IsString()) return false;
-    *out = obj[name].GetString();
-    return true;
-}
-
 bool ReadStringVector(const rapidjson::Value& obj,
                       const char* name,
                       std::vector<std::string>* out) {
@@ -917,18 +825,6 @@ bool ReadMonthPosBlock(const rapidjson::Value& obj, MonthPosBlock* out);
 bool ReadEventBlock(const rapidjson::Value& obj, EventBlock* out);
 void ReadCoverage(const rapidjson::Value& obj, BootstrapCoverageReport* out);
 
-bool ReadTaskIdentity(const rapidjson::Value& obj, BootstrapTaskIdentity* out) {
-    if (!out || !obj.HasMember("task_identity") || !obj["task_identity"].IsObject()) {
-        return false;
-    }
-    const auto& identity = obj["task_identity"];
-    return ReadString(identity, "task_id", &out->task_id) &&
-           ReadString(identity, "task_kind", &out->task_kind) &&
-           ReadString(identity, "feature_type", &out->feature_type) &&
-           ReadString(identity, "feature_id", &out->feature_id) &&
-           ReadString(identity, "profile", &out->profile);
-}
-
 bool ReadSeriesIdentity(const rapidjson::Value& obj, std::string* out) {
     if (!out || !obj.HasMember("series_identity") ||
         !obj["series_identity"].IsObject()) {
@@ -941,21 +837,6 @@ bool ReadSeriesIdentity(const rapidjson::Value& obj, std::string* out) {
     }
     *out = std::move(series_key);
     return true;
-}
-
-bool ReadClockSpec(const rapidjson::Value& obj, BootstrapClockSpec* out) {
-    if (!out || !obj.HasMember("clock_spec") || !obj["clock_spec"].IsObject()) return false;
-    const auto& clock = obj["clock_spec"];
-    if (!clock.HasMember("bucket_seconds") || !clock["bucket_seconds"].IsInt64()) return false;
-    out->bucket_seconds = clock["bucket_seconds"].GetInt64();
-    return ReadString(clock, "timezone", &out->timezone);
-}
-
-bool ReadCalendarRef(const rapidjson::Value& obj, BootstrapCalendarRef* out) {
-    if (!out || !obj.HasMember("calendar_ref") || !obj["calendar_ref"].IsObject()) return false;
-    const auto& calendar = obj["calendar_ref"];
-    return ReadString(calendar, "calendar_id", &out->calendar_id) &&
-           ReadString(calendar, "calendar_version", &out->calendar_version);
 }
 
 bool ReadRelationBasis(const rapidjson::Value& obj, RelationServiceBasis* out) {

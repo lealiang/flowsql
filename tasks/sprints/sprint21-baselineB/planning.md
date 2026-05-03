@@ -26,6 +26,7 @@ b3-detection-trust-and-maturity-design.md
 b4-relation-routed-rolling-and-stream-basis-design.md
 b5-relation-pattern-fusion-design.md
 b6-baseline-task-serialization-lock-optimization-design.md
+b7-relation-fusion-state-cleanup-design.md
 ```
 
 阶段设计文档只覆盖当前阶段的接口、算法取舍、迁移步骤、测试矩阵和完成门禁。已关闭阶段的遗留语义不得继续写入后续阶段设计。
@@ -59,6 +60,11 @@ B1 Optional Bootstrap Engine
 - `B3` 只扩展 Online Rolling Core 的检测可信度、band 校准、成熟度和组件解锁，不回头改 bootstrap 训练链路。
 - `B4` 接入 Relation block 的 routed summary rolling 训练，并实现 stream-only basis 成熟；不回头恢复旧重建链路，也不实现 Relation 模式融合。
 - `B5` 基于 B4 产出的 routed summary rolling result，实现 Relation 同源摘要模式融合、关系风险输出，以及 Bootstrap 侧必要的 fusion metadata；B5 开工前必须先完成独立设计文档。
+
+补充设计：
+
+- [B6 Baseline 同 task 串行调用与锁优化方案](b6-baseline-task-serialization-lock-optimization-design.md)
+- [B7 Relation Fusion Runtime State Cleanup 设计](b7-relation-fusion-state-cleanup-design.md)
 
 ---
 
