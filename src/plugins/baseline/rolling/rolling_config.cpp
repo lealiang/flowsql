@@ -175,6 +175,16 @@ BaselineStatus ValidateBaselineRollingConfig(const BaselineRollingConfig& config
         !UnitOpenClosed(config.monthpos_ready_coverage_ratio)) {
         return Invalid(err, "rolling_config monthpos fields are invalid");
     }
+    const auto& relation = config.relation_rolling;
+    if (relation.basis_stats_max_groups == 0 ||
+        !UnitOpenClosed(relation.basis_candidate_min_coverage_ratio) ||
+        !NonNegative(relation.basis_replacement_cap_ratio) ||
+        relation.basis_replacement_cap_max == 0 ||
+        relation.basis_threshold_margin < 1.0 ||
+        relation.basis_min_stable_refresh_count == 0 ||
+        relation.routed_state_shard_count == 0) {
+        return Invalid(err, "rolling_config.relation_rolling fields are invalid");
+    }
     if (config.bucket_seconds <= 0 ||
         config.timezone.empty() ||
         config.day_buckets == 0 ||

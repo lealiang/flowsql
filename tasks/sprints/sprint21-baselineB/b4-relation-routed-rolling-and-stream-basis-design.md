@@ -1,8 +1,8 @@
-# B4 T3 Routed Rolling and Stream Basis 阶段设计
+# B4 Relation Routed Rolling and Stream Basis 阶段设计
 
 ## 1. 阶段定位
 
-`B4` 的目标是让 `T3(Relation)` 进入 BaselineB 的在线主路径。
+`B4` 的目标是让 Relation 进入 BaselineB 的在线主路径。
 
 核心结论：
 
@@ -13,9 +13,9 @@ Relation block
   -> reuse B2/B3 Online Rolling Core
 ```
 
-`T3` 不单独实现新的时间序列基线算法。Relation 分布变化先被投影成一组稳定摘要特征，再按 `value_basic` 或 `ratio` 进入已有 rolling core，复用 B2 的滚动学习、B3 的 band 校准、score trust、maturity 和 forecast 语义。
+Relation 不单独实现新的时间序列基线算法。Relation 分布变化先被投影成一组稳定摘要特征，再按 `value_basic` 或 `ratio` 进入已有 rolling core，复用 B2 的滚动学习、B3 的 band 校准、score trust、maturity 和 forecast 语义。
 
-`T3 basis` 的职责是定义哪些 group 属于有界 support / stable head，以及这些 group 如何形成可解释摘要。basis 可以由 `B1` 历史训练 seed 初始化，也必须能在无历史时通过流式统计保守成熟。
+Relation basis 的职责是定义哪些 group 属于有界 support / stable head，以及这些 group 如何形成可解释摘要。basis 可以由 `B1` 历史训练 seed 初始化，也必须能在无历史时通过流式统计保守成熟。
 
 ### 1.1 上游依赖
 
@@ -38,7 +38,7 @@ Relation block
 
 B4 不做：
 
-- `T3` 专用时间序列模型。
+- Relation 专用时间序列模型。
 - Relation 分布整体长期 forecast 产品接口。
 - 每个 group 一个无界 rolling baseline。
 - 每个 bucket 动态切换 support / stable head。
@@ -752,6 +752,7 @@ relation_rolling:
 | `B4-T08` | 接入 snapshot 与 routed forecast | 第 9 节 | `relation_task.*`、`rolling_task_runner.*` 可选 | source snapshot、dedicated routed snapshot 和 forecast 字段稳定，forecast 只读 |
 | `B4-T09` | 补齐配置模板和解析 | 第 10 节 | `rolling_config.*`、`runtime_config.*`、`baseline-config-template.yaml` | struct、parser、strict whitelist、模板、strict schema 测试全部覆盖 |
 | `B4-T10` | 自动化测试与回归验证 | 全文 | `src/tests/test_baseline/*` | 覆盖无历史、有 seed、basis 刷新、handover、snapshot、无旧 rebuild |
+| `B4-T11` | 闭环 B4 设计细节 | 第 6.3、8、9、10 节 | `relation_basis_state.*`、`relation_task.*`、`test_baseline_*` | 配置开关控制实际行为；`routed_state_shard_count` 不再固定；`basis_min_stable_refresh_count` 落地连续满足计数；source snapshot 输出最小 schema；routed key 误用 `QuerySeriesSnapshot()` 返回 `kInvalidArgument`；source ordered lock 采用可配置 striped lock，保证同 source 有序且锁数量有上界 |
 
 ---
 

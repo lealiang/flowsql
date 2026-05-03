@@ -208,6 +208,53 @@ struct RollingBaselineResult {
     std::string diagnostics;
 };
 
+struct RelationRollingObservation {
+    std::string series_key;
+    int64_t bucket_id = 0;
+    std::vector<uint32_t> group_idx;
+    std::vector<RelationBootstrapMetric> metrics;
+};
+
+struct RelationRollingSubmitOptions {
+    RollingSubmitOptions routed_options;
+    bool allow_basis_update = true;
+    bool include_routed_results = true;
+    bool include_diagnostics = false;
+};
+
+struct RelationRoutedSummaryResult {
+    std::string source_series_key;
+    std::string routed_series_key;
+    std::string metric;
+    std::string summary;
+    std::string feature_type;
+    uint64_t basis_version = 0;
+    bool basis_scoped = false;
+    RollingBaselineResult rolling;
+};
+
+struct RelationRollingResult {
+    BaselineStatus status = BaselineStatus::kOk;
+    std::string series_key;
+    int64_t bucket_id = 0;
+    uint64_t basis_version = 0;
+    std::string basis_status;
+    bool basis_updated = false;
+    bool handover_active = false;
+    std::vector<RelationRoutedSummaryResult> routed_results;
+    std::string diagnostics;
+
+    bool ok() const { return status == BaselineStatus::kOk; }
+};
+
+struct RelationRoutedSummaryQuery {
+    std::string source_series_key;
+    std::string metric;
+    std::string summary;
+    std::string feature_type;
+    uint64_t basis_version = 0;
+};
+
 struct RollingPrediction {
     BaselineStatus status = BaselineStatus::kOk;
     double baseline_mu = 0.0;

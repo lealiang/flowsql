@@ -81,6 +81,13 @@ void TestRollingConfigDefaultsAndDerivedBuckets() {
     assert(config.forecast_trend_cap_buckets == config.day_buckets);
     AssertNear(config.monthpos_alpha, 0.005);
     assert(config.monthpos_min_month_transitions == 2);
+    assert(config.relation_rolling.enable_routed_rolling);
+    assert(config.relation_rolling.enable_stream_basis);
+    assert(config.relation_rolling.include_universal_summaries_without_basis);
+    assert(config.relation_rolling.basis_stats_max_groups == 256);
+    assert(config.relation_rolling.basis_collect_min_buckets == 0);
+    assert(config.relation_rolling.basis_replacement_cap_max == 2);
+    assert(config.relation_rolling.routed_state_shard_count == 16);
 
     BootstrapSeedQualityConfig seed_quality;
     assert(TryGetBootstrapSeedQualityConfigOverride(&seed_quality));
@@ -167,6 +174,21 @@ baseline:
     monthpos_delta_max_scale: 0.4
     monthpos_min_month_transitions: 1
     monthpos_ready_coverage_ratio: 0.5
+    relation_rolling:
+      enable_routed_rolling: true
+      enable_stream_basis: true
+      include_universal_summaries_without_basis: true
+      basis_stats_max_groups: 512
+      basis_collect_min_buckets: 10
+      basis_ready_min_buckets: 30
+      basis_refresh_interval_buckets: 20
+      basis_candidate_min_coverage_ratio: 0.70
+      basis_replacement_cap_ratio: 0.30
+      basis_replacement_cap_max: 3
+      basis_handover_warmup_buckets: 40
+      basis_threshold_margin: 1.30
+      basis_min_stable_refresh_count: 3
+      routed_state_shard_count: 32
   value_sampled_profiles:
     cont_core:
       n_train_min: 50
@@ -250,6 +272,17 @@ baseline:
     AssertNear(config.monthpos_delta_max_scale, 0.4);
     assert(config.monthpos_min_month_transitions == 1);
     AssertNear(config.monthpos_ready_coverage_ratio, 0.5);
+    assert(config.relation_rolling.basis_stats_max_groups == 512);
+    assert(config.relation_rolling.basis_collect_min_buckets == 10);
+    assert(config.relation_rolling.basis_ready_min_buckets == 30);
+    assert(config.relation_rolling.basis_refresh_interval_buckets == 20);
+    AssertNear(config.relation_rolling.basis_candidate_min_coverage_ratio, 0.70);
+    AssertNear(config.relation_rolling.basis_replacement_cap_ratio, 0.30);
+    assert(config.relation_rolling.basis_replacement_cap_max == 3);
+    assert(config.relation_rolling.basis_handover_warmup_buckets == 40);
+    AssertNear(config.relation_rolling.basis_threshold_margin, 1.30);
+    assert(config.relation_rolling.basis_min_stable_refresh_count == 3);
+    assert(config.relation_rolling.routed_state_shard_count == 32);
     BootstrapSeedQualityConfig seed_quality;
     assert(TryGetBootstrapSeedQualityConfigOverride(&seed_quality));
     AssertNear(seed_quality.full_min_coverage_ratio, 0.85);

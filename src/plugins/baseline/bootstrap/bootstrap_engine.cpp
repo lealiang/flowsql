@@ -27,6 +27,8 @@
 #include "plugins/baseline/model/formal_predictor.h"
 #include "plugins/baseline/bootstrap/formal_model_trainer.h"
 #include "plugins/baseline/relation/relation_basis.h"
+#include "plugins/baseline/relation/relation_summary.h"
+#include "plugins/baseline/relation/routed_summary.h"
 
 namespace flowsql {
 namespace baseline {
@@ -1067,6 +1069,20 @@ bool ReadRoutedSummaryArtifact(const rapidjson::Value& obj,
     } else {
         return false;
     }
+    artifact.basis_scoped = IsBasisScopedRelationSummary(artifact.summary_name);
+    if (obj.HasMember("basis_scoped")) {
+        if (!obj["basis_scoped"].IsBool() ||
+            obj["basis_scoped"].GetBool() != artifact.basis_scoped) {
+            return false;
+        }
+    }
+    if (obj.HasMember("basis_version")) {
+        if (!obj["basis_version"].IsUint64()) return false;
+        artifact.basis_version = obj["basis_version"].GetUint64();
+    }
+    if (!artifact.basis_scoped) {
+        artifact.basis_version = 0;
+    }
     ReadCoverage(obj, &artifact.coverage_report);
     (void)ReadStringVector(obj, "seeded_components", &artifact.seeded_components);
     (void)ReadStringVector(obj, "enabled_components", &artifact.enabled_components);
@@ -1355,124 +1371,6 @@ std::vector<RelationBootstrapBlock> BuildNormalizedRelationBlocks(
     return blocks;
 }
 
-struct RelationBootstrapMetricSummary {
-    bool valid = false;
-    double total = 0.0;
-    double entropy_shannon = 0.0;
-    double top1_share = 0.0;
-    double headk_share = 0.0;
-    double out_of_support_share = 0.0;
-    bool has_distinct_group_count = false;
-    double distinct_group_count = 0.0;
-    std::vector<double> stable_g_shares;
-    double stable_headk_coverage = 0.0;
-    bool has_stable_headk_mix_drift = false;
-    double stable_headk_mix_drift = 0.0;
-};
-
-void InsertTopMass(double mass, std::size_t limit, std::vector<double>* top_masses) {
-    if (!top_masses || limit == 0) return;
-    if (top_masses->size() < limit) {
-        top_masses->push_back(mass);
-        return;
-    }
-
-    auto min_it = std::min_element(top_masses->begin(), top_masses->end());
-    if (min_it != top_masses->end() && mass > *min_it) {
-        *min_it = mass;
-    }
-}
-
-bool ExtractRelationBootstrapMetricSummary(const RelationBootstrapBlock& block,
-                                           std::size_t metric_index,
-                                           const RelationServiceBasis& basis,
-                                           RelationBootstrapMetricSummary* out_summary) {
-    if (!out_summary) return false;
-    *out_summary = RelationBootstrapMetricSummary{};
-    if (metric_index >= block.metrics.size()) return false;
-    const RelationBootstrapMetric& metric = block.metrics[metric_index];
-    if (metric.total <= 0.0 || metric.values_by_group.size() < block.group_idx.size()) {
-        return false;
-    }
-
-    out_summary->total = metric.total;
-    const std::unordered_set<uint32_t> other_group_set(
-        basis.other_group_idxs.begin(), basis.other_group_idxs.end());
-    std::unordered_set<uint32_t> support_set(
-        basis.support_explicit.begin(), basis.support_explicit.end());
-    for (uint32_t group_idx : basis.other_group_idxs) {
-        support_set.erase(group_idx);
-    }
-
-    std::unordered_map<uint32_t, std::size_t> stable_index_by_group;
-    stable_index_by_group.reserve(basis.stable_head.size());
-    out_summary->stable_g_shares.assign(basis.stable_head.size(), 0.0);
-    for (std::size_t i = 0; i < basis.stable_head.size(); ++i) {
-        stable_index_by_group.emplace(basis.stable_head[i], i);
-    }
-
-    double support_mass = 0.0;
-    double top1_mass = 0.0;
-    std::vector<double> top_masses;
-    top_masses.reserve(static_cast<std::size_t>(std::max(0, basis.k_head)));
-    uint32_t active_count = 0;
-
-    for (std::size_t group_pos = 0; group_pos < block.group_idx.size(); ++group_pos) {
-        const double mass = metric.values_by_group[group_pos];
-        if (mass <= 0.0) continue;
-        ++active_count;
-        const uint32_t group_idx = block.group_idx[group_pos];
-        const bool is_other = other_group_set.find(group_idx) != other_group_set.end();
-        const double share = mass / metric.total;
-
-        out_summary->entropy_shannon -= share * std::log(share);
-        if (!is_other) {
-            if (mass > top1_mass) top1_mass = mass;
-            InsertTopMass(mass, static_cast<std::size_t>(std::max(0, basis.k_head)), &top_masses);
-        }
-        if (!is_other && support_set.find(group_idx) != support_set.end()) {
-            support_mass += mass;
-        }
-        if (!is_other) {
-            auto stable_it = stable_index_by_group.find(group_idx);
-            if (stable_it != stable_index_by_group.end()) {
-                out_summary->stable_g_shares[stable_it->second] = share;
-            }
-        }
-    }
-
-    out_summary->valid = true;
-    out_summary->top1_share = top1_mass / metric.total;
-    double head_mass = 0.0;
-    for (double mass : top_masses) head_mass += mass;
-    out_summary->headk_share = head_mass / metric.total;
-    out_summary->out_of_support_share =
-        std::max(0.0, metric.total - support_mass) / metric.total;
-    for (double share : out_summary->stable_g_shares) {
-        out_summary->stable_headk_coverage += share;
-    }
-
-    const uint32_t distinct_count = metric.active_count > 0 ? metric.active_count : active_count;
-    if (distinct_count > 0) {
-        out_summary->has_distinct_group_count = true;
-        out_summary->distinct_group_count = static_cast<double>(distinct_count);
-    }
-
-    if (basis.stable_head.size() >= 2 &&
-        basis.head_proto_q.size() == basis.stable_head.size() &&
-        out_summary->stable_headk_coverage > 0.0) {
-        out_summary->has_stable_headk_mix_drift = true;
-        const double coverage = out_summary->stable_headk_coverage;
-        double total_variation = 0.0;
-        for (std::size_t i = 0; i < basis.stable_head.size(); ++i) {
-            const double current_mix = out_summary->stable_g_shares[i] / coverage;
-            total_variation += std::fabs(current_mix - basis.head_proto_q[i]);
-        }
-        out_summary->stable_headk_mix_drift = 0.5 * total_variation;
-    }
-    return true;
-}
-
 struct RoutedValueSeries {
     std::string metric_name;
     std::string summary_name;
@@ -1519,46 +1417,6 @@ RatioBootstrapInput& RoutedRatioInput(std::vector<RoutedRatioSeries>* series,
     return series->back().input;
 }
 
-std::string RoutedFeatureId(const RelationTaskCreateSpec& spec,
-                            const std::string& metric_name,
-                            const std::string& summary_name) {
-    const std::string feature_base = spec.task_spec.feature_base.empty()
-                                         ? spec.task_spec.feature_id
-                                         : spec.task_spec.feature_base;
-    return feature_base + "." + metric_name + "." + summary_name;
-}
-
-BaselineTaskSpec MakeRoutedSummaryTaskSpec(const RelationTaskCreateSpec& spec,
-                                           const std::string& metric_name,
-                                           const std::string& summary_name,
-                                           BaselineTaskKind task_kind) {
-    BaselineTaskSpec task_spec;
-    task_spec.task_id = spec.task_spec.task_id + "::" + metric_name + "::" + summary_name;
-    task_spec.name = task_spec.task_id;
-    task_spec.task_kind = TaskKindName(task_kind);
-    task_spec.feature_id = RoutedFeatureId(spec, metric_name, summary_name);
-    task_spec.feature = task_spec.feature_id;
-    task_spec.feature_type =
-        task_kind == BaselineTaskKind::kValue ? "value_basic" : TaskKindName(task_kind);
-    task_spec.profile = task_kind == BaselineTaskKind::kRatio ? "rate_core" : "default";
-    task_spec.clock_spec.bucket_seconds = spec.clock_spec.delta;
-    task_spec.clock_spec.timezone = spec.clock_spec.tz;
-    task_spec.calendar_ref = spec.task_spec.calendar_ref;
-    task_spec.delta = spec.clock_spec.delta;
-    task_spec.tz = spec.clock_spec.tz;
-    return task_spec;
-}
-
-void AppendRatioPoint(RatioBootstrapInput* input,
-                      int64_t bucket_id,
-                      double share,
-                      double denominator) {
-    if (!input || denominator <= 0.0) return;
-    const double clipped_share = Clamp01(share);
-    input->observations.push_back(
-        RatioBootstrapPoint{bucket_id, clipped_share * denominator, denominator});
-}
-
 void WriteUintVector(rapidjson::Writer<rapidjson::StringBuffer>* writer,
                      const char* name,
                      const std::vector<uint32_t>& values) {
@@ -1581,6 +1439,27 @@ BootstrapRelationBasisSeed MakeRelationBasisSeed(const RelationServiceBasis& bas
     seed.stable_head = basis.stable_head;
     seed.head_proto_q = basis.head_proto_q;
     return seed;
+}
+
+uint64_t FindRelationBasisVersion(const std::vector<RelationServiceBasis>& bases,
+                                  const std::string& metric_name) {
+    for (const auto& basis : bases) {
+        if (basis.metric_name == metric_name) return basis.basis_version;
+    }
+    return 0;
+}
+
+void NormalizeRoutedSummaryScope(const std::vector<RelationServiceBasis>& bases,
+                                 RelationRoutedBootstrapArtifact* artifact) {
+    if (!artifact) return;
+    artifact->basis_scoped = IsBasisScopedRelationSummary(artifact->summary_name);
+    if (!artifact->basis_scoped) {
+        artifact->basis_version = 0;
+        return;
+    }
+    if (artifact->basis_version == 0) {
+        artifact->basis_version = FindRelationBasisVersion(bases, artifact->metric_name);
+    }
 }
 
 template <typename BasisT>
@@ -1607,6 +1486,10 @@ void WriteRoutedSummaryArtifact(rapidjson::Writer<rapidjson::StringBuffer>* writ
     WriteStringField(writer, "metric", artifact.metric_name);
     WriteStringField(writer, "summary", artifact.summary_name);
     WriteStringField(writer, "task_kind", TaskKindName(artifact.task_kind));
+    writer->Key("basis_version");
+    writer->Uint64(artifact.basis_version);
+    writer->Key("basis_scoped");
+    writer->Bool(artifact.basis_scoped);
     WriteTaskIdentity(writer, artifact.task_identity);
     WriteClockSpec(writer, artifact.clock_spec);
     WriteCalendarRef(writer, artifact.calendar_ref);
@@ -1632,6 +1515,10 @@ void WriteRoutedSummarySeed(rapidjson::Writer<rapidjson::StringBuffer>* writer,
     WriteStringField(writer, "metric", seed.metric_name);
     WriteStringField(writer, "summary", seed.summary_name);
     WriteStringField(writer, "task_kind", TaskKindName(seed.task_kind));
+    writer->Key("basis_version");
+    writer->Uint64(seed.basis_version);
+    writer->Key("basis_scoped");
+    writer->Bool(seed.basis_scoped);
     writer->Key("seed_status");
     writer->String(SeedStatusName(seed.seed_status));
     WriteTaskIdentity(writer, seed.task_identity);
@@ -2157,77 +2044,40 @@ BootstrapTrainResult BootstrapEngine::TrainRelation(
     std::vector<RoutedRatioSeries> routed_ratio_series;
     for (const auto& block : normalized_blocks) {
         for (std::size_t metric_index = 0; metric_index < metric_count; ++metric_index) {
-            RelationBootstrapMetricSummary summary;
-            if (!ExtractRelationBootstrapMetricSummary(
-                    block, metric_index, bases[metric_index], &summary) ||
-                !summary.valid) {
+            RelationSummaryProjectionOptions summary_options;
+            summary_options.summary_policy = spec.task_spec.summary_policy;
+            summary_options.other_group_idxs = spec.task_spec.other_group_idxs;
+            summary_options.basis = &bases[metric_index];
+            std::vector<RelationProjectedSummary> summaries;
+            if (!ProjectRelationMetricSummaries(block,
+                                                metric_index,
+                                                bases[metric_index].metric_name,
+                                                summary_options,
+                                                &summaries)) {
                 continue;
             }
 
             const std::string& metric_name = bases[metric_index].metric_name;
-            RoutedValueInput(&routed_value_series,
-                             metric_name,
-                             "entropy_shannon",
-                             input.series_key)
-                .observations.push_back(
-                    ValueBootstrapPoint{block.bucket_id, summary.entropy_shannon, 1});
-            if (summary.has_distinct_group_count) {
-                RoutedValueInput(&routed_value_series,
+            for (const RelationProjectedSummary& summary : summaries) {
+                if (summary.task_kind == BaselineTaskKind::kValue) {
+                    RoutedValueInput(&routed_value_series,
+                                     metric_name,
+                                     summary.summary_name,
+                                     input.series_key)
+                        .observations.push_back(
+                            ValueBootstrapPoint{block.bucket_id, summary.value, 1});
+                    continue;
+                }
+                if (summary.task_kind != BaselineTaskKind::kRatio ||
+                    summary.denominator <= 0.0) {
+                    continue;
+                }
+                RoutedRatioInput(&routed_ratio_series,
                                  metric_name,
-                                 "distinct_group_count",
+                                 summary.summary_name,
                                  input.series_key)
-                    .observations.push_back(
-                        ValueBootstrapPoint{block.bucket_id, summary.distinct_group_count, 1});
-            }
-            if (summary.has_stable_headk_mix_drift) {
-                RoutedValueInput(&routed_value_series,
-                                 metric_name,
-                                 "stable_headk_mix_drift",
-                                 input.series_key)
-                    .observations.push_back(
-                        ValueBootstrapPoint{block.bucket_id,
-                                            summary.stable_headk_mix_drift,
-                                            1});
-            }
-
-            AppendRatioPoint(&RoutedRatioInput(&routed_ratio_series,
-                                               metric_name,
-                                               "top1_share",
-                                               input.series_key),
-                             block.bucket_id,
-                             summary.top1_share,
-                             summary.total);
-            AppendRatioPoint(&RoutedRatioInput(&routed_ratio_series,
-                                               metric_name,
-                                               "headk_share",
-                                               input.series_key),
-                             block.bucket_id,
-                             summary.headk_share,
-                             summary.total);
-            AppendRatioPoint(&RoutedRatioInput(&routed_ratio_series,
-                                               metric_name,
-                                               "out_of_support_share",
-                                               input.series_key),
-                             block.bucket_id,
-                             summary.out_of_support_share,
-                             summary.total);
-            AppendRatioPoint(&RoutedRatioInput(&routed_ratio_series,
-                                               metric_name,
-                                               "stable_headk_coverage",
-                                               input.series_key),
-                             block.bucket_id,
-                             summary.stable_headk_coverage,
-                             summary.total);
-            for (std::size_t stable_index = 0; stable_index < summary.stable_g_shares.size();
-                 ++stable_index) {
-                AppendRatioPoint(&RoutedRatioInput(&routed_ratio_series,
-                                                   metric_name,
-                                                   "stable_g_share_" +
-                                                       std::to_string(stable_index),
-                                                   input.series_key),
-                                 block.bucket_id,
-                                 summary.stable_g_shares[stable_index],
-                                 summary.total);
+                    .observations.push_back(RatioBootstrapPoint{
+                        block.bucket_id, summary.numerator, summary.denominator});
             }
         }
     }
@@ -2262,6 +2112,7 @@ BootstrapTrainResult BootstrapEngine::TrainRelation(
         item.enabled_components = routed_artifact.enabled_components;
         item.value_model = routed_artifact.value_model;
         item.diagnostics = routed_artifact.diagnostics;
+        NormalizeRoutedSummaryScope(bases, &item);
         routed_artifacts.push_back(std::move(item));
     }
     for (const auto& series : routed_ratio_series) {
@@ -2286,6 +2137,7 @@ BootstrapTrainResult BootstrapEngine::TrainRelation(
         item.enabled_components = routed_artifact.enabled_components;
         item.ratio_model = routed_artifact.ratio_model;
         item.diagnostics = routed_artifact.diagnostics;
+        NormalizeRoutedSummaryScope(bases, &item);
         routed_artifacts.push_back(std::move(item));
     }
 
@@ -2534,6 +2386,9 @@ BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,
         routed_seed.metric_name = routed_artifact.metric_name;
         routed_seed.summary_name = routed_artifact.summary_name;
         routed_seed.task_kind = routed_artifact.task_kind;
+        routed_seed.basis_scoped = IsBasisScopedRelationSummary(routed_seed.summary_name);
+        routed_seed.basis_version =
+            routed_seed.basis_scoped ? routed_artifact.basis_version : 0;
         routed_seed.task_identity = routed_artifact.task_identity;
         routed_seed.clock_spec = routed_artifact.clock_spec;
         routed_seed.calendar_ref = routed_artifact.calendar_ref;
@@ -2728,6 +2583,9 @@ BaselineStatus BootstrapEngine::LoadArtifact(std::string_view content,
                 return BaselineStatus::kParseFailed;
             }
             artifact.relation_routed_summary_artifacts.push_back(std::move(routed));
+        }
+        for (auto& routed : artifact.relation_routed_summary_artifacts) {
+            NormalizeRoutedSummaryScope(artifact.relation_basis_by_metric, &routed);
         }
     } else {
         return BaselineStatus::kIncompatibleArtifact;

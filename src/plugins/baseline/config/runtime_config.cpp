@@ -367,6 +367,53 @@ void ParseRollingConfig(const YAML::Node& node, BaselineRollingConfig* out) {
                         &out->monthpos_min_month_transitions);
     ParseOptionalScalar(node, "monthpos_ready_coverage_ratio",
                         &out->monthpos_ready_coverage_ratio);
+    const YAML::Node relation = node["relation_rolling"];
+    if (relation) {
+        ParseOptionalScalar(relation,
+                            "enable_routed_rolling",
+                            &out->relation_rolling.enable_routed_rolling);
+        ParseOptionalScalar(relation,
+                            "enable_stream_basis",
+                            &out->relation_rolling.enable_stream_basis);
+        ParseOptionalScalar(
+            relation,
+            "include_universal_summaries_without_basis",
+            &out->relation_rolling.include_universal_summaries_without_basis);
+        ParseOptionalScalar(relation,
+                            "basis_stats_max_groups",
+                            &out->relation_rolling.basis_stats_max_groups);
+        ParseOptionalScalar(relation,
+                            "basis_collect_min_buckets",
+                            &out->relation_rolling.basis_collect_min_buckets);
+        ParseOptionalScalar(relation,
+                            "basis_ready_min_buckets",
+                            &out->relation_rolling.basis_ready_min_buckets);
+        ParseOptionalScalar(relation,
+                            "basis_refresh_interval_buckets",
+                            &out->relation_rolling.basis_refresh_interval_buckets);
+        ParseOptionalScalar(
+            relation,
+            "basis_candidate_min_coverage_ratio",
+            &out->relation_rolling.basis_candidate_min_coverage_ratio);
+        ParseOptionalScalar(relation,
+                            "basis_replacement_cap_ratio",
+                            &out->relation_rolling.basis_replacement_cap_ratio);
+        ParseOptionalScalar(relation,
+                            "basis_replacement_cap_max",
+                            &out->relation_rolling.basis_replacement_cap_max);
+        ParseOptionalScalar(relation,
+                            "basis_handover_warmup_buckets",
+                            &out->relation_rolling.basis_handover_warmup_buckets);
+        ParseOptionalScalar(relation,
+                            "basis_threshold_margin",
+                            &out->relation_rolling.basis_threshold_margin);
+        ParseOptionalScalar(relation,
+                            "basis_min_stable_refresh_count",
+                            &out->relation_rolling.basis_min_stable_refresh_count);
+        ParseOptionalScalar(relation,
+                            "routed_state_shard_count",
+                            &out->relation_rolling.routed_state_shard_count);
+    }
 }
 
 void ParseCalendars(const YAML::Node& node, RuntimeConfigState* out) {
@@ -532,8 +579,29 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
         if (!ValidateAllowedKeys(bootstrap["export_seed"],
                                  {"include_monthpos_when_ready",
                                   "include_event_when_ready",
-                                  "include_t3_basis_when_ready"},
+                                  "include_relation_basis_when_ready"},
                                  "bootstrap.export_seed",
+                                 err)) {
+            return false;
+        }
+    }
+    if (defaults["rolling_config"] && defaults["rolling_config"]["relation_rolling"]) {
+        if (!ValidateAllowedKeys(defaults["rolling_config"]["relation_rolling"],
+                                 {"enable_routed_rolling",
+                                  "enable_stream_basis",
+                                  "include_universal_summaries_without_basis",
+                                  "basis_stats_max_groups",
+                                  "basis_collect_min_buckets",
+                                  "basis_ready_min_buckets",
+                                  "basis_refresh_interval_buckets",
+                                  "basis_candidate_min_coverage_ratio",
+                                  "basis_replacement_cap_ratio",
+                                  "basis_replacement_cap_max",
+                                  "basis_handover_warmup_buckets",
+                                  "basis_threshold_margin",
+                                  "basis_min_stable_refresh_count",
+                                  "routed_state_shard_count"},
+                                 "rolling_config.relation_rolling",
                                  err)) {
             return false;
         }
@@ -644,7 +712,8 @@ bool ValidateStrictDefaultsSchema(const YAML::Node& defaults, std::string* err) 
                               "monthpos_alpha",
                               "monthpos_delta_max_scale",
                               "monthpos_min_month_transitions",
-                              "monthpos_ready_coverage_ratio"},
+                              "monthpos_ready_coverage_ratio",
+                              "relation_rolling"},
                              "rolling_config",
                              err)) {
         return false;

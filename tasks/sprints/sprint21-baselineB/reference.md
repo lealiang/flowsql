@@ -258,7 +258,7 @@ trend + seasonality + holiday/event
 | `Maturity Gate` | 流式异常检测工程经验、NAB 评价目标 | 组件按覆盖度和稳定性逐步启用 |
 | 残差异常评分 | Kusto、Twitter S-H-ESD、robust statistics | 在 residual 空间输出异常分与解释 |
 | 自适应遗忘 | ADWIN、RLS forgetting factor、Datadog Agile 思路 | 漂移时加快在线状态适应 |
-| `T3` routed 摘要 | Sprint 19 `T3` 设计、Kusto 分解思想 | 摘要特征路由到 `T1/T2` rolling core |
+| Relation routed 摘要 | Sprint 19 relation 设计、Kusto 分解思想 | 摘要特征路由到 `T1/T2` rolling core |
 
 ---
 

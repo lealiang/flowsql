@@ -52,9 +52,11 @@ int RelationBasisBuilder::BuildServiceBasis(const RelationBasisBuildInput& input
     const std::unordered_set<uint32_t> other_group_set(other_group_idxs.begin(),
                                                        other_group_idxs.end());
 
-    double total_hist_mass = 0.0;
-    for (const auto& stat : input.group_stats) {
-        if (stat.hist_mass > 0.0) total_hist_mass += stat.hist_mass;
+    double total_hist_mass = input.total_hist_mass_denominator;
+    if (total_hist_mass <= 0.0) {
+        for (const auto& stat : input.group_stats) {
+            if (stat.hist_mass > 0.0) total_hist_mass += stat.hist_mass;
+        }
     }
     if (total_hist_mass <= 0.0) return error::BAD_REQUEST;
 

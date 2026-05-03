@@ -19,6 +19,23 @@
 namespace flowsql {
 namespace baseline {
 
+struct BaselineRelationRollingConfig {
+    bool enable_routed_rolling = true;
+    bool enable_stream_basis = true;
+    bool include_universal_summaries_without_basis = true;
+    uint64_t basis_stats_max_groups = 256;
+    uint64_t basis_collect_min_buckets = 0;
+    uint64_t basis_ready_min_buckets = 0;
+    uint64_t basis_refresh_interval_buckets = 0;
+    double basis_candidate_min_coverage_ratio = 0.60;
+    double basis_replacement_cap_ratio = 0.20;
+    uint32_t basis_replacement_cap_max = 2;
+    uint64_t basis_handover_warmup_buckets = 0;
+    double basis_threshold_margin = 1.20;
+    uint64_t basis_min_stable_refresh_count = 2;
+    uint32_t routed_state_shard_count = 16;
+};
+
 struct BaselineRollingConfig {
     uint32_t n_min_score = 3;
     uint32_t n_min_update = 10;
@@ -133,6 +150,7 @@ struct BaselineRollingConfig {
     std::string timezone = "UTC";
     uint64_t day_buckets = 1440;
     uint64_t week_buckets = 10080;
+    BaselineRelationRollingConfig relation_rolling;
 };
 
 BaselineRollingConfig DefaultBaselineRollingConfig();

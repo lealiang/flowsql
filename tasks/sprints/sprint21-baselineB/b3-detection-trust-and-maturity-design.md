@@ -34,7 +34,7 @@ stream observation
 
 本阶段不做：
 
-- `T3` routed rolling 接入和 stream-only basis 刷新，这归 `B4`。
+- Relation routed rolling 接入和 stream-only basis 刷新，这归 `B4`。
 - 长周期自适应 forecast 产品接口、批量 forecast API 或 Rolling 反向改写 bootstrap artifact。
 - Rolling 反向改写 `BootstrapSeed` 或 bootstrap artifact。
 - 新的 batch 重建链路。
@@ -48,7 +48,7 @@ stream observation
 - `SubmitObservation(...)` 仍是 `Value / Ratio` task 的唯一 public rolling 提交入口。
 - `PredictRolling(series_key, bucket_id)` 仍是只读预测接口，不更新状态、不触发 lazy init。
 - `BootstrapSeed` 仍是 baseline plugin 内部结构，不进入 `framework/interfaces` public ABI。
-- `IBaselineRelationTask` 不新增 rolling 提交接口；`T3 routed summary` 后续仍作为 `value_basic`、`value_sampled` 或 `ratio` series 复用 `T1/T2` rolling core。
+- `IBaselineRelationTask` 不新增 rolling 提交接口；Relation routed summary 后续仍作为 `value_basic`、`value_sampled` 或 `ratio` series 复用 `T1/T2` rolling core。
 
 `B2` 的粗粒度状态：
 

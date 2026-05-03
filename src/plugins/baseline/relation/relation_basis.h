@@ -34,6 +34,7 @@ struct RelationBasisBuildInput {
     RelationSupportPolicySpec support_policy;
     RelationSummaryPolicySpec summary_policy;
     uint64_t valid_bucket_count = 0;
+    double total_hist_mass_denominator = 0.0;
     std::vector<RelationGroupHistoryStat> group_stats;
 };
 

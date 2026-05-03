@@ -435,6 +435,23 @@ RelationBootstrapInput BuildRelationHistory() {
     return input;
 }
 
+RelationRollingObservation BuildRelationObservation(int64_t bucket,
+                                                    double g1,
+                                                    double g2,
+                                                    double g3) {
+    RelationRollingObservation obs;
+    obs.series_key = "svc-a";
+    obs.bucket_id = bucket;
+    obs.group_idx = {1, 2, 3};
+    RelationBootstrapMetric metric;
+    metric.metric = "bps";
+    metric.total = g1 + g2 + g3;
+    metric.active_count = 3;
+    metric.values_by_group = {g1, g2, g3};
+    obs.metrics.push_back(metric);
+    return obs;
+}
+
 void TestTaskBootstrapPredictAndExport() {
     std::printf("[TEST] B1 task bootstrap predict export...\n");
     auto env = LoadBaselineService();
@@ -520,6 +537,20 @@ void TestTaskBootstrapPredictAndExport() {
     const BootstrapTrainResult relation_train =
         relation_task->Bootstrap(BuildRelationHistory());
     assert(relation_train.status == BaselineStatus::kOk);
+    auto [relation_snapshot_status, relation_snapshot] =
+        relation_task->QueryTaskSnapshot(BaselineSerializationFormat::kJson);
+    assert(relation_snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document relation_snapshot_doc;
+    relation_snapshot_doc.Parse(relation_snapshot.c_str());
+    assert(!relation_snapshot_doc.HasParseError());
+    assert(relation_snapshot_doc.HasMember("document_kind"));
+    assert(std::string(relation_snapshot_doc["document_kind"].GetString()) ==
+           "relation_task_snapshot");
+    assert(relation_snapshot_doc.HasMember("relation_runtime"));
+    const auto& relation_runtime = relation_snapshot_doc["relation_runtime"];
+    assert(relation_runtime["routed_shard_count"].GetUint64() == 16);
+    assert(relation_runtime["source_state_count"].GetUint64() == 1);
+    assert(relation_runtime["routed_seed_count"].GetUint64() > 0);
     auto [basis_status, basis_json] =
         relation_task->QueryBootstrapBasis(BaselineSerializationFormat::kJson);
     assert(basis_status == BaselineStatus::kOk);
@@ -636,6 +667,261 @@ void TestValueTaskKeepsBootstrapPerSeriesAndExportsAll() {
     assert(reloaded_prediction_b.baseline_mu > reloaded_prediction_a.baseline_mu + 300.0);
 
     std::printf("[PASS] B1 value task keeps bootstrap per series and exports all\n");
+}
+
+void TestB4RelationSubmitObservation() {
+    std::printf("[TEST] B4 relation submit observation routes summaries...\n");
+
+    auto env = LoadBaselineService();
+    auto [status, relation_task] = env.service->CreateRelationTask(
+        RelationTaskConfig(), BaselineSerializationFormat::kJson);
+    assert(status == BaselineStatus::kOk);
+    assert(relation_task != nullptr);
+
+    RelationRollingSubmitOptions options;
+    RelationRollingResult cold_result =
+        relation_task->SubmitObservation(BuildRelationObservation(100, 60, 30, 10), options);
+    assert(cold_result.status == BaselineStatus::kOk);
+    assert(cold_result.series_key == "svc-a");
+    assert(cold_result.bucket_id == 100);
+    assert(cold_result.basis_status == "collecting");
+
+    bool has_entropy = false;
+    bool has_top1 = false;
+    bool has_basis_scoped = false;
+    std::string top1_routed_series_key;
+    for (const auto& routed : cold_result.routed_results) {
+        if (routed.summary == "entropy_shannon") {
+            has_entropy = true;
+            assert(!routed.basis_scoped);
+            assert(routed.rolling.status == BaselineStatus::kOk);
+        }
+        if (routed.summary == "top1_share") {
+            has_top1 = true;
+            assert(!routed.basis_scoped);
+            assert(routed.rolling.status == BaselineStatus::kOk);
+            top1_routed_series_key = routed.routed_series_key;
+        }
+        if (routed.basis_scoped) has_basis_scoped = true;
+    }
+    assert(has_entropy);
+    assert(has_top1);
+    assert(!has_basis_scoped);
+    assert(!top1_routed_series_key.empty());
+
+    auto [snapshot_status, snapshot] =
+        relation_task->QueryTaskSnapshot(BaselineSerializationFormat::kJson);
+    assert(snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document snapshot_doc;
+    snapshot_doc.Parse(snapshot.c_str());
+    assert(!snapshot_doc.HasParseError());
+    assert(snapshot_doc["relation_runtime"]["source_state_count"].GetUint64() == 1);
+    assert(snapshot_doc["relation_runtime"]["routed_state_count"].GetUint64() > 0);
+
+    auto [source_snapshot_status, source_snapshot] =
+        relation_task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+    assert(source_snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document source_snapshot_doc;
+    source_snapshot_doc.Parse(source_snapshot.c_str());
+    assert(!source_snapshot_doc.HasParseError());
+    assert(std::string(source_snapshot_doc["document_kind"].GetString()) ==
+           "relation_series_snapshot");
+    assert(source_snapshot_doc["series_key"].GetString() == std::string("svc-a"));
+    assert(source_snapshot_doc["source_series_key"].GetString() == std::string("svc-a"));
+    assert(source_snapshot_doc.HasMember("basis_by_metric"));
+    assert(source_snapshot_doc["basis_by_metric"].IsArray());
+    assert(source_snapshot_doc.HasMember("routed_summaries"));
+    assert(source_snapshot_doc["routed_summaries"].IsArray());
+    assert(source_snapshot_doc["routed_summaries"].Size() > 0);
+
+    auto [wrong_source_status, wrong_source_snapshot] =
+        relation_task->QuerySeriesSnapshot(top1_routed_series_key,
+                                           BaselineSerializationFormat::kJson);
+    assert(wrong_source_status == BaselineStatus::kInvalidArgument);
+    assert(wrong_source_snapshot.empty());
+
+    RelationRoutedSummaryQuery routed_query;
+    routed_query.source_series_key = "svc-a";
+    routed_query.metric = "bps";
+    routed_query.summary = "top1_share";
+    routed_query.feature_type = "ratio";
+    RollingPrediction routed_prediction =
+        relation_task->PredictRoutedSummary(routed_query, 101);
+    assert(routed_prediction.status == BaselineStatus::kOk);
+
+    auto [routed_snapshot_status, routed_snapshot] =
+        relation_task->QueryRoutedSummarySnapshot(routed_query,
+                                                  BaselineSerializationFormat::kJson);
+    assert(routed_snapshot_status == BaselineStatus::kOk);
+    rapidjson::Document routed_snapshot_doc;
+    routed_snapshot_doc.Parse(routed_snapshot.c_str());
+    assert(!routed_snapshot_doc.HasParseError());
+    assert(std::string(routed_snapshot_doc["document_kind"].GetString()) ==
+           "rolling_series_snapshot");
+    assert(routed_snapshot_doc["last_seen_bucket"].GetInt64() == 100);
+
+    std::string seeded_config = RelationTaskConfig();
+    const std::string old_task_id = "baseline_task_client_mix";
+    const std::size_t task_id_pos = seeded_config.find(old_task_id);
+    assert(task_id_pos != std::string::npos);
+    seeded_config.replace(task_id_pos, old_task_id.size(), "baseline_task_client_mix_seeded");
+    auto [seeded_status, seeded_task] = env.service->CreateRelationTask(
+        seeded_config, BaselineSerializationFormat::kJson);
+    assert(seeded_status == BaselineStatus::kOk);
+    assert(seeded_task != nullptr);
+    assert(seeded_task->Bootstrap(BuildRelationHistory()).status == BaselineStatus::kOk);
+    RelationRollingResult seeded_result =
+        seeded_task->SubmitObservation(BuildRelationObservation(20, 50, 25, 25), options);
+    assert(seeded_result.status == BaselineStatus::kOk);
+
+    bool has_out_of_support = false;
+    for (const auto& routed : seeded_result.routed_results) {
+        if (routed.summary == "out_of_support_share") {
+            has_out_of_support = true;
+            assert(routed.basis_scoped);
+            assert(routed.basis_version > 0);
+            assert(routed.rolling.status == BaselineStatus::kOk);
+        }
+    }
+    assert(has_out_of_support);
+
+    std::printf("[PASS] B4 relation submit observation routes summaries\n");
+}
+
+void TestB4RelationRollingConfigSwitches() {
+    std::printf("[TEST] B4 relation rolling config switches close design contract...\n");
+
+    const std::string routed_disabled_config = "/tmp/flowsql_b4_relation_routed_disabled.yaml";
+    {
+        std::ofstream file(routed_disabled_config);
+        file << R"(
+baseline:
+  rolling_config:
+    relation_rolling:
+      enable_routed_rolling: false
+      enable_stream_basis: true
+      include_universal_summaries_without_basis: true
+      basis_collect_min_buckets: 1
+      basis_ready_min_buckets: 1
+      basis_refresh_interval_buckets: 1
+      basis_candidate_min_coverage_ratio: 0.01
+      basis_min_stable_refresh_count: 1
+      routed_state_shard_count: 4
+)";
+        assert(file.good());
+    }
+    {
+        auto env = LoadBaselineService("config_file=" + routed_disabled_config + ";strict=false");
+        auto [status, relation_task] = env.service->CreateRelationTask(
+            RelationTaskConfig(), BaselineSerializationFormat::kJson);
+        assert(status == BaselineStatus::kOk);
+        assert(relation_task != nullptr);
+
+        RelationRollingSubmitOptions options;
+        RelationRollingResult result =
+            relation_task->SubmitObservation(BuildRelationObservation(100, 60, 30, 10), options);
+        assert(result.status == BaselineStatus::kOk);
+        assert(result.routed_results.empty());
+        assert(result.basis_version == 1);
+
+        auto [task_snapshot_status, task_snapshot] =
+            relation_task->QueryTaskSnapshot(BaselineSerializationFormat::kJson);
+        assert(task_snapshot_status == BaselineStatus::kOk);
+        rapidjson::Document task_doc;
+        task_doc.Parse(task_snapshot.c_str());
+        assert(!task_doc.HasParseError());
+        assert(task_doc["relation_runtime"]["routed_shard_count"].GetUint64() == 4);
+        assert(task_doc["relation_runtime"]["routed_state_count"].GetUint64() == 0);
+
+        auto [source_status, source_snapshot] =
+            relation_task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+        assert(source_status == BaselineStatus::kOk);
+        rapidjson::Document source_doc;
+        source_doc.Parse(source_snapshot.c_str());
+        assert(!source_doc.HasParseError());
+        assert(source_doc["basis_by_metric"].IsArray());
+        assert(source_doc["basis_by_metric"].Size() == 1);
+        assert(source_doc["routed_summaries"].IsArray());
+        assert(source_doc["routed_summaries"].Empty());
+    }
+    flowsql::baseline::ResetBaselineRuntimeConfig();
+
+    const std::string stream_disabled_config = "/tmp/flowsql_b4_relation_stream_disabled.yaml";
+    {
+        std::ofstream file(stream_disabled_config);
+        file << R"(
+baseline:
+  rolling_config:
+    relation_rolling:
+      enable_routed_rolling: true
+      enable_stream_basis: false
+      include_universal_summaries_without_basis: true
+      routed_state_shard_count: 4
+)";
+        assert(file.good());
+    }
+    {
+        auto env = LoadBaselineService("config_file=" + stream_disabled_config + ";strict=false");
+        auto [status, relation_task] = env.service->CreateRelationTask(
+            RelationTaskConfig(), BaselineSerializationFormat::kJson);
+        assert(status == BaselineStatus::kOk);
+        assert(relation_task != nullptr);
+
+        RelationRollingSubmitOptions options;
+        RelationRollingResult result =
+            relation_task->SubmitObservation(BuildRelationObservation(100, 60, 30, 10), options);
+        assert(result.status == BaselineStatus::kOk);
+        assert(!result.routed_results.empty());
+
+        auto [source_status, source_snapshot] =
+            relation_task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+        assert(source_status == BaselineStatus::kOk);
+        rapidjson::Document source_doc;
+        source_doc.Parse(source_snapshot.c_str());
+        assert(!source_doc.HasParseError());
+        assert(source_doc["basis_by_metric"].IsArray());
+        assert(source_doc["basis_by_metric"].Empty());
+        assert(source_doc["routed_summaries"].IsArray());
+        assert(source_doc["routed_summaries"].Size() > 0);
+    }
+    flowsql::baseline::ResetBaselineRuntimeConfig();
+
+    const std::string universal_disabled_config =
+        "/tmp/flowsql_b4_relation_universal_disabled.yaml";
+    {
+        std::ofstream file(universal_disabled_config);
+        file << R"(
+baseline:
+  rolling_config:
+    relation_rolling:
+      enable_routed_rolling: true
+      enable_stream_basis: false
+      include_universal_summaries_without_basis: false
+      routed_state_shard_count: 4
+)";
+        assert(file.good());
+    }
+    {
+        auto env = LoadBaselineService("config_file=" + universal_disabled_config + ";strict=false");
+        auto [status, relation_task] = env.service->CreateRelationTask(
+            RelationTaskConfig(), BaselineSerializationFormat::kJson);
+        assert(status == BaselineStatus::kOk);
+        assert(relation_task != nullptr);
+
+        RelationRollingSubmitOptions options;
+        RelationRollingResult result =
+            relation_task->SubmitObservation(BuildRelationObservation(100, 60, 30, 10), options);
+        assert(result.status == BaselineStatus::kOk);
+        assert(result.routed_results.empty());
+
+        auto [source_status, source_snapshot] =
+            relation_task->QuerySeriesSnapshot("svc-a", BaselineSerializationFormat::kJson);
+        assert(source_status == BaselineStatus::kNotTrained);
+        assert(source_snapshot.empty());
+    }
+    flowsql::baseline::ResetBaselineRuntimeConfig();
+
+    std::printf("[PASS] B4 relation rolling config switches close design contract\n");
 }
 
 void TestBootstrapUsesConfiguredEventCalendar() {
@@ -1288,5 +1574,7 @@ int main() {
     TestB2RollingPredict();
     TestB2RollingFailureSemantics();
     TestB3RollingResultUsesPreUpdateTrustSnapshot();
+    TestB4RelationSubmitObservation();
+    TestB4RelationRollingConfigSwitches();
     return 0;
 }

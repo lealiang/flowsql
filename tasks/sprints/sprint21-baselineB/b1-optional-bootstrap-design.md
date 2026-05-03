@@ -6,9 +6,9 @@
 
 本阶段目标是把旧基线中的历史训练能力干净抽离成可选启动器，为后续 `Online Rolling Core` 提供启动 seed 和可验证的未来预测接口。
 
-本文不设计在线滚动更新算法，不设计成熟度自动推进，不设计 `T3` stream-only basis 刷新。
+本文不设计在线滚动更新算法，不设计成熟度自动推进，不设计 Relation stream-only basis 刷新。
 
-旧基线算法来源可按需定向参考 [Sprint 19 Baseline 设计](../sprint19-baseline/design.md)，但不得全文引用。本文只继承历史训练、预测和 `T3` 初始 basis 能力；`shadow/candidate/rebuild` 在线恢复链路只作为迁移对象，不进入新主路径。
+旧基线算法来源可按需定向参考 [Sprint 19 Baseline 设计](../sprint19-baseline/design.md)，但不得全文引用。本文只继承历史训练、预测和 Relation 初始 basis 能力；`shadow/candidate/rebuild` 在线恢复链路只作为迁移对象，不进入新主路径。
 
 ---
 
@@ -25,7 +25,7 @@
 1. 使用一次性历史数据训练 bootstrap artifact。
 2. 使用 bootstrap artifact 对未来 bucket 输出 baseline band。
 3. 导出 `B2 Online Rolling Core` 可消费的 `BootstrapSeed`。
-4. 为 `T3` 导出初始 `RelationServiceBasis` seed，以及由历史 relation 摘要训练出的 routed value/ratio seed。
+4. 为 Relation 导出初始 `RelationServiceBasis` seed，以及由历史 relation 摘要训练出的 routed value/ratio seed。
 
 `B1` 不允许继续保留以下主路径假设：
 
@@ -86,7 +86,7 @@ src/plugins/baseline/bootstrap/
 | `B1-T06` | 实现 series 级 seed / artifact 生成和 task 级全量序列化 | `bootstrap_engine.*`、`bootstrap_types.*` | `6.3`、`6.4`、`6.6`、`6.7`、`7.1`、`11.2`、`11.3` | 可按 `series_key` 获得内存态 `BootstrapSeed`；`ExportBootstrapArtifact`、`LoadBootstrapArtifact`、`ExportBootstrapSeed` 以 task 为单位导出 / 导入全部 series，并做严格兼容性校验 |
 | `B1-T07` | 改造 registry、plugin 生命周期和 service snapshot | `task/task_registry.*`、`baseline_plugin.*`、`task/baseline_task_base.*` | `7.4`、`7.10`、`7.11` | registry 使用 config 提供的 `task_id`；`Create*Task` 返回 `shared_ptr`；`Close` 幂等；`QueryServiceSnapshot` 不再暴露 rebuild queue / worker 状态 |
 | `B1-T08` | 接入 T1/T2 统一任务模型 | `task/value_task.*`、`task/ratio_task.*`、`baseline_plugin.*` | `7.0`、`7.4`、`7.5`、`7.6` | `Create*Task -> Bootstrap(series_key) -> PredictBootstrap(series_key) -> Export*()` 路径打通；任务内部按 series 保存 artifact / seed；导出 / 导入按 task 全量处理；任务不再持有 `HistoryReader`、`RebuildRuntime`、`KeyRiskFusion` |
-| `B1-T09` | 接入 T3 初始 basis 与离线摘要 bootstrap | `relation/relation_basis.*`、`bootstrap_trainer.*`、`task/relation_task.*` | `4.5`、`6.3`、`7.2`、`7.7` | 历史 `RelationBootstrapBlock` 聚合为 `RelationGroupHistoryStat` 后调用 `BuildServiceBasis`，并在该 basis 上离线路由 relation 摘要，导出 routed value/ratio seed；不调用 `BuildEvalBasis`，不恢复旧在线 route |
+| `B1-T09` | 接入 Relation 初始 basis 与离线摘要 bootstrap | `relation/relation_basis.*`、`bootstrap_trainer.*`、`task/relation_task.*` | `4.5`、`6.3`、`7.2`、`7.7` | 历史 `RelationBootstrapBlock` 聚合为 `RelationGroupHistoryStat` 后调用 `BuildServiceBasis`，并在该 basis 上离线路由 relation 摘要，导出 routed value/ratio seed；不调用 `BuildEvalBasis`，不恢复旧在线 route |
 | `B1-T10` | 删除旧在线恢复链路 | `rebuild/*`、`model/shadow_state.h`、`model/formal_model_state.h`、`task/*` | `5`、`8.3`、`9.3`、`11.3` | 代码中移除 `RequestRebuild`、`SetHistoryReader`、`SubmitObservation`、`SubmitBlock`、shadow / candidate / rebuild 状态和配置 |
 | `B1-T11` | 补齐验证 | `tests` / baseline 相关测试 | `10` | 覆盖训练、预测、序列化重载、无旧状态触发、配置清理；编译或测试能证明旧在线恢复符号不再进入 B1 主路径 |
 | `B1-T12` | 补充 `BootstrapSeed` 质量自动评价 | `bootstrap_engine.*`、`bootstrap_types.*`、`config/runtime_config.*`、`tests` | `6.3`、`6.3.1`、`8.2`、`10` | `EvaluateBootstrapSeedStatus()` 基于 profile 目标、训练跨度、覆盖率、phase coverage、组件可用性和 `sigma_init` 自动输出 `full/partial/weak/none`；调用方不能直接写入成熟度标签；routed summary seed 使用同一评价规则并补充测试 |
@@ -188,7 +188,7 @@ RatioBootstrapSeries
 - 不把 gap 填成 `0`。
 - 不在 bootstrap 内部调用外部历史读取器。
 
-### 4.5 T3 初始 basis 与离线摘要路由能力
+### 4.5 Relation 初始 basis 与离线摘要路由能力
 
 保留 `RelationBasisBuilder::BuildServiceBasis`。
 
@@ -201,7 +201,7 @@ head_proto_q
 basis_version
 ```
 
-同时，`B1` 必须在该 basis 上对历史 relation block 做离线摘要投影，并复用 T1/T2 bootstrap trainer 训练 routed summary artifact / seed。该能力用于让后续 rolling 阶段在 `T3 routed 摘要 -> T1/T2 rolling baseline` 路径上获得历史启动参数。
+同时，`B1` 必须在该 basis 上对历史 relation block 做离线摘要投影，并复用 T1/T2 bootstrap trainer 训练 routed summary artifact / seed。该能力用于让后续 rolling 阶段在 `Relation routed 摘要 -> T1/T2 rolling baseline` 路径上获得历史启动参数。
 
 首版 routed 摘要包括：
 
@@ -528,7 +528,7 @@ struct BootstrapMaturityInit {
 - `B1` 必须保证 `uncertainty_init.component_uncertainty` 中的 scale 为有限正数；若训练过程无法估计组件级不确定性，应使用保守默认值，而不是留空或写 `0`。
 - `B1` 必须保证 `seed_status`、`coverage_ratio`、`maturity_init.confidence` 与实际训练支撑一致，供 `B2` 映射初始 `P`、confidence 和 cold/warming 状态。
 - `theta_init.model_space`、`sigma_init.model_space` 和任务 transform 必须一致；不一致的 seed 对 `B2` 来说是不可兼容 seed，不能依赖 B2 静默降级。
-- `relation_routed_summary_seeds` 中的每个 routed value/ratio seed 也必须满足上述要求，否则 `T3 routed summary -> T1/T2 rolling` 无法获得可靠历史启动参数。
+- `relation_routed_summary_seeds` 中的每个 routed value/ratio seed 也必须满足上述要求，否则 `Relation routed summary -> T1/T2 rolling` 无法获得可靠历史启动参数。
 
 #### 6.3.1 Seed 质量自动评价
 
@@ -614,8 +614,8 @@ history
 - 初始化 `level_0`、`trend_0`、day/week 周期系数。
 - 初始化 `sigma`、band 宽度、`confidence`、`maturity`。
 - 可选携带 `monthpos/event` 的初始提示，但不要求 rolling core 完全照搬旧模型结构。
-- 对 `T3`，可携带初始 `basis/support/stable_head` seed。
-- 对 `T3 routed summary`，每个 routed value/ratio seed 必须携带可初始化 rolling core 的模型参数，不能只导出 summary 名称。
+- 对 Relation，可携带初始 `basis/support/stable_head` seed。
+- 对 Relation routed summary，每个 routed value/ratio seed 必须携带可初始化 rolling core 的模型参数，不能只导出 summary 名称。
 - 更接近“流式滚动模型启动参数”。
 
 `B1 -> B2` 的主交接路径必须是内存中的 `BootstrapSeed` 结构体：
@@ -1377,7 +1377,7 @@ bootstrap:
   export_seed:
     include_monthpos_when_ready: true
     include_event_when_ready: true
-    include_t3_basis_when_ready: true
+    include_relation_basis_when_ready: true
 
 shared_profile_config:
   daily_harmonic_order: 6
@@ -1464,7 +1464,7 @@ task/* 中的 ExecuteRebuild / RequestRebuild / SetHistoryReader
 - [ ] 可对指定 `series_key` 的未来 `bucket_id` 调用预测接口，返回 `baseline_mu/lower/upper/band_width/confidence`。
 - [ ] `Value` 预测输出在原始观测空间，不能只暴露 `log1p` 模型空间值。
 - [ ] `Ratio` 预测输出在 `[0, 1]` 概率空间。
-- [ ] 可从历史 `RelationBootstrapBlock` 导出 `T3` 初始 basis seed 和 routed value/ratio summary seed。
+- [ ] 可从历史 `RelationBootstrapBlock` 导出 Relation 初始 basis seed 和 routed value/ratio summary seed。
 - [ ] 统一任务可按 `series_key` 完成 `Bootstrap -> PredictBootstrap`，并通过 task 级全量 `ExportBootstrapArtifact -> ExportBootstrapSeed` 导出全部 series。
 - [ ] 同一 task 下两个不同 `series_key` 连续训练时，artifact / seed / prediction 互不覆盖，导出的 JSON 每个 series 条目均包含正确 `series_identity`。
 - [ ] `BootstrapSeed.seed_status` 由 `BootstrapEngine` 自动评价；覆盖 `full/partial/weak/none`、daily-only、day-week、低覆盖、缺 `sigma_init` 和 routed summary seed 场景，调用方不能直接覆盖成熟度标签。

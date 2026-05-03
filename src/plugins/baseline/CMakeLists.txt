@@ -12,6 +12,9 @@ add_library(${PROJECT_NAME} SHARED
     model/readiness_helper.cpp
     bootstrap/formal_model_trainer.cpp
     relation/relation_basis.cpp
+    relation/relation_basis_state.cpp
+    relation/relation_summary.cpp
+    relation/routed_summary.cpp
     rolling/drift_adapt.cpp
     rolling/detection_calibration.cpp
     rolling/maturity_gate.cpp

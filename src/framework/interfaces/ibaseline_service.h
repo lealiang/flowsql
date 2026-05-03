@@ -89,6 +89,16 @@ interface IBaselineRatioTask : public IBaselineTask {
 };
 
 interface IBaselineRelationTask : public IBaselineTask {
+    virtual RelationRollingResult SubmitObservation(
+        const RelationRollingObservation& obs,
+        const RelationRollingSubmitOptions& options) = 0;
+    virtual RollingPrediction PredictRoutedSummary(
+        const RelationRoutedSummaryQuery& query,
+        int64_t bucket_id) const = 0;
+    virtual BaselineSerializationResult QueryRoutedSummarySnapshot(
+        const RelationRoutedSummaryQuery& query,
+        BaselineSerializationFormat format) const = 0;
+
     virtual BootstrapTrainResult Bootstrap(const RelationBootstrapInput& input) = 0;
     virtual BaselineSerializationResult ExportBootstrapArtifact(
         BaselineSerializationFormat format) const = 0;

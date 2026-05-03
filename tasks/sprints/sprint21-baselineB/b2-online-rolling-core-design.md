@@ -19,7 +19,7 @@ stream observation -> rolling prediction band -> residual score -> gated update
 本阶段不做：
 
 - 完整 `Maturity Gate`、组件成熟度状态机和月位置在线成熟，这些归 `B3`。
-- `T3` routed rolling 接入和 stream-only basis 刷新，这归 `B4`。
+- Relation routed rolling 接入和 stream-only basis 刷新，这归 `B4`。
 - 任何旧 `shadow/candidate/rebuild` 恢复链路。
 - `RollingState` 持久化格式；重启恢复后续单独设计。
 - relation 分布本身的在线 rolling 建模。
@@ -967,7 +967,7 @@ B3 需要把 learning confidence 与 score trust 分开处理：B2 可以输出�
 Relation 边界：
 
 - B2 不提供 relation rolling 提交接口。
-- `T3 routed summary` 后续作为 `value_basic` / `value_sampled` / `ratio` series 复用 T1/T2 rolling core。
+- Relation routed summary 后续作为 `value_basic` / `value_sampled` / `ratio` series 复用 T1/T2 rolling core。
 - relation routed rolling 接入和 basis 在线刷新归 `B4`。
 
 ## 8. 实现任务与测试矩阵

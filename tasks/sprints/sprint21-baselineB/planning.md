@@ -23,7 +23,8 @@
 b1-optional-bootstrap-design.md
 b2-online-rolling-core-design.md
 b3-detection-trust-and-maturity-design.md
-b4-t3-routed-rolling-and-stream-basis-design.md
+b4-relation-routed-rolling-and-stream-basis-design.md
+b5-relation-pattern-fusion-design.md
 ```
 
 阶段设计文档只覆盖当前阶段的接口、算法取舍、迁移步骤、测试矩阵和完成门禁。已关闭阶段的遗留语义不得继续写入后续阶段设计。
@@ -40,13 +41,14 @@ b4-t3-routed-rolling-and-stream-basis-design.md
 
 ## 2. 总体阶段划分
 
-BaselineB 分 4 个阶段推进，每个阶段对应一个独立迭代。阶段之间只通过明确产物衔接，禁止把上一阶段遗留语义带入下一阶段。
+BaselineB 分 5 个阶段推进，每个阶段对应一个独立迭代。阶段之间只通过明确产物衔接，禁止把上一阶段遗留语义带入下一阶段。
 
 ```text
 B1 Optional Bootstrap Engine
   -> B2 Online Rolling Core MVP
   -> B3 Detection Trust, Band Calibration and Monthly Readiness
-  -> B4 T3 Routed Rolling and Stream Basis
+  -> B4 Relation Routed Rolling and Stream Basis
+  -> B5 Relation Pattern Fusion and Risk Output
 ```
 
 关键约束：
@@ -54,7 +56,8 @@ B1 Optional Bootstrap Engine
 - `B1` 必须彻底闭合旧基线改造。`B2` 之后不得再处理旧 `shadow/candidate/rebuild` 主路径遗留问题。
 - `B2` 只消费同一 task 内部按 `series_key` 持有的内存态 `BootstrapSeed`，不把 seed JSON 或 bootstrap prediction 作为 rolling 初始化主路径，也不回头修改旧训练语义。
 - `B3` 只扩展 Online Rolling Core 的检测可信度、band 校准、成熟度和组件解锁，不回头改 bootstrap 训练链路。
-- `B4` 接入 `T3` relation block 的 routed summary rolling 训练，并实现 stream-only basis 成熟；不回头恢复旧重建链路。
+- `B4` 接入 Relation block 的 routed summary rolling 训练，并实现 stream-only basis 成熟；不回头恢复旧重建链路，也不实现 Relation 模式融合。
+- `B5` 基于 B4 产出的 routed summary rolling result，实现 Relation 同源摘要模式融合、关系风险输出，以及 Bootstrap 侧必要的 fusion metadata；B5 开工前必须先完成独立设计文档。
 
 ---
 
@@ -92,7 +95,7 @@ uncertainty_source
 ```
 
 - 保留 `T1/T2` 历史拟合、残差尺度、成熟度和 band 预测能力。
-- `T3` 只导出初始 `basis seed`，不做未来分布预测。
+- Relation 只导出初始 `basis seed`，不做未来分布预测。
 - 明确删除或隔离旧主路径：
   - `shadow baseline`
   - `candidate model`
@@ -109,7 +112,7 @@ uncertainty_source
 - Online Rolling 状态递推。
 - 无历史自学习。
 - 成熟度自动推进。
-- `T3` routed rolling 接入和 stream-only basis 刷新。
+- Relation routed rolling 接入和 stream-only basis 刷新。
 
 ### 3.4 验收标准
 
@@ -157,7 +160,7 @@ predict -> band -> score -> gate_update -> update_state
 
 - 月位置在线成熟。
 - 完整 `Maturity Gate`。
-- `T3` routed rolling 接入和 stream-only basis。
+- Relation routed rolling 接入和 stream-only basis。
 - 任何旧 `shadow/candidate/rebuild` 逻辑。
 
 ### 4.4 验收标准
@@ -223,7 +226,7 @@ cold_learning
 
 本阶段不实现：
 
-- `T3` routed rolling 接入和 stream-only basis 刷新。
+- Relation routed rolling 接入和 stream-only basis 刷新。
 - 长周期自适应 forecast 产品接口、批量 forecast API 或 Rolling 反向改写 Bootstrap artifact；`PredictRolling(series_key, bucket_id)` 只承担基础 Rolling/Bootstrap 融合 forecast view。
 - Rolling 反向改写 Bootstrap artifact。
 - 新的 batch 重建链路。
@@ -242,13 +245,13 @@ cold_learning
 
 ---
 
-## 6. B4：T3 Routed Rolling and Stream Basis
+## 6. B4：Relation Routed Rolling and Stream Basis
 
-阶段设计：[B4 T3 Routed Rolling and Stream Basis 阶段设计](b4-t3-routed-rolling-and-stream-basis-design.md)
+阶段设计：[B4 Relation Routed Rolling and Stream Basis 阶段设计](b4-relation-routed-rolling-and-stream-basis-design.md)
 
 ### 6.1 阶段目标
 
-让关系分布类 `T3` 也符合 stream-first 目标：Relation 流式 block 到达后，能够被投影为 routed summary observations，并复用 `T1/T2 Online Rolling Core` 完成预测、band、score、更新和 B3 检测可信度；同时，`T3` basis 在无历史时可在线保守成熟，有历史时只作为初始 basis seed。
+让关系分布类 Relation 也符合 stream-first 目标：Relation 流式 block 到达后，能够被投影为 routed summary observations，并复用 `T1/T2 Online Rolling Core` 完成预测、band、score、更新和 B3 检测可信度；同时，Relation basis 在无历史时可在线保守成熟，有历史时只作为初始 basis seed。
 
 ### 6.2 范围
 
@@ -261,15 +264,16 @@ cold_learning
 - 在线维护有界 basis 统计，不保存无界 group 历史。
 - 低频形成 / 刷新 `support_explicit`、`stable_head`、`head_proto_q`。
 - 实现 replacement cap、warm-up handover 和 `basis_version` evidence。
-- `B1` 导出的 `T3 basis seed` 只作为可选初始值。
+- `B1` 导出的 Relation basis seed 只作为可选初始值。
 - `B1` 导出的 relation routed summary seed 可用于同 key routed summary 的 rolling 初始化；没有 seed 时必须 stream-only 空启动。
 
 ### 6.3 非目标
 
 本阶段不实现：
 
-- 为 `T3` 单独实现新的时间序列基线算法。
+- 为 Relation 单独实现新的时间序列基线算法。
 - Relation 分布整体的长期 forecast 产品接口。
+- Relation 摘要特征模式融合、跨 metric 模式合成或 Key 级统一风险输出；这些归入 `B5`。
 - 旧 `candidate vs incumbent` 验证。
 - 基于 `HistoryReader.fetch` 的正式重建。
 - 每个 bucket 动态改变 support / stable head。
@@ -277,28 +281,97 @@ cold_learning
 
 ### 6.4 验收标准
 
-- [ ] 无 `T3` 历史时，Relation 任务可接收流式 block，并输出通用 routed summary 的 rolling band / score / trust。
+- [ ] 无 Relation 历史时，Relation 任务可接收流式 block，并输出通用 routed summary 的 rolling band / score / trust。
 - [ ] 有 `B1` relation basis seed 和 routed summary seed 时，同 key routed summary 可从 seed warm-up，且不能绕过 B3 score trust。
 - [ ] 在线统计积累后，stable head 相关摘要可进入 warming / ready，并开始参与 routed rolling。
 - [ ] basis 切换有版本、有 evidence，不破坏摘要特征解释。
 - [ ] basis 统计有固定上限，不随 group 数无界增长。
 - [ ] routed summary 的 rolling state 可在 task / series snapshot 中观测到 `basis_version`、summary identity、maturity 和 score trust。
-- [ ] 旧 rebuild 链路不参与 `T3` basis 成熟。
+- [ ] 旧 rebuild 链路不参与 Relation basis 成熟。
 
 ---
 
-## 7. 阶段依赖与交付口径
+## 7. B5：Relation Pattern Fusion and Risk Output
 
-### 7.1 阶段依赖
+阶段设计：[B5 Relation Pattern Fusion and Risk Output 阶段设计](b5-relation-pattern-fusion-design.md)
+
+### 7.1 阶段目标
+
+补齐 Sprint 19 设计中 Relation 的 fusion 能力：把 B4 产出的 routed summary rolling result 转换为同源摘要特征证据，计算结构性模式分，并输出关系分布层面的风险解释。
+
+B5 只处理 Relation 内部的局部模式融合和关系风险输出，不把 Value / Ratio / Relation 全部合并成全局 Key 级统一风险引擎。全局统一风险引擎如需实现，应作为后续独立阶段。
+
+### 7.2 范围
+
+必须完成：
+
+- 定义 `RelationFusionResult` 或等价输出结构，至少包含：
+
+```text
+relation_risk
+dominant_single[<=3]
+dominant_pattern[<=2]
+pattern_scores
+```
+
+- 将 routed summary 的 `RollingBaselineResult` 标准化为 fusion evidence：
+  - `normalized_score`
+  - `confidence`
+  - `direction`
+  - `persistence`
+  - `can_alert` / `score_trust` 降级语义
+- 实现 Sprint 19 定义的 Relation v1 局部模式库：
+  - `support_escape`
+  - `head_concentration`
+  - `legacy_head_dilution`
+  - `stable_head_mix_shift`
+- 实现同一 `(source_series_key, feature_base, metric)` 内的局部模式融合。
+- 实现同一 `(source_series_key, feature_base, pattern)` 下的跨 metric 模式合成。
+- 输出最小解释信息，说明：
+  - 哪些 summary 是主导单特征证据。
+  - 哪些 pattern 是主导结构模式。
+  - 哪些 metric 参与了该 pattern 的合成。
+- Bootstrap 侧补齐 fusion metadata：
+  - 记录哪些 metric / summary / pattern 可计算。
+  - 记录 pattern 权重和 scope。
+  - 记录 basis-scoped summary 对 `basis_version` 的依赖。
+  - 不训练新的 fusion 时间序列模型，不把历史 fusion risk 当成 rolling 初始化主路径。
+
+### 7.3 非目标
+
+本阶段不实现：
+
+- 全局 `Risk(Key,t)` 统一融合引擎。
+- 业务语义判别，例如攻击、割接、上线或专家规则判断。
+- 新的 Relation 时间序列模型。
+- 旧 `shadow/candidate/rebuild` 或 `HistoryReader.fetch`。
+- Fusion 反向修改 routed rolling state、bootstrap artifact 或 basis。
+
+### 7.4 验收标准
+
+- [ ] 单个 routed summary 弱异常不会被机械放大为高风险。
+- [ ] 多个 summary 对同一结构模式给出一致证据时，pattern score 可显式提级。
+- [ ] `support_escape`、`head_concentration`、`legacy_head_dilution`、`stable_head_mix_shift` 均有单元测试覆盖。
+- [ ] `can_alert = false`、`score_untrusted`、basis 未 ready 或 summary 缺测时，fusion evidence 被降权或视为不可用。
+- [ ] 跨 metric 合成遵循饱和型公式，不因 metric 数量线性无界增长。
+- [ ] Bootstrap artifact / seed 中包含 B5 所需 fusion metadata，导出 / 导入后语义一致。
+- [ ] B5 输出可在 Relation source snapshot 中观测，且不替代 routed summary 的原始 rolling result。
+
+---
+
+## 8. 阶段依赖与交付口径
+
+### 8.1 阶段依赖
 
 ```text
 B1 输出内部 BootstrapSeed[series_key]（bootstrap prediction 仅用于 B1 验证）
   B2 在同一 task 内按 series_key 消费 BootstrapSeed，开发 Online Rolling Core
     B3 扩展 Online Rolling Core 的检测可信度、band 校准、成熟度与月位置能力
-      B4 接入 T3 routed summary rolling，并扩展 stream-only basis 能力
+      B4 接入 Relation routed summary rolling，并扩展 stream-only basis 能力
+        B5 消费 B4 的 routed summary rolling result，形成 Relation pattern fusion 输出
 ```
 
-### 7.2 交付口径
+### 8.2 交付口径
 
 每个阶段交付时必须包含：
 
@@ -308,18 +381,19 @@ B1 输出内部 BootstrapSeed[series_key]（bootstrap prediction 仅用于 B1 �
 - 验证命令和输出证据。
 - 阶段回顾，确认是否有遗留语义会污染下一阶段。
 
-### 7.3 禁止跨阶段遗留
+### 8.3 禁止跨阶段遗留
 
 以下问题不得跨阶段遗留：
 
 - `B1` 不得遗留旧 `shadow/candidate/rebuild` 主路径。
 - `B2` 不得引入新的 batch 依赖。
-- `B3` 不得把检测可信度、band 校准或月位置成熟问题推给 `T3` 或 bootstrap。
-- `B4` 不得恢复 `HistoryReader` 作为 basis 刷新前置条件，也不得绕过 B2/B3 另建 T3 专用时间基线。
+- `B3` 不得把检测可信度、band 校准或月位置成熟问题推给 Relation 或 bootstrap。
+- `B4` 不得恢复 `HistoryReader` 作为 basis 刷新前置条件，也不得绕过 B2/B3 另建 Relation 专用时间基线。
+- `B5` 不得回头改变 B4 的 routed rolling 初始化 / 更新主路径，也不得把 fusion 结果回写为单特征 rolling state。
 
 ---
 
-## 8. 当前下一步
+## 9. 当前下一步
 
 当前执行进度：
 
@@ -350,4 +424,4 @@ B1 输出内部 BootstrapSeed[series_key]（bootstrap prediction 仅用于 B1 �
 
 1. 先做 `B3` 收口审查，确认哪些调试评估代码保留、删除或迁移为长期回归测试。
 2. 若确认清理，单独执行 `B3-C01：评估代码收口与诊断暴露面整理`，避免和算法改动混在一起。
-3. 已进入 `B4：T3 Routed Rolling and Stream Basis` 阶段设计；设计收口后再按 B4-T01 起顺序实施。
+3. 已进入 `B4：Relation Routed Rolling and Stream Basis` 阶段设计；设计收口后再按 B4-T01 起顺序实施。

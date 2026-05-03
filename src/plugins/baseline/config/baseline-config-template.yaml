@@ -109,7 +109,7 @@ baseline:
     export_seed:
       include_monthpos_when_ready: true
       include_event_when_ready: true
-      include_t3_basis_when_ready: true
+      include_relation_basis_when_ready: true
 
   rolling_config:
     # value_sampled observation reliability
@@ -234,6 +234,23 @@ baseline:
     monthpos_delta_max_scale: 0.5
     monthpos_min_month_transitions: 2
     monthpos_ready_coverage_ratio: 0.60
+
+    # relation routed rolling and stream basis
+    relation_rolling:
+      enable_routed_rolling: true
+      enable_stream_basis: true
+      include_universal_summaries_without_basis: true
+      basis_stats_max_groups: 256
+      basis_collect_min_buckets: 0
+      basis_ready_min_buckets: 0
+      basis_refresh_interval_buckets: 0
+      basis_candidate_min_coverage_ratio: 0.60
+      basis_replacement_cap_ratio: 0.20
+      basis_replacement_cap_max: 2
+      basis_handover_warmup_buckets: 0
+      basis_threshold_margin: 1.20
+      basis_min_stable_refresh_count: 2
+      routed_state_shard_count: 16
 
   value_sampled_profiles:
     cont_core:

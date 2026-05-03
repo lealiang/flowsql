@@ -158,6 +158,8 @@ struct RelationRoutedBootstrapSeed {
     std::string metric_name;
     std::string summary_name;
     BaselineTaskKind task_kind = BaselineTaskKind::kValue;
+    uint64_t basis_version = 0;
+    bool basis_scoped = false;
     BootstrapTaskIdentity task_identity;
     BootstrapClockSpec clock_spec;
     BootstrapCalendarRef calendar_ref;
@@ -201,6 +203,8 @@ struct RelationRoutedBootstrapArtifact {
     std::string metric_name;
     std::string summary_name;
     BaselineTaskKind task_kind = BaselineTaskKind::kValue;
+    uint64_t basis_version = 0;
+    bool basis_scoped = false;
     BootstrapTaskIdentity task_identity;
     BootstrapClockSpec clock_spec;
     BootstrapCalendarRef calendar_ref;

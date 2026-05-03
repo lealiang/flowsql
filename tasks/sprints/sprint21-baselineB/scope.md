@@ -29,13 +29,13 @@ BaselineB 的一句话目标：
    被检测系统刚上线、没有任何历史数据时，基线任务仍必须能进入流式学习状态，不能等待批处理历史。
 
 2. **有历史可加速**  
-   若启动时一次性提交了历史数据，历史数据只用于初始化在线状态、提高初始成熟度、生成初始 `T3` basis；它不是后续在线恢复能力的依赖。
+   若启动时一次性提交了历史数据，历史数据只用于初始化在线状态、提高初始成熟度、生成初始 Relation basis；它不是后续在线恢复能力的依赖。
 
 3. **流式是唯一持续更新路径**  
    进入流式处理后，每个有效 bucket 都按在线状态进行预测、评分、门控更新和成熟度推进。后续不再依赖批处理重建。
 
 4. **能力按成熟度解锁**  
-   基线组件按 `level -> day -> week -> monthpos -> T3 stable head` 逐步成熟。未成熟组件不得参与高置信异常判断。
+   基线组件按 `level -> day -> week -> monthpos -> relation stable head` 逐步成熟。未成熟组件不得参与高置信异常判断。
 
 5. **置信度必须表达成熟度**  
    输出必须显式携带 `maturity`、`enabled_components`、`confidence` 等证据，避免把冷启动期结果伪装成成熟基线。
@@ -60,7 +60,7 @@ BaselineB 的一句话目标：
 - 三层架构：`Online Rolling Core`、`Maturity Gate`、`Optional Bootstrap`。
 - 无历史、弱历史、完整历史 3 类启动方式。
 - 老方案迁移成 `Optional Bootstrap Engine` 的保留项和删除项。
-- `T1/T2/T3` 在新框架下的职责边界。
+- Value / Ratio / Relation 在新框架下的职责边界。
 
 ### 3.2 本轮暂不展开的内容
 
@@ -70,7 +70,7 @@ BaselineB 的一句话目标：
 - 简化 Kalman/RLS 的状态块、协方差近似和更新公式。
 - 异常门控、漂移适配和遗忘因子的阈值。
 - `monthpos` 在线成熟与更新规则。
-- `T3` basis 在线统计、低频刷新和 warm-up handover 细节。
+- Relation basis 在线统计、低频刷新和 warm-up handover 细节。
 - 状态持久化格式、API 契约和测试矩阵。
 
 ---
@@ -81,7 +81,7 @@ BaselineB 的一句话目标：
 
 `Series = (key, feature)`，表示一个独立建模单元。
 
-所有在线状态、成熟度、基线来源、`T3` routed 摘要特征，都必须最终收口到明确的 `Series` 身份上。
+所有在线状态、成熟度、基线来源、Relation routed 摘要特征，都必须最终收口到明确的 `Series` 身份上。
 
 ### 4.2 Online Rolling Core
 
@@ -146,7 +146,7 @@ BootstrapSeed = {
   uncertainty_init,
   sigma_init,
   maturity_init,
-  t3_basis_init?,
+  relation_basis_init?,
   diagnostics
 }
 ```
@@ -160,7 +160,7 @@ BootstrapSeed = {
 - `uncertainty_init`：初始不确定性，历史越少，不确定性越高
 - `sigma_init`：初始残差尺度或尺度下限
 - `maturity_init`：初始成熟度
-- `t3_basis_init`：可选的 `T3` 初始 support / stable head / head prototype
+- `relation_basis_init`：可选的 Relation 初始 support / stable head / head prototype
 - `diagnostics`：解释 seed 质量和降级原因
 
 `BootstrapSeed` 不是正式服务模型。正式服务对象是流式阶段不断演化的 `RollingState`。
@@ -232,7 +232,7 @@ weak_history_start:
   有少量历史，只初始化 level / scale / weak maturity
 
 full_history_bootstrap:
-  有足够历史，初始化 day / week / monthpos / T3 basis 等更多组件
+  有足够历史，初始化 day / week / monthpos / Relation basis 等更多组件
 ```
 
 进入流式阶段后，不再提交批处理历史，也不再执行批处理重建。
@@ -249,7 +249,7 @@ uncertainty_0            -> 初始参数可信度 / 初始学习速度依据
 maturity_init            -> 初始成熟度
 enabled_components       -> 初始启用组件
 monthpos_coeffs          -> 月位置组件 seed（若历史覆盖足够）
-t3_basis_init            -> T3 初始 support / stable head / head prototype
+relation_basis_init      -> Relation 初始 support / stable head / head prototype
 ```
 
 这些参数带来的直接优势：
@@ -258,7 +258,7 @@ t3_basis_init            -> T3 初始 support / stable head / head prototype
 - 波动尺度更准：初始 `sigma_0` 能让早期异常分数和置信区间更稳定，减少冷启动误报。
 - 周期结构更准：日周期、周周期和月位置不需要等流式数据重新跑满完整周期后才可用。
 - 成熟度更高：完整历史可以让任务直接进入 `daily_ready`、`weekly_ready` 或 `monthly_ready`，而不是停在 `cold_learning`。
-- T3 结构更早可用：完整历史可以直接生成 `stable_head` 和 `head_proto_q`，使 stable head 相关摘要特征从启动期就具备解释基础。
+- Relation 结构更早可用：完整历史可以直接生成 `stable_head` 和 `head_proto_q`，使 stable head 相关摘要特征从启动期就具备解释基础。
 
 因此，完整历史的 bootstrap 是准确性加速器：它提升在线模型的初始预测、初始尺度和初始成熟度，但不改变“进入流式后由 `Online Rolling Core` 持续学习”的主路径。
 
@@ -321,7 +321,7 @@ BootstrapSeed.seed_status = weak | partial
 
 ---
 
-## 7. T1 / T2 / T3 职责边界
+## 7. Value / Ratio / Relation 职责边界
 
 ### 7.1 T1 / T2
 
@@ -354,18 +354,18 @@ T1/T2 的服务主体是持续演化的 RollingState。
 
 具体月位置状态、门控和更新公式后续单独设计。
 
-### 7.3 T3
+### 7.3 Relation
 
-`T3` 不单独实现一套新的时间基线。
+Relation 不单独实现一套新的时间基线。
 
 目标：
 
-- `T3` 摘要特征继续路由到 `T1 / T2`，复用 `Online Rolling Core`。
-- `T3` 初始 support / stable head / head prototype 可由 batch bootstrap 提供。
-- 无 batch 历史时，`T3` 先输出通用形状特征，stable head 相关能力随在线统计成熟后启用。
-- 后续 `T3` basis 刷新必须支持 stream-only 模式，通过有界在线统计和低频保守切换完成。
+- Relation 摘要特征继续路由到 Value / Ratio rolling，复用 `Online Rolling Core`。
+- Relation 初始 support / stable head / head prototype 可由 batch bootstrap 提供。
+- 无 batch 历史时，Relation 先输出通用形状特征，stable head 相关能力随在线统计成熟后启用。
+- 后续 Relation basis 刷新必须支持 stream-only 模式，通过有界在线统计和低频保守切换完成。
 
-本轮不展开 `T3` basis 刷新算法。
+本轮不展开 Relation basis 刷新算法。
 
 ---
 
@@ -403,7 +403,7 @@ Online Rolling Core
 4. **T2 比例类初始化**  
    使用历史 numerator / denominator 初始化比例类特征的初始中心、尺度和 profile 信息。
 
-5. **T3 初始 basis**  
+5. **Relation 初始 basis**
    使用历史分布生成初始 `support_explicit`、`stable_head`、`head_proto_q`。
 
 6. **初始残差尺度**  
@@ -423,7 +423,7 @@ residual sigma             -> sigma_0 / sigma_floor
 coverage / sample quality  -> maturity_init / enabled_components
 parameter reliability      -> uncertainty_0 / learning_rate_hint
 monthpos coefficients      -> monthpos seed
-T3 support/stable head     -> T3 basis seed
+Relation support/stable head -> Relation basis seed
 ```
 
 这份映射是 `Optional Bootstrap Engine` 的核心产物。它只负责给在线核心一个更准的起点，不负责后续在线生命周期管理。
@@ -504,7 +504,7 @@ BaselineB 的在线状态会常驻在 `Series` 粒度上，必须严格控制状
 - 状态结构固定有界。
 - 清理策略有界、可观测。
 - 不允许按高基数 group 动态创建无限 mutex 或无限状态。
-- `T3` 在线候选统计必须有 `topN` 上限。
+- Relation 在线候选统计必须有 `topN` 上限。
 
 ### 10.2 冷启动误报
 
@@ -522,9 +522,9 @@ BaselineB 的在线状态会常驻在 `Series` 粒度上，必须严格控制状
 - 成熟阈值高于 day / week。
 - 更新速度慢于 level / day / week。
 
-### 10.4 T3 basis 漂移
+### 10.4 Relation basis 漂移
 
-`T3` basis 变化会改变摘要特征身份，不能每个 bucket 动态变化。
+Relation basis 变化会改变摘要特征身份，不能每个 bucket 动态变化。
 
 后续刷新必须满足：
 
@@ -552,15 +552,15 @@ BaselineB 的在线状态会常驻在 `Series` 粒度上，必须严格控制状
 4. 老方案删除清单与代码落点  
    明确 `shadow/candidate/rebuild` 相关代码如何下线或隔离。
 
-5. `T3` routed rolling 与 stream-only basis 设计
-   阶段设计见 [B4 T3 Routed Rolling and Stream Basis 阶段设计](b4-t3-routed-rolling-and-stream-basis-design.md)。
+5. Relation routed rolling 与 stream-only basis 设计
+   阶段设计见 [B4 Relation Routed Rolling and Stream Basis 阶段设计](b4-relation-routed-rolling-and-stream-basis-design.md)。
    定义在线有界统计、低频刷新、warm-up handover 和版本语义。
 
 6. 状态持久化与恢复  
    定义 `RollingState` 的持久化格式、版本兼容和恢复语义。
 
 7. 测试矩阵  
-   覆盖无历史启动、弱历史启动、完整历史启动、漂移适应、成熟度推进和 `T3` basis 成熟。
+   覆盖无历史启动、弱历史启动、完整历史启动、漂移适应、成熟度推进和 Relation basis 成熟。
 
 ---
 
@@ -573,7 +573,7 @@ BaselineB 的在线状态会常驻在 `Series` 粒度上，必须严格控制状
 3. 无历史启动是正常路径，不能作为异常降级处理。
 4. 旧方案的历史拟合能力保留，`shadow/candidate/rebuild` 链路退出主路径。
 5. `T1/T2` 是在线滚动核心的主要承载对象。
-6. `T3` 摘要继续路由到 `T1/T2`，basis 支持 stream-only 成熟和低频刷新。
+6. Relation 摘要继续路由到 `T1/T2`，basis 支持 stream-only 成熟和低频刷新。
 7. 月位置不是 batch-only 能力，但在成熟前必须保守，不参与高置信异常判断。
 
 后续所有算法细节必须服从以上目标：不能再引入任何“缺少历史数据就无法建立或恢复基线”的主路径依赖。

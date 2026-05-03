@@ -42,7 +42,10 @@ template <typename T, typename = void>
 struct HasValueSubmitObservation : std::false_type {};
 
 template <typename T>
-struct HasValueSubmitObservation<T, std::void_t<decltype(&T::SubmitObservation)>>
+struct HasValueSubmitObservation<
+    T,
+    std::void_t<decltype(static_cast<RollingBaselineResult (T::*)(
+        const ValueRollingObservation&, const RollingSubmitOptions&)>(&T::SubmitObservation))>>
     : std::true_type {};
 
 template <typename T, typename = void>
@@ -72,7 +75,10 @@ template <typename T, typename = void>
 struct HasRatioSubmitObservation : std::false_type {};
 
 template <typename T>
-struct HasRatioSubmitObservation<T, std::void_t<decltype(&T::SubmitObservation)>>
+struct HasRatioSubmitObservation<
+    T,
+    std::void_t<decltype(static_cast<RollingBaselineResult (T::*)(
+        const RatioRollingObservation&, const RollingSubmitOptions&)>(&T::SubmitObservation))>>
     : std::true_type {};
 
 template <typename T, typename = void>
@@ -104,6 +110,33 @@ struct HasRelationSubmitBlock : std::false_type {};
 template <typename T>
 struct HasRelationSubmitBlock<T, std::void_t<decltype(&T::SubmitBlock)>>
     : std::true_type {};
+
+template <typename T, typename = void>
+struct HasRelationSubmitObservation : std::false_type {};
+
+template <typename T>
+struct HasRelationSubmitObservation<
+    T,
+    std::void_t<decltype(static_cast<RelationRollingResult (T::*)(
+        const RelationRollingObservation&, const RelationRollingSubmitOptions&)>(
+        &T::SubmitObservation))>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasRelationPredictRoutedSummary : std::false_type {};
+
+template <typename T>
+struct HasRelationPredictRoutedSummary<
+    T,
+    std::void_t<decltype(&T::PredictRoutedSummary)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasRelationQueryRoutedSummarySnapshot : std::false_type {};
+
+template <typename T>
+struct HasRelationQueryRoutedSummarySnapshot<
+    T,
+    std::void_t<decltype(&T::QueryRoutedSummarySnapshot)>> : std::true_type {};
 
 template <typename T, typename = void>
 struct HasSetHistoryReader : std::false_type {};
@@ -138,6 +171,15 @@ void TestTaskHeaderContracts() {
         RollingPrediction (IBaselineValueTask::*)(std::string_view, int64_t) const;
     using ExpectedRatioPredictRolling =
         RollingPrediction (IBaselineRatioTask::*)(std::string_view, int64_t) const;
+    using ExpectedRelationSubmitObservation =
+        RelationRollingResult (IBaselineRelationTask::*)(
+            const RelationRollingObservation&, const RelationRollingSubmitOptions&);
+    using ExpectedRelationPredictRoutedSummary =
+        RollingPrediction (IBaselineRelationTask::*)(
+            const RelationRoutedSummaryQuery&, int64_t) const;
+    using ExpectedRelationQueryRoutedSummarySnapshot =
+        BaselineSerializationResult (IBaselineRelationTask::*)(
+            const RelationRoutedSummaryQuery&, BaselineSerializationFormat) const;
 
     static_assert(std::is_same_v<decltype(&IBaselineService::CreateValueTask),
                                  ExpectedCreateValueTask>);
@@ -149,6 +191,12 @@ void TestTaskHeaderContracts() {
                                  ExpectedValuePredictRolling>);
     static_assert(std::is_same_v<decltype(&IBaselineRatioTask::PredictRolling),
                                  ExpectedRatioPredictRolling>);
+    static_assert(std::is_same_v<decltype(&IBaselineRelationTask::SubmitObservation),
+                                 ExpectedRelationSubmitObservation>);
+    static_assert(std::is_same_v<decltype(&IBaselineRelationTask::PredictRoutedSummary),
+                                 ExpectedRelationPredictRoutedSummary>);
+    static_assert(std::is_same_v<decltype(&IBaselineRelationTask::QueryRoutedSummarySnapshot),
+                                 ExpectedRelationQueryRoutedSummarySnapshot>);
 
     static_assert(!HasRequestRebuild<IBaselineTask>::value);
     static_assert(!HasSetHistoryReader<IBaselineValueTask>::value);
@@ -171,6 +219,9 @@ void TestTaskHeaderContracts() {
     static_assert(!HasRatioSubmitObservation<IBaselineRelationTask>::value);
     static_assert(!HasRatioPredictRolling<IBaselineRelationTask>::value);
     static_assert(!HasRelationSubmitBlock<IBaselineRelationTask>::value);
+    static_assert(HasRelationSubmitObservation<IBaselineRelationTask>::value);
+    static_assert(HasRelationPredictRoutedSummary<IBaselineRelationTask>::value);
+    static_assert(HasRelationQueryRoutedSummarySnapshot<IBaselineRelationTask>::value);
     static_assert(!HasQueryBootstrapSeed<IBaselineValueTask>::value);
     static_assert(!HasQueryBootstrapSeed<IBaselineRatioTask>::value);
     static_assert(!HasQueryBootstrapSeed<IBaselineRelationTask>::value);
@@ -181,12 +232,31 @@ void TestTaskHeaderContracts() {
     RollingSubmitOptions rolling_submit_options;
     ValueRollingObservation value_obs;
     RatioRollingObservation ratio_obs;
+    RelationRollingObservation relation_obs;
+    RelationRollingSubmitOptions relation_options;
+    RelationRoutedSummaryResult relation_routed_result;
+    RelationRollingResult relation_result;
+    RelationRoutedSummaryQuery relation_query;
     RollingBaselineResult rolling_result;
     RollingPrediction rolling_prediction;
     assert(rolling_submit_options.allow_auto_init_from_bootstrap);
     assert(rolling_submit_options.allow_auto_init_from_empty);
     assert(value_obs.sample_count == 0);
     assert(ratio_obs.denominator == 0.0);
+    assert(relation_obs.bucket_id == 0);
+    assert(relation_options.routed_options.allow_auto_init_from_bootstrap);
+    assert(relation_options.routed_options.allow_auto_init_from_empty);
+    assert(relation_options.allow_basis_update);
+    assert(relation_options.include_routed_results);
+    assert(!relation_options.include_diagnostics);
+    assert(relation_routed_result.basis_version == 0);
+    assert(!relation_routed_result.basis_scoped);
+    assert(relation_result.status == BaselineStatus::kOk);
+    assert(relation_result.basis_version == 0);
+    assert(!relation_result.basis_updated);
+    assert(!relation_result.handover_active);
+    assert(relation_result.routed_results.empty());
+    assert(relation_query.basis_version == 0);
     assert(rolling_result.status == BaselineStatus::kOk);
     assert(rolling_result.maturity_status.empty());
     assert(rolling_result.score_trust_status.empty());
@@ -729,9 +799,29 @@ void TestBootstrapEngineTrainsRelationBasis() {
     BootstrapSeed relation_seed;
     assert(engine.ExportSeed(artifact, &relation_seed) == BaselineStatus::kOk);
     assert(!relation_seed.relation_routed_summary_seeds.empty());
+    bool has_universal_seed_scope = false;
+    bool has_basis_scoped_seed_scope = false;
+    const uint64_t relation_basis_version =
+        relation_seed.relation_basis_by_metric[0].basis_version;
+    for (const auto& routed_seed : relation_seed.relation_routed_summary_seeds) {
+        if (routed_seed.summary_name == "top1_share") {
+            assert(!routed_seed.basis_scoped);
+            assert(routed_seed.basis_version == 0);
+            has_universal_seed_scope = true;
+        }
+        if (routed_seed.summary_name == "out_of_support_share") {
+            assert(routed_seed.basis_scoped);
+            assert(routed_seed.basis_version == relation_basis_version);
+            has_basis_scoped_seed_scope = true;
+        }
+    }
+    assert(has_universal_seed_scope);
+    assert(has_basis_scoped_seed_scope);
     auto [seed_status, seed_json] =
         engine.ExportSeed(relation_seed, BaselineSerializationFormat::kJson);
     assert(seed_status == BaselineStatus::kOk);
+    assert(seed_json.find("\"basis_scoped\"") != std::string::npos);
+    assert(seed_json.find("\"basis_version\"") != std::string::npos);
     assert(seed_json.find("\"feature_type\":\"relation\"") != std::string::npos);
     assert(seed_json.find("\"feature_type\":\"value_basic\"") != std::string::npos);
     assert(seed_json.find("\"feature_type\":\"ratio\"") != std::string::npos);
