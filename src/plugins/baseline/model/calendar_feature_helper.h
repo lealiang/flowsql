@@ -16,8 +16,33 @@
 namespace flowsql {
 namespace baseline {
 
+struct LocalCalendarFeature {
+    bool valid = false;
+    int64_t bucket_id = 0;
+    int64_t epoch_second = 0;
+
+    int32_t hour = 0;
+    int32_t minute = 0;
+    int32_t second = 0;
+    int32_t weekday = 0;
+    int32_t monday_weekday = 0;
+    int32_t day_of_month = 0;
+    int32_t days_to_month_end = 0;
+    bool is_last_weekday_of_month = false;
+
+    int32_t second_of_day = 0;
+    int32_t second_of_week = 0;
+    int64_t local_wall_second = 0;
+    double day_phase = 0.0;
+    double week_phase = 0.0;
+};
+
 // Calendar feature helper 是 bucket_id -> 本地日历语义的唯一入口。
 // bucket_id 始终按 UTC 绝对窗口解释；tz 只影响本地相位和月位置字段。
+bool ResolveOneLocalCalendarFeature(int64_t bucket_id,
+                                    int64_t delta,
+                                    const std::string& tz,
+                                    LocalCalendarFeature* out);
 bool ResolveLocalTime(int64_t bucket_id, int64_t delta, const std::string& tz, std::tm* out);
 double PhaseDayLocal(int64_t bucket_id, int64_t delta, const std::string& tz);
 double PhaseWeekLocal(int64_t bucket_id, int64_t delta, const std::string& tz);

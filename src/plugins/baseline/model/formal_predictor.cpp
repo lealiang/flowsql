@@ -76,6 +76,27 @@ double EvaluateFourier(const std::vector<double>& sin_coeff,
     return value;
 }
 
+double EvaluateFourierWithFeature(const std::vector<double>& sin_coeff,
+                                  const std::vector<double>& cos_coeff,
+                                  const double* sin_feature,
+                                  const double* cos_feature,
+                                  std::size_t feature_size) {
+    double value = 0.0;
+    if (sin_feature) {
+        const std::size_t size = std::min(sin_coeff.size(), feature_size);
+        for (std::size_t i = 0; i < size; ++i) {
+            value += sin_coeff[i] * sin_feature[i];
+        }
+    }
+    if (cos_feature) {
+        const std::size_t size = std::min(cos_coeff.size(), feature_size);
+        for (std::size_t i = 0; i < size; ++i) {
+            value += cos_coeff[i] * cos_feature[i];
+        }
+    }
+    return value;
+}
+
 double CenterAt(const std::vector<double>& centers, std::size_t index) {
     return index < centers.size() ? centers[index] : 0.0;
 }
@@ -116,6 +137,42 @@ double EvaluateMonthPos(const MonthPosBlock& block,
     return value;
 }
 
+double EvaluateMonthPosWithFeature(const MonthPosBlock& block,
+                                   const LocalCalendarFeature* feature) {
+    if (!block.enabled || !feature || !feature->valid) return 0.0;
+
+    double value = 0.0;
+    const int32_t dom = feature->day_of_month;
+    if (dom >= 1 && dom <= 31) {
+        for (std::size_t i = 0; i < block.dom_coeff.size(); ++i) {
+            const double indicator = (static_cast<int32_t>(i + 1) == dom) ? 1.0 : 0.0;
+            value += block.dom_coeff[i] * (indicator - block.dom_center[i]);
+        }
+    }
+
+    if (!block.dme_coeff.empty()) {
+        const std::size_t dme_index = static_cast<std::size_t>(
+            std::max<int32_t>(
+                0,
+                std::min<int32_t>(
+                    feature->days_to_month_end,
+                    static_cast<int32_t>(block.dme_coeff.size() - 1))));
+        for (std::size_t i = 0; i < block.dme_coeff.size(); ++i) {
+            const double indicator = i == dme_index ? 1.0 : 0.0;
+            value += block.dme_coeff[i] * (indicator - CenterAt(block.dme_center, i));
+        }
+    }
+
+    for (std::size_t i = 0; i < block.lwd_coeff.size(); ++i) {
+        const double indicator =
+            (feature->is_last_weekday_of_month && static_cast<int32_t>(i) == feature->weekday)
+                ? 1.0
+                : 0.0;
+        value += block.lwd_coeff[i] * (indicator - block.lwd_center[i]);
+    }
+    return value;
+}
+
 double EvaluateCore(const CoreBlock& block,
                     int64_t bucket_id,
                     int64_t train_start,
@@ -126,6 +183,21 @@ double EvaluateCore(const CoreBlock& block,
         value += EvaluateFourier(block.day_sin, block.day_cos, PhaseDayLocal(bucket_id, delta, tz));
         value += EvaluateFourier(block.week_sin, block.week_cos, PhaseWeekLocal(bucket_id, delta, tz));
     }
+    return value;
+}
+
+double EvaluateCoreWithFeature(const CoreBlock& block,
+                               int64_t bucket_id,
+                               int64_t train_start,
+                               const FormalPredictFeatureView& feature) {
+    double value = block.beta0 + block.trend_k * static_cast<double>(bucket_id - train_start);
+    value += EvaluateFourierWithFeature(
+        block.day_sin, block.day_cos, feature.day_sin, feature.day_cos, feature.day_size);
+    value += EvaluateFourierWithFeature(block.week_sin,
+                                        block.week_cos,
+                                        feature.week_sin,
+                                        feature.week_cos,
+                                        feature.week_size);
     return value;
 }
 
@@ -232,6 +304,30 @@ int PredictFormalModel(const ValueFormalModel* model,
     return error::OK;
 }
 
+int PredictFormalModelWithFeature(const ValueFormalModel* model,
+                                  const FormalPredictContext& context,
+                                  const FormalPredictFeatureView& feature,
+                                  FormalPrediction* out) {
+    if (!out) return error::BAD_REQUEST;
+    *out = FormalPrediction{};
+    if (!model || model->metadata.kind != FormalModelKind::kValueBaseline) {
+        return error::UNAVAILABLE;
+    }
+    if (!feature.calendar || !feature.calendar->valid ||
+        feature.calendar->bucket_id != context.bucket_id) {
+        return error::BAD_REQUEST;
+    }
+
+    FillCommonPrediction(*model, context, out);
+    double value =
+        EvaluateCoreWithFeature(model->core_block, context.bucket_id, model->train_start, feature);
+    value += EvaluateMonthPosWithFeature(model->monthpos_block, feature.calendar);
+    value += EvaluateEventBlock(model->event_block, context, out->event_status);
+    out->value = value;
+    out->sigma_ref = model->sigma_ref;
+    return error::OK;
+}
+
 int PredictFormalModel(const RatioFormalModel* model,
                        const FormalPredictContext& context,
                        FormalPrediction* out) {
@@ -246,6 +342,30 @@ int PredictFormalModel(const RatioFormalModel* model,
     const std::string tz = ResolveTimezone(model->tz, context);
     double eta = EvaluateCore(model->core_block, context.bucket_id, model->train_start, delta, tz);
     eta += EvaluateMonthPos(model->monthpos_block, context.bucket_id, delta, tz);
+    eta += EvaluateEventBlock(model->event_block, context, out->event_status);
+    out->value = ClipRatio(Sigmoid(eta));
+    out->sigma_ref = 0.0;
+    return error::OK;
+}
+
+int PredictFormalModelWithFeature(const RatioFormalModel* model,
+                                  const FormalPredictContext& context,
+                                  const FormalPredictFeatureView& feature,
+                                  FormalPrediction* out) {
+    if (!out) return error::BAD_REQUEST;
+    *out = FormalPrediction{};
+    if (!model || model->metadata.kind != FormalModelKind::kRatioBaseline) {
+        return error::UNAVAILABLE;
+    }
+    if (!feature.calendar || !feature.calendar->valid ||
+        feature.calendar->bucket_id != context.bucket_id) {
+        return error::BAD_REQUEST;
+    }
+
+    FillCommonPrediction(*model, context, out);
+    double eta =
+        EvaluateCoreWithFeature(model->core_block, context.bucket_id, model->train_start, feature);
+    eta += EvaluateMonthPosWithFeature(model->monthpos_block, feature.calendar);
     eta += EvaluateEventBlock(model->event_block, context, out->event_status);
     out->value = ClipRatio(Sigmoid(eta));
     out->sigma_ref = 0.0;

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "plugins/baseline/rolling/rolling_feature_batch.h"
 #include "plugins/baseline/rolling/rolling_state.h"
 
 namespace flowsql {
@@ -57,6 +58,12 @@ BaselineStatus PredictRollingForecastState(const RollingState& state,
                                            int64_t bucket_id,
                                            const BaselineRollingConfig& config,
                                            RollingEstimatorResult* out);
+
+BaselineStatus PredictRollingForecastStateWithFeature(const RollingState& state,
+                                                      int64_t bucket_id,
+                                                      const BaselineRollingConfig& config,
+                                                      const RollingFeatureView& feature,
+                                                      RollingEstimatorResult* out);
 
 BaselineStatus UpdateRollingStateWithObservation(const ObservedModelPoint& point,
                                                  const BaselineRollingConfig& config,

@@ -6,6 +6,14 @@ add_executable(test_baseline_task_headers test_baseline_task_headers.cpp)
 add_executable(test_baseline_link_bootstrap_eval test_baseline_link_bootstrap_eval.cpp)
 add_executable(test_baseline_link_rolling_eval test_baseline_link_rolling_eval.cpp)
 add_executable(test_baseline_rolling_config test_baseline_rolling_config.cpp)
+add_executable(test_baseline_rolling_feature_batch
+    test_baseline_rolling_feature_batch.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/rolling_feature_batch.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/rolling_estimator.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/monthpos_state.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/rolling_state.cpp
+    ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
+)
 add_executable(test_baseline_relation_summary
     test_baseline_relation_summary.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/relation/relation_summary.cpp
@@ -53,12 +61,16 @@ add_executable(test_baseline_rolling_b3
     ${CMAKE_SOURCE_DIR}/plugins/baseline/rolling/rolling_state.cpp
     ${CMAKE_SOURCE_DIR}/plugins/baseline/model/calendar_feature_helper.cpp
 )
+add_executable(test_baseline_batch_prediction_perf
+    test_baseline_batch_prediction_perf.cpp
+)
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_task_headers PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_link_bootstrap_eval PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_link_rolling_eval PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_rolling_config PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(test_baseline_rolling_feature_batch PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_relation_summary PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_relation_basis_state PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(test_baseline_relation_fusion PUBLIC ${CMAKE_SOURCE_DIR})
@@ -76,6 +88,10 @@ target_include_directories(test_baseline_rolling_b3 PUBLIC
     ${CMAKE_SOURCE_DIR}
     ${ICU_INCLUDE_DIRS}
 )
+target_include_directories(test_baseline_batch_prediction_perf PUBLIC
+    ${CMAKE_SOURCE_DIR}
+    ${ICU_INCLUDE_DIRS}
+)
 
 target_compile_definitions(test_baseline_rolling_config
     PRIVATE FLOWSQL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
@@ -86,6 +102,7 @@ add_dependencies(test_baseline_task_headers flowsql_common flowsql_baseline)
 add_dependencies(test_baseline_link_bootstrap_eval flowsql_common flowsql_baseline)
 add_dependencies(test_baseline_link_rolling_eval flowsql_common flowsql_baseline)
 add_dependencies(test_baseline_rolling_config flowsql_common flowsql_baseline)
+add_dependencies(test_baseline_rolling_feature_batch flowsql_common)
 add_dependencies(test_baseline_relation_summary flowsql_common)
 add_dependencies(test_baseline_relation_basis_state flowsql_common)
 add_dependencies(test_baseline_relation_fusion flowsql_common)
@@ -94,12 +111,14 @@ add_dependencies(test_baseline_rolling_state flowsql_common)
 add_dependencies(test_baseline_rolling_estimator flowsql_common)
 add_dependencies(test_baseline_rolling_gate_scale flowsql_common)
 add_dependencies(test_baseline_rolling_b3 flowsql_common)
+add_dependencies(test_baseline_batch_prediction_perf flowsql_common flowsql_baseline)
 
 target_link_libraries(${PROJECT_NAME} flowsql_common flowsql_baseline)
 target_link_libraries(test_baseline_task_headers flowsql_common flowsql_baseline)
 target_link_libraries(test_baseline_link_bootstrap_eval flowsql_common flowsql_baseline)
 target_link_libraries(test_baseline_link_rolling_eval flowsql_common flowsql_baseline)
 target_link_libraries(test_baseline_rolling_config flowsql_common flowsql_baseline)
+target_link_libraries(test_baseline_rolling_feature_batch flowsql_common ${ICU_LIBRARIES})
 target_link_libraries(test_baseline_relation_summary flowsql_common)
 target_link_libraries(test_baseline_relation_basis_state flowsql_common)
 target_link_libraries(test_baseline_relation_fusion flowsql_common)
@@ -108,12 +127,14 @@ target_link_libraries(test_baseline_rolling_state flowsql_common ${ICU_LIBRARIES
 target_link_libraries(test_baseline_rolling_estimator flowsql_common ${ICU_LIBRARIES})
 target_link_libraries(test_baseline_rolling_gate_scale flowsql_common)
 target_link_libraries(test_baseline_rolling_b3 flowsql_common ${ICU_LIBRARIES})
+target_link_libraries(test_baseline_batch_prediction_perf flowsql_common flowsql_baseline ${ICU_LIBRARIES})
 
 target_compile_options(${PROJECT_NAME} PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_task_headers PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_link_bootstrap_eval PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_link_rolling_eval PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rolling_config PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_rolling_feature_batch PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_relation_summary PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_relation_basis_state PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_relation_fusion PRIVATE -UNDEBUG)
@@ -122,9 +143,11 @@ target_compile_options(test_baseline_rolling_state PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rolling_estimator PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rolling_gate_scale PRIVATE -UNDEBUG)
 target_compile_options(test_baseline_rolling_b3 PRIVATE -UNDEBUG)
+target_compile_options(test_baseline_batch_prediction_perf PRIVATE -UNDEBUG)
 
 add_thirddepen(${PROJECT_NAME} rapidjson)
 add_thirddepen(test_baseline_task_headers rapidjson)
+add_thirddepen(test_baseline_batch_prediction_perf rapidjson)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
@@ -139,6 +162,9 @@ set_target_properties(test_baseline_link_rolling_eval PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 set_target_properties(test_baseline_rolling_config PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_rolling_feature_batch PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 set_target_properties(test_baseline_relation_summary PROPERTIES
@@ -163,5 +189,8 @@ set_target_properties(test_baseline_rolling_gate_scale PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )
 set_target_properties(test_baseline_rolling_b3 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+set_target_properties(test_baseline_batch_prediction_perf PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
 )

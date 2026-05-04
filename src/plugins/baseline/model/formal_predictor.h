@@ -9,8 +9,10 @@
 #ifndef _FLOWSQL_PLUGINS_BASELINE_MODEL_FORMAL_PREDICTOR_H_
 #define _FLOWSQL_PLUGINS_BASELINE_MODEL_FORMAL_PREDICTOR_H_
 
+#include <cstddef>
 #include <cstdint>
 
+#include "calendar_feature_helper.h"
 #include "event_calendar_matcher.h"
 #include "formal_model.h"
 
@@ -28,6 +30,17 @@ struct FormalPredictContext {
     const BaselineTaskSpec* task_spec = nullptr;
     const CompiledEventCalendar* event_calendar = nullptr;
     int64_t bucket_id = 0;
+};
+
+struct FormalPredictFeatureView {
+    // FormalPredictFeatureView 不拥有内存；父 batch 必须覆盖 view 的使用期。
+    const LocalCalendarFeature* calendar = nullptr;
+    const double* day_sin = nullptr;
+    const double* day_cos = nullptr;
+    std::size_t day_size = 0;
+    const double* week_sin = nullptr;
+    const double* week_cos = nullptr;
+    std::size_t week_size = 0;
 };
 
 const char* EventCalendarStatusName(EventCalendarStatus status);
@@ -62,9 +75,19 @@ int PredictFormalModel(const ValueFormalModel* model,
                        const FormalPredictContext& context,
                        FormalPrediction* out);
 
+int PredictFormalModelWithFeature(const ValueFormalModel* model,
+                                  const FormalPredictContext& context,
+                                  const FormalPredictFeatureView& feature,
+                                  FormalPrediction* out);
+
 int PredictFormalModel(const RatioFormalModel* model,
                        const FormalPredictContext& context,
                        FormalPrediction* out);
+
+int PredictFormalModelWithFeature(const RatioFormalModel* model,
+                                  const FormalPredictContext& context,
+                                  const FormalPredictFeatureView& feature,
+                                  FormalPrediction* out);
 
 }  // namespace baseline
 }  // namespace flowsql

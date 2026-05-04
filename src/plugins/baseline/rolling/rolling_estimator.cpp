@@ -71,6 +71,26 @@ double EvaluateHarmonic(const RollingHarmonicState& harmonic,
     return value;
 }
 
+double EvaluateHarmonicView(const RollingHarmonicState& harmonic,
+                            const double* sin_feature,
+                            const double* cos_feature,
+                            std::size_t feature_size) {
+    double value = 0.0;
+    if (sin_feature) {
+        const std::size_t size = std::min(harmonic.sin_coeff.size(), feature_size);
+        for (std::size_t i = 0; i < size; ++i) {
+            value += harmonic.sin_coeff[i] * sin_feature[i];
+        }
+    }
+    if (cos_feature) {
+        const std::size_t size = std::min(harmonic.cos_coeff.size(), feature_size);
+        for (std::size_t i = 0; i < size; ++i) {
+            value += harmonic.cos_coeff[i] * cos_feature[i];
+        }
+    }
+    return value;
+}
+
 double HarmonicVariance(const RollingHarmonicState& harmonic,
                         const std::vector<double>& sin_feature,
                         const std::vector<double>& cos_feature) {
@@ -82,6 +102,26 @@ double HarmonicVariance(const RollingHarmonicState& harmonic,
     const std::size_t cos_size = std::min(harmonic.cos_p.size(), cos_feature.size());
     for (std::size_t i = 0; i < cos_size; ++i) {
         value += harmonic.cos_p[i] * cos_feature[i] * cos_feature[i];
+    }
+    return value;
+}
+
+double HarmonicVarianceView(const RollingHarmonicState& harmonic,
+                            const double* sin_feature,
+                            const double* cos_feature,
+                            std::size_t feature_size) {
+    double value = 0.0;
+    if (sin_feature) {
+        const std::size_t size = std::min(harmonic.sin_p.size(), feature_size);
+        for (std::size_t i = 0; i < size; ++i) {
+            value += harmonic.sin_p[i] * sin_feature[i] * sin_feature[i];
+        }
+    }
+    if (cos_feature) {
+        const std::size_t size = std::min(harmonic.cos_p.size(), feature_size);
+        for (std::size_t i = 0; i < size; ++i) {
+            value += harmonic.cos_p[i] * cos_feature[i] * cos_feature[i];
+        }
     }
     return value;
 }
@@ -149,6 +189,18 @@ double ForecastTrendSteps(int64_t dt, const BaselineRollingConfig& config) {
             : config.forecast_trend_cap_buckets;
     return static_cast<double>(
         std::min<uint64_t>(cap, static_cast<uint64_t>(std::max<int64_t>(1, dt))));
+}
+
+RollingFeatureView ViewFromVector(int64_t bucket_id, const RollingFeatureVector& feature) {
+    RollingFeatureView view;
+    view.bucket_id = bucket_id;
+    view.day_sin = feature.day_sin.empty() ? nullptr : feature.day_sin.data();
+    view.day_cos = feature.day_cos.empty() ? nullptr : feature.day_cos.data();
+    view.day_size = std::max(feature.day_sin.size(), feature.day_cos.size());
+    view.week_sin = feature.week_sin.empty() ? nullptr : feature.week_sin.data();
+    view.week_cos = feature.week_cos.empty() ? nullptr : feature.week_cos.data();
+    view.week_size = std::max(feature.week_sin.size(), feature.week_cos.size());
+    return view;
 }
 
 void UpdateDiagonalHarmonic(const std::vector<double>& feature,
@@ -269,25 +321,42 @@ BaselineStatus PredictRollingForecastState(const RollingState& state,
     if (!out || !state.has_seen_observation) {
         return BaselineStatus::kInvalidArgument;
     }
-    const int64_t dt = bucket_id - state.last_seen_bucket;
-    if (dt <= 0) return BaselineStatus::kInvalidArgument;
+    if (bucket_id <= state.last_seen_bucket) return BaselineStatus::kInvalidArgument;
 
     RollingFeatureVector feature;
     const BaselineStatus feature_status =
         BuildRollingFeatureVector(bucket_id, config, &feature);
     if (feature_status != BaselineStatus::kOk) return feature_status;
+    return PredictRollingForecastStateWithFeature(
+        state, bucket_id, config, ViewFromVector(bucket_id, feature), out);
+}
+
+BaselineStatus PredictRollingForecastStateWithFeature(const RollingState& state,
+                                                      int64_t bucket_id,
+                                                      const BaselineRollingConfig& config,
+                                                      const RollingFeatureView& feature,
+                                                      RollingEstimatorResult* out) {
+    if (!out || !state.has_seen_observation || feature.bucket_id != bucket_id) {
+        return BaselineStatus::kInvalidArgument;
+    }
+    const int64_t dt = bucket_id - state.last_seen_bucket;
+    if (dt <= 0) return BaselineStatus::kInvalidArgument;
 
     const double trend_steps = ForecastTrendSteps(dt, config);
     const double seasonal_mu =
-        EvaluateHarmonic(state.theta.daily, feature.day_sin, feature.day_cos) +
-        EvaluateHarmonic(state.theta.weekly, feature.week_sin, feature.week_cos);
+        EvaluateHarmonicView(
+            state.theta.daily, feature.day_sin, feature.day_cos, feature.day_size) +
+        EvaluateHarmonicView(
+            state.theta.weekly, feature.week_sin, feature.week_cos, feature.week_size);
     // Forecast view is a conditional baseline curve. The local trend may move
     // the center line, but its covariance is not treated as long-horizon drift
     // risk; drift risk is handled by online detection trust.
     const double raw_pred_var =
         state.p_level +
-        HarmonicVariance(state.theta.daily, feature.day_sin, feature.day_cos) +
-        HarmonicVariance(state.theta.weekly, feature.week_sin, feature.week_cos);
+        HarmonicVarianceView(
+            state.theta.daily, feature.day_sin, feature.day_cos, feature.day_size) +
+        HarmonicVarianceView(
+            state.theta.weekly, feature.week_sin, feature.week_cos, feature.week_size);
     const double pred_var = std::max(0.0, raw_pred_var);
     const double sigma =
         std::max(config.sigma_floor,

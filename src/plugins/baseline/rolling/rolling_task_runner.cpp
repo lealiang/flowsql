@@ -21,6 +21,7 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
+#include "plugins/baseline/model/calendar_feature_helper.h"
 #include "plugins/baseline/rolling/detection_calibration.h"
 #include "plugins/baseline/rolling/drift_adapt.h"
 #include "plugins/baseline/rolling/maturity_gate.h"
@@ -29,6 +30,7 @@
 #include "plugins/baseline/rolling/residual_scale.h"
 #include "plugins/baseline/rolling/rolling_config.h"
 #include "plugins/baseline/rolling/rolling_estimator.h"
+#include "plugins/baseline/rolling/rolling_feature_batch.h"
 #include "plugins/baseline/rolling/score_trust.h"
 #include "plugins/baseline/rolling/update_gate.h"
 #include "plugins/baseline/serialization/json_serialization.h"
@@ -240,6 +242,33 @@ double EvaluateBootstrapHarmonic(const std::vector<BootstrapHarmonicInit>& harmo
     return value;
 }
 
+double EvaluateBootstrapHarmonicView(const std::vector<BootstrapHarmonicInit>& harmonic,
+                                     const double* sin_feature,
+                                     const double* cos_feature,
+                                     std::size_t feature_size) {
+    double value = 0.0;
+    for (const BootstrapHarmonicInit& item : harmonic) {
+        if (item.order <= 0) continue;
+        const std::size_t index = static_cast<std::size_t>(item.order - 1);
+        if (index >= feature_size) continue;
+        if (sin_feature) value += item.sin * sin_feature[index];
+        if (cos_feature) value += item.cos * cos_feature[index];
+    }
+    return value;
+}
+
+RollingFeatureView ViewFromVector(int64_t bucket_id, const RollingFeatureVector& feature) {
+    RollingFeatureView view;
+    view.bucket_id = bucket_id;
+    view.day_sin = feature.day_sin.empty() ? nullptr : feature.day_sin.data();
+    view.day_cos = feature.day_cos.empty() ? nullptr : feature.day_cos.data();
+    view.day_size = std::max(feature.day_sin.size(), feature.day_cos.size());
+    view.week_sin = feature.week_sin.empty() ? nullptr : feature.week_sin.data();
+    view.week_cos = feature.week_cos.empty() ? nullptr : feature.week_cos.data();
+    view.week_size = std::max(feature.week_sin.size(), feature.week_cos.size());
+    return view;
+}
+
 bool CanUseBootstrapForecastSeed(const BootstrapSeed& seed) {
     return seed.theta_init.available &&
            seed.sigma_init.available &&
@@ -254,6 +283,13 @@ double ForecastCorrectionWeight(const RollingState& state) {
     if (!std::isfinite(weight)) return 0.0;
     return std::max(0.0, std::min(1.0, weight));
 }
+
+BaselineStatus BuildFusionForecastEstimatorWithFeature(const RollingState& state,
+                                                       const BootstrapSeed& seed,
+                                                       int64_t bucket_id,
+                                                       const BaselineRollingConfig& config,
+                                                       const RollingFeatureView& feature,
+                                                       RollingEstimatorResult* out);
 
 BaselineStatus BuildFusionForecastEstimator(const RollingState& state,
                                             const BootstrapSeed& seed,
@@ -270,6 +306,22 @@ BaselineStatus BuildFusionForecastEstimator(const RollingState& state,
     const BaselineStatus feature_status =
         BuildRollingFeatureVector(bucket_id, config, &feature);
     if (feature_status != BaselineStatus::kOk) return feature_status;
+    return BuildFusionForecastEstimatorWithFeature(
+        state, seed, bucket_id, config, ViewFromVector(bucket_id, feature), out);
+}
+
+BaselineStatus BuildFusionForecastEstimatorWithFeature(const RollingState& state,
+                                                       const BootstrapSeed& seed,
+                                                       int64_t bucket_id,
+                                                       const BaselineRollingConfig& config,
+                                                       const RollingFeatureView& feature,
+                                                       RollingEstimatorResult* out) {
+    if (!out || !state.has_seen_observation || !CanUseBootstrapForecastSeed(seed) ||
+        feature.bucket_id != bucket_id) {
+        return BaselineStatus::kInvalidArgument;
+    }
+    const int64_t dt = bucket_id - state.last_seen_bucket;
+    if (dt <= 0) return BaselineStatus::kInvalidArgument;
 
     const double bootstrap_level_at_anchor =
         seed.theta_init.level +
@@ -279,12 +331,14 @@ BaselineStatus BuildFusionForecastEstimator(const RollingState& state,
         seed.theta_init.level +
         seed.theta_init.trend *
             static_cast<double>(bucket_id - seed.theta_init.reference_bucket_id) +
-        EvaluateBootstrapHarmonic(seed.theta_init.daily_harmonic,
-                                  feature.day_sin,
-                                  feature.day_cos) +
-        EvaluateBootstrapHarmonic(seed.theta_init.weekly_harmonic,
-                                  feature.week_sin,
-                                  feature.week_cos);
+        EvaluateBootstrapHarmonicView(seed.theta_init.daily_harmonic,
+                                      feature.day_sin,
+                                      feature.day_cos,
+                                      feature.day_size) +
+        EvaluateBootstrapHarmonicView(seed.theta_init.weekly_harmonic,
+                                      feature.week_sin,
+                                      feature.week_cos,
+                                      feature.week_size);
     const double level_delta = state.theta.level - bootstrap_level_at_anchor;
     const double trend_delta =
         (state.theta.trend - seed.theta_init.trend) * ForecastTrendSteps(dt, config);
@@ -324,12 +378,41 @@ RollingPrediction MakeRollingPredictionStatus(const std::string& key,
     return result;
 }
 
+RollingPrediction PredictRollingForStateWithFeature(const BaselineTaskSpec& spec,
+                                                    const RollingState& state,
+                                                    const BootstrapSeed* seed,
+                                                    const std::string& key,
+                                                    int64_t bucket_id,
+                                                    const BaselineRollingConfig& config,
+                                                    const RollingFeatureView& feature);
+
 RollingPrediction PredictRollingForState(const BaselineTaskSpec& spec,
                                          const RollingState& state,
                                          const BootstrapSeed* seed,
                                          const std::string& key,
                                          int64_t bucket_id,
                                          const BaselineRollingConfig& config) {
+    RollingFeatureVector feature;
+    const BaselineStatus feature_status =
+        BuildRollingFeatureVector(bucket_id, config, &feature);
+    if (feature_status != BaselineStatus::kOk) {
+        return MakeRollingPredictionStatus(key, bucket_id, feature_status);
+    }
+    LocalCalendarFeature calendar;
+    RollingFeatureView view = ViewFromVector(bucket_id, feature);
+    if (ResolveOneLocalCalendarFeature(bucket_id, config.bucket_seconds, config.timezone, &calendar)) {
+        view.calendar = &calendar;
+    }
+    return PredictRollingForStateWithFeature(spec, state, seed, key, bucket_id, config, view);
+}
+
+RollingPrediction PredictRollingForStateWithFeature(const BaselineTaskSpec& spec,
+                                                    const RollingState& state,
+                                                    const BootstrapSeed* seed,
+                                                    const std::string& key,
+                                                    int64_t bucket_id,
+                                                    const BaselineRollingConfig& config,
+                                                    const RollingFeatureView& feature) {
     RollingPrediction result;
     result.series_key = key;
     result.bucket_id = bucket_id;
@@ -337,11 +420,12 @@ RollingPrediction PredictRollingForState(const BaselineTaskSpec& spec,
     RollingEstimatorResult estimator;
     BaselineStatus predict_status = BaselineStatus::kNotTrained;
     if (seed && CanUseBootstrapForecastSeed(*seed)) {
-        predict_status =
-            BuildFusionForecastEstimator(state, *seed, bucket_id, config, &estimator);
+        predict_status = BuildFusionForecastEstimatorWithFeature(
+            state, *seed, bucket_id, config, feature, &estimator);
     }
     if (predict_status != BaselineStatus::kOk) {
-        predict_status = PredictRollingForecastState(state, bucket_id, config, &estimator);
+        predict_status = PredictRollingForecastStateWithFeature(
+            state, bucket_id, config, feature, &estimator);
     }
     if (predict_status != BaselineStatus::kOk) {
         result.status = predict_status;
@@ -351,7 +435,9 @@ RollingPrediction PredictRollingForState(const BaselineTaskSpec& spec,
     const bool monthpos_ready =
         state.monthpos_status == RollingMonthposStatus::kMonthlyReady;
     const double active_monthpos_effect =
-        monthpos_ready ? EvaluateRollingMonthpos(state, bucket_id, config) : 0.0;
+        monthpos_ready && feature.calendar
+            ? EvaluateRollingMonthposWithFeature(state, *feature.calendar)
+            : 0.0;
     const double forecast_model_mu = estimator.model_mu + active_monthpos_effect;
     const double forecast_model_lower =
         forecast_model_mu - config.forecast_band_z * estimator.band_std;
@@ -740,23 +826,52 @@ RollingPredictionSequence PredictRollingSequenceForSeries(const BaselineTaskSpec
         config_status = ResolveConfigOrStatus(spec, &config, &diagnostics);
     }
 
-    for (uint32_t i = 0; i < point_count; ++i) {
-        const int64_t bucket_id = start_bucket_id + static_cast<int64_t>(i);
-        RollingPrediction prediction;
-        if (bucket_id <= it->second.last_seen_bucket) {
-            prediction = MakeRollingPredictionStatus(
-                key, bucket_id, BaselineStatus::kInvalidArgument);
-        } else if (config_status != BaselineStatus::kOk) {
-            prediction = MakeRollingPredictionStatus(key, bucket_id, config_status);
-        } else {
-            prediction =
-                PredictRollingForState(spec, it->second, seed, key, bucket_id, config);
+    uint32_t index = 0;
+    while (index < point_count) {
+        const int64_t bucket_id = start_bucket_id + static_cast<int64_t>(index);
+        if (bucket_id <= it->second.last_seen_bucket || config_status != BaselineStatus::kOk) {
+            const BaselineStatus status =
+                bucket_id <= it->second.last_seen_bucket
+                    ? BaselineStatus::kInvalidArgument
+                    : config_status;
+            RollingPrediction prediction = MakeRollingPredictionStatus(key, bucket_id, status);
+            if (sequence.status == BaselineStatus::kOk &&
+                prediction.status != BaselineStatus::kOk) {
+                sequence.status = prediction.status;
+            }
+            sequence.predictions.push_back(std::move(prediction));
+            ++index;
+            continue;
         }
-        if (sequence.status == BaselineStatus::kOk &&
-            prediction.status != BaselineStatus::kOk) {
-            sequence.status = prediction.status;
+
+        const uint32_t chunk_size =
+            ComputeRollingFeatureChunkSize(config.daily_harmonic_order,
+                                           config.weekly_harmonic_order);
+        const uint32_t chunk_count = std::min<uint32_t>(chunk_size, point_count - index);
+        RollingFeatureBatch batch;
+        const BaselineStatus batch_status =
+            BuildRollingFeatureBatch(bucket_id, chunk_count, config, &batch);
+        for (uint32_t j = 0; j < chunk_count; ++j) {
+            const int64_t current_bucket = bucket_id + static_cast<int64_t>(j);
+            RollingPrediction prediction;
+            if (batch_status != BaselineStatus::kOk) {
+                prediction = MakeRollingPredictionStatus(key, current_bucket, batch_status);
+            } else {
+                prediction = PredictRollingForStateWithFeature(spec,
+                                                               it->second,
+                                                               seed,
+                                                               key,
+                                                               current_bucket,
+                                                               config,
+                                                               batch.View(j));
+            }
+            if (sequence.status == BaselineStatus::kOk &&
+                prediction.status != BaselineStatus::kOk) {
+                sequence.status = prediction.status;
+            }
+            sequence.predictions.push_back(std::move(prediction));
         }
-        sequence.predictions.push_back(std::move(prediction));
+        index += chunk_count;
     }
     return sequence;
 }

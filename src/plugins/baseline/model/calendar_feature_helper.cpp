@@ -187,6 +187,51 @@ bool ResolveLocalTime(int64_t bucket_id, int64_t delta, const std::string& tz, s
     return ResolveLocalTimeFromEpoch(bucket_id * delta, tz, out);
 }
 
+bool ResolveOneLocalCalendarFeature(int64_t bucket_id,
+                                    int64_t delta,
+                                    const std::string& tz,
+                                    LocalCalendarFeature* out) {
+    if (!out || delta <= 0) return false;
+    std::tm local{};
+    const int64_t epoch_second = bucket_id * delta;
+    if (!ResolveLocalTimeFromEpoch(epoch_second, tz, &local)) return false;
+
+    LocalCalendarFeature feature;
+    feature.valid = true;
+    feature.bucket_id = bucket_id;
+    feature.epoch_second = epoch_second;
+    feature.hour = local.tm_hour;
+    feature.minute = local.tm_min;
+    feature.second = local.tm_sec;
+    feature.weekday = local.tm_wday;
+    feature.monday_weekday = PositiveModulo(local.tm_wday + 6, 7);
+    feature.day_of_month = local.tm_mday;
+    const int32_t year = local.tm_year + 1900;
+    const int32_t month = local.tm_mon + 1;
+    feature.days_to_month_end = DaysInMonth(year, month) - local.tm_mday;
+    feature.is_last_weekday_of_month =
+        local.tm_mday + 7 > DaysInMonth(year, month);
+    feature.second_of_day = local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec;
+    feature.second_of_week = feature.monday_weekday * kSecondsPerDay + feature.second_of_day;
+
+    /*
+    local_wall_second interprets local fields as UTC via timegm.
+    The absolute value is meaningless;
+    it's only used to detect DST via consecutive diff:
+    current.local_wall_second - previous.local_wall_second == bucket_seconds
+    implies no DST transition. Spring-forward/fall-back produce != bucket_seconds.
+    */
+    std::tm wall_clock = local;
+    wall_clock.tm_isdst = 0;
+    feature.local_wall_second = static_cast<int64_t>(timegm(&wall_clock));
+    feature.day_phase =
+        static_cast<double>(feature.second_of_day) / static_cast<double>(kSecondsPerDay);
+    feature.week_phase =
+        static_cast<double>(feature.second_of_week) / static_cast<double>(kSecondsPerWeek);
+    *out = feature;
+    return true;
+}
+
 double PhaseDayLocal(int64_t bucket_id, int64_t delta, const std::string& tz) {
     std::tm local{};
     if (!ResolveLocalTime(bucket_id, delta, tz, &local)) return 0.0;

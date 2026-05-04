@@ -12,6 +12,7 @@
 #include <framework/interfaces/ibaseline_types.h>
 
 #include "plugins/baseline/bootstrap/bootstrap_types.h"
+#include "plugins/baseline/model/calendar_feature_helper.h"
 #include "plugins/baseline/rolling/observation_adapter.h"
 #include "plugins/baseline/rolling/rolling_state.h"
 
@@ -25,6 +26,9 @@ BaselineStatus InitializeRollingMonthposFromSeed(const BootstrapSeed& seed,
 double EvaluateRollingMonthpos(const RollingState& state,
                                int64_t bucket_id,
                                const BaselineRollingConfig& config);
+
+double EvaluateRollingMonthposWithFeature(const RollingState& state,
+                                          const LocalCalendarFeature& feature);
 
 BaselineStatus UpdateRollingMonthpos(const ObservedModelPoint& point,
                                      double monthpos_residual,

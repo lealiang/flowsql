@@ -31,6 +31,7 @@
 #include "plugins/baseline/relation/relation_summary.h"
 #include "plugins/baseline/relation/routed_summary.h"
 #include "plugins/baseline/rolling/rolling_config.h"
+#include "plugins/baseline/rolling/rolling_feature_batch.h"
 #include "plugins/baseline/serialization/json_serialization.h"
 
 namespace flowsql {
@@ -168,6 +169,45 @@ double ZValue(double confidence_level) {
 
 double Clamp01(double value) {
     return std::max(0.0, std::min(1.0, value));
+}
+
+template <typename TModel>
+int64_t ResolvePredictDelta(const TModel& model, const BaselineTaskSpec* task_spec) {
+    if (model.delta > 0) return model.delta;
+    if (task_spec && task_spec->delta > 0) return task_spec->delta;
+    return 0;
+}
+
+template <typename TModel>
+std::string ResolvePredictTimezone(const TModel& model, const BaselineTaskSpec* task_spec) {
+    if (!model.tz.empty()) return model.tz;
+    if (task_spec && !task_spec->tz.empty()) return task_spec->tz;
+    return "UTC";
+}
+
+BaselineRollingConfig MakeFormalFeatureConfig(const CoreBlock& core_block,
+                                              int64_t bucket_seconds,
+                                              const std::string& timezone) {
+    BaselineRollingConfig config;
+    config.bucket_seconds = bucket_seconds;
+    config.timezone = timezone;
+    config.daily_harmonic_order = static_cast<int32_t>(
+        std::max(core_block.day_sin.size(), core_block.day_cos.size()));
+    config.weekly_harmonic_order = static_cast<int32_t>(
+        std::max(core_block.week_sin.size(), core_block.week_cos.size()));
+    return config;
+}
+
+FormalPredictFeatureView MakeFormalFeatureView(const RollingFeatureView& view) {
+    FormalPredictFeatureView result;
+    result.calendar = view.calendar;
+    result.day_sin = view.day_sin;
+    result.day_cos = view.day_cos;
+    result.day_size = view.day_size;
+    result.week_sin = view.week_sin;
+    result.week_cos = view.week_cos;
+    result.week_size = view.week_size;
+    return result;
 }
 
 void AppendDiagnostic(std::string* diagnostics, const char* token) {
@@ -2405,45 +2445,75 @@ BootstrapPredictionSequence BootstrapEngine::PredictValueSequence(
     context.event_calendar = compiled_event_calendar;
     const double sigma = std::max(artifact.value_model->sigma_ref, 1.0e-3);
     const double z = ZValue(options.confidence_level);
-    for (uint32_t i = 0; i < point_count; ++i) {
-        const int64_t bucket_id = start_bucket_id + static_cast<int64_t>(i);
-        context.bucket_id = bucket_id;
-        FormalPrediction formal_prediction;
-        if (PredictFormalModel(artifact.value_model.get(), context, &formal_prediction) !=
-                error::OK ||
-            !formal_prediction.ready) {
+    const int64_t delta = ResolvePredictDelta(*artifact.value_model, task_spec);
+    const std::string timezone = ResolvePredictTimezone(*artifact.value_model, task_spec);
+    const BaselineRollingConfig feature_config =
+        MakeFormalFeatureConfig(artifact.value_model->core_block, delta, timezone);
+    const uint32_t chunk_size =
+        delta > 0
+            ? ComputeRollingFeatureChunkSize(feature_config.daily_harmonic_order,
+                                             feature_config.weekly_harmonic_order)
+            : point_count;
+
+    for (uint32_t offset = 0; offset < point_count; offset += chunk_size) {
+        const uint32_t chunk_count = std::min<uint32_t>(chunk_size, point_count - offset);
+        RollingFeatureBatch batch;
+        const BaselineStatus batch_status =
+            delta > 0
+                ? BuildRollingFeatureBatch(
+                      start_bucket_id + static_cast<int64_t>(offset),
+                      chunk_count,
+                      feature_config,
+                      &batch)
+                : BaselineStatus::kInvalidArgument;
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            const int64_t bucket_id =
+                start_bucket_id + static_cast<int64_t>(offset + i);
+            context.bucket_id = bucket_id;
+            FormalPrediction formal_prediction;
+            const int predict_status =
+                batch_status == BaselineStatus::kOk
+                    ? PredictFormalModelWithFeature(artifact.value_model.get(),
+                                                    context,
+                                                    MakeFormalFeatureView(batch.View(i)),
+                                                    &formal_prediction)
+                    : PredictFormalModel(
+                          artifact.value_model.get(), context, &formal_prediction);
+            if (predict_status != error::OK || !formal_prediction.ready) {
+                BootstrapPrediction prediction;
+                prediction.status = BaselineStatus::kPredictFailed;
+                prediction.series_key = artifact.series_key;
+                prediction.bucket_id = bucket_id;
+                prediction.diagnostics = "formal value prediction failed";
+                ApplyPredictionDiagnosticsOption(options, &prediction);
+                if (sequence.status == BaselineStatus::kOk) sequence.status = prediction.status;
+                sequence.predictions.push_back(std::move(prediction));
+                continue;
+            }
+
+            const double model_mu = formal_prediction.value;
+            const double model_lower = model_mu - z * sigma;
+            const double model_upper = model_mu + z * sigma;
+
             BootstrapPrediction prediction;
-            prediction.status = BaselineStatus::kPredictFailed;
+            prediction.status = BaselineStatus::kOk;
             prediction.series_key = artifact.series_key;
             prediction.bucket_id = bucket_id;
-            prediction.diagnostics = "formal value prediction failed";
-            ApplyPredictionDiagnosticsOption(options, &prediction);
-            if (sequence.status == BaselineStatus::kOk) sequence.status = prediction.status;
+            prediction.baseline_mu = std::max(0.0, std::expm1(model_mu));
+            prediction.baseline_lower = std::max(0.0, std::expm1(model_lower));
+            prediction.baseline_upper =
+                std::max(prediction.baseline_lower, std::expm1(model_upper));
+            prediction.band_width = prediction.baseline_upper - prediction.baseline_lower;
+            prediction.confidence = formal_prediction.confidence_base;
+            prediction.uncertainty_source.push_back("value_sigma_ref");
+            if (options.include_model_space_debug) {
+                prediction.has_model_space = true;
+                prediction.model_space_mu = model_mu;
+                prediction.model_space_lower = model_lower;
+                prediction.model_space_upper = model_upper;
+            }
             sequence.predictions.push_back(std::move(prediction));
-            continue;
         }
-
-        const double model_mu = formal_prediction.value;
-        const double model_lower = model_mu - z * sigma;
-        const double model_upper = model_mu + z * sigma;
-
-        BootstrapPrediction prediction;
-        prediction.status = BaselineStatus::kOk;
-        prediction.series_key = artifact.series_key;
-        prediction.bucket_id = bucket_id;
-        prediction.baseline_mu = std::max(0.0, std::expm1(model_mu));
-        prediction.baseline_lower = std::max(0.0, std::expm1(model_lower));
-        prediction.baseline_upper = std::max(prediction.baseline_lower, std::expm1(model_upper));
-        prediction.band_width = prediction.baseline_upper - prediction.baseline_lower;
-        prediction.confidence = formal_prediction.confidence_base;
-        prediction.uncertainty_source.push_back("value_sigma_ref");
-        if (options.include_model_space_debug) {
-            prediction.has_model_space = true;
-            prediction.model_space_mu = model_mu;
-            prediction.model_space_lower = model_lower;
-            prediction.model_space_upper = model_upper;
-        }
-        sequence.predictions.push_back(std::move(prediction));
     }
     return sequence;
 }
@@ -2544,40 +2614,69 @@ BootstrapPredictionSequence BootstrapEngine::PredictRatioSequence(
         static_cast<double>(artifact.coverage_report.accepted_count) +
             artifact.ratio_model->alpha0 + artifact.ratio_model->beta0);
     const double z = ZValue(options.confidence_level);
-    for (uint32_t i = 0; i < point_count; ++i) {
-        const int64_t bucket_id = start_bucket_id + static_cast<int64_t>(i);
-        context.bucket_id = bucket_id;
-        FormalPrediction formal_prediction;
-        if (PredictFormalModel(artifact.ratio_model.get(), context, &formal_prediction) !=
-                error::OK ||
-            !formal_prediction.ready) {
+    const int64_t delta = ResolvePredictDelta(*artifact.ratio_model, task_spec);
+    const std::string timezone = ResolvePredictTimezone(*artifact.ratio_model, task_spec);
+    const BaselineRollingConfig feature_config =
+        MakeFormalFeatureConfig(artifact.ratio_model->core_block, delta, timezone);
+    const uint32_t chunk_size =
+        delta > 0
+            ? ComputeRollingFeatureChunkSize(feature_config.daily_harmonic_order,
+                                             feature_config.weekly_harmonic_order)
+            : point_count;
+
+    for (uint32_t offset = 0; offset < point_count; offset += chunk_size) {
+        const uint32_t chunk_count = std::min<uint32_t>(chunk_size, point_count - offset);
+        RollingFeatureBatch batch;
+        const BaselineStatus batch_status =
+            delta > 0
+                ? BuildRollingFeatureBatch(
+                      start_bucket_id + static_cast<int64_t>(offset),
+                      chunk_count,
+                      feature_config,
+                      &batch)
+                : BaselineStatus::kInvalidArgument;
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            const int64_t bucket_id =
+                start_bucket_id + static_cast<int64_t>(offset + i);
+            context.bucket_id = bucket_id;
+            FormalPrediction formal_prediction;
+            const int predict_status =
+                batch_status == BaselineStatus::kOk
+                    ? PredictFormalModelWithFeature(artifact.ratio_model.get(),
+                                                    context,
+                                                    MakeFormalFeatureView(batch.View(i)),
+                                                    &formal_prediction)
+                    : PredictFormalModel(
+                          artifact.ratio_model.get(), context, &formal_prediction);
+            if (predict_status != error::OK || !formal_prediction.ready) {
+                BootstrapPrediction prediction;
+                prediction.status = BaselineStatus::kPredictFailed;
+                prediction.series_key = artifact.series_key;
+                prediction.bucket_id = bucket_id;
+                prediction.diagnostics = "formal ratio prediction failed";
+                ApplyPredictionDiagnosticsOption(options, &prediction);
+                if (sequence.status == BaselineStatus::kOk) sequence.status = prediction.status;
+                sequence.predictions.push_back(std::move(prediction));
+                continue;
+            }
+
+            const double p = Clamp01(formal_prediction.value);
+            const double sigma = std::max(
+                std::sqrt(std::max(p * (1.0 - p), 0.0) / effective_n), 1.0e-4);
+            const double half_width = z * sigma;
+
             BootstrapPrediction prediction;
-            prediction.status = BaselineStatus::kPredictFailed;
+            prediction.status = BaselineStatus::kOk;
             prediction.series_key = artifact.series_key;
             prediction.bucket_id = bucket_id;
-            prediction.diagnostics = "formal ratio prediction failed";
-            ApplyPredictionDiagnosticsOption(options, &prediction);
-            if (sequence.status == BaselineStatus::kOk) sequence.status = prediction.status;
+            prediction.baseline_mu = p;
+            prediction.baseline_lower = Clamp01(p - half_width);
+            prediction.baseline_upper = Clamp01(p + half_width);
+            prediction.band_width = prediction.baseline_upper - prediction.baseline_lower;
+            prediction.confidence = formal_prediction.confidence_base;
+            prediction.uncertainty_source.push_back("ratio_probability_variance");
             sequence.predictions.push_back(std::move(prediction));
-            continue;
         }
-
-        const double p = Clamp01(formal_prediction.value);
-        const double sigma = std::max(std::sqrt(std::max(p * (1.0 - p), 0.0) / effective_n),
-                                      1.0e-4);
-        const double half_width = z * sigma;
-
-        BootstrapPrediction prediction;
-        prediction.status = BaselineStatus::kOk;
-        prediction.series_key = artifact.series_key;
-        prediction.bucket_id = bucket_id;
-        prediction.baseline_mu = p;
-        prediction.baseline_lower = Clamp01(p - half_width);
-        prediction.baseline_upper = Clamp01(p + half_width);
-        prediction.band_width = prediction.baseline_upper - prediction.baseline_lower;
-        prediction.confidence = formal_prediction.confidence_base;
-        prediction.uncertainty_source.push_back("ratio_probability_variance");
-        sequence.predictions.push_back(std::move(prediction));
     }
     return sequence;
 }

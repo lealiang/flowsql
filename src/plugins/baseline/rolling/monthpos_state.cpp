@@ -60,6 +60,26 @@ std::size_t LastWeekdayIndex(int64_t bucket_id, const BaselineRollingConfig& con
     return static_cast<std::size_t>(std::max(0, std::min(6, local.tm_wday)));
 }
 
+std::size_t DayOfMonthIndexFromFeature(const LocalCalendarFeature& feature) {
+    if (!feature.valid || feature.day_of_month < 1) return 0;
+    return static_cast<std::size_t>(std::min(31, feature.day_of_month) - 1);
+}
+
+std::size_t DaysToMonthEndIndexFromFeature(const LocalCalendarFeature& feature,
+                                           std::size_t size) {
+    if (!feature.valid || size == 0) return 0;
+    return static_cast<std::size_t>(
+        std::max<int32_t>(
+            0,
+            std::min<int32_t>(
+                static_cast<int32_t>(size - 1), feature.days_to_month_end)));
+}
+
+std::size_t LastWeekdayIndexFromFeature(const LocalCalendarFeature& feature) {
+    if (!feature.valid) return 0;
+    return static_cast<std::size_t>(std::max(0, std::min(6, feature.weekday)));
+}
+
 double Clip(double value, double limit) {
     return std::max(-limit, std::min(limit, value));
 }
@@ -114,6 +134,24 @@ double EvaluateRollingMonthpos(const RollingState& state,
         effect += CenteredOneHotEffect(state.monthpos_lwd_coeff,
                                        state.monthpos_lwd_center,
                                        LastWeekdayIndex(bucket_id, config));
+    }
+    return effect;
+}
+
+double EvaluateRollingMonthposWithFeature(const RollingState& state,
+                                          const LocalCalendarFeature& feature) {
+    double effect = CenteredOneHotEffect(
+        state.monthpos_dom_coeff,
+        state.monthpos_dom_center,
+        DayOfMonthIndexFromFeature(feature));
+    effect += CenteredOneHotEffect(
+        state.monthpos_dme_coeff,
+        state.monthpos_dme_center,
+        DaysToMonthEndIndexFromFeature(feature, state.monthpos_dme_coeff.size()));
+    if (feature.valid && feature.is_last_weekday_of_month) {
+        effect += CenteredOneHotEffect(state.monthpos_lwd_coeff,
+                                       state.monthpos_lwd_center,
+                                       LastWeekdayIndexFromFeature(feature));
     }
     return effect;
 }

@@ -23,6 +23,7 @@ add_library(${PROJECT_NAME} SHARED
     rolling/observation_adapter.cpp
     rolling/residual_scale.cpp
     rolling/rolling_estimator.cpp
+    rolling/rolling_feature_batch.cpp
     rolling/rolling_config.cpp
     rolling/rolling_state.cpp
     rolling/rolling_task_runner.cpp
