@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -2364,6 +2365,89 @@ BootstrapPrediction BootstrapEngine::PredictValue(
     return prediction;
 }
 
+BootstrapPredictionSequence BootstrapEngine::PredictValueSequence(
+    const BootstrapArtifact& artifact,
+    int64_t start_bucket_id,
+    uint32_t point_count,
+    const BootstrapPredictionOptions& options,
+    const BaselineTaskSpec* task_spec,
+    const CompiledEventCalendar* compiled_event_calendar) const {
+    BootstrapPredictionSequence sequence;
+    sequence.series_key = artifact.series_key;
+    sequence.start_bucket_id = start_bucket_id;
+    sequence.point_count = point_count;
+    if (point_count == 0) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
+    }
+    if (start_bucket_id > std::numeric_limits<int64_t>::max() -
+                              static_cast<int64_t>(point_count - 1)) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
+    }
+
+    sequence.predictions.reserve(point_count);
+    if (!artifact.value_model || artifact.train_status != BaselineStatus::kOk) {
+        sequence.status = BaselineStatus::kNotTrained;
+        for (uint32_t i = 0; i < point_count; ++i) {
+            BootstrapPrediction prediction = UnavailablePrediction(
+                start_bucket_id + static_cast<int64_t>(i),
+                "value bootstrap artifact is not available");
+            prediction.series_key = artifact.series_key;
+            ApplyPredictionDiagnosticsOption(options, &prediction);
+            sequence.predictions.push_back(std::move(prediction));
+        }
+        return sequence;
+    }
+
+    FormalPredictContext context;
+    context.task_spec = task_spec;
+    context.event_calendar = compiled_event_calendar;
+    const double sigma = std::max(artifact.value_model->sigma_ref, 1.0e-3);
+    const double z = ZValue(options.confidence_level);
+    for (uint32_t i = 0; i < point_count; ++i) {
+        const int64_t bucket_id = start_bucket_id + static_cast<int64_t>(i);
+        context.bucket_id = bucket_id;
+        FormalPrediction formal_prediction;
+        if (PredictFormalModel(artifact.value_model.get(), context, &formal_prediction) !=
+                error::OK ||
+            !formal_prediction.ready) {
+            BootstrapPrediction prediction;
+            prediction.status = BaselineStatus::kPredictFailed;
+            prediction.series_key = artifact.series_key;
+            prediction.bucket_id = bucket_id;
+            prediction.diagnostics = "formal value prediction failed";
+            ApplyPredictionDiagnosticsOption(options, &prediction);
+            if (sequence.status == BaselineStatus::kOk) sequence.status = prediction.status;
+            sequence.predictions.push_back(std::move(prediction));
+            continue;
+        }
+
+        const double model_mu = formal_prediction.value;
+        const double model_lower = model_mu - z * sigma;
+        const double model_upper = model_mu + z * sigma;
+
+        BootstrapPrediction prediction;
+        prediction.status = BaselineStatus::kOk;
+        prediction.series_key = artifact.series_key;
+        prediction.bucket_id = bucket_id;
+        prediction.baseline_mu = std::max(0.0, std::expm1(model_mu));
+        prediction.baseline_lower = std::max(0.0, std::expm1(model_lower));
+        prediction.baseline_upper = std::max(prediction.baseline_lower, std::expm1(model_upper));
+        prediction.band_width = prediction.baseline_upper - prediction.baseline_lower;
+        prediction.confidence = formal_prediction.confidence_base;
+        prediction.uncertainty_source.push_back("value_sigma_ref");
+        if (options.include_model_space_debug) {
+            prediction.has_model_space = true;
+            prediction.model_space_mu = model_mu;
+            prediction.model_space_lower = model_lower;
+            prediction.model_space_upper = model_upper;
+        }
+        sequence.predictions.push_back(std::move(prediction));
+    }
+    return sequence;
+}
+
 BootstrapPrediction BootstrapEngine::PredictRatio(
     const BootstrapArtifact& artifact,
     int64_t bucket_id,
@@ -2415,6 +2499,87 @@ BootstrapPrediction BootstrapEngine::PredictRatio(
     prediction.confidence = formal_prediction.confidence_base;
     prediction.uncertainty_source.push_back("ratio_probability_variance");
     return prediction;
+}
+
+BootstrapPredictionSequence BootstrapEngine::PredictRatioSequence(
+    const BootstrapArtifact& artifact,
+    int64_t start_bucket_id,
+    uint32_t point_count,
+    const BootstrapPredictionOptions& options,
+    const BaselineTaskSpec* task_spec,
+    const CompiledEventCalendar* compiled_event_calendar) const {
+    BootstrapPredictionSequence sequence;
+    sequence.series_key = artifact.series_key;
+    sequence.start_bucket_id = start_bucket_id;
+    sequence.point_count = point_count;
+    if (point_count == 0) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
+    }
+    if (start_bucket_id > std::numeric_limits<int64_t>::max() -
+                              static_cast<int64_t>(point_count - 1)) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
+    }
+
+    sequence.predictions.reserve(point_count);
+    if (!artifact.ratio_model || artifact.train_status != BaselineStatus::kOk) {
+        sequence.status = BaselineStatus::kNotTrained;
+        for (uint32_t i = 0; i < point_count; ++i) {
+            BootstrapPrediction prediction = UnavailablePrediction(
+                start_bucket_id + static_cast<int64_t>(i),
+                "ratio bootstrap artifact is not available");
+            prediction.series_key = artifact.series_key;
+            ApplyPredictionDiagnosticsOption(options, &prediction);
+            sequence.predictions.push_back(std::move(prediction));
+        }
+        return sequence;
+    }
+
+    FormalPredictContext context;
+    context.task_spec = task_spec;
+    context.event_calendar = compiled_event_calendar;
+    const double effective_n = std::max<double>(
+        1.0,
+        static_cast<double>(artifact.coverage_report.accepted_count) +
+            artifact.ratio_model->alpha0 + artifact.ratio_model->beta0);
+    const double z = ZValue(options.confidence_level);
+    for (uint32_t i = 0; i < point_count; ++i) {
+        const int64_t bucket_id = start_bucket_id + static_cast<int64_t>(i);
+        context.bucket_id = bucket_id;
+        FormalPrediction formal_prediction;
+        if (PredictFormalModel(artifact.ratio_model.get(), context, &formal_prediction) !=
+                error::OK ||
+            !formal_prediction.ready) {
+            BootstrapPrediction prediction;
+            prediction.status = BaselineStatus::kPredictFailed;
+            prediction.series_key = artifact.series_key;
+            prediction.bucket_id = bucket_id;
+            prediction.diagnostics = "formal ratio prediction failed";
+            ApplyPredictionDiagnosticsOption(options, &prediction);
+            if (sequence.status == BaselineStatus::kOk) sequence.status = prediction.status;
+            sequence.predictions.push_back(std::move(prediction));
+            continue;
+        }
+
+        const double p = Clamp01(formal_prediction.value);
+        const double sigma = std::max(std::sqrt(std::max(p * (1.0 - p), 0.0) / effective_n),
+                                      1.0e-4);
+        const double half_width = z * sigma;
+
+        BootstrapPrediction prediction;
+        prediction.status = BaselineStatus::kOk;
+        prediction.series_key = artifact.series_key;
+        prediction.bucket_id = bucket_id;
+        prediction.baseline_mu = p;
+        prediction.baseline_lower = Clamp01(p - half_width);
+        prediction.baseline_upper = Clamp01(p + half_width);
+        prediction.band_width = prediction.baseline_upper - prediction.baseline_lower;
+        prediction.confidence = formal_prediction.confidence_base;
+        prediction.uncertainty_source.push_back("ratio_probability_variance");
+        sequence.predictions.push_back(std::move(prediction));
+    }
+    return sequence;
 }
 
 BaselineStatus BootstrapEngine::ExportSeed(const BootstrapArtifact& artifact,

@@ -104,17 +104,21 @@ RollingPredictionSequence BaselineRatioTask::PredictRolling(
         return sequence;
     }
 
-    sequence.predictions.reserve(point_count);
-    for (uint32_t i = 0; i < point_count; ++i) {
-        RollingPrediction prediction =
-            PredictRolling(series_key, start_bucket_id + static_cast<int64_t>(i));
-        if (sequence.status == BaselineStatus::kOk &&
-            prediction.status != BaselineStatus::kOk) {
-            sequence.status = prediction.status;
+    const BaselineStatus status = EnsureOpen();
+    if (status != BaselineStatus::kOk) {
+        sequence.status = status;
+        sequence.predictions.reserve(point_count);
+        for (uint32_t i = 0; i < point_count; ++i) {
+            RollingPrediction prediction;
+            prediction.series_key = sequence.series_key;
+            prediction.bucket_id = start_bucket_id + static_cast<int64_t>(i);
+            prediction.status = status;
+            sequence.predictions.push_back(std::move(prediction));
         }
-        sequence.predictions.push_back(std::move(prediction));
+        return sequence;
     }
-    return sequence;
+    return PredictRollingSequenceForSeries(
+        spec_, seeds_by_series_, rolling_states_, series_key, start_bucket_id, point_count);
 }
 
 BootstrapTrainResult BaselineRatioTask::Bootstrap(const RatioBootstrapInput& input) {
@@ -193,19 +197,38 @@ BootstrapPredictionSequence BaselineRatioTask::PredictBootstrap(
         return sequence;
     }
 
-    sequence.predictions.reserve(point_count);
-    for (uint32_t i = 0; i < point_count; ++i) {
-        BootstrapPrediction prediction =
-            PredictBootstrap(series_key,
-                             start_bucket_id + static_cast<int64_t>(i),
-                             options);
-        if (sequence.status == BaselineStatus::kOk &&
-            prediction.status != BaselineStatus::kOk) {
-            sequence.status = prediction.status;
+    const BaselineStatus status = EnsureOpen();
+    if (status != BaselineStatus::kOk) {
+        sequence.status = status;
+        sequence.predictions.reserve(point_count);
+        for (uint32_t i = 0; i < point_count; ++i) {
+            BootstrapPrediction prediction;
+            prediction.status = status;
+            prediction.series_key = sequence.series_key;
+            prediction.bucket_id = start_bucket_id + static_cast<int64_t>(i);
+            sequence.predictions.push_back(std::move(prediction));
         }
-        sequence.predictions.push_back(std::move(prediction));
+        return sequence;
     }
-    return sequence;
+
+    const BootstrapArtifact* artifact =
+        FindBootstrapArtifact(artifacts_by_series_, sequence.series_key);
+    if (!artifact) {
+        sequence.status = sequence.series_key.empty() ? BaselineStatus::kInvalidArgument
+                                                      : BaselineStatus::kNotTrained;
+        sequence.predictions.reserve(point_count);
+        for (uint32_t i = 0; i < point_count; ++i) {
+            BootstrapPrediction prediction;
+            prediction.status = sequence.status;
+            prediction.series_key = sequence.series_key;
+            prediction.bucket_id = start_bucket_id + static_cast<int64_t>(i);
+            sequence.predictions.push_back(std::move(prediction));
+        }
+        return sequence;
+    }
+
+    return bootstrap_engine_.PredictRatioSequence(
+        *artifact, start_bucket_id, point_count, options, &spec_, compiled_event_calendar_.get());
 }
 
 BaselineSerializationResult BaselineRatioTask::ExportBootstrapArtifact(

@@ -41,6 +41,13 @@ RollingPrediction PredictRollingForSeries(const BaselineTaskSpec& spec,
                                           std::string_view series_key,
                                           int64_t bucket_id);
 
+RollingPredictionSequence PredictRollingSequenceForSeries(const BaselineTaskSpec& spec,
+                                                          const BootstrapSeedStore& seeds,
+                                                          const RollingStateMap& states,
+                                                          std::string_view series_key,
+                                                          int64_t start_bucket_id,
+                                                          uint32_t point_count);
+
 struct RollingWarmupStats {
     uint64_t success_count = 0;
     uint64_t failure_count = 0;

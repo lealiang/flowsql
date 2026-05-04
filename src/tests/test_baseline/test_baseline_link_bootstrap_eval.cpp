@@ -298,11 +298,52 @@ bool WritePredictions(const std::filesystem::path& path,
                                                 points.size());
     std::vector<std::size_t> weekly_end_index(static_cast<std::size_t>(prediction_weeks),
                                               points.size());
+
+    const int64_t start_bucket_id = points[predict_start_index].bucket_id;
+    const int64_t end_bucket_id = points[predict_end_index - 1].bucket_id;
+    if (end_bucket_id < start_bucket_id) {
+        std::cerr << "invalid prediction bucket range\n";
+        return false;
+    }
+    const uint64_t sequence_bucket_count =
+        static_cast<uint64_t>(end_bucket_id - start_bucket_id + 1);
+    if (sequence_bucket_count > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "prediction bucket range is too large for sequence API\n";
+        return false;
+    }
+    const BootstrapPredictionSequence prediction_sequence =
+        engine.PredictValueSequence(artifact,
+                                    start_bucket_id,
+                                    static_cast<uint32_t>(sequence_bucket_count),
+                                    options);
+    if (prediction_sequence.status != BaselineStatus::kOk ||
+        prediction_sequence.predictions.size() != sequence_bucket_count) {
+        std::cerr << "batch prediction failed, status="
+                  << static_cast<int>(prediction_sequence.status) << "\n";
+        return false;
+    }
+
     for (std::size_t i = predict_start_index; i < predict_end_index; ++i) {
         const LinkPoint& point = points[i];
-        const BootstrapPrediction prediction = engine.PredictValue(artifact, point.bucket_id, options);
+        if (point.bucket_id < start_bucket_id) {
+            std::cerr << "prediction point is before batch start bucket: " << point.bucket_id << "\n";
+            return false;
+        }
+        const uint64_t prediction_offset =
+            static_cast<uint64_t>(point.bucket_id - start_bucket_id);
+        if (prediction_offset >= prediction_sequence.predictions.size()) {
+            std::cerr << "prediction point is outside batch range: " << point.bucket_id << "\n";
+            return false;
+        }
+        const BootstrapPrediction& prediction =
+            prediction_sequence.predictions[static_cast<std::size_t>(prediction_offset)];
         if (prediction.status != BaselineStatus::kOk) {
             std::cerr << "prediction failed at bucket: " << point.bucket_id << "\n";
+            return false;
+        }
+        if (prediction.bucket_id != point.bucket_id) {
+            std::cerr << "batch prediction bucket mismatch: expected " << point.bucket_id
+                      << ", got " << prediction.bucket_id << "\n";
             return false;
         }
         const double z_score = DirectionalZScore(prediction, point.mbps);

@@ -256,12 +256,9 @@ BaselineSerializationResult ExportBootstrapArtifactStore(
         if (it == artifacts.end()) continue;
         auto [status, json] = engine.ExportArtifact(it->second, format);
         if (status != BaselineStatus::kOk) return {status, ""};
-        rapidjson::Document item;
-        item.Parse(json.c_str());
-        if (item.HasParseError() || !item.IsObject()) {
-            return {BaselineStatus::kSerializationFailed, ""};
-        }
-        item.Accept(writer);
+        writer.RawValue(json.c_str(),
+                        static_cast<rapidjson::SizeType>(json.size()),
+                        rapidjson::kObjectType);
     }
     writer.EndArray();
     writer.EndObject();
@@ -299,12 +296,9 @@ BaselineSerializationResult ExportBootstrapSeedStore(
         if (it == seeds.end()) continue;
         auto [status, json] = engine.ExportSeed(it->second, format);
         if (status != BaselineStatus::kOk) return {status, ""};
-        rapidjson::Document item;
-        item.Parse(json.c_str());
-        if (item.HasParseError() || !item.IsObject()) {
-            return {BaselineStatus::kSerializationFailed, ""};
-        }
-        item.Accept(writer);
+        writer.RawValue(json.c_str(),
+                        static_cast<rapidjson::SizeType>(json.size()),
+                        rapidjson::kObjectType);
     }
     writer.EndArray();
     writer.EndObject();

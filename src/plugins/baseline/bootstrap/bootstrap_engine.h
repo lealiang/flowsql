@@ -47,12 +47,28 @@ class __attribute__((visibility("default"))) BootstrapEngine {
                                      const CompiledEventCalendar* compiled_event_calendar =
                                          nullptr) const;
 
+    BootstrapPredictionSequence PredictValueSequence(
+        const BootstrapArtifact& artifact,
+        int64_t start_bucket_id,
+        uint32_t point_count,
+        const BootstrapPredictionOptions& options,
+        const BaselineTaskSpec* task_spec = nullptr,
+        const CompiledEventCalendar* compiled_event_calendar = nullptr) const;
+
     BootstrapPrediction PredictRatio(const BootstrapArtifact& artifact,
                                      int64_t bucket_id,
                                      const BootstrapPredictionOptions& options,
                                      const BaselineTaskSpec* task_spec = nullptr,
                                      const CompiledEventCalendar* compiled_event_calendar =
                                          nullptr) const;
+
+    BootstrapPredictionSequence PredictRatioSequence(
+        const BootstrapArtifact& artifact,
+        int64_t start_bucket_id,
+        uint32_t point_count,
+        const BootstrapPredictionOptions& options,
+        const BaselineTaskSpec* task_spec = nullptr,
+        const CompiledEventCalendar* compiled_event_calendar = nullptr) const;
 
     BaselineStatus ExportSeed(const BootstrapArtifact& artifact,
                               BootstrapSeed* out_seed) const;

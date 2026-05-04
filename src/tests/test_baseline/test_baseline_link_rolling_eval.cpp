@@ -631,10 +631,52 @@ bool WriteWeek4ComparisonAndTrainRolling(const std::filesystem::path& path,
     bootstrap_options.confidence_level = kConfidenceLevel;
     EvalAccumulator bootstrap_acc;
     EvalAccumulator rolling_acc;
+
+    const int64_t start_bucket_id = points[begin].bucket_id;
+    const int64_t end_bucket_id = points[end - 1].bucket_id;
+    if (end_bucket_id < start_bucket_id) {
+        std::cerr << "invalid week4 train comparison bucket range\n";
+        return false;
+    }
+    const uint64_t sequence_bucket_count =
+        static_cast<uint64_t>(end_bucket_id - start_bucket_id + 1);
+    if (sequence_bucket_count > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "week4 train comparison bucket range is too large for sequence API\n";
+        return false;
+    }
+    const BootstrapPredictionSequence bootstrap_sequence =
+        task->PredictBootstrap(kSeriesKey,
+                               start_bucket_id,
+                               static_cast<uint32_t>(sequence_bucket_count),
+                               bootstrap_options);
+    if (bootstrap_sequence.status != BaselineStatus::kOk ||
+        bootstrap_sequence.predictions.size() != sequence_bucket_count) {
+        std::cerr << "week4 train comparison bootstrap batch predict failed, status="
+                  << static_cast<int>(bootstrap_sequence.status) << "\n";
+        return false;
+    }
+
     for (std::size_t i = begin; i < end; ++i) {
         const LinkPoint& point = points[i];
-        const BootstrapPrediction bp =
-            task->PredictBootstrap(kSeriesKey, point.bucket_id, bootstrap_options);
+        if (point.bucket_id < start_bucket_id) {
+            std::cerr << "week4 train comparison point is before batch start: "
+                      << point.bucket_id << "\n";
+            return false;
+        }
+        const uint64_t prediction_offset =
+            static_cast<uint64_t>(point.bucket_id - start_bucket_id);
+        if (prediction_offset >= bootstrap_sequence.predictions.size()) {
+            std::cerr << "week4 train comparison point is outside batch range: "
+                      << point.bucket_id << "\n";
+            return false;
+        }
+        const BootstrapPrediction& bp =
+            bootstrap_sequence.predictions[static_cast<std::size_t>(prediction_offset)];
+        if (bp.bucket_id != point.bucket_id) {
+            std::cerr << "week4 train comparison bootstrap batch bucket mismatch at "
+                      << point.timestamp << "\n";
+            return false;
+        }
         const RollingBaselineResult rr =
             task->SubmitObservation(ToObservation(point), RollingSubmitOptions{});
         if (bp.status != BaselineStatus::kOk || rr.status != BaselineStatus::kOk) {
@@ -698,15 +740,64 @@ bool WriteWeek4FrozenPredictComparison(const std::filesystem::path& path,
     EvalAccumulator rolling_acc;
     SmoothnessAccumulator bootstrap_smooth_acc;
     SmoothnessAccumulator rolling_smooth_acc;
+
+    const int64_t start_bucket_id = points[begin].bucket_id;
+    const int64_t end_bucket_id = points[end - 1].bucket_id;
+    if (end_bucket_id < start_bucket_id) {
+        std::cerr << "invalid frozen prediction bucket range\n";
+        return false;
+    }
+    const uint64_t sequence_bucket_count =
+        static_cast<uint64_t>(end_bucket_id - start_bucket_id + 1);
+    if (sequence_bucket_count > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "frozen prediction bucket range is too large for sequence API\n";
+        return false;
+    }
+    const BootstrapPredictionSequence bootstrap_sequence =
+        task->PredictBootstrap(kSeriesKey,
+                               start_bucket_id,
+                               static_cast<uint32_t>(sequence_bucket_count),
+                               bootstrap_options);
+    const RollingPredictionSequence rolling_sequence =
+        task->PredictRolling(kSeriesKey,
+                             start_bucket_id,
+                             static_cast<uint32_t>(sequence_bucket_count));
+    if (bootstrap_sequence.status != BaselineStatus::kOk ||
+        bootstrap_sequence.predictions.size() != sequence_bucket_count ||
+        rolling_sequence.status != BaselineStatus::kOk ||
+        rolling_sequence.predictions.size() != sequence_bucket_count) {
+        std::cerr << "week4 frozen batch predict failed"
+                  << ", bootstrap_status=" << static_cast<int>(bootstrap_sequence.status)
+                  << ", rolling_status=" << static_cast<int>(rolling_sequence.status) << "\n";
+        return false;
+    }
+
     for (std::size_t i = begin; i < end; ++i) {
         const LinkPoint& point = points[i];
-        const BootstrapPrediction bp =
-            task->PredictBootstrap(kSeriesKey, point.bucket_id, bootstrap_options);
-        const RollingPrediction rp = task->PredictRolling(kSeriesKey, point.bucket_id);
+        if (point.bucket_id < start_bucket_id) {
+            std::cerr << "frozen prediction point is before batch start: " << point.bucket_id << "\n";
+            return false;
+        }
+        const uint64_t prediction_offset =
+            static_cast<uint64_t>(point.bucket_id - start_bucket_id);
+        if (prediction_offset >= bootstrap_sequence.predictions.size() ||
+            prediction_offset >= rolling_sequence.predictions.size()) {
+            std::cerr << "frozen prediction point is outside batch range: " << point.bucket_id << "\n";
+            return false;
+        }
+        const BootstrapPrediction& bp =
+            bootstrap_sequence.predictions[static_cast<std::size_t>(prediction_offset)];
+        const RollingPrediction& rp =
+            rolling_sequence.predictions[static_cast<std::size_t>(prediction_offset)];
         if (bp.status != BaselineStatus::kOk || rp.status != BaselineStatus::kOk) {
             std::cerr << "week4 frozen predict failed at " << point.timestamp
                       << ", bootstrap_status=" << static_cast<int>(bp.status)
                       << ", rolling_status=" << static_cast<int>(rp.status) << "\n";
+            return false;
+        }
+        if (bp.bucket_id != point.bucket_id || rp.bucket_id != point.bucket_id) {
+            std::cerr << "week4 frozen batch prediction bucket mismatch at " << point.timestamp
+                      << "\n";
             return false;
         }
         bootstrap_acc.Add(point.mbps,
@@ -780,10 +871,52 @@ bool WriteWeek4RollingPredictAndTrainComparison(
     EvalAccumulator rolling_forecast_acc;
     SmoothnessAccumulator bootstrap_smooth_acc;
     SmoothnessAccumulator rolling_smooth_acc;
+
+    const int64_t start_bucket_id = points[begin].bucket_id;
+    const int64_t end_bucket_id = points[end - 1].bucket_id;
+    if (end_bucket_id < start_bucket_id) {
+        std::cerr << "invalid week4 prediction bucket range\n";
+        return false;
+    }
+    const uint64_t sequence_bucket_count =
+        static_cast<uint64_t>(end_bucket_id - start_bucket_id + 1);
+    if (sequence_bucket_count > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "week4 prediction bucket range is too large for sequence API\n";
+        return false;
+    }
+    const BootstrapPredictionSequence bootstrap_sequence =
+        task->PredictBootstrap(kSeriesKey,
+                               start_bucket_id,
+                               static_cast<uint32_t>(sequence_bucket_count),
+                               bootstrap_options);
+    if (bootstrap_sequence.status != BaselineStatus::kOk ||
+        bootstrap_sequence.predictions.size() != sequence_bucket_count) {
+        std::cerr << "week4 bootstrap batch predict failed, status="
+                  << static_cast<int>(bootstrap_sequence.status) << "\n";
+        return false;
+    }
+
     for (std::size_t i = begin; i < end; ++i) {
         const LinkPoint& point = points[i];
-        const BootstrapPrediction bp =
-            task->PredictBootstrap(kSeriesKey, point.bucket_id, bootstrap_options);
+        if (point.bucket_id < start_bucket_id) {
+            std::cerr << "week4 prediction point is before batch start: " << point.bucket_id << "\n";
+            return false;
+        }
+        const uint64_t prediction_offset =
+            static_cast<uint64_t>(point.bucket_id - start_bucket_id);
+        if (prediction_offset >= bootstrap_sequence.predictions.size()) {
+            std::cerr << "week4 prediction point is outside batch range: " << point.bucket_id << "\n";
+            return false;
+        }
+        const BootstrapPrediction& bp =
+            bootstrap_sequence.predictions[static_cast<std::size_t>(prediction_offset)];
+        if (bp.bucket_id != point.bucket_id) {
+            std::cerr << "week4 bootstrap batch prediction bucket mismatch at "
+                      << point.timestamp << "\n";
+            return false;
+        }
+        // 这里是 walk-forward 预测：每个点预测后会立即 SubmitObservation 更新状态。
+        // 整段 rolling 批预测会冻结状态，改变该评估窗口的语义。
         const RollingPrediction rp = task->PredictRolling(kSeriesKey, point.bucket_id);
         if (bp.status != BaselineStatus::kOk || rp.status != BaselineStatus::kOk) {
             std::cerr << "week4 rolling predict failed at " << point.timestamp

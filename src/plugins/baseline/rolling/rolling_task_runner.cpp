@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -311,6 +312,59 @@ BaselineStatus BuildFusionForecastEstimator(const RollingState& state,
     result.pred_p_level = pred_var;
     *out = result;
     return BaselineStatus::kOk;
+}
+
+RollingPrediction MakeRollingPredictionStatus(const std::string& key,
+                                              int64_t bucket_id,
+                                              BaselineStatus status) {
+    RollingPrediction result;
+    result.series_key = key;
+    result.bucket_id = bucket_id;
+    result.status = status;
+    return result;
+}
+
+RollingPrediction PredictRollingForState(const BaselineTaskSpec& spec,
+                                         const RollingState& state,
+                                         const BootstrapSeed* seed,
+                                         const std::string& key,
+                                         int64_t bucket_id,
+                                         const BaselineRollingConfig& config) {
+    RollingPrediction result;
+    result.series_key = key;
+    result.bucket_id = bucket_id;
+
+    RollingEstimatorResult estimator;
+    BaselineStatus predict_status = BaselineStatus::kNotTrained;
+    if (seed && CanUseBootstrapForecastSeed(*seed)) {
+        predict_status =
+            BuildFusionForecastEstimator(state, *seed, bucket_id, config, &estimator);
+    }
+    if (predict_status != BaselineStatus::kOk) {
+        predict_status = PredictRollingForecastState(state, bucket_id, config, &estimator);
+    }
+    if (predict_status != BaselineStatus::kOk) {
+        result.status = predict_status;
+        return result;
+    }
+
+    const bool monthpos_ready =
+        state.monthpos_status == RollingMonthposStatus::kMonthlyReady;
+    const double active_monthpos_effect =
+        monthpos_ready ? EvaluateRollingMonthpos(state, bucket_id, config) : 0.0;
+    const double forecast_model_mu = estimator.model_mu + active_monthpos_effect;
+    const double forecast_model_lower =
+        forecast_model_mu - config.forecast_band_z * estimator.band_std;
+    const double forecast_model_upper =
+        forecast_model_mu + config.forecast_band_z * estimator.band_std;
+    result.baseline_mu = ModelToObservedValue(spec, forecast_model_mu);
+    result.baseline_lower = ModelToObservedValue(spec, forecast_model_lower);
+    result.baseline_upper = ModelToObservedValue(spec, forecast_model_upper);
+    result.band_z = config.forecast_band_z;
+    if (result.baseline_upper < result.baseline_lower) {
+        std::swap(result.baseline_upper, result.baseline_lower);
+    }
+    return result;
 }
 
 void CountStatuses(const RollingStateMap& states,
@@ -621,38 +675,90 @@ RollingPrediction PredictRollingForSeries(const BaselineTaskSpec& spec,
         return result;
     }
 
-    RollingEstimatorResult estimator;
-    BaselineStatus predict_status = BaselineStatus::kNotTrained;
     const BootstrapSeed* seed = FindSeed(seeds, key);
-    if (seed && CanUseBootstrapForecastSeed(*seed)) {
-        predict_status =
-            BuildFusionForecastEstimator(it->second, *seed, bucket_id, config, &estimator);
+    return PredictRollingForState(spec, it->second, seed, key, bucket_id, config);
+}
+
+RollingPredictionSequence PredictRollingSequenceForSeries(const BaselineTaskSpec& spec,
+                                                          const BootstrapSeedStore& seeds,
+                                                          const RollingStateMap& states,
+                                                          std::string_view series_key,
+                                                          int64_t start_bucket_id,
+                                                          uint32_t point_count) {
+    RollingPredictionSequence sequence;
+    const std::string key(series_key);
+    sequence.series_key = key;
+    sequence.start_bucket_id = start_bucket_id;
+    sequence.point_count = point_count;
+    if (point_count == 0) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
     }
-    if (predict_status != BaselineStatus::kOk) {
-        predict_status = PredictRollingForecastState(it->second, bucket_id, config, &estimator);
-    }
-    if (predict_status != BaselineStatus::kOk) {
-        result.status = predict_status;
-        return result;
+    if (start_bucket_id > std::numeric_limits<int64_t>::max() -
+                              static_cast<int64_t>(point_count - 1)) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        return sequence;
     }
 
-    const bool monthpos_ready =
-        it->second.monthpos_status == RollingMonthposStatus::kMonthlyReady;
-    const double active_monthpos_effect =
-        monthpos_ready ? EvaluateRollingMonthpos(it->second, bucket_id, config) : 0.0;
-    const double forecast_model_mu = estimator.model_mu + active_monthpos_effect;
-    const double forecast_model_lower =
-        forecast_model_mu - config.forecast_band_z * estimator.band_std;
-    const double forecast_model_upper =
-        forecast_model_mu + config.forecast_band_z * estimator.band_std;
-    result.baseline_mu = ModelToObservedValue(spec, forecast_model_mu);
-    result.baseline_lower = ModelToObservedValue(spec, forecast_model_lower);
-    result.baseline_upper = ModelToObservedValue(spec, forecast_model_upper);
-    result.band_z = config.forecast_band_z;
-    if (result.baseline_upper < result.baseline_lower) {
-        std::swap(result.baseline_upper, result.baseline_lower);
+    sequence.predictions.reserve(point_count);
+    if (key.empty()) {
+        sequence.status = BaselineStatus::kInvalidArgument;
+        for (uint32_t i = 0; i < point_count; ++i) {
+            sequence.predictions.push_back(MakeRollingPredictionStatus(
+                key,
+                start_bucket_id + static_cast<int64_t>(i),
+                BaselineStatus::kInvalidArgument));
+        }
+        return sequence;
     }
-    return result;
+
+    const auto it = states.find(key);
+    if (it == states.end()) {
+        sequence.status = BaselineStatus::kNotTrained;
+        for (uint32_t i = 0; i < point_count; ++i) {
+            sequence.predictions.push_back(MakeRollingPredictionStatus(
+                key,
+                start_bucket_id + static_cast<int64_t>(i),
+                BaselineStatus::kNotTrained));
+        }
+        return sequence;
+    }
+
+    bool has_future_bucket = false;
+    for (uint32_t i = 0; i < point_count; ++i) {
+        if (start_bucket_id + static_cast<int64_t>(i) > it->second.last_seen_bucket) {
+            has_future_bucket = true;
+            break;
+        }
+    }
+
+    BaselineRollingConfig config;
+    std::string diagnostics;
+    BaselineStatus config_status = BaselineStatus::kOk;
+    const BootstrapSeed* seed = FindSeed(seeds, key);
+    if (has_future_bucket) {
+        config_status = ResolveConfigOrStatus(spec, &config, &diagnostics);
+    }
+
+    for (uint32_t i = 0; i < point_count; ++i) {
+        const int64_t bucket_id = start_bucket_id + static_cast<int64_t>(i);
+        RollingPrediction prediction;
+        if (bucket_id <= it->second.last_seen_bucket) {
+            prediction = MakeRollingPredictionStatus(
+                key, bucket_id, BaselineStatus::kInvalidArgument);
+        } else if (config_status != BaselineStatus::kOk) {
+            prediction = MakeRollingPredictionStatus(key, bucket_id, config_status);
+        } else {
+            prediction =
+                PredictRollingForState(spec, it->second, seed, key, bucket_id, config);
+        }
+        if (sequence.status == BaselineStatus::kOk &&
+            prediction.status != BaselineStatus::kOk) {
+            sequence.status = prediction.status;
+        }
+        sequence.predictions.push_back(std::move(prediction));
+    }
+    return sequence;
 }
 
 RollingWarmupStats WarmupRollingStatesFromBootstrapSeeds(const BaselineTaskSpec& spec,

@@ -480,6 +480,18 @@ void TestBootstrapEngineTrainsValueAndRatio() {
     assert(value_prediction.baseline_upper >= value_prediction.baseline_mu);
     assert(value_prediction.band_width > 0.0);
     assert(value_prediction.has_model_space);
+    const BootstrapPredictionSequence value_sequence =
+        engine.PredictValueSequence(value_artifact, 220, 3, prediction_options);
+    assert(value_sequence.status == BaselineStatus::kOk);
+    assert(value_sequence.series_key == "svc-a");
+    assert(value_sequence.start_bucket_id == 220);
+    assert(value_sequence.point_count == 3);
+    assert(value_sequence.predictions.size() == 3);
+    assert(value_sequence.predictions[0].bucket_id == 220);
+    assert(value_sequence.predictions[1].bucket_id == 221);
+    assert(value_sequence.predictions[2].bucket_id == 222);
+    assert(value_sequence.predictions[0].status == BaselineStatus::kOk);
+    AssertNear(value_sequence.predictions[0].baseline_mu, value_prediction.baseline_mu);
 
     auto [artifact_status, artifact_json] =
         engine.ExportArtifact(value_artifact, BaselineSerializationFormat::kJson);
@@ -598,6 +610,17 @@ void TestBootstrapEngineTrainsValueAndRatio() {
     assert(ratio_prediction.baseline_lower <= ratio_prediction.baseline_mu);
     assert(ratio_prediction.baseline_upper >= ratio_prediction.baseline_mu);
     assert(ratio_prediction.band_width > 0.0);
+    const BootstrapPredictionSequence ratio_sequence =
+        engine.PredictRatioSequence(ratio_artifact, 220, 2, prediction_options);
+    assert(ratio_sequence.status == BaselineStatus::kOk);
+    assert(ratio_sequence.series_key == "svc-a");
+    assert(ratio_sequence.start_bucket_id == 220);
+    assert(ratio_sequence.point_count == 2);
+    assert(ratio_sequence.predictions.size() == 2);
+    assert(ratio_sequence.predictions[0].bucket_id == 220);
+    assert(ratio_sequence.predictions[1].bucket_id == 221);
+    assert(ratio_sequence.predictions[0].status == BaselineStatus::kOk);
+    AssertNear(ratio_sequence.predictions[0].baseline_mu, ratio_prediction.baseline_mu);
 
     BootstrapSeed ratio_seed;
     assert(engine.ExportSeed(ratio_artifact, &ratio_seed) == BaselineStatus::kOk);

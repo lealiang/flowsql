@@ -37,15 +37,9 @@ double RatioClipEps() {
     return eps;
 }
 
-struct ValueTrainRow {
+struct TrainRow {
     int64_t bucket_id = 0;
-    double x = 0.0;
-    double weight = 1.0;
-};
-
-struct RatioTrainRow {
-    int64_t bucket_id = 0;
-    double eta = 0.0;
+    double target = 0.0;       // log1p(value) or logit(smoothed_ratio)
     double weight = 1.0;
 };
 
@@ -104,25 +98,15 @@ double EstimateSigmaMAD(const std::vector<double>& residual) {
     return std::max(kSigmaFloor, 1.4826 * UpperMedian(&deviation));
 }
 
-int64_t ResolveDelta(const ValueFormalTrainInput& input) {
+template <typename TInput>
+int64_t ResolveDelta(const TInput& input) {
     if (input.delta > 0) return input.delta;
     if (input.task_spec && input.task_spec->delta > 0) return input.task_spec->delta;
     return 0;
 }
 
-int64_t ResolveDelta(const RatioFormalTrainInput& input) {
-    if (input.delta > 0) return input.delta;
-    if (input.task_spec && input.task_spec->delta > 0) return input.task_spec->delta;
-    return 0;
-}
-
-std::string ResolveTimezone(const ValueFormalTrainInput& input) {
-    if (!input.tz.empty()) return input.tz;
-    if (input.task_spec && !input.task_spec->tz.empty()) return input.task_spec->tz;
-    return "UTC";
-}
-
-std::string ResolveTimezone(const RatioFormalTrainInput& input) {
+template <typename TInput>
+std::string ResolveTimezone(const TInput& input) {
     if (!input.tz.empty()) return input.tz;
     if (input.task_spec && !input.task_spec->tz.empty()) return input.task_spec->tz;
     return "UTC";
@@ -172,7 +156,7 @@ void AppendCoreRow(const SharedProfileConfig& shared_config,
     }
 }
 
-BlockFitSpec BuildCoreFitSpec(const std::vector<ValueTrainRow>& rows,
+BlockFitSpec BuildCoreFitSpec(const std::vector<TrainRow>& rows,
                               const SharedProfileConfig& shared_config,
                               int64_t delta,
                               const std::string& tz) {
@@ -203,7 +187,7 @@ BlockFitSpec BuildCoreFitSpec(const std::vector<ValueTrainRow>& rows,
 
     const int64_t train_start = rows.front().bucket_id;
     for (const auto& row : rows) {
-        spec.y_target.push_back(row.x);
+        spec.y_target.push_back(row.target);
         spec.sample_weight.push_back(row.weight);
         AppendCoreRow(shared_config, row.bucket_id, train_start, delta, tz, &spec.x_matrix);
     }
@@ -271,7 +255,7 @@ struct MonthPosDesign {
     std::size_t col_count = 0;
 };
 
-MonthPosDesign BuildMonthPosDesign(const std::vector<ValueTrainRow>& rows,
+MonthPosDesign BuildMonthPosDesign(const std::vector<TrainRow>& rows,
                                    const SharedProfileConfig& shared_config,
                                    const CoreBlock& core_block,
                                    int64_t train_start,
@@ -335,7 +319,7 @@ MonthPosDesign BuildMonthPosDesign(const std::vector<ValueTrainRow>& rows,
     for (std::size_t row_index = 0; row_index < rows.size(); ++row_index) {
         const auto& row = rows[row_index];
         const double core_mu = EvaluateCore(core_block, row.bucket_id, train_start, delta, tz);
-        design.y_target.push_back(row.x - core_mu);
+        design.y_target.push_back(row.target - core_mu);
         design.sample_weight.push_back(row.weight);
 
         std::vector<double>& raw = raw_rows[row_index];
@@ -412,43 +396,38 @@ double EvaluateMonthPos(const MonthPosBlock& block,
     return value;
 }
 
-void BuildEventTaskSpec(const ValueFormalTrainInput& input,
-                        BaselineTaskSpec* out_task_spec) {
-    if (!out_task_spec) return;
-    if (input.task_spec) {
-        *out_task_spec = *input.task_spec;
-        return;
-    }
-    out_task_spec->feature = "";
-    out_task_spec->key = "";
-    out_task_spec->delta = input.delta;
-    out_task_spec->tz = input.tz;
-}
-
-bool BuildEventFitSpec(const ValueFormalTrainInput& input,
-                       const std::vector<ValueTrainRow>& rows,
+bool BuildEventFitSpec(const std::vector<TrainRow>& rows,
+                       const CompiledEventCalendar* compiled_event_calendar,
+                       const BaselineTaskSpec* task_spec,
+                       int64_t delta,
+                       const std::string& tz,
                        const CoreBlock& core_block,
                        const MonthPosBlock& monthpos_block,
                        int64_t train_start,
-                       int64_t delta,
-                       const std::string& tz,
                        BlockFitSpec* out_spec,
-    std::vector<std::string>* out_codes) {
-    if (!out_spec || !out_codes) return false;
-    if (!input.compiled_event_calendar ||
-        input.compiled_event_calendar->enabled_event_codes.empty()) {
+                       std::vector<std::string>* out_codes) {
+    if (!out_spec || !out_codes || rows.empty() ||
+        !compiled_event_calendar ||
+        compiled_event_calendar->enabled_event_codes.empty()) {
         return false;
     }
 
     BaselineTaskSpec event_task_spec;
-    BuildEventTaskSpec(input, &event_task_spec);
+    if (task_spec) {
+        event_task_spec = *task_spec;
+    } else {
+        event_task_spec.feature = "";
+        event_task_spec.key = "";
+        event_task_spec.delta = delta;
+        event_task_spec.tz = tz;
+    }
     if (event_task_spec.delta <= 0) event_task_spec.delta = delta;
     if (event_task_spec.tz.empty()) event_task_spec.tz = tz;
 
     BlockFitSpec spec;
     spec.block_name = "event";
     spec.row_count = rows.size();
-    spec.col_count = input.compiled_event_calendar->enabled_event_codes.size();
+    spec.col_count = compiled_event_calendar->enabled_event_codes.size();
     spec.y_target.reserve(rows.size());
     spec.sample_weight.reserve(rows.size());
     spec.x_matrix.reserve(rows.size() * spec.col_count);
@@ -458,7 +437,7 @@ bool BuildEventFitSpec(const ValueFormalTrainInput& input,
     std::vector<double> event_row(spec.col_count, 0.0);
     for (const auto& row : rows) {
         std::fill(event_row.begin(), event_row.end(), 0.0);
-        if (BuildEventIndicatorRow(*input.compiled_event_calendar,
+        if (BuildEventIndicatorRow(*compiled_event_calendar,
                                    event_task_spec,
                                    row.bucket_id,
                                    event_row.data(),
@@ -467,7 +446,7 @@ bool BuildEventFitSpec(const ValueFormalTrainInput& input,
         }
 
         const double residual =
-            row.x - EvaluateCore(core_block, row.bucket_id, train_start, delta, tz) -
+            row.target - EvaluateCore(core_block, row.bucket_id, train_start, delta, tz) -
             EvaluateMonthPos(monthpos_block, row.bucket_id, delta, tz);
         spec.y_target.push_back(residual);
         spec.sample_weight.push_back(row.weight);
@@ -475,13 +454,13 @@ bool BuildEventFitSpec(const ValueFormalTrainInput& input,
     }
 
     *out_spec = std::move(spec);
-    *out_codes = input.compiled_event_calendar->enabled_event_codes;
+    *out_codes = compiled_event_calendar->enabled_event_codes;
     return true;
 }
 
-void CollectValueTrainRows(const ValueFormalTrainInput& input,
-                           std::vector<ValueTrainRow>* out_rows,
-                           std::vector<int64_t>* out_bucket_ids) {
+void CollectTrainRows(const ValueFormalTrainInput& input,
+                      std::vector<TrainRow>* out_rows,
+                      std::vector<int64_t>* out_bucket_ids) {
     if (!out_rows || !out_bucket_ids) return;
     out_rows->clear();
     out_bucket_ids->clear();
@@ -490,9 +469,9 @@ void CollectValueTrainRows(const ValueFormalTrainInput& input,
         const auto& point = input.replay->points[i];
         if (input.profile->is_sampled && point.sample_count < input.profile->n_train_min) continue;
 
-        ValueTrainRow row;
+        TrainRow row;
         row.bucket_id = point.bucket_id;
-        row.x = TransformValuePoint(*input.profile, point.value);
+        row.target = TransformValuePoint(*input.profile, point.value);
         if (input.profile->is_sampled) {
             const double rho = std::sqrt(
                 1.0 + input.profile->kappa_sample / static_cast<double>(point.sample_count));
@@ -503,10 +482,10 @@ void CollectValueTrainRows(const ValueFormalTrainInput& input,
     }
 }
 
-void CollectRatioTrainRows(const RatioFormalTrainInput& input,
-                           const RatioPriorConfig& prior,
-                           std::vector<RatioTrainRow>* out_rows,
-                           std::vector<int64_t>* out_bucket_ids) {
+void CollectTrainRows(const RatioFormalTrainInput& input,
+                      const RatioPriorConfig& prior,
+                      std::vector<TrainRow>* out_rows,
+                      std::vector<int64_t>* out_bucket_ids) {
     if (!out_rows || !out_bucket_ids) return;
     out_rows->clear();
     out_bucket_ids->clear();
@@ -515,7 +494,7 @@ void CollectRatioTrainRows(const RatioFormalTrainInput& input,
         const auto& point = input.replay->points[i];
         if (point.denominator < static_cast<double>(input.profile->d_min_train)) continue;
 
-        RatioTrainRow row;
+        TrainRow row;
         row.bucket_id = point.bucket_id;
         const double ratio_eps = RatioClipEps();
         const double smoothed =
@@ -523,200 +502,13 @@ void CollectRatioTrainRows(const RatioFormalTrainInput& input,
                      std::max(ratio_eps,
                               (point.numerator + prior.alpha0) /
                                   (point.denominator + prior.alpha0 + prior.beta0)));
-        row.eta = std::log(smoothed / (1.0 - smoothed));
+        row.target = std::log(smoothed / (1.0 - smoothed));
         row.weight =
             point.denominator /
             (point.denominator + static_cast<double>(input.profile->d_min_train));
         out_rows->push_back(row);
         out_bucket_ids->push_back(point.bucket_id);
     }
-}
-
-BlockFitSpec BuildCoreFitSpec(const std::vector<RatioTrainRow>& rows,
-                              const SharedProfileConfig& shared_config,
-                              int64_t delta,
-                              const std::string& tz) {
-    BlockFitSpec spec;
-    spec.block_name = "core";
-    spec.row_count = rows.size();
-    spec.col_count =
-        2 + static_cast<std::size_t>(shared_config.k_day + shared_config.k_week) * 2;
-    spec.y_target.reserve(rows.size());
-    spec.x_matrix.reserve(rows.size() * spec.col_count);
-    spec.sample_weight.reserve(rows.size());
-    spec.ridge_diag.assign(spec.col_count, 0.0);
-    spec.col_roles.reserve(spec.col_count);
-
-    spec.col_roles.push_back(BlockColumnRole::kIntercept);
-    spec.col_roles.push_back(BlockColumnRole::kTrend);
-    for (int32_t i = 0; i < shared_config.k_day; ++i) {
-        spec.col_roles.push_back(BlockColumnRole::kDaySin);
-        spec.col_roles.push_back(BlockColumnRole::kDayCos);
-    }
-    for (int32_t i = 0; i < shared_config.k_week; ++i) {
-        spec.col_roles.push_back(BlockColumnRole::kWeekSin);
-        spec.col_roles.push_back(BlockColumnRole::kWeekCos);
-    }
-    for (std::size_t i = 2; i < spec.col_count; ++i) {
-        spec.ridge_diag[i] = shared_config.lambda_season;
-    }
-
-    const int64_t train_start = rows.front().bucket_id;
-    for (const auto& row : rows) {
-        spec.y_target.push_back(row.eta);
-        spec.sample_weight.push_back(row.weight);
-        AppendCoreRow(shared_config, row.bucket_id, train_start, delta, tz, &spec.x_matrix);
-    }
-    return spec;
-}
-
-MonthPosDesign BuildMonthPosDesign(const std::vector<RatioTrainRow>& rows,
-                                   const SharedProfileConfig& shared_config,
-                                   const CoreBlock& core_block,
-                                   int64_t train_start,
-                                   int64_t delta,
-                                   const std::string& tz) {
-    MonthPosDesign design;
-    design.row_count = rows.size();
-    design.col_count = 31 + static_cast<std::size_t>(shared_config.dme_max + 1) + 7;
-    design.dme_center.assign(shared_config.dme_max + 1, 0.0);
-    design.ridge_diag.assign(design.col_count, 0.0);
-    design.y_target.reserve(rows.size());
-    design.sample_weight.reserve(rows.size());
-    design.x_matrix.reserve(rows.size() * design.col_count);
-
-    for (std::size_t i = 0; i < 31; ++i) {
-        design.ridge_diag[i] = shared_config.lambda_dom;
-    }
-    for (std::size_t i = 31; i < 31 + design.dme_center.size(); ++i) {
-        design.ridge_diag[i] = shared_config.lambda_dme;
-    }
-    for (std::size_t i = 31 + design.dme_center.size(); i < design.col_count; ++i) {
-        design.ridge_diag[i] = shared_config.lambda_lwd;
-    }
-
-    std::vector<std::vector<double>> raw_rows;
-    raw_rows.reserve(rows.size());
-    for (const auto& row : rows) {
-        std::vector<double> raw(design.col_count, 0.0);
-        const int32_t dom = DayOfMonthLocal(row.bucket_id, delta, tz);
-        if (dom >= 1 && dom <= 31) raw[static_cast<std::size_t>(dom - 1)] = 1.0;
-
-        const int32_t dme = DaysToMonthEndLocal(row.bucket_id, delta, tz);
-        const std::size_t dme_index = 31 + static_cast<std::size_t>(
-                                               std::max<int32_t>(
-                                                   0,
-                                                   std::min<int32_t>(
-                                                       dme, shared_config.dme_max)));
-        raw[dme_index] = 1.0;
-
-        std::tm local{};
-        if (ResolveLocalTime(row.bucket_id, delta, tz, &local) &&
-            IsLastWeekdayOfMonthLocal(row.bucket_id, delta, tz)) {
-            raw[31 + design.dme_center.size() + static_cast<std::size_t>(local.tm_wday)] = 1.0;
-        }
-
-        for (std::size_t i = 0; i < 31; ++i) design.dom_center[i] += raw[i];
-        for (std::size_t i = 0; i < design.dme_center.size(); ++i) {
-            design.dme_center[i] += raw[31 + i];
-        }
-        for (std::size_t i = 0; i < 7; ++i) {
-            design.lwd_center[i] += raw[31 + design.dme_center.size() + i];
-        }
-
-        raw_rows.push_back(std::move(raw));
-    }
-
-    for (double& center : design.dom_center) center /= static_cast<double>(rows.size());
-    for (double& center : design.dme_center) center /= static_cast<double>(rows.size());
-    for (double& center : design.lwd_center) center /= static_cast<double>(rows.size());
-
-    for (std::size_t row_index = 0; row_index < rows.size(); ++row_index) {
-        const auto& row = rows[row_index];
-        const double core_mu = EvaluateCore(core_block, row.bucket_id, train_start, delta, tz);
-        design.y_target.push_back(row.eta - core_mu);
-        design.sample_weight.push_back(row.weight);
-
-        std::vector<double>& raw = raw_rows[row_index];
-        for (std::size_t i = 0; i < 31; ++i) {
-            design.x_matrix.push_back(raw[i] - design.dom_center[i]);
-        }
-        for (std::size_t i = 0; i < design.dme_center.size(); ++i) {
-            design.x_matrix.push_back(raw[31 + i] - design.dme_center[i]);
-        }
-        for (std::size_t i = 0; i < 7; ++i) {
-            design.x_matrix.push_back(raw[31 + design.dme_center.size() + i] - design.lwd_center[i]);
-        }
-    }
-
-    return design;
-}
-
-void BuildEventTaskSpec(const RatioFormalTrainInput& input,
-                        BaselineTaskSpec* out_task_spec) {
-    if (!out_task_spec) return;
-    if (input.task_spec) {
-        *out_task_spec = *input.task_spec;
-        return;
-    }
-    out_task_spec->feature = "";
-    out_task_spec->key = "";
-    out_task_spec->delta = input.delta;
-    out_task_spec->tz = input.tz;
-}
-
-bool BuildEventFitSpec(const RatioFormalTrainInput& input,
-                       const std::vector<RatioTrainRow>& rows,
-                       const CoreBlock& core_block,
-                       const MonthPosBlock& monthpos_block,
-                       int64_t train_start,
-                       int64_t delta,
-                       const std::string& tz,
-                       BlockFitSpec* out_spec,
-    std::vector<std::string>* out_codes) {
-    if (!out_spec || !out_codes) return false;
-    if (!input.compiled_event_calendar ||
-        input.compiled_event_calendar->enabled_event_codes.empty()) {
-        return false;
-    }
-
-    BaselineTaskSpec event_task_spec;
-    BuildEventTaskSpec(input, &event_task_spec);
-    if (event_task_spec.delta <= 0) event_task_spec.delta = delta;
-    if (event_task_spec.tz.empty()) event_task_spec.tz = tz;
-
-    BlockFitSpec spec;
-    spec.block_name = "event";
-    spec.row_count = rows.size();
-    spec.col_count = input.compiled_event_calendar->enabled_event_codes.size();
-    spec.y_target.reserve(rows.size());
-    spec.sample_weight.reserve(rows.size());
-    spec.x_matrix.reserve(rows.size() * spec.col_count);
-    spec.ridge_diag.assign(spec.col_count, DefaultSharedProfileConfig().lambda_event);
-    spec.col_roles.assign(spec.col_count, BlockColumnRole::kEvent);
-
-    std::vector<double> event_row(spec.col_count, 0.0);
-    for (const auto& row : rows) {
-        std::fill(event_row.begin(), event_row.end(), 0.0);
-        if (BuildEventIndicatorRow(*input.compiled_event_calendar,
-                                   event_task_spec,
-                                   row.bucket_id,
-                                   event_row.data(),
-                                   event_row.size()) != error::OK) {
-            return false;
-        }
-
-        const double residual =
-            row.eta - EvaluateCore(core_block, row.bucket_id, train_start, delta, tz) -
-            EvaluateMonthPos(monthpos_block, row.bucket_id, delta, tz);
-        spec.y_target.push_back(residual);
-        spec.sample_weight.push_back(row.weight);
-        spec.x_matrix.insert(spec.x_matrix.end(), event_row.begin(), event_row.end());
-    }
-
-    *out_spec = std::move(spec);
-    *out_codes = input.compiled_event_calendar->enabled_event_codes;
-    return true;
 }
 
 }  // namespace
@@ -751,9 +543,9 @@ FormalTrainFailureCode FormalModelTrainer::TrainValue(const ValueFormalTrainInpu
     const int64_t delta = ResolveDelta(input);
     const std::string tz = ResolveTimezone(input);
 
-    std::vector<ValueTrainRow> rows;
+    std::vector<TrainRow> rows;
     std::vector<int64_t> bucket_ids;
-    CollectValueTrainRows(input, &rows, &bucket_ids);
+    CollectTrainRows(input, &rows, &bucket_ids);
     if (rows.size() < 2) {
         return out->failure = FormalTrainFailureCode::kInsufficientTrainData;
     }
@@ -847,13 +639,14 @@ FormalTrainFailureCode FormalModelTrainer::TrainValue(const ValueFormalTrainInpu
     BlockFitSpec event_spec;
     std::vector<std::string> event_codes;
     if (input.enable_event &&
-        BuildEventFitSpec(input,
-                          rows,
+        BuildEventFitSpec(rows,
+                          input.compiled_event_calendar,
+                          input.task_spec,
+                          delta,
+                          tz,
                           model->core_block,
                           model->monthpos_block,
                           model->train_start,
-                          delta,
-                          tz,
                           &event_spec,
                           &event_codes)) {
         FitBlockResult event_fit;
@@ -895,7 +688,7 @@ FormalTrainFailureCode FormalModelTrainer::TrainValue(const ValueFormalTrainInpu
                 }
             }
         }
-        residual.push_back(row.x - mu);
+        residual.push_back(row.target - mu);
     }
     model->sigma_ref = EstimateSigmaMAD(residual);
     model->readiness = monthpos_applied ? ModelReadiness::kMonthposReady
@@ -940,9 +733,9 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
     }
     const RatioPriorConfig prior = ComputeRatioPrior(profile_config, numerator_sum, denominator_sum);
 
-    std::vector<RatioTrainRow> rows;
+    std::vector<TrainRow> rows;
     std::vector<int64_t> bucket_ids;
-    CollectRatioTrainRows(input, prior, &rows, &bucket_ids);
+    CollectTrainRows(input, prior, &rows, &bucket_ids);
     if (rows.size() < 2) {
         return out->failure = FormalTrainFailureCode::kInsufficientTrainData;
     }
@@ -1039,13 +832,14 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
     BlockFitSpec event_spec;
     std::vector<std::string> event_codes;
     if (input.enable_event &&
-        BuildEventFitSpec(input,
-                          rows,
+        BuildEventFitSpec(rows,
+                          input.compiled_event_calendar,
+                          input.task_spec,
+                          delta,
+                          tz,
                           model->core_block,
                           model->monthpos_block,
                           model->train_start,
-                          delta,
-                          tz,
                           &event_spec,
                           &event_codes)) {
         FitBlockResult event_fit;
@@ -1073,8 +867,8 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
     std::vector<double> residual;
     residual.reserve(rows.size());
     for (const auto& row : rows) {
-        double eta = EvaluateCore(model->core_block, row.bucket_id, model->train_start, delta, tz);
-        eta += EvaluateMonthPos(model->monthpos_block, row.bucket_id, delta, tz);
+        double pred_eta = EvaluateCore(model->core_block, row.bucket_id, model->train_start, delta, tz);
+        pred_eta += EvaluateMonthPos(model->monthpos_block, row.bucket_id, delta, tz);
         if (model->event_block.enabled && input.task_spec && input.compiled_event_calendar) {
             std::vector<double> indicator(model->event_block.coeff.size(), 0.0);
             if (BuildEventIndicatorRow(*input.compiled_event_calendar,
@@ -1083,11 +877,11 @@ FormalTrainFailureCode FormalModelTrainer::TrainRatio(const RatioFormalTrainInpu
                                        indicator.data(),
                                        indicator.size()) == error::OK) {
                 for (std::size_t i = 0; i < indicator.size(); ++i) {
-                    eta += indicator[i] * model->event_block.coeff[i];
+                    pred_eta += indicator[i] * model->event_block.coeff[i];
                 }
             }
         }
-        residual.push_back(row.eta - eta);
+        residual.push_back(row.target - pred_eta);
     }
     model->sigma_ref = EstimateSigmaMAD(residual);
     model->readiness = monthpos_applied ? ModelReadiness::kMonthposReady

@@ -27,6 +27,7 @@ b4-relation-routed-rolling-and-stream-basis-design.md
 b5-relation-pattern-fusion-design.md
 b6-baseline-task-serialization-lock-optimization-design.md
 b7-relation-fusion-state-cleanup-design.md
+b8-batch-prediction-feature-cache-optimization-design.md
 ```
 
 阶段设计文档只覆盖当前阶段的接口、算法取舍、迁移步骤、测试矩阵和完成门禁。已关闭阶段的遗留语义不得继续写入后续阶段设计。
@@ -65,6 +66,7 @@ B1 Optional Bootstrap Engine
 
 - [B6 Baseline 同 task 串行调用与锁优化方案](b6-baseline-task-serialization-lock-optimization-design.md)
 - [B7 Relation Fusion Runtime State Cleanup 设计](b7-relation-fusion-state-cleanup-design.md)
+- [B8 Baseline 批量预测特征缓存与谐波递推优化设计](b8-batch-prediction-feature-cache-optimization-design.md)
 
 ---
 
