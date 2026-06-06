@@ -1329,13 +1329,23 @@
 ---
 
 ## Epic 18: 通用基线检测插件
-**优先级**: P1 | **状态**: 🚧 重新规划并实施中（Sprint 20 BaselineA）
-**价值**: 将基线能力从上游业务中解耦，建设可复用的 `baseline` 通用插件，统一支撑数值指标、比例指标和关系分布的异常检测，并提供高性能热路径、异步正式重建与可诊断的工程闭环。
+**优先级**: P1 | **状态**: ✅ 已完成（Sprint 21 BaselineB，B1-B8 已实现并验证）
+**价值**: 将基线能力从上游业务中解耦，建设可复用的 `baseline` 通用插件，统一支撑数值指标、比例指标和关系分布的异常检测。当前主路径已从固定历史模型与异步重建迁移为 `Optional Bootstrap + Online Rolling Core + Maturity / Score Trust + Relation Fusion`，支持无历史流式启动、历史 seed 预热、基线 band 输出、关系模式融合、高基数状态治理和批量预测优化。
 
 **历史说明**:
 - Sprint 19 已完成统一算法设计，但实现迭代失败；评审结论以 `tasks/sprints/sprint19-baseline/review.md` 和 `tasks/sprints/sprint19-baseline/retrospective.md` 为准。
 - 原 `18.1 ~ 18.9` 属于 Sprint 19 的第一版 Story 分解，现已归档，仅保留历史参考，不再作为当前实施入口。
-- 当前实施基线以 `tasks/sprints/sprint20-baselineA/code-design.md` 和 `tasks/sprints/sprint20-baselineA/planning.md` 为准。
+- Sprint 20 BaselineA 已完成固定历史模型、正式重建与一致性整改收口；其状态以 `tasks/sprints/sprint20-baselineA/review.md` 为准。
+- Sprint 21 BaselineB 将生命周期迁移为 stream-first、自成熟在线基线；`shadow baseline`、`candidate model`、正式重建和切换验证链路已退出在线主路径。
+- 当前代码状态以 `src/plugins/baseline`、`src/framework/interfaces/ibaseline_service.h`、`src/framework/interfaces/ibaseline_types.h` 和 `src/tests/test_baseline` 为准。
+
+**最近验证**（2026-06-06）:
+- `cmake --build /mnt/d/working/flowSQL/build --target test_baseline test_baseline_rolling_feature_batch test_baseline_batch_prediction_perf`
+- `/mnt/d/working/flowSQL/build/output/test_baseline`
+- `/mnt/d/working/flowSQL/build/output/test_baseline_rolling_feature_batch`
+- `/mnt/d/working/flowSQL/build/output/test_baseline_batch_prediction_perf`
+
+> `18.10 ~ 18.20` 为 Sprint 20 BaselineA 的历史收口项；其中涉及 `shadow/candidate/rebuild` 的旧生命周期语义，已在 Sprint 21 BaselineB 中迁移为可选 bootstrap 与在线 rolling 主路径。
 
 ### Story 18.10: 统一协议与任务规格闭环
 **状态**: ✅ 已完成（Sprint 20 BaselineA）
@@ -1374,7 +1384,7 @@
 ---
 
 ### Story 18.14: `T1` 训练与正式重建慢路径
-**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**状态**: ✅ 已完成（Sprint 20 BaselineA；Sprint 21 已迁移为 Optional Bootstrap 历史拟合能力）
 **验收标准**:
 - 实现 `WeightedHuberRidgeBlockSolver`、`TrainCore / MonthPos / Event`、`sigma` 估计与 `candidate vs incumbent` 验证。
 - `formal_model_state` 收口 `candidate_state / switch_state`，`rebuild_worker` 完成正式重建闭环。
@@ -1383,7 +1393,7 @@
 ---
 
 ### Story 18.15: `T1` 在线评分、漂移证据与 `shadow baseline`
-**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**状态**: ✅ 已完成（Sprint 20 BaselineA；Sprint 21 已迁移为在线 rolling、drift adapt 与 score trust）
 **验收标准**:
 - `T1a / T1b` 热路径正式接入 predictor、`ReadinessState`、`DriftState` 与 `ShadowState`。
 - `ValueEvidence`、`RebuildIntent`、`sample_count -> gate / rho / sigma_eff` 等正式证据链路全部生效。
@@ -1392,7 +1402,7 @@
 ---
 
 ### Story 18.16: `T2` 训练与在线评分闭环
-**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**状态**: ✅ 已完成（Sprint 20 BaselineA；Sprint 21 已迁移为 ratio rolling 与 band 输出）
 **验收标准**:
 - `T2` 完整实现 `m0 / alpha0 / beta0 / p_smooth / logit / sigmoid / variance layer` 数学路径。
 - `rate_core / ratio_bursty` 的 profile 差异、来源借用和正式重建全部落地。
@@ -1401,7 +1411,7 @@
 ---
 
 ### Story 18.17: `T3` basis、摘要特征与 routed detector
-**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**状态**: ✅ 已完成（Sprint 20 BaselineA；Sprint 21 已迁移为 Relation routed rolling 与 stream basis）
 **验收标准**:
 - 补齐 `ServiceBasis / EvalBasis / lineage` 结构与兼容判断。
 - 实现 `entropy_shannon / top1_share / headK_share / out_of_support_share / distinct_group_count / stable_g[i]_share / stable_headK_coverage / stable_headK_mix_drift` 摘要特征。
@@ -1410,7 +1420,7 @@
 ---
 
 ### Story 18.18: 模式融合层与 key 级风险合成
-**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**状态**: ✅ 已完成（Sprint 20 BaselineA；Sprint 21 已迁移为 Relation pattern fusion）
 **验收标准**:
 - 实现 `relation_pattern_fusion` 与 `key_risk_fusion`，正式落地 `core_P / support_P / oppose_P` 和 `lambda_sup / lambda_opp / lambda_P(pattern)`。
 - 输出 `Risk_T1T2 / Risk_single_T3 / Risk_pattern / Risk_T3 / Risk(Key,t)` 与 `FusionResult`。
@@ -1419,7 +1429,7 @@
 ---
 
 ### Story 18.19: `T3` 正式重建、验证与 lineage 切换
-**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**状态**: ✅ 已完成（Sprint 20 BaselineA；Sprint 21 已迁移为 stream basis refresh / handover）
 **验收标准**:
 - `T3` 正式重建同时产出 `CandidateServiceBasis / CandidateEvalBasis`。
 - `candidate vs incumbent` 比较严格在共同 `EvalBasis` 上完成，并处理兼容与 `new lineage` 两条路径。
@@ -1428,11 +1438,83 @@
 ---
 
 ### Story 18.20: 测试收口、死代码清理与最终一致性审查
-**状态**: 🚧 进行中（Sprint 20 BaselineA）
+**状态**: ✅ 已完成（Sprint 20 BaselineA）
 **验收标准**:
 - 建立覆盖 `T1 / T2 / T3 / fusion / rebuild / relation snapshot / concurrency` 的完整测试矩阵。
 - 删除旧的 `intercept-only`、常数预测和其他占位路径，清理无效死代码。
 - 以 `design.md + code-design.md` 为基准完成最终一致性审查，确认不再出现“只有壳、没有算法”的偏差。
+
+---
+
+### Story 18.21: BaselineB 生命周期迁移与 Optional Bootstrap Engine
+**状态**: ✅ 已完成（Sprint 21 BaselineB B1）
+**验收标准**:
+- 旧 `shadow/candidate/rebuild` 在线恢复链路退出主路径，历史拟合能力保留为可选 bootstrap。
+- `Value / Ratio / Relation` 支持 bootstrap 训练、预测、artifact / seed 导出导入和兼容性校验。
+- bootstrap 输出 `baseline_mu / baseline_lower / baseline_upper / band_width / confidence / uncertainty_source`，并可作为后续 rolling 初始化种子。
+
+---
+
+### Story 18.22: Online Rolling Core MVP
+**状态**: ✅ 已完成（Sprint 21 BaselineB B2）
+**验收标准**:
+- `Value / Ratio` 在无历史时可直接流式启动并持续学习。
+- 在线路径按 `predict -> band -> score -> gate_update -> update_state` 推进。
+- 输出包含基线 band、置信度、更新门控和状态诊断；历史 seed 可预热但不是可用性前置条件。
+
+---
+
+### Story 18.23: Detection Trust、Band Calibration 与 Monthly Readiness
+**状态**: ✅ 已完成（Sprint 21 BaselineB B3）
+**验收标准**:
+- `maturity_status` 与 `score_trust_status` 分离，冷启动和重校准阶段不输出高置信异常结论。
+- 检测 band 支持残差尺度、成熟度不确定性、水平变化降级和月位置成熟。
+- task / series snapshot 可观测 maturity、score trust、enabled components、component readiness 与 coverage。
+
+---
+
+### Story 18.24: Relation Routed Rolling and Stream Basis
+**状态**: ✅ 已完成（Sprint 21 BaselineB B4）
+**验收标准**:
+- Relation 流式 block 可投影为 routed summary observations，并复用 `T1/T2` Online Rolling Core。
+- 无历史时支持通用摘要流式学习；有 bootstrap seed 时支持 basis 与 routed summary warm-up。
+- basis 统计有固定上限，basis refresh / handover 有版本和 evidence，旧 rebuild 链路不参与 Relation basis 成熟。
+
+---
+
+### Story 18.25: Relation Pattern Fusion and Risk Output
+**状态**: ✅ 已完成（Sprint 21 BaselineB B5）
+**验收标准**:
+- `RelationFusionResult` 输出 `relation_risk`、主导单特征证据、主导结构模式和 pattern scores。
+- `support_escape / head_concentration / legacy_head_dilution / stable_head_mix_shift` 均已实现并有测试覆盖。
+- fusion 受 B3 score trust、basis gate、metric 缺测和跨 metric 饱和合成约束，不反向修改 routed rolling state。
+
+---
+
+### Story 18.26: Baseline 同 task 串行调用与锁优化
+**状态**: ✅ 已完成（Sprint 21 BaselineB B6）
+**验收标准**:
+- `IBaselineTask` 明确同一 task 实例不支持重叠并发调用，跨线程串行 handoff 由上游建立 happens-before。
+- `BaselineTaskBase` 不再暴露 task 级 mutex；不同 task 仍可并行调用，registry / plugin 外边界保留必要同步。
+- 测试覆盖同 task 跨线程串行 handoff、Relation lifecycle 序列和不同 task 并行。
+
+---
+
+### Story 18.27: Relation Fusion Runtime State Cleanup
+**状态**: ✅ 已完成（Sprint 21 BaselineB B7）
+**验收标准**:
+- Relation fusion source state 支持 TTL、容量上限、扫描游标和清理统计。
+- evidence persistence key 有上限治理，清理指标可在 task snapshot 中观测。
+- 配置模板、运行时配置解析和 TTL / capacity 回归测试均已覆盖。
+
+---
+
+### Story 18.28: 批量预测特征缓存与谐波递推优化
+**状态**: ✅ 已完成（Sprint 21 BaselineB B8）
+**验收标准**:
+- `RollingFeatureBatch` 支持批量构造日 / 周谐波特征与本地日历特征 view。
+- Fourier 递推在 `DST`、非连续 bucket 和重锚间隔边界自动 re-anchor，保持与单点特征等价。
+- `Rolling / Bootstrap` 批量预测等价性通过测试，性能测试输出批量路径相对单点路径的加速结果。
 
 ## 优先级说明
 - **P0**: 核心功能，必须实现
