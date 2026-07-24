@@ -125,17 +125,22 @@ typedef std::function<int32_t(const std::string& uri,
 
 ## Scheduler
 
-Scheduler 进程加载多个插件，通过 `IQuerier` 进行进程内插件间通信：
+Scheduler 进程加载 SQL、通道、算子等服务插件，通过 `IQuerier` 进行进程内插件间通信。Baseline 是可选同进程能力插件；需要在线基线能力的部署必须显式加载 `libflowsql_baseline.so`，调用方再通过 `IID_BASELINE_SERVICE` 获取服务接口。
 
 | 插件 | IID | 职责 |
 |------|-----|------|
 | `libflowsql_router.so` | — | HTTP 服务 + 路由代理 + Gateway KeepAlive |
 | `libflowsql_task.so` | `IID_TASK_STORE` | 任务提交、异步执行、状态持久化 |
 | `libflowsql_scheduler.so` | `IID_SCHEDULER` | SQL 解析、Pipeline 执行、数据读写调度 |
+| `libflowsql_builtin.so` | `IID_BUILTIN_REGISTRY` | 内置通道、批处理算子和流式算子注册 |
 | `libflowsql_catalog.so` | `IID_OPERATOR_CATALOG` / `IID_OPERATOR_REGISTRY` / `IID_CHANNEL_REGISTRY` | DataFrame 目录与算子目录统一管理、`/operators/*` 统一入口 |
 | `libflowsql_binaddon.so` | `IID_BINADDON_HOST` | C++ 算子插件（`.so`）上传/激活/去激活/删除/详情 |
 | `libflowsql_bridge.so` | `IID_BRIDGE` | Python 算子发现与执行桥接、同步算子元数据 |
 | `libflowsql_database.so` | `IID_DATABASE_FACTORY` | 数据库通道管理（MySQL / SQLite / PostgreSQL / ClickHouse） |
+| `libflowsql_stream.so` | `IID_STREAM_FACTORY` / `IID_STREAM_MANAGER` | Stream 通道实例管理、运行态重建和持久化 |
+| `libflowsql_baseline.so` | `IID_BASELINE_SERVICE` | 可选在线基线检测能力：Value / Ratio / Relation task、Optional Bootstrap、rolling band、maturity / score trust、Relation fusion |
+
+Baseline 插件不直接实现 `IRouterHandle`，也不通过 RouterAgency 注册 HTTP 路由。它是进程内 interface 能力，调用方应通过 `IQuerier` 查询 `IID_BASELINE_SERVICE` 后创建具体 baseline task。
 
 ### SQL 执行流程
 
@@ -408,12 +413,17 @@ services:
         option: "db_path=./meta/flowsql_meta.db"
       - libflowsql_scheduler.so
       - libflowsql_bridge.so
+      - libflowsql_builtin.so
       - name: libflowsql_catalog.so
         option: "data_dir=./dataframes;operator_db_path=./meta/flowsql_meta.db"
       - name: libflowsql_binaddon.so
         option: "operator_db_path=./meta/flowsql_meta.db;upload_dir=./uploads/binaddon"
       - name: libflowsql_database.so
         option: "config_file=config/flowsql.yml"
+      - name: libflowsql_stream.so
+        option: "config_file=config/flowsql.yml;db_path=./meta/flowsql_meta.db"
+      # 可选：需要在线基线能力时加载
+      # - libflowsql_baseline.so
 
   - name: pyworker
     type: python
@@ -438,12 +448,17 @@ services:
         option: "db_path=./meta/flowsql_meta.db"
       - libflowsql_scheduler.so
       - libflowsql_bridge.so
+      - libflowsql_builtin.so
       - name: libflowsql_catalog.so
         option: "data_dir=./dataframes;operator_db_path=./meta/flowsql_meta.db"
       - name: libflowsql_binaddon.so
         option: "operator_db_path=./meta/flowsql_meta.db;upload_dir=./uploads/binaddon"
       - name: libflowsql_database.so
         option: "config_file=config/flowsql.yml"
+      - name: libflowsql_stream.so
+        option: "config_file=config/flowsql.yml;db_path=./meta/flowsql_meta.db"
+      # 可选：需要在线基线能力时加载
+      # - libflowsql_baseline.so
 
   - name: pyworker
     type: python
@@ -482,8 +497,12 @@ flowSQL/
 │   │   ├── catalog/        # libflowsql_catalog.so（通道目录 + 算子目录）
 │   │   ├── binaddon/       # libflowsql_binaddon.so（C++ 插件算子管理）
 │   │   ├── database/       # libflowsql_database.so（含 MySQL/SQLite/PostgreSQL/ClickHouse 驱动）
+│   │   ├── stream/         # libflowsql_stream.so（Stream 通道运行态）
 │   │   ├── bridge/         # libflowsql_bridge.so
 │   │   └── web/            # libflowsql_web.so + 前端静态文件
+│   ├── plugins/
+│   │   ├── baseline/       # libflowsql_baseline.so（在线基线检测）
+│   │   └── npi/            # NPI 协议识别
 │   ├── python/             # Python Worker（FastAPI + 算子运行时）
 │   ├── frontend/           # Vue.js 前端
 │   ├── app/                # flowsql 可执行文件入口（main.cpp）
@@ -494,6 +513,8 @@ flowSQL/
 │       ├── test_builtin/   # Catalog/BinAddon/算子管理
 │       ├── test_task/
 │       ├── test_router/    # RouterAgencyPlugin 单元测试（11 个用例）
+│       ├── test_stream/
+│       ├── test_baseline/
 │       └── test_npi/
 ├── config/
 │   ├── deploy-multi.yaml   # 多进程部署配置（guardian 模式）

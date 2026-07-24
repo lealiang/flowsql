@@ -1210,27 +1210,40 @@
 
 ---
 
-## Epic 15: 高性能数据面与网络分析
+## Epic 15: 高性能实时采集与数据面加速
 **优先级**: P1 | **状态**: 📋 待规划
-**价值**: 构建路径 B 的高吞吐、低时延数据面，支撑网络性能分析与协议级实时处理场景
+**价值**: 构建路径 B 的高吞吐、低时延 packet 数据面，为 DPDK、AF_XDP 等实时采集通道提供统一加速能力，并复用上层 NPM 核心
 
-### Story 15.1: DPDK 网卡采集插件（承接原 Story 14.5）
+> 本 Epic 聚焦高性能采集和零拷贝数据面，不承载 NPM 语义分析。NPM 基础分析拆分到 Epic 20，避免在采集通道中重复实现协议解析、会话聚合和检测逻辑。
+
+### Story 15.1: DPDK 网卡采集通道（承接原 Story 14.5）
 **状态**: 📋 待规划
 **验收标准**:
-- 实现 netcard 插件（基于 DPDK）
-- 支持网卡数据包采集
-- 支持零拷贝传输
-- 支持多队列并行
+- 实现 `netcard` / `dpdk` 采集通道，支持网卡数据包实时采集
+- 支持多队列并行、RSS 分发和基础运行状态观测
+- 输出统一 packet 逻辑契约，不向上层暴露 DPDK `mbuf` 细节
+- 支持与路径 B 块式数据面衔接，避免热路径不必要拷贝
 
 ---
 
-### Story 15.2: 网络性能分析算子（承接原 Story 14.6）
+### Story 15.2: AF_XDP / 其他高性能采集通道适配
 **状态**: 📋 待规划
 **验收标准**:
-- 实现 npm 算子（网络性能分析）
-- 支持流量统计
-- 支持协议解析
-- 支持异常检测
+- 预留 AF_XDP、PF_RING、netmap 等高性能采集通道的适配边界
+- 明确不同采集后端到统一 packet 逻辑契约的映射规则
+- 支持不同后端按能力声明零拷贝、批大小、队列模型和时间戳来源
+- NPM 核心不依赖具体采集后端，新增采集通道不要求重写 NPM
+
+---
+
+### Story 15.3: 高性能采集通道复用 Packet 数据面契约
+**状态**: 📋 待规划
+**验收标准**:
+- 复用 Epic 19 定义的 `IBlockPayload` / `PacketBatchView` / `packet.v1` 契约，不在高性能采集 Epic 中重复定义 packet 数据面基础模型
+- 明确 DPDK `mbuf`、AF_XDP frame 等实时采集 buffer 到 `PacketBatchView` 的零拷贝映射规则
+- 明确 `PollBlock()` / `ReleaseBlock()` 生命周期：下游处理完成并释放 block 前，底层 packet buffer 不得回收到采集内存池
+- 支持不同实时采集后端声明批大小、队列模型、时间戳来源、零拷贝能力和 buffer 生命周期约束
+- 为后续 DPDK / AF_XDP 采集通道提供性能测试和资源回收验证入口
 
 ---
 
@@ -1515,6 +1528,257 @@
 - `RollingFeatureBatch` 支持批量构造日 / 周谐波特征与本地日历特征 view。
 - Fourier 递推在 `DST`、非连续 bucket 和重锚间隔边界自动 re-anchor，保持与单点特征等价。
 - `Rolling / Bootstrap` 批量预测等价性通过测试，性能测试输出批量路径相对单点路径的加速结果。
+
+---
+
+## Epic 19: Packet 数据面契约与可复现 pcap 数据源
+**优先级**: P1 | **状态**: 📋 待规划
+**价值**: 建立 FlowSQL 内部统一 packet 数据形态和可复现 pcap 数据源，让 pcapfile、DPDK、AF_XDP 等通道都能输出一致的 `PacketBatchView`，并将 packet 上下文稳定交给后续 NPM、packet filter 和检测算子复用
+
+### Story 19.1: `IBlockPayload` / `PacketBatchView` 与 `packet.v1` 契约
+**状态**: 📋 待规划
+**验收标准**:
+- 将当前 `IBlockStreamChannel` 从 Arrow 专用块扩展为通用块式数据面契约，`BlockPollEvent` 承载 `IBlockPayload` 或等价抽象
+- 保留 Arrow `RecordBatch` 作为可选 payload 类型或边界导出格式，不作为 packet 热路径的唯一表示
+- 定义统一 `packet.v1` schema，至少包含 `ts_ns`、`source_id`、`link_type`、`cap_len`、`wire_len`、`rx_queue`、`packet_id`、`data`
+- `packet.v1` 与采集来源解耦，pcapfile、DPDK、AF_XDP 等通道都映射到同一逻辑契约
+- 定义 `PacketBatchView` 运行时视图，承载 packet 指针 / 长度 / 时间戳 / source / queue / packet_id、buffer 引用和可扩展 packet 上下文等数组化访问能力
+- 明确 `packet.v1` 是逻辑语义契约，`PacketBatchView` 是 packet 热路径主执行形态；Arrow 仅用于边界导出、调试或与现有 DataFrame / Stream 生态互操作
+- 明确 `PollBlock()` / `ReleaseBlock()` 生命周期：下游处理完成并释放 block 前，底层 packet buffer 不得回收
+- 明确 schema 版本、字段兼容策略、上下文扩展策略和最小支持链路类型（MVP 先支持 Ethernet）
+- 提供 schema / view / payload 文档和构造 / 校验 / 生命周期测试
+
+---
+
+### Story 19.2: `PacketLayerHints` 与 packet 上下文
+**状态**: 📋 待规划
+**价值**: 将分层识别结果写入 packet 上下文，使下游 NPM 可以复用统一层信息，同时为 Epic 22 的 `packet_filter.v1` 提供结构层过滤输入，避免 NPM 和 packet filter 在热路径重复解析 packet
+**验收标准**:
+- 盘点 `src/plugins/npi` 现有 `NetworkLayer::Layer()` / `protocol::Layers` 能力，明确其可解析的层级与封装范围，包括 Ethernet、VLAN、PPPoE、PPP、MPLS、IPv4 / IPv6、IPv6 扩展头、TCP、UDP、SCTP、GRE、VXLAN / VXLAN_GPE、GENEVE、L2TP、GTP 等
+- 定义 `PacketLayerHints` 与 `protocol::Layers` 的映射关系，至少包含 layer count、layer type 数组、layer offset 数组、payload offset、top layer，以及派生的 L2 / L3 / L4 offset、IP version、L4 protocol、VLAN depth 和 tunnel depth
+- `PacketLayerHints` 必须写入 `PacketBatchView` 或等价 packet 上下文，作为下游 NPM Core 的可复用输入；NPM 可以基于 hints 快速定位 L3 / L4 / payload，但仍保留必要校验能力
+- `PacketLayerHints` 必须作为 `packet_filter.v1` 结构层过滤的输入，支撑 IP、端口、L4 protocol、VLAN、tunnel depth、parse status 等过滤条件，不要求执行应用层协议识别
+- 提供轻量 adapter / classifier，使 `pcapfile`、DPDK、AF_XDP 等 packet 通道可以填充统一 layer hints；该 adapter 只消费 packet 指针、`cap_len` 和 `link_type`，不依赖 pcapfile 文件状态、buffer 生命周期或 wall-clock 时间
+- 本 Story 只复用 / 提炼 NPI 的分层识别能力，不调用 `IProtocol::Identify()`，不加载应用层协议规则，不输出 HTTP / TLS / DNS 等应用层协议结果；应用层协议识别仍归属 Epic 20 或后续 NPI 算子
+- 对截断包和异常包提供安全保护：header length 不合法、offset 超出 `cap_len`、layer 数量超过上限或无法继续解析时，必须标记 `parse_status` / `truncated` / `malformed`，不得发生越界访问
+- 适配接口必须可被后续 DPDK / AF_XDP 通道复用，保证实时采集与 `pcapfile` 对同一 packet 产生一致的 layer hints
+- 提供固定 packet 样本或构造型单元测试，覆盖 Ethernet + IPv4 + TCP、VLAN + IPv4 + UDP、IPv6 + TCP、截断包和至少一种隧道封装样本
+
+---
+
+### Story 19.3: `pcapfile` 单文件块式流通道 MVP
+**状态**: 📋 待规划
+**验收标准**:
+- 实现 `pcapfile` 通道，支持从单个 pcap / pcapng 文件读取 packet
+- 通道实现 `IBlockStreamChannel`，通过 `PollBlock()` 输出 `PacketBatchView` block
+- `PacketBatchView` 中必须标识 packet 来源文件、文件内 packet 序号和全局递增 `packet_id`，便于排障、去重和回归校验
+- 每个 packet 必须保留原始事件时间，后续 NPM / Baseline 不依赖读取时的 wall-clock 时间
+- 每个 block 持有 pcap buffer 生命周期，调用方完成处理并 `ReleaseBlock()` 后才能释放底层内存
+- 支持文件 EOF、读取错误、文件元数据和基础运行统计
+- 在 Story 19.2 已完成时，`pcapfile` 应填充 `PacketLayerHints`；未完成时必须保留可插拔的 layer hints 扩展点
+- `pcapfile` 不执行 NPM 语义分析，不解析 TCP 会话、不聚合 flow
+
+---
+
+### Story 19.4: `pcapfile` 多文件集合顺序读取
+**状态**: 📋 待规划
+**验收标准**:
+- 支持从多个 pcap / pcapng 文件组成的文件集合读取 packet
+- 文件集合支持显式列表和目录扫描两类输入；目录扫描必须有稳定排序规则，避免同一批文件多次执行顺序不一致
+- 默认按文件顺序串行读取 packet，并保留每个 packet 的原始事件时间；适用于同一采集源按大小或时间轮转切分出的 pcap 文件
+- `PacketBatchView` 中必须标识 packet 来源文件、文件内 packet 序号和全局递增 `packet_id`
+- 通道实现 `IBlockStreamChannel`，通过 `PollBlock()` 输出 `PacketBatchView` block
+- 支持单文件 EOF、全局 EOF、读取错误、文件元数据和基础运行统计；单文件失败是否中断整体读取需由配置声明
+- `pcapfile` 不执行 NPM 语义分析，不解析 TCP 会话、不聚合 flow
+
+---
+
+### Story 19.5: `pcapfile` 多文件时间戳归并读取
+**状态**: 📋 待规划
+**验收标准**:
+- 当多个文件来自不同接口、不同采集点或存在时间范围重叠时，支持按 packet 时间戳做多文件全局归并读取
+- 归并读取必须保持来源文件、文件内 packet 序号和全局递增 `packet_id` 可追踪
+- 支持配置归并策略，默认不启用全局归并，避免轮转切分文件承担不必要的复杂度
+- 归并读取应避免后续 NPM / Baseline 看到明显乱序的事件流
+- 覆盖多文件时间重叠、空文件、单文件提前 EOF 和时间戳相同 packet 的排序回归
+
+---
+
+### Story 19.6: 固定样本与 `pcap_replay` 验证回归
+**状态**: 📋 待规划
+**验收标准**:
+- 本 Story 不重复实现 pcap / pcapng 解析，复用 Story 19.3 / 19.4 / 19.5 的 `pcapfile` 读取能力和 `PacketBatchView`
+- 提供固定小样本 pcap 和基准期望值，用于端到端测试、演示和后续回归
+- 默认验证路径使用 packet 原始时间戳作为事件时间，不要求按 wall-clock sleep 回放
+- 测试覆盖包数、字节数、事件时间戳、layer hints、EOF、错误路径和 `ReleaseBlock()` 生命周期
+- 可选支持最快速度、固定倍率、按原始间隔 sleep 的 live-like 回放模式，用于压测和实时链路验证
+- 回放控制能力可作为后续 NPM / Baseline / 模型算子的稳定输入源，但不阻塞 Story 19.3 / 19.4 的最小读取闭环
+
+---
+
+## Epic 20: NPM 基础分析算子与流量事实表
+**优先级**: P1 | **状态**: 📋 待规划
+**价值**: 将统一 packet 数据转化为可查询、可聚合、可建模的 flow / session 事实表，完成 `流量输入 → NPM 分析 → SQL 查询` 的最小闭环
+
+### Story 20.1: NPM Core 与 packet 解析
+**状态**: 📋 待规划
+**验收标准**:
+- 实现独立 `NpmCore`，直接消费 `PacketBatchView`，不依赖 `pcapfile`、DPDK 或 AF_XDP 具体实现
+- 支持 Ethernet、IPv4 / IPv6、TCP、UDP、ICMP 的基础解析
+- 对截断包、异常包、未知链路类型提供可观测错误计数
+- 提供 parser 单元测试和固定 packet 样本回归
+
+---
+
+### Story 20.2: `npm.basic` 块式流算子
+**状态**: 📋 待规划
+**验收标准**:
+- 实现 `npm.basic` 块式流算子，消费 `IBlockStreamChannel` 输出的 `PacketBatchView`
+- 按五元组聚合基础 flow，输出 `flow.v1`
+- 基础字段包含 `src_ip`、`dst_ip`、`src_port`、`dst_port`、`protocol`、`first_seen`、`last_seen`、`packets`、`bytes`、`duration`
+- 算子不打开 pcap 文件，不依赖采集通道实现细节
+- 算子在处理完成后释放输入 block，验证 `ReleaseBlock()` 生命周期闭环
+
+---
+
+### Story 20.3: TCP / UDP Session 基础事实表
+**状态**: 📋 待规划
+**验收标准**:
+- 基于 `NpmCore` 输出 `tcp_session.v1` 和 `udp_session.v1` 基础事实
+- TCP MVP 支持连接方向、起止时间、包数、字节数和基础状态计数
+- UDP MVP 支持基于五元组和超时时间的会话归并
+- 明确 session 超时、方向判定和重复 / 乱序包处理策略
+
+---
+
+### Story 20.4: NPM SQL 闭环与端到端验证
+**状态**: 📋 待规划
+**验收标准**:
+- 支持类似 `npm.basic packet from pcapfile.sample into ts.npm` 的端到端执行路径
+- SQL 执行路径优先走 `IBlockStreamChannel` + `PacketBatchView`，而不是先走 Arrow `RecordBatch` 再二次迁移
+- NPM 结果可通过 SQL 查询 `flow` / `tcp_session` / `udp_session`
+- 固定 pcap 样本验证 flow 数、包数、字节数和协议分布
+- 文档同步说明 packet 通道、NPM 算子和结果事实表的边界
+
+---
+
+## Epic 21: 流量检测算子化与分析闭环
+**优先级**: P1 | **状态**: 📋 待规划
+**价值**: 将 NPM 事实数据接入 Baseline、模型、规则匹配等检测能力，把插件服务推进为 SQL 可编排的流量分析闭环
+
+### Story 21.1: Baseline 算子适配层
+**状态**: 📋 待规划
+**验收标准**:
+- 在保留 `IBaselineService` 进程内服务边界的前提下，提供 `baseline.value`、`baseline.ratio`、`baseline.relation` 算子适配层
+- 算子从 NPM 事实表或流式 batch 中构造 baseline observation
+- 输出 score、band、maturity、trust、risk 和诊断字段
+- 适配层不复制 Baseline 核心算法，只负责 SQL / batch / stream 输入输出桥接
+
+---
+
+### Story 21.2: NPM 特征到检测输入的标准化
+**状态**: 📋 待规划
+**验收标准**:
+- 定义 flow / session 到检测特征的标准映射，例如 bps、pps、连接数、失败率、协议占比、关系分布
+- 支持 Value / Ratio / Relation 三类检测输入
+- 明确窗口粒度、source key、route key、metric 名称和缺失值策略
+- 提供固定 NPM 样本的特征构造测试
+
+---
+
+### Story 21.3: 检测结果事实表与告警输出
+**状态**: 📋 待规划
+**验收标准**:
+- 定义 `anomaly_event.v1` 或同等检测结果事实表
+- 支持将检测结果写入数据库、stream sink 或后续 SIEM / 告警通道
+- 结果包含事件时间、主体、指标、score、risk、解释字段和关联 evidence
+- 提供 NPM → Baseline → anomaly event 的端到端测试
+
+---
+
+## Epic 22: 通用 WHERE 绑定与通道过滤下推架构
+**优先级**: P1 | **状态**: 📋 待规划
+**价值**: 将 SQL `WHERE` 从原始字符串传递升级为可解析、可绑定、可下推的通用过滤架构，让不同通道声明自身过滤能力，由 planner 生成 typed filter IR 并下推执行，避免在高吞吐路径中引入独立过滤算子的额外开销
+
+### Story 22.1: `WHERE` AST 与通用 `FilterExpr` / `FilterPlan`
+**状态**: 📋 待规划
+**验收标准**:
+- `SqlParser` 将 `WHERE` 子句解析为通用 AST，保留原始 `where_clause` 仅用于日志、兼容和错误提示
+- AST 覆盖字段引用、字面值、比较操作、范围、列表、AND / OR / NOT 等基础表达能力；解析阶段不判断字段是否属于某类通道
+- 定义通用 `FilterExpr` / `FilterPlan` IR，用于承载经过绑定后的 typed predicate、字段规范名、值类型、操作符和逻辑结构
+- `FilterPlan` 支持版本化和序列化，短期可用 JSON 作为插件边界载体，避免不同通道自行解析 SQL 字符串
+- 现有 DataFrame / 数据库 `WHERE` 路径保持兼容，并逐步迁移到新 IR
+
+---
+
+### Story 22.2: 通道 `FilterCapabilities` 能力声明
+**状态**: 📋 待规划
+**验收标准**:
+- 定义通用过滤能力描述，至少包含 `filter_schema`、字段规范名、字段别名、值类型、支持操作符、逻辑操作支持、是否要求 full match、可执行阶段和可选加速方式
+- 提供 `IFilterableChannel` 或等价接口，使 `IStreamChannel`、`IBlockStreamChannel`、DataFrame / Database 通道都能声明过滤能力
+- 将现有 `supports_filter_pushdown` / `filter_requires_full_match` 从布尔能力升级为可枚举、可诊断的能力描述
+- 不支持过滤的通道必须返回空能力或明确能力状态，planner 可以据此生成可读错误
+- 能力声明按通道实例生效，允许同一通道类型在不同后端、不同配置或不同运行模式下暴露不同过滤能力
+
+---
+
+### Story 22.3: `WHERE` Binder 与过滤计划校验
+**状态**: 📋 待规划
+**验收标准**:
+- planner 先解析 `FROM` 并解析源通道，再基于通道 `FilterCapabilities` 绑定 `WHERE` AST
+- Binder 将用户字段名和别名绑定到通道声明的规范字段，例如 `ipaddress` → `packet.endpoint_ip`、`port` → `packet.endpoint_port`
+- 对歧义字段必须显式消歧，例如 `protocol` 需绑定到 `l4_protocol` 或 `app_protocol`，绑定失败时给出明确错误
+- 对通道不支持的字段、值类型、操作符、逻辑结构或 partial pushdown 场景输出结构化 unsupported reason
+- 多源输入场景必须明确策略：按通道分别绑定、取能力交集或拒绝执行；共享源场景必须保持 `WHERE` signature 一致
+- 禁止通道直接解析 SQL 字符串，通道只接收已绑定的 `FilterPlan`
+
+---
+
+### Story 22.4: 统一过滤下推接口与执行生命周期
+**状态**: 📋 待规划
+**验收标准**:
+- 统一 `SetFilter()` 语义，使通道接收 `FilterPlan` 或其 JSON 表示，而不是未绑定的原始 `WHERE` 字符串
+- 补齐 `IBlockStreamChannel` 的过滤下推能力，并与现有 `IStreamChannel`、fan-in、fan-out、stream hub、shared source 过滤路径保持一致
+- 过滤计划必须在通道开始生产数据前设置；已启动共享源禁止变更过滤条件，除非显式创建新的 source instance
+- `unsupported_out` 或错误响应必须包含字段、操作符、原因和建议改写方式，便于前端和 API 用户定位问题
+- 支持 full pushdown 优先；如未来引入 partial pushdown，剩余 predicate 仍必须在通道内执行，避免重新引入独立热路径过滤算子
+
+---
+
+### Story 22.5: `packet_filter.v1` 过滤契约
+**状态**: 📋 待规划
+**验收标准**:
+- 定义 `packet_filter.v1` 字段和语义，覆盖时间、source、来源文件、packet 序号、长度、MAC、EtherType、VLAN、IP、端口、L4 protocol、tunnel depth、parse status 等结构层过滤字段
+- 明确 endpoint 语义字段，例如 `ip` / `mac` / `port` 表示源或目的任一端匹配，`src_ip` / `dst_ip` / `src_port` / `dst_port` 表示方向性匹配
+- 支持 IP 等值、列表、CIDR、范围；端口等值、列表、范围；协议枚举和长度范围等基础操作
+- 明确 `l4_protocol` 与 `app_protocol` 的边界，Epic 22 只定义能力描述和绑定规则，不要求所有通道支持应用层协议过滤
+- `packet_filter.v1` 必须能够复用 `PacketLayerHints`，为 `pcapfile`、DPDK、AF_XDP 等 packet 通道提供一致过滤语义
+
+---
+
+### Story 22.6: `pcapfile` 作为 `packet_filter.v1` 首个验证实现
+**状态**: 📋 待规划
+**验收标准**:
+- `pcapfile` 作为 Epic 22 的首个 packet 通道验证实现，支持声明 `packet_filter.v1` 的 `FilterCapabilities`，但不改变 Epic 19 的 pcapfile 主线边界
+- 支持 `packet_filter.v1` 的结构层过滤，至少覆盖时间、长度、MAC、IP、端口、L4 protocol、VLAN 和 source / 文件元数据
+- 过滤执行复用 `PacketLayerHints`，不调用应用层协议识别，不支持 `app_protocol` / `application` 等需要 NPI / NPM 语义的条件
+- 不匹配 packet 不进入 `PacketBatchView`；时间、长度和来源类条件应在可行时先于 layer 解析执行，降低无效解析成本
+- 保留原始 packet 可追踪性：来源文件、文件内 packet 序号、输出 `packet_id`、扫描包数、命中包数和过滤丢弃包数都可观测
+- 过滤计划必须在 `PollBlock()` 开始前设置；通道启动后变更过滤计划必须明确拒绝或创建新的 source instance
+- 覆盖单文件、多文件顺序读取和时间戳归并读取下的过滤回归，确保过滤不破坏事件时间、来源追踪和输出顺序
+
+---
+
+### Story 22.7: 过滤架构兼容回归与文档收口
+**状态**: 📋 待规划
+**验收标准**:
+- DataFrame / 数据库现有 `WHERE` 场景通过新 AST / IR 路径保持行为兼容，既有端到端测试继续通过
+- 覆盖成功过滤、unsupported 字段、unsupported 操作符、歧义字段、partial pushdown 禁止场景、共享源 `WHERE` signature mismatch 和 block stream 过滤生命周期回归
+- 错误响应必须包含可读的字段名、操作符、通道能力信息和失败原因，便于 Web / API 用户定位问题
+- 验证过滤下推不会重新引入独立热路径过滤算子；通道自身负责执行完整 predicate 或明确拒绝执行
+- 文档同步说明 SQL `WHERE`、通道能力声明、Filter IR 和通道执行过滤之间的职责边界
+
+---
 
 ## 优先级说明
 - **P0**: 核心功能，必须实现

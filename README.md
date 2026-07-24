@@ -17,6 +17,7 @@ FlowSQL 是一个全栈式实时数据处理与分析平台，通过扩展的 SQ
 - **SQL 驱动**：扩展 SQL 语法统一数据采集、分析、探索操作
 - **流批双模式统一**：Batch 与 Stream 均采用 SQL 驱动、统一任务管理与统一插件体系
 - **三类算子统一管理**：内置算子（builtin）+ Python 算子 + C++ 插件算子统一走 `/api/operators/*`
+- **在线基线检测**：Baseline 插件通过 `IBaselineService` 提供 `Optional Bootstrap`、在线 rolling、基线 band、maturity / score trust 和 Relation fusion 能力
 - **Web 管理**：Vue.js 前端 + REST API，支持通道/算子/任务管理
 
 ## 快速开始
@@ -110,6 +111,9 @@ export FLOWSQL_SECRET_KEY="your-32-byte-secret-key-here!!"
 ./test_builtin      # Catalog/BinAddon/算子管理链路
 ./test_stream       # 流式通道与运行时
 ./test_scheduler_e2e # Stream Group DAG 端到端回归
+./test_baseline     # Baseline 插件 B1-B7 集成路径
+./test_baseline_rolling_feature_batch # Baseline B8 批量特征缓存
+./test_baseline_batch_prediction_perf # Baseline 批量预测等价与性能
 ```
 
 ## 架构
@@ -151,13 +155,19 @@ IPlugin（生命周期）
 │   ├── IDataFrameChannel（批处理）
 │   ├── IDatabaseChannel（数据库 Reader/Writer 工厂）
 │   └── IStreamChannel（流式，已实现）
-└── IOperator（数据算子：Work(in, out)）
+├── IOperator（数据算子：Work(in, out)）
+└── IBaselineService（进程内在线基线能力，不直接暴露 HTTP 路由）
 ```
 
 IPlugin 生命周期由宿主框架串行推进。框架不得在同一插件实例的
 `Option()` / `Load()` / `Start()` / `Stop()` / `Unload()` 回调之间制造并发，
 也不得让 `Stop()` / `Unload()` 与该插件已经暴露出去的业务接口调用并发执行。
 插件业务接口自身的并发能力由各接口文档单独声明。
+
+Baseline 插件是同进程能力插件，调用方通过 `IID_BASELINE_SERVICE` 获取
+`IBaselineService`，再创建 Value / Ratio / Relation task。它不通过
+RouterAgency 直接注册 HTTP 路由；若某个部署需要使用 baseline，必须在同一
+C++ 服务进程的插件列表中加载 `libflowsql_baseline.so`。
 
 ### URI 设计约束
 
