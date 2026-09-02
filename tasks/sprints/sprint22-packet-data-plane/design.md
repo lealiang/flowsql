@@ -1,6 +1,6 @@
 # Sprint 22 Packet 数据面设计
 
-本文定义 Sprint 22 的实现契约，范围为完整 Story 19.1 和完整 Story 19.2。设计状态为已确认、待实现；后续代码、测试和 Sprint 计划必须与本文保持一致。
+本文定义 Sprint 22 的实现契约，范围为完整 Story 19.1 和完整 Story 19.2。Story 19.2 采用“现有 NPI 能力可信、只建设 checked façade 和 packet 上下文”的边界，当前处于修订后待复审状态；后续代码、测试和 Sprint 计划必须与确认后的本文保持一致。
 
 ## 1. 设计范围与关键决策
 
@@ -14,9 +14,10 @@ Sprint 22 建立统一的 packet 块式数据面，使 `pcapfile`、DPDK、AF_XD
 2. 定义 `packet.v1` 逻辑 schema、`PacketDescriptor`、`PacketBatchView` 和 owning `PacketBatchPayload`。
 3. 定义 `logical_entity_id + source_id + packet_id` 身份模型。
 4. 定义批级强类型 packet context sidecar，并交付完整 `PacketLayerHints`。
-5. 复用公共 `eLayer` 和 `protocol::Layers`，提炼 NPI 的安全分层解析核心。
+5. 复用公共 `eLayer`、`protocol::Layers` 和现有 NPI parser/dispatch，增加 checked `LayerHints()` façade、必要终态传播和上下文映射。
 6. 冻结 `PollBlock()`、`BlockLease`、`ReleaseBlock()` 及 packet buffer 的生命周期。
-7. 使用构造型 packet 和构造型 block source 完成协议、安全、并发及生命周期验收。
+7. 将插件装载改为完整批次的注册、`Option()`、`Load()`、`Start()` 生命周期，并保证 NPI 在 worker 启动前按冻结并发度完成 Hyperscan scratch 初始化。
+8. 使用构造型 packet 和构造型 block source 完成协议、安全、并发及生命周期验收。
 
 “可运行骨架”指以下进程内闭环可以独立构造和测试：
 
@@ -44,7 +45,7 @@ synthetic block source
 - packet context 的通用动态属性容器。
 - Scheduler 的 block stream SQL 生产路径。
 
-Story 19.2 作为完整 Story 一次性交付。`tunnel_depth`、安全解析、当前 NPI 分层协议盘点和至少一种固定隧道样本均在本 Sprint 内交付。
+Story 19.2 作为完整 Story 一次性交付。`PacketLayerHints`、checked façade、终态传播、`tunnel_depth` 和至少一种固定隧道样本均在本 Sprint 内交付；NPI 协议能力盘点、逐协议认证、完整 parser 重构和第二套 layer parser 不属于本 Sprint。
 
 ### 1.3 当前基线与改造边界
 
@@ -55,8 +56,10 @@ Story 19.2 作为完整 Story 一次性交付。`tunnel_depth`、安全解析、
 - 两个 block stream 接口来自 Sprint 13 的占位设计，仓库内没有生产实现或调用方。
 - Scheduler 会明确拒绝 `ChannelType::kBlockStream`。
 - `eLayer` 位于公共网络定义中；`protocol::Layers` 固定保存最多 15 层，当前大小为 64 字节。
-- NPI `NetworkLayer::Layer()` 已注册 Ethernet、VLAN、PPPoE、PPP、MPLS、IPv4 / IPv6、IPv6 扩展头、TCP、UDP、SCTP、GRE、VXLAN / VXLAN_GPE、GENEVE、L2TP 和 GTP parser。
-- 现有主循环硬编码从 Ethernet 开始，没有 `link_type`、解析终态和完整的变长头边界校验。
+- NPI `NetworkLayer::Layer()`、现有 parser map/dispatch 和协议语义作为完整可用的可信基础能力，本 Sprint 不重新盘点或认证。
+- 现有 `Layer()` 只输出 `protocol::Layers` 和层数，默认从 Ethernet 开始，缺少 `link_type`、结构化解析终态和 packet context 映射；本 Sprint 只补齐这些接口表达。
+- `pluginregist()` 宏当前在接口注册后直接调用 `Option()` 并忽略返回值；loader 又在每个 `.so` 注册后立即调用该插件的 `Load()`，`app/main.cpp` 仍逐插件提交单元素加载批次。
+- NPI 当前在 `Load() -> Engine::Create() -> Model::operator() -> Engine::Ready()` 中按默认并发度 1 创建 Hyperscan scratch；loader 返回后再调用 `Concurrency(N)` 只修改整数，不会重新创建 scratch。
 - `test_npi` 是手工打印程序，`test_framework` 尚未注册 CTest，均不能直接作为 Sprint 验收证据。
 
 本 Sprint 可以直接替换现有占位 block stream ABI，不保留 Arrow-only V1/V2 双轨。所有相关 `.so` 必须整体重新编译，发生虚函数签名变化的接口 IID 必须随 ABI 更新，禁止混用新宿主与旧插件。
@@ -72,7 +75,7 @@ Story 19.2 作为完整 Story 一次性交付。`tunnel_depth`、安全解析、
 | 逻辑 schema | `packet.v1` | 定义跨来源一致的字段语义和版本兼容规则 | 与存储实现无关 |
 | 通用 block | `IBlockPayload` / `BlockLease` | 表达 payload 类型、schema 和一次 block 租约 | `BlockLease` 独占租约 |
 | packet 运行时 | `PacketBatchPayload` / `PacketBatchView` | 保存 descriptor、buffer 引用和强类型 context | payload owning，view non-owning |
-| 分层上下文 | `PacketLayerHints` | 保存安全分层结果和派生定位字段 | payload 拥有连续 sidecar |
+| 分层上下文 | `PacketLayerHints` | 保存 NPI 分层结果、解析终态和派生定位字段 | payload 拥有连续 sidecar |
 
 `packet.v1` 不能代替进程内热路径结构，`PacketBatchView` 不能脱离 payload 和 lease 生命周期，sidecar 也不能独立于对应 descriptor 数组存在。
 
@@ -107,8 +110,11 @@ packet source
 | `src/framework/core/packet_batch.h/.cpp` | 定义 descriptor、entity/source 描述、view 和 owning payload |
 | `src/framework/core/packet_context.h/.cpp` | 实现 `PacketContextView`、PImpl storage 和强类型 sidecar accessor |
 | `src/framework/core/arrow_block_payload.h/.cpp` | 包装 `arrow::RecordBatch` |
+| `src/common/iplugin.h` | 保留 `pluginregist` 导出 ABI，移除注册宏对 `Option()` 的隐式调用 |
+| `src/common/loader.hpp` | 实现单初始化批次的注册、Option、Load、Start 状态机和失败回滚 |
+| `src/app/main.cpp` | 一次提交完整插件列表，并只在批次 Load 成功后调用 `StartAll()` |
 | `src/plugins/npi/iprotocol.h` | 继续定义并导出 `IID_PROTOCOL` / `IProtocol`，引用公共 Layers / Hints 类型 |
-| `src/plugins/npi/layer.h/.cpp` | 实现无应用层依赖的安全分层核心 |
+| `src/plugins/npi/layer.h/.cpp` | 复用现有 parser/dispatch，实现 checked façade 所需的终态传播和输出校验 |
 | `src/tests/test_packet_data_plane/benchmark_packet_data_plane.cpp` | 实现 AoS + sidecar 访问模式和 `Layer()` / `LayerHints()` 性能基准 |
 
 `protocol::Layers` 只移动声明位置，不修改字段顺序、字段类型和 `MAX_LAYERS`。实现时使用 `static_assert(sizeof(protocol::Layers) == 64)` 防止无意改变 ABI。
@@ -119,29 +125,84 @@ packet source
 
 | 公共设计 ID | 契约 | Owner Task | Consumer Task |
 | --- | --- | --- | --- |
+| C-PLUGIN-LIFECYCLE | 完整插件批次注册、Option、Load、Start、回滚和业务开放顺序 | T0 | T5、T7、T8、T9 |
 | C-BLOCK-ABI | 通用 payload、schema、Channel/Operator ABI | T1 | T2、T3、T4、T8、T9 |
 | C-LEASE | move-only lease、exactly-once reclaimer、owner queue | T2 | T1、T3、T8、T9 |
 | C-PACKET-IDENTITY | logical entity、source registry、entity-level packet allocator | T3 | T4、T7、T8 |
 | C-PACKET-SCHEMA | `packet.v1` 字段、版本和 Arrow metadata | T4 | T1、T3、T8 |
 | C-LAYERS-ABI | 公共 `eLayer` / `protocol::Layers` / `PacketLayerHints` | T5 | T6、T7、T8、T9 |
-| C-PARSER | 安全 parser step、父协议边界和支持矩阵 | T6 | T5、T7、T8、T9 |
+| C-NPI-HINTS | 现有 NPI parser/dispatch 复用、checked façade、终态传播和 Layers 映射 | T6 | T5、T7、T8、T9 |
 | C-PUBLISH | sidecar 原位构建、build-then-publish、checked accessor | T7 | T3、T8、T9 |
 | C-TEST | 构造型样本、CTest、Scheduler 回归 | T8 | T0-T7、T9、T10 |
 | C-NONFUNCTIONAL | ABI static_assert、Sanitizer、TSan、性能预算 | T9 | T0-T8、T10 |
 
 文档顺序不表示执行依赖，实际依赖以 `planning.md` Task 表为准。共享文件以 owner Task 为主修改方；consumer Task 若需要改变公共契约，必须先更新 owner Task 设计和 planning 依赖。
 
-## 3. T0：设计/ABI 基线、公共头归属和实现分支准备
+### 2.4 插件批次生命周期
+
+C-PLUGIN-LIFECYCLE 冻结单个 `PluginLoader` epoch 的初始化顺序：
+
+```text
+R: dlopen 全部 .so，并注册全部 IPlugin/IID
+  -> O: 按注册顺序调用全部 Option()，检查每个返回值
+  -> L: 仅在全部 Option() 成功后调用全部 Load()，检查每个返回值
+  -> C: Load() 返回后、StartAll() 前，由装配方调用 Concurrency(N) 等运行资源配置
+  -> S: 按依赖顺序调用全部 Start()
+       NPI Start()/Ready() 成功后，后置 packet consumer 的 Start() 才能启动 worker
+```
+
+约束如下：
+
+1. `pluginregist()` 只创建静态插件实例并注册接口，不再隐式调用 `Option()`；导出函数签名保持不变，`opt` 由 loader 在 O 阶段传给对应插件。
+2. `PluginLoader::Load()` 的一次数组调用是完整初始化批次。`app/main.cpp` 必须一次提交完整插件列表，禁止用多次单插件 `Load()` 拼接一个进程启动批次。
+3. 一个 loader epoch 只接受一个初始化批次；第二次 `Load()` 在 `Unload()` 重置前必须失败，避免出现先加载插件已执行 `Load()`、后加载插件尚未注册的混合状态。
+4. O 阶段和 L 阶段都以任意非零返回值为失败；失败后不得进入下一阶段或 `StartAll()`。
+5. L 阶段完成后开放显式装配窗口。知道 worker 数量的装配方通过 `IQuerier` 获取 `IProtocol`，调用 `Concurrency(N)`；loader 不猜测 worker 数，也不把 `pipeno` 与 source/queue 混合。
+6. S 阶段保持注册顺序，插件列表必须按依赖在先、消费者在后排列。NPI 必须排在会启动 packet worker 的消费者之前；consumer 的 `Start()` 只有在 NPI `Start()/Ready()` 成功后才会被调用。后续插件启动失败时，loader 逆序 `Stop()` 已启动的 consumer。
+7. `IPlugin::Start()` 采用失败原子性：返回非零前必须自行撤销本次创建的线程、监听器和运行资源，恢复到可 `Unload()` 的 stopped 状态。loader 不对失败插件调用 `Stop()`，只逆序停止此前成功插件；该契约写入 `iplugin.h`，所有覆盖 `Start()` 的实现必须审计。
+8. `StartAll()` 中途失败时，对此前成功启动插件按逆序调用 `Stop()` 并进入只允许卸载的失败态；`Unload()` 对已 Load 插件按逆序释放。O/L 失败时移除本批次注册的 IID、关闭 handle，并把 loader 恢复为可重新提交完整批次的空状态。
+9. `StopAll()` / `Unload()` 不得与业务调用并发；停止顺序与启动顺序相反。
+
+该契约不新增 `Prepare()` 或第二套插件生命周期。`Concurrency(N)` 是 L 与 S 之间的显式装配动作，NPI 的 scratch finalization 归入现有 `Start()`。
+
+## 3. T0：插件批次生命周期、设计/ABI 基线和公共头归属
 
 ### 3.1 设计目标与验收责任
 
-T0 冻结 Sprint 22 的当前代码基线、公共类型归属、ABI 迁移规则和测试入口基线，为 T1-T9 提供共同开工条件。T0 不单独关闭 Story 验收，但直接支撑 `S19.1-A09`、`S19.2-A01` 和所有涉及 public ABI / CTest 的实现 Task。
+T0 负责 C-PLUGIN-LIFECYCLE，并冻结 Sprint 22 的当前代码基线、公共类型归属、ABI 迁移规则和测试入口基线。它承担 `S19.1-A09` 的插件生命周期部分、`S19.2-A10` 的批次启动顺序，并支撑 `S19.2-A01` 和所有涉及 public ABI / CTest 的实现 Task。
 
 ### 3.2 公共依赖
 
-T0 维护第 2 章公共设计归属表，重点冻结 C-BLOCK-ABI、C-LAYERS-ABI、C-TEST 和 C-NONFUNCTIONAL 的初始边界。后续 Task 可以实现这些契约，但不能在不更新本文的情况下改变类型 owner、IID 迁移或测试目标名称。
+T0 实现第 2.4 节 C-PLUGIN-LIFECYCLE，并维护第 2 章公共设计归属表。T5 消费其 L/S 装配窗口完成 NPI 并发资源初始化，T7 的 packet consumer 排在 NPI 之后启动，T8/T9 验证阶段顺序、回滚和并发门槛。后续 Task 不能绕过 loader 状态机单独调用插件生命周期。
 
-### 3.3 ABI 与兼容基线
+### 3.3 loader 状态机与批次实现
+
+loader epoch 采用以下状态机：
+
+```text
+kEmpty -> Load(batch): kRegistering -> kOptioning -> kLoading
+  -> success: kLoaded
+  -> R/O/L failure + rollback: kEmpty
+kLoaded -> StartAll(): kStarting
+  -> success: kStarted
+  -> failure + reverse Stop: kStartFailed
+kStarted -> StopAll(): kLoaded
+kLoaded / kStartFailed -> Unload(): kEmpty
+```
+
+任一阶段失败不得伪装成前一稳定状态：R/O/L 失败执行本批次回滚后回到 `kEmpty`；S 失败逆序 `Stop()` 已启动插件并进入 `kStartFailed`，只允许随后 `Unload()`，禁止在同一 epoch 直接重试可能已经部分初始化的 `Start()`。`StartAll()` 只接受 `kLoaded`，`StopAll()` 只对 `kStarted` 生效，第二次 `Load()` 在非 `kEmpty` 状态返回失败。
+
+实现要求：
+
+1. 两个 `PluginLoader::Load()` 重载共享同一批次实现，不能各自维护不同的阶段或回滚语义。
+2. R 阶段记录每个 `.so` 的 handle、本次注册前各 IID vector 的长度、对应 IPlugin 列表和 option 副本；`plugins_ref_` 只在完整 L 阶段成功后提交。
+3. `END_PLUGIN_REGIST()` 只返回插件实例，不调用 `Option()`。loader 对本批次注册的所有 IPlugin 执行 O/L，保留每个插件与 option 的关联。
+4. `Option()`、`Load()` 和 `Start()` 均以 `rc != 0` 判定失败，不能只识别 `-1`。
+5. O 失败时不调用任何 `Load()`；L 失败时只对已成功 Load 的插件逆序调用 `Unload()`；两条路径都截断本批次新增 IID vector 并关闭已打开 handle。
+6. `app/main.cpp` 先解析完整 plugin list 和逐插件 option，再一次调用数组版 `Load()`；不得保留 `LoadPluginOnly()` 循环造成的伪批次。
+7. 已启动后不支持热加载。当前测试若在 `StartAll()` 后追加插件，必须改为初始完整批次或独立 loader epoch，不能为测试保留生命周期漏洞。
+
+### 3.4 ABI 与兼容基线
 
 1. `protocol::Layers` 布局和大小保持不变，只迁移到公共头文件。
 2. `eLayer` 直接复用，现有枚举数值不变。
@@ -152,26 +213,41 @@ T0 维护第 2 章公共设计归属表，重点冻结 C-BLOCK-ABI、C-LAYERS-AB
 7. `PacketLayerHints` 是进程内公共结构，不作为跨版本持久化二进制格式。
 8. Arrow `RecordBatch` 通过 wrapper 保留，现有 `IStreamChannel` 行为不变。
 9. Scheduler 的 `BLOCK_STREAM_NOT_IMPLEMENTED` 错误在真实 block source 接入前保持不变。
+10. `pluginregist(IRegister*, const char*)` 导出签名不变，但 `Option()` 的调用责任从注册宏迁移到 loader；所有插件和宿主仍必须整体重编并接受新的批次语义。
 
-### 3.4 文件落点
+### 3.5 文件落点
 
 - `tasks/sprints/sprint22-packet-data-plane/planning.md` / `design.md`：冻结 Task、公共设计和验收关系。
+- `src/common/iplugin.h`：注册宏只注册接口并返回 IPlugin。
+- `src/common/loader.hpp`：批次阶段、状态检查、option 传播和失败回滚。
+- `src/app/main.cpp`：一次提交完整插件集合，在 L/S 之间保留显式装配窗口。
+- `src/services/{web,stream,gateway,task,scheduler,database,catalog,bridge,router,binaddon}/*plugin.cpp`、`src/plugins/baseline/baseline_plugin.cpp`：审计现有 `Start()` override 的失败原子性，仅对不满足契约的实现做最小修复。
+- `src/tests/test_framework/test_plugin_lifecycle.cpp`、`fixtures/plugin_lifecycle_*.cpp`：生产 loader 的跨 `.so` 事件顺序和失败回滚测试。
 - `src/CMakeLists.txt`：确认新增测试目录和 CTest 总入口。
 - 第 2.2 节列出的公共头：由 T1、T3、T5 分别实现，T0 只冻结归属和 ABI 迁移要求。
 
-### 3.5 测试设计与通过门槛
+### 3.6 测试设计与通过门槛
 
-T0 的配置检查必须在实现前记录并在 T10 复核：
+T0 使用至少 3 个可记录事件的测试插件验证跨 `.so` 批次，不以 mock loader 替代生产 `PluginLoader`：
 
-1. 当前 `sizeof(protocol::Layers) == 64`，`eLayer` 数值基线可由 compile-time assertion 固化。
-2. 当前 `test_npi` 是手工程序、`test_framework` 未注册 CTest；T8 必须将替代目标接入 CTest。
-3. 当前 Scheduler 对 `kBlockStream` 的拒绝路径存在；T8 必须增加生产路径回归测试，而不是删除门禁。
-4. 所有发生虚函数签名变化的 IID 都必须进入 ABI 差异清单，旧 IID 加载测试必须失败。
+1. 事件日志严格满足所有 `register` 先于任一 `Option`、所有 `Option` 先于任一 `Load`、所有 `Load` 先于任一 `Start`；`Stop` / `Unload` 顺序相反。
+2. 前置插件的 `Load()` 可以查询后置 `.so` 在 R 阶段注册的接口。
+3. 任一插件的 `Option()` 失败时没有 `Load/Start`；任一 `Load()` 失败时没有 `Start`，且只逆序 Unload 已成功 Load 的插件；fixture 在创建部分线程/资源后返回 Start 失败时必须先自回滚，loader 再逆序 Stop 此前成功插件、进入 `kStartFailed`，随后完整 Unload 且不能直接重试 Start。
+4. 回滚后没有本批次悬挂 IID/handle，loader 可以重新提交完整批次；启动后增量 `Load()` 被拒绝。
+5. `app/main.cpp` 的多插件启动走单次批量 `Load()`，不再逐插件调用。
+6. T0 枚举并审计仓库当前全部 11 个非 NPI `Start()` override，逐项记录“失败点、失败前已创建资源、自回滚路径、自动化测试”；发现不满足失败原子性时，在所属插件做最小修复并增加定向失败测试。T5 单独审计本 Sprint 新增的 NPI `Start()`。
+7. 当前 `sizeof(protocol::Layers) == 64`，`eLayer` 数值基线由 compile-time assertion 固化。
+8. 当前 Scheduler 对 `kBlockStream` 的拒绝路径存在；T8 必须增加生产路径回归测试，而不是删除门禁。
+9. 所有发生虚函数签名变化的 IID 都进入 ABI 差异清单，旧 IID 加载测试失败。
 
-### 3.6 完成出口
+T0 将生命周期用例接入 `test_framework` 并注册 CTest，直接运行该目标作为自身完成门槛；T8 在整体验收命令中复用并确认该 CTest 未被遗漏。测试必须使用确定的事件序号断言，不以日志文本人工检查替代。
 
+### 3.7 完成出口
+
+- C-PLUGIN-LIFECYCLE 在 loader、注册宏和应用入口中形成单一实现，顺序和失败回滚测试通过。
+- 当前 11 个非 NPI `Start()` override 均有失败原子性审计证据；发现的问题已最小修复并有对应失败测试，NPI 审计由 T5 接管。
 - 公共设计 owner/consumer、文件归属和 IID 迁移清单已冻结。
-- T1-T9 的 Task 名称、依赖和设计章节与 planning 一致。
+- T0-T9 的 Task 名称、依赖和设计章节与 planning 一致。
 - CMake/CTest、ABI 和 Scheduler 当前基线均有后续验证 Task 接管。
 
 ## 4. T1：通用 payload、schema、Channel/Operator ABI 和 Arrow wrapper
@@ -610,15 +686,15 @@ Arrow 导出 `packet.v1` 时：
 
 测试必须覆盖全字段、null 语义、major 拒绝、producer minor 低于 required minor 拒绝、未知高 minor 可忽略、缺失必需 sidecar capability 拒绝。schema 文档、Arrow metadata 和测试一致后，T4 才能完成。
 
-## 8. T5：公共 Layers 提取、checked helper、`PacketLayerHints` 结构和 NPI façade/pipeno
+## 8. T5：公共 Layers/Hints、NPI façade、pipeno 和分阶段初始化
 
 ### 8.1 设计目标与验收 ID
 
-T5 负责 C-LAYERS-ABI，关闭 `S19.2-A01`、`S19.2-A02`、`S19.2-A04`，并承担 `S19.2-A10` 的 `pipeno` 契约。它定义公共结构和 façade，不在本 Task 中完成全部协议 parser。
+T5 负责 C-LAYERS-ABI，关闭 `S19.2-A01`、`S19.2-A02`、`S19.2-A04`，并承担 `S19.2-A10` 的 NPI 初始化和 `pipeno` 契约。它定义公共结构、façade 和 `Concurrency -> Ready` 顺序，不重新盘点、认证或改变 NPI 协议能力。
 
 ### 8.2 公共依赖
 
-T5 消费 T0 的 ABI 基线，向 T6、T7、T8、T9 提供公共 Layers/Hints 和 NPI 接口。`IProtocol` 继续通过 IID 注册查询，`PacketLayerHints` 是结构对象，不新增 IID。
+T5 消费 T0 的 C-PLUGIN-LIFECYCLE 和 ABI 基线，向 T6、T7、T8、T9 提供公共 Layers/Hints、已启动 NPI 和接口契约。`IProtocol` 继续通过 IID 注册查询，`PacketLayerHints` 是结构对象，不新增 IID。
 
 ### 8.3 状态和结构
 
@@ -668,9 +744,9 @@ sidecar 分配后必须对每个 slot 执行一次最小语义初始化，而不
 `layers` 是原始层序列、layer offset 和 payload offset 的唯一事实来源：
 
 - `layers.layercount <= protocol::MAX_LAYERS`。
-- 只在完整验证某层头部后写入该层；失败层不进入数组。
-- 有效 layer offset 单调递增且小于等于 `cap_len`；派生 offset 使用 32 位表示，`UINT32_MAX` 只表示 absent。
-- `layers.payload` 表示已验证前缀后的安全 offset，不能超过 `cap_len`。
+- 只接收 checked façade 已确认可表示的 NPI layer；终态对应的失败层不进入数组。
+- 有效 layer offset 单调递增且小于 `cap_len`；派生 offset 使用 32 位表示，`UINT32_MAX` 只表示 absent。
+- `layers.payload` 表示 NPI 已解析前缀后的 checked offset；内部 cursor 使用 32 位计算，写入该 `uint16_t` 字段前必须同时满足 `cursor <= cap_len` 和 `cursor <= UINT16_MAX`，否则产生 `kLayerLimit`，禁止先窄化再校验。
 - `top layer` 由 `layers.layers[layercount - 1].layer` 派生；`layercount == 0` 时为 `eLayer::NONE`。
 - 调用方不得在 `layercount == 0` 时直接调用现有不带保护的 `Layers::Top()`。
 - 未使用的 `layers.layers[]` 槽位内容未定义，任何调用方和序列化逻辑都只能读取 `[0, layercount)`。
@@ -679,15 +755,15 @@ sidecar 分配后必须对每个 slot 执行一次最小语义初始化，而不
 
 派生字段默认指向最内层有效协议：
 
-- `l2_offset`：从已提交 layer 序列尾部反向查找最内层有效 L2 层（`ETHERNET`、`VLAN`、`PPPoE_Session`、`PPP`、`MPLS`）的 offset。QinQ / MPLS stack 取最内层已验证 tag/label；隧道内层优先于外层。
+- `l2_offset`：从已提交 layer 序列尾部反向查找最内层有效 L2 层（`ETHERNET`、`VLAN`、`PPPoE_Session`、`PPP`、`MPLS`）的 offset。QinQ / MPLS stack 取最内层 NPI layer；隧道内层优先于外层。
 - `l3_offset`：最内层 IPv4 或 IPv6 基础头起点，不指向 IPv6 扩展头。
 - `l4_offset`：最内层 TCP、UDP 或 SCTP 头起点；未知协议或非首分片时为 `kInvalidLayerOffset`。
 - `ip_version`：与 `l3_offset` 对应，只允许 0、4、6；没有有效 IP 层时为 0。
 - `l4_protocol`：记录最内层 IP 的扩展链解析完成后、最终上层协议的 IANA Protocol / Next Header 数值，不使用 `eLayer` 替代；没有有效 IP 层时为 `kInvalidL4Protocol`。因此合法值 0（IPv6 Hop-by-Hop）不会与 absent 混淆。
-- `vlan_depth`：完整已验证层序列中的 VLAN 层总数，包括外层和隧道内层 VLAN。
-- `tunnel_depth`：每跨越一个已验证 GRE、VXLAN、VXLAN_GPE、GENEVE、L2TP 或 GTP 封装边界加 1。
+- `vlan_depth`：NPI 返回层序列中的 VLAN 层总数，包括外层和隧道内层 VLAN。
+- `tunnel_depth`：NPI 返回层序列每跨越一个 GRE、VXLAN、VXLAN_GPE、GENEVE、L2TP 或 GTP 封装边界加 1。
 
-VLAN、PPP、PPPoE 和 MPLS 是封装层，但不计入 `tunnel_depth`。IPv4-in-IPv6 和 IPv6-in-IPv4 属于本 Sprint 的 IP-in-IP 支持范围，每次 IP-in-IP 封装边界计为 1。
+VLAN、PPP、PPPoE 和 MPLS 是封装层，但不计入 `tunnel_depth`。Sprint 22 只用固定 VXLAN 样本验收 `tunnel_depth == 1`；其他封装沿用 NPI 既有层序列语义，不在本 Sprint 单独认证。
 
 `PacketLayerHints` 不重复保存 IP 地址和端口值。`packet_filter.v1` 需要 IP / 端口条件时，必须根据 `l3_offset`、`l4_offset`、`ip_version`、`l4_protocol` 和 `parse_status` 通过 checked accessor 读取 packet header；offset 无效、状态不是可用终态或剩余长度不足时，条件匹配返回“不可用”，不得重新进行未约束解析。未来若需要直接存储地址/端口，只能作为新的具名 typed sidecar 或 minor 扩展。
 
@@ -697,9 +773,9 @@ VLAN、PPP、PPPoE 和 MPLS 是封装层，但不计入 `tunnel_depth`。IPv4-in
 | --- | --- | --- |
 | `kNotParsed` | sidecar 已分配但尚未调用 classifier | 无保证；`layercount` 视为 0 |
 | `kComplete` | 在已支持的合法终点完成解析 | 完整已识别层链和派生字段 |
-| `kPartial` | 当前头合法，但下一协议未知或暂不支持 | 已验证前缀有效；未知层不写入 |
-| `kTruncated` | `cap_len` 不足以读取基础头或声明长度 | 失败前已验证前缀有效 |
-| `kMalformed` | 字节存在，但版本、header length 或协议字段不合法 | 失败前已验证前缀有效 |
+| `kPartial` | 当前头合法，但下一协议未知或暂不支持 | 已提交前缀有效；未知层不写入 |
+| `kTruncated` | `cap_len` 不足以读取基础头或声明长度 | 失败前已提交前缀有效 |
+| `kMalformed` | 字节存在，但版本、header length 或协议字段不合法 | 失败前已提交前缀有效 |
 | `kLayerLimit` | 下一层将超过 15 层或 `protocol::Layers` 的 offset 表示范围 | 已写入的 15 层或可表示前缀有效 |
 | `kUnsupportedLinkType` | 外层 LINKTYPE 不支持 | 不读取 packet 字节，层链为空 |
 
@@ -710,13 +786,13 @@ VLAN、PPP、PPPoE 和 MPLS 是封装层，但不计入 `tunnel_depth`。IPv4-in
 - 未知 EtherType、IP protocol 或合法但未注册的 next layer 是 `kPartial`。
 - 非首 IP 分片是合法停止：状态为 `kComplete`，保留 IANA `l4_protocol`，`l4_offset` 无效。
 - `wire_len > cap_len` 本身不改变 classifier 状态；只有解析某层需要的字节超出 `cap_len` 时才是 `kTruncated`。
-- 下游在 `kTruncated`、`kMalformed`、`kLayerLimit` 下可以使用已验证 offset 做诊断，但不能将 `layers.payload` 解释为完整应用层 payload 起点。
+- 下游在 `kTruncated`、`kMalformed`、`kLayerLimit` 下可以使用 checked façade 已提交的 offset 做诊断，但不能将 `layers.payload` 解释为完整应用层 payload 起点。
 
 ### 8.6 NPI `LayerHints()` 接口
 
 NPI 仍是基础、不可缺少的流量分析插件，调用方继续通过 `IQuerier` 和 `IID_PROTOCOL` 查询 `IProtocol`。`PacketBatchPayload`、`PacketLayerHints` 等结构对象不参与 IID 查询。
 
-`LayerHints()` 只调用无状态安全 layer core，不调用 `Identify()`，不访问 Engine 的规则匹配入口，不触发 Hyperscan scan，也不因为分层而加载 HTTP / TLS / DNS 等应用规则。NPI 插件的常规 `Load()` 是否为其他调用方准备规则属于插件生命周期，不属于本方法的隐式副作用。
+`LayerHints()` 通过 checked façade 复用现有 `NetworkLayer` parser map/dispatch，不调用 `Identify()`，不访问 Engine 的规则匹配入口，不触发 Hyperscan scan，也不因为分层而加载 HTTP / TLS / DNS 等应用规则。Hyperscan database/scratch 由显式插件生命周期准备，不是本方法的隐式副作用。
 
 `IProtocol` 增加：
 
@@ -732,6 +808,7 @@ virtual int32_t LayerHints(int32_t pipeno,
 
 - `0`：`hints` 已产生确定终态；包括 `kComplete`、`kPartial`、`kTruncated`、`kMalformed`、`kLayerLimit` 和 `kUnsupportedLinkType`。
 - `-EINVAL`：`hints == nullptr`，或 `cap_len > 0` 且 `packet == nullptr`。
+- `-EOVERFLOW`：`cap_len > INT32_MAX`，无法无损传给现有 NPI parser 的 `int32_t size` 契约。
 - `-ERANGE`：`pipeno` 不在已配置的并发范围内。
 - 其他负值：实现内部错误；只要 `hints != nullptr`，实现必须先将其重置为 canonical `kNotParsed` 状态，不能留下半写结果。
 
@@ -746,156 +823,133 @@ virtual int32_t Layer(int32_t pipeno,
                       protocol::Layers* layers) = 0;
 ```
 
-旧 `Layer()` 默认使用 `LINKTYPE_ETHERNET`，直接让安全解析核心写入调用方提供的局部 `protocol::Layers`。对 `kComplete` / `kPartial` 返回层数，对其他解析终态返回负数，并保留已验证前缀；新 packet 数据面必须使用 `LayerHints()` 获得完整状态。
+旧 `Layer()` 保留当前 ABI/接口签名、默认 Ethernet 假设、入口路径和返回语义，不新增 `link_type` 或 `PacketParseStatus`。新 `LayerHints()` 复用同一 parser map 和 parser function，不通过调用旧 `Layer()` 后复制局部 64 字节 `protocol::Layers`，也不复制或重写协议 parser。
 
-旧 `Layer()` 的接口错误与新入口一致：`layers == nullptr`、`packet_size < 0`、`packet_size > 0 && packet == nullptr` 返回 `-EINVAL`；`pipeno` 越界返回 `-ERANGE`；`packet_size == 0` 且 `packet == nullptr` 允许作为空 packet，返回 0 并输出空层。发生负返回时，调用方不得继续 `Identify()`。
+本 Sprint 只要求仓库已有旧 `Layer()` 回归保持通过，并在 PB 固定合法样本上与 `LayerHints()` 比较层序列。`LayerHints()` 的参数校验和错误码不得反向定义旧 `Layer()` 的异常输入语义。
 
-### 8.7 `pipeno` 语义
+### 8.7 NPI 初始化顺序与 `pipeno` 语义
+
+NPI `Option()` 的空值和错误语义先于生命周期阶段冻结：`nullptr`、空串或空 JSON object 表示“不加载应用层规则”，返回 0，`LayerHints()` 仍可使用；非空配置必须是 JSON object，`ldfile` 若存在必须是非空字符串且配置文件加载成功。畸形 JSON、错误字段类型或 `ldfile` 加载失败返回非零，由 loader 停在 O 阶段，不进入任何插件的 L/S 阶段。并发度不重复放入 Option，仍只通过 L/S 窗口的 `Concurrency(N)` 配置。
+
+NPI 在 C-PLUGIN-LIFECYCLE 中的阶段责任固定为：
+
+```text
+Option(): 解析并持有协议配置，不建模、不创建 Hyperscan 资源
+  -> Load(): Engine::Create()/Config::Modeling() 只构建 recognizer graph，不调用 Ready()
+  -> Concurrency(N): 在 loader 的 L/S 装配窗口冻结 worker 数
+  -> Start(): 校验并发配置，调用 Engine::Ready()，创建 database 和 N 份 scratch
+  -> NPI Start() success: 后置 packet consumer 才可启动并调用 LayerHints()/Layer()/Identify()
+```
+
+为保持 NPI 改动最小，保留现有 `void Concurrency(int32_t)` 接口签名和默认并发度 1。实现必须增加明确的阶段状态：
+
+- `Concurrency(N)` 只允许在本插件 `Load()` 成功后、首次 `Start()` 前调用一次；`1 <= N <= 16` 时更新 pending 值。
+- 非法 N 或 Start 前重复配置会标记启动配置错误并保持原 pending 值；由于接口保留 `void` 签名，错误统一由随后 `Start()` 的非零返回传播，使 `StartAll()` 失败。
+- 首次 `Start()` / `Ready()` 成功后并发度永久冻结到 `Unload()`；后续 `Concurrency()` 不改变值，并输出可诊断的契约错误。
+- 未显式调用 `Concurrency()` 时使用默认 N=1，保证不需要 NPI 应用识别的既有单线程装配可以启动。
+- `Stop()` 不释放 database/scratch；同一 Load epoch 再次 `Start()` 复用已 ready 的只读资源，不重复编译或分配。`Unload()` 才释放并重置状态。
+
+`Engine::Create()` 与 `Engine::Ready()` 必须成为两个真实阶段：`Model::operator()` 完成 recognizer graph 构建后直接返回，不再隐式调用 `Ready()`；`NetworkProtocolIdentify::Start()` 是唯一的 `Ready()` 调用点。`Ready()` 在 compile database 或第 k 份 scratch 分配失败时，必须释放本次 database 和全部 `[0, k)` scratch、恢复 `not-ready`，再由 `Start()` 返回非零；这满足 IPlugin Start 失败原子性，随后 T0 的 `StartAll()` 逆序回滚此前已启动插件，packet worker 不会进入。
 
 `pipeno` 是上游处理线程/pipe index，不是 `source_id` 或 `rx_queue`。NPI 的 Hyperscan scratch 按 `pipeno` 选择实例，因此：
 
 1. `Concurrency(N)` 建立合法范围 `[0, N)`，每个上游 worker 持有稳定且唯一的 `pipeno`。
 2. 同一处理 pass 若连续调用 `LayerHints()` 和 `Identify()`，两次调用必须使用当前 worker 的相同 `pipeno`。
 3. 不同 `pipeno` 可以并发处理；同一 `pipeno` 不允许被多个线程同时调用 `Identify()`。
-4. 安全分层核心本身不访问 Hyperscan scratch，解析结果不应随 `pipeno` 改变，但接口仍保留并校验该参数，避免后续应用识别失去线程亲和。
+4. checked façade 和现有 layer parser 不访问 Hyperscan scratch，解析结果不应随 `pipeno` 改变，但接口仍保留并校验该参数，避免后续应用识别失去线程亲和。
 5. `pipeno` 不写入 packet context；它只属于当前执行实例的并发资源选择。同一处理 pass 若紧接着执行 `LayerHints()` 和 `Identify()`，两次调用必须使用当前 worker 的同一 `pipeno`；已发布的 thread-independent hints 被后续 worker 复用时，后续 `Identify()` 使用其当前 worker 的合法 `pipeno`，不继承旧线程编号。
 
-`Concurrency(N)` 必须在 Hyperscan scratch 创建和 worker 启动前完成；当前 Hyperscan scratch 数组上限为 16，因此合法范围固定为 `1 <= N <= 16`。非法值必须在配置/`Ready()` 阶段使插件启动失败并保持旧值，不能写入固定数组；worker 启动后并发范围只读，禁止与 `LayerHints()` / `Identify()` 并发修改。
+`Concurrency(N)` 必须在 Hyperscan scratch 创建和 worker 启动前完成；当前 Hyperscan scratch 数组上限为 16，因此合法范围固定为 `1 <= N <= 16`。NPI 必须在完整插件列表中排在 packet worker 消费者之前，使其 `Start()/Ready()` 先完成；消费者 `Start()` 只能在依赖已启动后创建 worker。
 
-分层复用的核心函数只接收 `(packet, cap_len, link_type)`；`pipeno` 只存在于 NPI `IProtocol::LayerHints()` façade，用于校验当前 worker 和保持与 `Identify()` 的调用亲和。这样后续 pcapfile、DPDK 和 AF_XDP 可以直接调用同一 classifier，而不依赖文件状态、buffer owner、wall-clock 或 Hyperscan 规则。
+NPI 内部 checked layer 入口只接收 `(packet, cap_len, link_type)`；`pipeno` 只存在于 `IProtocol::LayerHints()` façade，用于校验当前 worker 和保持与 `Identify()` 的调用亲和。这样后续 pcapfile、DPDK 和 AF_XDP 可以直接调用同一能力，而不依赖文件状态、buffer owner、wall-clock 或 Hyperscan 规则。
 
 ### 8.8 文件落点、测试设计与完成出口
 
 - `src/common/network/layers.h`：公共 `protocol::Layers` 和安全 helper。
 - `src/common/network/packet_layer_hints.h`：状态、sentinel 和派生字段结构。
 - `src/plugins/npi/iprotocol.h`：`LayerHints()` façade 和新 IID。
-- `src/plugins/npi/layer.h/.cpp`：façade 到安全 core 的适配。
+- `src/plugins/npi/npi.h/.cpp`：NPI 阶段状态、`Start()` / `Stop()` 和 lifecycle guard；T6 只在同文件增加 `LayerHints()` façade 转发。
+- `src/plugins/npi/engine.h/.cpp`、`model.cpp`：拆分 recognizer graph 构建与 `Ready()` finalization。
+- `src/plugins/npi/regexmatch.h/.cpp`：使 Hyperscan database 和 N 份 scratch 的创建具备失败原子性。
 
-测试必须覆盖 `Layers` ABI/helper、canonical 初始态、状态/absent、最内层 offset、合法/非法 `pipeno`、不触发 `Identify()` / Hyperscan，以及旧 `Layer()` 的接口错误。公共结构、façade 和 IID 迁移闭合后，T5 才能完成。
+测试必须覆盖 `Layers` ABI/helper、canonical 初始态、状态/absent、最内层 offset、`LayerHints()` 合法/非法 `pipeno`、不触发 `Identify()` / Hyperscan，以及旧 `Layer()` 的接口签名兼容。NPI 启动测试还必须证明：null/空 Option 成功且畸形/无效 `ldfile` 停在 O 阶段；`Load()` 后调用 `Concurrency(2)`，`StartAll()` 成功后 pipeno 0/1 各有可用 scratch；N=0/17 使启动失败且无 worker 进入；通过 test-only 内部故障注入使第 k 份 scratch 分配失败后，本次 database 和 `[0, k)` scratch 全部释放且 Start 返回非零；默认 N=1 可启动；Start 后再次配置不改变合法范围；Stop/Start 不重复创建资源。故障注入不得进入 public ABI。公共结构、façade、IID 迁移和分阶段初始化闭合后，T5 才能完成；checked 实现、终态传播和旧接口回归由 T6/T8 负责。
 
-## 9. T6：安全 parser core 和完整协议/隧道支持矩阵
+## 9. T6：NPI `LayerHints()` checked façade、终态传播与映射适配
 
 ### 9.1 设计目标与验收 ID
 
-T6 负责 C-PARSER，关闭 `S19.2-A03`、`S19.2-A05`、`S19.2-A06`、`S19.2-A08`。它在 T5 公共结构上实现单一安全解析核心和完整 Story 19.2 协议矩阵。
+T6 负责 C-NPI-HINTS，关闭 `S19.2-A03`、`S19.2-A05`、`S19.2-A06`、`S19.2-A08`。它在 T5 公共结构和接口上实现 checked façade，复用现有 NPI parser/dispatch，并将必要终态和 Layers 映射为 `PacketLayerHints`。T6 不盘点或认证协议能力，不建设第二套 parser。
 
 ### 9.2 公共依赖
 
-T6 消费 T5 的 C-LAYERS-ABI，并向 T7、T8、T9 提供安全、无应用层识别的 classifier。所有 parser 共享同一个 step 契约和父协议边界模型。
+T6 消费 T5 的 C-LAYERS-ABI，向 T7、T8、T9 提供可直接写入 sidecar 的 `LayerHints()` 实现。现有 `NetworkLayer`、`parsers_map_`、`Delamination` parser function 和协议分派语义均是可信依赖；T6 只增加接口约束、必要终态表达和输出映射。
 
-### 9.3 单一核心、两个写入目标
+### 9.3 单一 parser/dispatch 与兼容边界
 
-不在 `LayerHints()` 外包装旧的不安全 `Layer()`，也不维护两套 parser。提取一个内部安全解析核心，并支持两个直接写入目标：
+新旧入口共享同一 parser map 和 parser function：
 
 ```text
-IProtocol::Layer()
-  -> safe layer core
-  -> caller-owned protocol::Layers
-
 IProtocol::LayerHints()
-  -> safe layer core
+  -> NetworkLayer checked façade
+  -> existing parsers_map_ / Delamination parser functions
   -> caller-owned PacketLayerHints::layers
-  -> derived fields in the same parse loop
+  -> bounded Layers-to-Hints derivation
+
+IProtocol::Layer()
+  -> existing NetworkLayer::Layer() compatibility entry
+  -> existing parsers_map_ / Delamination parser functions
 ```
 
-两个入口都直接写调用方内存，不创建局部 64 字节 `protocol::Layers` 再复制。`LayerHints()` 在同一解析循环中更新 L2/L3/L4、IP version、IANA L4 protocol、VLAN depth 和 tunnel depth，不进行第二次层数组扫描。
+`LayerHints()` 不调用旧 `Layer()` 后再复制局部 64 字节 `protocol::Layers`，而是让 checked 入口直接写 `hints->layers`。允许为复用 parser map 抽取不改变语义的内部遍历 helper，但禁止复制 parser table、分叉协议 dispatch、重写协议 parser 或改变旧 `Layer()` 的签名、默认 Ethernet 假设和返回语义。
 
-### 9.4 Parser step 契约
+### 9.4 Checked façade 与终态传播
 
-每个 parser step 返回结构化结果：
+调用顺序固定为：
 
-```cpp
-enum class LayerStepStatus : uint8_t {
-    kContinue,
-    kComplete,
-    kPartial,
-    kTruncated,
-    kMalformed,
-};
+1. 只要 `hints != nullptr`，先将其重置为 T5 定义的 canonical `kNotParsed` 状态。
+2. 校验 `packet`、`cap_len`、`pipeno` 和 `link_type`；`cap_len > INT32_MAX` 返回 `-EOVERFLOW`，不支持的 LINKTYPE 在读取 packet 前产生 `kUnsupportedLinkType`。
+3. checked 入口在调用现有 `Delamination` parser function 前检查该 parser 已登记的固定最小头长度；不足时产生 `kTruncated`，且不调用 parser。
+4. parser 返回后校验 `consumed > 0`、`consumed` 不小于固定最小头长度且不超过剩余 `cap_len`，并使用 checked add 推进 32 位 cursor。声明长度超过捕获长度产生 `kTruncated`，存在足够字节但 header length 或 parser 结果非法产生 `kMalformed`。
+5. 写入 `protocol::Layers` 前检查 layer count、`eLayer` 值，以及 layer offset 和最终 payload 两类 `uint16_t` 字段的表示范围；任一待写值超过 `UINT16_MAX`，或下一层超过 `MAX_LAYERS`，均产生 `kLayerLimit`。
+6. 正常停止原因由现有 NPI 解析路径传播为 `kComplete` 或 `kPartial`，不能由 façade 根据层数猜测。
 
-struct LayerStepResult {
-    LayerStepStatus status;
-    uint32_t consumed;
-    uint32_t next_limit;
-    eLayer next;
-    uint16_t upper_protocol;
-    bool tunnel_boundary;
-};
-```
+现有内部解析结果只允许增加表达 `continue / complete / partial / malformed` 所需的最小终止原因；固定头不足由 checked 调用统一产生 `kTruncated`，layer/offset/payload 的层数或表示上限由中央入口统一产生 `kLayerLimit`。这些字段属于 NPI 内部实现，不进入 public ABI。现有 parser function 只做必要的终止原因赋值；除 PB 固定契约样本暴露的直接阻塞问题外，不在本 Sprint 增加协议分支、重写可选字段逻辑或开展逐协议安全加固。
 
-单步执行顺序固定为：
+接口错误码与 packet 终态严格分离：参数或 NPI 内部错误返回负值并保持 canonical `kNotParsed`；packet 数据导致的 `kPartial`、`kTruncated`、`kMalformed`、`kLayerLimit` 和 `kUnsupportedLinkType` 均返回 0，由调用方读取 `parse_status`。
 
-1. 检查固定最小头长度。
-2. 在长度满足后读取固定字段。
-3. 验证版本、header length、option length 和协议约束。
-4. 使用 checked add 计算下一 offset，并将父协议声明的长度转换为 `next_limit = min(parent_limit, declared_end, cap_len)`。
-5. 确认结果不超过 `next_limit` 且可由 `protocol::Layers` 表示。
-6. 只有成功验证当前 layer 后才提交 layer 和派生字段；失败 step 不提交失败层。
-7. `kContinue` 必须满足 `consumed > 0` 且 `next != eLayer::NONE`；若不能推进，返回 `kMalformed`，防止死循环。
-8. tunnel depth 只在 tunnel header 成功提交后增加。
+### 9.5 输出 invariant 与派生字段
 
-任何一步失败都不能提交未完整验证的 layer。
+checked 入口提交结果前必须确认：
 
-内层 parser 的每次读取同时受 `cap_len` 和父协议声明的 `next_limit` 约束，不能把 Ethernet padding 或容器尾部字节当作内层 packet。IPv4 total length、IPv6 payload length、UDP length、PPPoE length、GTP length 等字段都必须收紧该边界。
+- `layers.layercount <= protocol::MAX_LAYERS`。
+- `[0, layercount)` 中每个 layer type 合法，offset 单调递增且小于 `cap_len`。
+- 32 位最终 cursor 在窄化前满足 `cursor <= cap_len` 和 `cursor <= UINT16_MAX`；发布后的 `layers.payload` 等于该 cursor，且不小于最后一个已提交 layer 的 offset。
+- 未使用 layer slot 不参与比较、派生或发布。
+- `kUnsupportedLinkType` 的层链为空；其余异常终态只暴露已提交的有效前缀。
 
-### 9.5 必须补齐的边界校验
+若现有 parser 返回的 `consumed` 触发截断或畸形规则，当前失败层不提交；若已提交结果在最终 invariant 检查中出现不可能的内部矛盾，则 façade 返回内部错误并重置为 canonical `kNotParsed`，不得发布半写 sidecar。
 
-安全核心至少覆盖：
+L2/L3/L4、IP version、IANA L4 protocol、VLAN depth 和 tunnel depth 通过一次最多 `MAX_LAYERS`（15）的有界后处理从 `hints->layers` 和 checked packet view 派生。该后处理不是协议解析，不递归、不分配内存、不调用 `Identify()`；它以最小 NPI 改动换取清晰的映射边界，性能由 T9 的 15% 门槛约束。
 
-- Ethernet / VLAN / QinQ 固定头和 EtherType。
-- PPPoE payload length、PPP protocol。
-- MPLS label stack 和 Bottom-of-Stack。
-- IPv4 version、IHL、total length、fragment offset 和 IP-in-IP next protocol。
-- IPv6 payload length 和 extension header 链。
-- TCP data offset。
-- UDP length。
-- SCTP 基础头及需要遍历时的 chunk length。
-- GRE flags 和可选字段长度。
-- 标准 VXLAN 只校验 flags 并固定进入 inner Ethernet；VXLAN_GPE 独立校验 GPE next-protocol，再按其协议值分派，不读取标准 VXLAN 不存在的字段。
-- GENEVE version 和 option length。
-- L2TP flags、length、sequence 和 offset 可选字段。
-- GTP version、length、sequence / N-PDU / extension 字段。
+公共 `protocol::Layers` helper 同时完成安全收口：`Top()` 对空层返回 `eLayer::NONE`；`Get/Forward/Backward/Top<Header>` 在 `packet == nullptr`、offset 越界或 `offset + sizeof(Header) > packet_size` 时返回空指针；`Payload/Data` 对 payload 超出 packet size 返回空/0。`operator(layer1, layer2)` 必须比较两个参数，`Levels::degree[7]` 写入必须饱和。packet context 直接遍历 `[0, layercount)`，不依赖最多容纳 7 个匹配项的 `Levels` union。
 
-中央循环使用至少 32 位 offset，所有 `offset + length` 都使用 checked add。写入 `protocol::Layers` 的 `uint16_t` offset 前检查范围，超出表示能力时返回 `kLayerLimit`。
+### 9.6 文件落点、测试设计与完成出口
 
-公共 `protocol::Layers` helper 也必须经过安全收口：`Top()` 对空层返回 `eLayer::NONE`；`Get/Forward/Backward/Top<Header>` 在 `packet == nullptr`、offset 越界或 `offset + sizeof(Header) > packet_size` 时返回空指针；`Payload/Data` 对 payload 超出 packet size 返回空/0。`operator(layer1, layer2)` 修复为同时比较两个参数，`Levels` 的 `degree[7]` 写入必须饱和而不能越界。需要完整 layer 列表的 packet context 代码直接遍历 `[0, layercount)`，不依赖只能容纳 7 个匹配项的 Levels union。
+- `src/plugins/npi/layer.h/.cpp`：checked 入口、现有 parser map 复用、必要终态传播、结果 invariant 和 Layers-to-Hints 映射。
+- `src/plugins/npi/npi.h/.cpp`：`IProtocol::LayerHints()` façade 接入；旧 `Layer()` 入口保持。
+- `src/tests/test_npi_layer/`：façade 参数/错误码、PB 固定契约 corpus、输出 invariant、固定 VXLAN 和旧接口对照。
 
-### 9.6 支持矩阵
-
-| 协议族 | Sprint 22 行为 |
-| --- | --- |
-| Ethernet、VLAN / QinQ | 完整安全解析 |
-| PPPoE Session、PPP、MPLS stack | 完整安全解析 |
-| IPv4、IPv6 | 完整安全解析 |
-| IPv6 Hop-by-Hop、Routing、Fragment、ESP、AH、Destination Options | 完整边界校验；ESP 作为合法终点 |
-| TCP、UDP、SCTP | 完整安全解析到 transport payload |
-| GRE | 解析可选字段并进入支持的 inner layer |
-| VXLAN | 解析 tunnel header，固定进入 inner Ethernet |
-| VXLAN_GPE、GENEVE | 分别解析 GPE / option 字段并进入声明的 next protocol |
-| L2TP、GTP | 解析可选字段并进入支持的 inner layer |
-| IPv4-in-IPv6、IPv6-in-IPv4 | 解析互嵌 IP，计入 tunnel depth 并继续寻找最内层 L3/L4 |
-| 其他合法 next protocol | `kPartial`，保留已验证前缀 |
-| 非 Ethernet LINKTYPE | Sprint 22 返回 `kUnsupportedLinkType` |
-
-首个支持的外层链路类型是标准 `LINKTYPE_ETHERNET` (1)。classifier 必须先判断 `link_type`，不支持时不得读取 packet 数据。后续增加 LINKTYPE 只扩展入口分派，不改变 `packet.v1` 或 `PacketLayerHints` major 版本。
-
-### 9.7 文件落点、测试设计与完成出口
-
-- `src/plugins/npi/layer.h/.cpp`：单一 parser core、step dispatcher 和协议实现。
-- 必要的 NPI parser headers：仅承载协议头解析，不引入应用层识别依赖。
-- `src/tests/test_npi_layer/`：protocol matrix、边界、旧接口和固定 corpus。
-
-每种支持协议必须至少有正常、截断和畸形边界样本；隧道、IP-in-IP、offset 65535/65536、未知 LINKTYPE 和 layer limit 必须有确定终态。合法 Ethernet 输入上旧 `Layer()` 与新 core 的层序列一致，所有非法输入不越界后，T6 才能完成。
+T6 测试只覆盖 Ethernet + IPv4 + TCP、VLAN + IPv4 + UDP、IPv6 + TCP、固定 VXLAN、代表性截断/畸形、layer offset 与最终 payload 的 65535/65536 边界、unknown LINKTYPE 和 layer limit。PB 固定合法样本上旧 `Layer()` 与 `LayerHints()` 的层序列一致，终态和输出 invariant 确定，仓库已有旧接口回归保持通过后，T6 才能完成。其他协议沿用 NPI 可信能力，不新增能力表、逐协议 corpus、逐隧道 corpus 或 parser 重构验收。
 
 ## 10. T7：批级 sidecar 预分配、原位写入、发布同步和 hints checked accessor
 
 ### 10.1 设计目标与验收 ID
 
-T7 负责 C-PUBLISH，关闭 `S19.2-A09`、`S19.2-A11`，并完成 `S19.1-A06` 的 sidecar 集成。它把 T6 classifier 写入 T3 context，不承担独立协议 parser 或最终性能/Sanitizer 验收。
+T7 负责 C-PUBLISH，关闭 `S19.2-A09`、`S19.2-A11`，并完成 `S19.1-A06` 的 sidecar 集成。它把 T6 checked façade 的结果写入 T3 context，不承担协议 parser 或最终性能/Sanitizer 验收。
 
 ### 10.2 公共依赖
 
-T7 消费 T3 的 packet context、T5 的 hints ABI 和 T6 的 classifier，向 T8、T9 提供 immutable payload、checked accessor 和可测量热路径。
+T7 消费 T3 的 packet context、T5 的 hints ABI 和 T6 的 checked façade，向 T8、T9 提供 immutable payload、checked accessor 和可测量热路径。
 
 ### 10.3 原位构建
 
@@ -915,12 +969,12 @@ if (rc != 0) {
 约束：
 
 - 每个 worker 只写不重叠的 slot 区间；同一 slot 不允许并发写。
-- batch builder 必须检查每次 `LayerHints()` 返回值：`0` 才允许发布该 slot；`-EINVAL`、`-ERANGE` 或内部错误会中止当前 block 构造并释放其资源，不得发布 `kNotParsed` 或未初始化 slot。
+- batch builder 必须检查每次 `LayerHints()` 返回值：只有 `0` 才允许发布该 slot；任何非零返回（包括 `-EINVAL`、`-EOVERFLOW`、`-ERANGE` 或内部错误）都会中止当前 block 构造并释放其资源，不得发布 `kNotParsed` 或未初始化 slot。
 - 当输入 packet 本身合法但解析失败时，接口返回 `0`，slot 发布为确定的 `kPartial` / `kTruncated` / `kMalformed` / `kLayerLimit` / `kUnsupportedLinkType`，由下游按状态处理。
 - payload 发布前允许填充，发布后 sidecar 只读。
-- parser 只初始化语义字段和实际使用的 layer slot，不对全部 15 个 slot 做逐包 blanket clear。
+- checked façade 只初始化语义字段和实际使用的 layer slot，不对全部 15 个 slot 做逐包 blanket clear。
 - 未使用 slot 不得被读取、比较或序列化。
-- parser dispatch table 初始化后只读；热路径不分配内存、不加锁、不抛异常。
+- NPI parser dispatch table 初始化后只读；热路径不分配内存、不加锁、不抛异常。
 - 每包复杂度为 `O(min(layer_count, MAX_LAYERS))`。
 
 ### 10.4 缓存权衡
@@ -935,8 +989,8 @@ if (rc != 0) {
 
 1. descriptor 数组和 hints 数组都连续分配并按相同 index 访问。
 2. worker 以连续 packet range 为单位处理，不随机跨 batch 跳转。
-3. classifier 直接原位写 `hints[i]`，不复制 64 字节 `Layers`。
-4. 派生字段在解析循环内同步计算，不二次扫描层数组。
+3. checked façade 直接原位写 `hints[i]`，不复制 64 字节 `Layers`。
+4. 派生字段只做一次最多 15 层的顺序后处理，不重复解析 packet；该额外读取由性能基准约束。
 5. 性能基准同时测 descriptor-only、descriptor+hints 顺序扫描和单 packet 随机访问，不能只用一种访问模式证明布局优劣。
 
 最终是否需要进一步调整布局，以 Sprint 22 基准数据为依据，不在未测量前将 hints 合并回 descriptor。
@@ -951,7 +1005,7 @@ if (rc != 0) {
 4. 一个有效 lease 可以在明确的执行器所有权下移动到另一线程，但同一 lease 不得并发消费。`LeaseState` 的 release path 必须线程安全：若 backend（例如 AF_XDP / 部分 DPDK ring）要求 owner lcore 回收，跨线程 `ReleaseBlock()` / destructor 只能将 token 投递到 owner queue，由 owner drain；不得直接在错误线程调用 backend callback。
 5. 多个下游若需并发读取同一 block，必须由上层 fan-out 建立明确的共享读取和合并 release 计数；Sprint 22 的基础 lease 本身不提供隐式复制。
 
-NPI layer parser 的分发表只读，可以被不同 `pipeno` 并发调用。Hyperscan 应用识别仍遵守一个 worker 对应一个 `pipeno` / scratch 的独占规则。
+NPI layer parser 的分发表只读，可以被不同 `pipeno` 并发调用。checked façade 只写调用方提供的独立 hint slot；Hyperscan 应用识别仍遵守一个 worker 对应一个 `pipeno` / scratch 的独占规则。
 
 ### 10.6 错误处理与降级
 
@@ -960,19 +1014,19 @@ NPI layer parser 的分发表只读，可以被不同 `pipeno` 并发调用。Hy
 | payload kind 未知 | operator 返回不支持错误，不做 unchecked cast |
 | schema name/major 不匹配 | `OnSchemaReady()` 拒绝，不能尝试消费首块 |
 | sidecar 缺失 | 不需要 hints 的 operator 正常运行；依赖 hints 的 operator 明确拒绝。Sprint 22 不允许在 NPM/filter 内部临时补齐或重复解析 |
-| 单 packet `kPartial` | 可使用已验证层和派生字段，不能假定未知 next layer |
-| 单 packet `kTruncated` / `kMalformed` | 保留诊断前缀，下游按策略过滤或计数，不重新做不安全解析 |
+| 单 packet `kPartial` | 可使用已提交层和派生字段，不能假定未知 next layer |
+| 单 packet `kTruncated` / `kMalformed` | 保留已提交前缀，下游按策略过滤或计数，不重新解析 |
 | `kLayerLimit` | 保留可表示前缀并计数，不能静默当作完整解析 |
 | 不支持的 LINKTYPE | `kUnsupportedLinkType`，不读取 packet 数据 |
 | operator 返回错误 | 执行器先释放 lease，再传播错误 |
 | `Cancel()` 时有 outstanding lease | 停止新生产并立即返回；各 lease 独立归还，不能提前回收 buffer |
 
-NPM 和 `packet_filter.v1` 可以复用 hints 快速定位，但仍必须校验对应 status、offset sentinel 和 `cap_len`。Hints 是经过验证的定位信息，不是绕过边界检查的授权。
+NPM 和 `packet_filter.v1` 可以复用 hints 快速定位，但仍必须校验对应 status、offset sentinel 和 `cap_len`。Hints 是经过 checked façade 收口的定位信息，不是绕过边界检查的授权。
 
 ### 10.7 文件落点、测试设计与完成出口
 
 - `src/framework/core/packet_batch.*`、`packet_context.*`：sidecar storage、publish barrier 和 accessor integration。
-- `src/plugins/npi/`：调用已冻结的 `LayerHints()` façade，不复制 parser。
+- `src/plugins/npi/`：提供已冻结的 `LayerHints()` façade，复用现有 parser/dispatch。
 - `src/tests/test_packet_data_plane/`：build-then-publish、range partition、checked accessor 和 absent sidecar 用例。
 
 每个 slot 的 classifier 返回值都必须检查，发布前不能存在 `kNotParsed` 或未初始化状态；发布后 descriptor/sidecar/registry 只读。性能基准覆盖 descriptor-only、descriptor+hints 顺序和随机访问三种模式后，T7 才能完成。
@@ -981,11 +1035,11 @@ NPM 和 `packet_filter.v1` 可以复用 hints 快速定位，但仍必须校验�
 
 ### 11.1 设计目标与验收 ID
 
-T8 负责 C-TEST 的生产路径回归，关闭 `S19.1-A08`、`S19.1-A09`、`S19.2-A07`、`S19.2-A08`、`S19.2-A10` 的测试责任。T8 不重新定义 T1-T7 的接口，只提供构造型数据、测试装配、CTest 注册和 Scheduler 拒绝门禁验证。
+T8 负责 C-TEST 的生产路径回归，关闭 `S19.1-A08`、`S19.1-A09`、`S19.2-A07`、`S19.2-A08`、`S19.2-A10` 的测试责任。T8 不重新定义 T0-T7 的接口或生命周期，只提供构造型数据、测试装配、CTest 汇总和 Scheduler 拒绝门禁验证。
 
 ### 11.2 公共依赖
 
-T8 消费 T1-T7 的稳定契约，并把实际 target、CTest 名称和证据格式交给 T9/T10 复用。测试必须走生产插件加载/调度路径；test-only builder 不进入 production ABI。
+T8 消费 T0-T7 的稳定契约，并把实际 target、CTest 名称和证据格式交给 T9/T10 复用。测试必须走生产插件加载/调度路径；test-only builder 不进入 production ABI。
 
 ### 11.3 构造型测试数据边界
 
@@ -1017,6 +1071,7 @@ Ethernet
 
 | 类别 | 必测内容 |
 | --- | --- |
+| 插件生命周期 | 至少 3 个插件的完整 R/O/L/C/S 顺序、跨插件查询、L/S 装配窗口、Option/Load/Start 失败阻断、逆序回滚、无悬挂 IID/handle、启动后增量 Load 拒绝 |
 | Payload | Kind、schema name/major/minor、checked cast、未知 Kind 拒绝 |
 | Schema | `OutputSchema()` 在首个 block 前可读、`packet.v1` 全字段、Arrow metadata、major 拒绝、producer minor 低于 required minor 拒绝、未知高 minor 可忽略 |
 | Identity | 同实体跨多个 block 的 packet ID 重复拒绝；跨实体允许重复；多 source 同实体可解析；allocator 分区和重启 high-water mark 规则可复现 |
@@ -1031,31 +1086,28 @@ Ethernet
 
 | 类别 | 必测内容 |
 | --- | --- |
-| 基础链 | Ethernet+IPv4+TCP、Ethernet+IPv4+UDP、VLAN/QinQ+IPv4+UDP、Ethernet+IPv6+TCP |
-| 封装层 | PPPoE+PPP、MPLS stack |
-| IP 边界 | IPv4 IHL/total length/fragment、IPv6 extension 链和非首分片 |
-| Transport | TCP data offset、UDP length、SCTP 基础头 |
-| 隧道 | GRE、VXLAN、VXLAN_GPE、GENEVE、L2TP、GTP、IPv4-in-IPv6、IPv6-in-IPv4 parser 边界 |
+| Façade 契约 | null 参数组合、`cap_len > INT32_MAX`、canonical 初始化、接口错误码/packet 终态分离、layercount/offset/payload 输出 invariant |
+| PB 基础链 | Ethernet+IPv4+TCP、VLAN+IPv4+UDP、Ethernet+IPv6+TCP |
 | 固定隧道样本 | VXLAN 完整链、最内层派生 offset、`tunnel_depth == 1` |
-| 截断 | 各固定头 `0..N-1`、所有变长头声明长度超过 `cap_len` |
-| 畸形 | 非法 IP version、IPv4 IHL < 5、TCP offset < 5、option length 溢出 |
-| 层限制 | 超过 15 层、`protocol::Layers` offset 65535（合法）/65536（`kLayerLimit`），以及派生 offset `UINT32_MAX` absent 边界 |
+| 终态传播 | PB 固定路径的代表性固定头截断、声明长度超过 `cap_len`、IPv4 IHL < 5、TCP offset < 5，分别得到约定的 `kTruncated` / `kMalformed` |
+| 层限制 | 超过 15 层；layer offset 和最终 payload 分别覆盖 65535（合法）/65536（`kLayerLimit`）；派生 offset 覆盖 `UINT32_MAX` absent 边界 |
 | LINKTYPE | Ethernet 成功；未知、Linux cooked、Null loopback 不读数据并返回 unsupported |
-| `pipeno` | 合法范围、越界拒绝、同一处理 pass 的 LayerHints/Identify 使用相同 index |
-| 一致性 | 旧 `Layer()` 与新安全核心在合法 Ethernet 输入上产生相同层序列 |
+| NPI 启动 | null/空 Option 与畸形/无效 ldfile；`Load()` 不调用 `Ready()`；L/S 窗口设置 N=2 后 `Start()` 创建 2 份 scratch；默认 N=1；N=0/17 启动失败；第 k 份 scratch 故障注入后 database/已有 scratch 原子回滚；Start 后并发范围不可变；Stop/Start 不重复创建资源 |
+| `pipeno` | 启动成功后的合法范围、越界拒绝、同一处理 pass 的 LayerHints/Identify 使用相同 index |
+| 一致性 | 旧 `Layer()` 与 `LayerHints()` 复用同一 parser/dispatch，并在 PB 固定合法样本上产生相同层序列 |
 | 无应用识别 | `LayerHints()` 不调用 `Identify()`，不触发 Hyperscan scan |
 | checked accessor | `packet_filter.v1` 通过 offset/status checked accessor 读取 IP/端口；sidecar absent 或状态不可用时返回不可用且不重复解析 |
 | 并发 | 不同 `pipeno` 并发无串扰；range partition 不重叠；合法并行写在 TSan 下无 data race，禁止用实际同 slot 冲突制造未定义行为 |
-| 旧接口异常 | 旧 `Layer()` 对空指针、负长度、pipeno 越界、截断、畸形、layer-limit 返回约定错误；调用方不得继续 `Identify()` |
-| Sanitizer | `test_packet_data_plane` 和 `test_npi_layer` 均在 ASan / UBSan 下运行截断、畸形和构造型 corpus |
+| 旧接口兼容 | 旧 `Layer()` 的 ABI/签名、入口和返回语义保持，仓库已有可执行回归通过 |
+| Sanitizer | `test_packet_data_plane` 和 `test_npi_layer` 在 ASan / UBSan 下运行 PB 固定契约 corpus，验证 façade 与现有 NPI 的集成边界 |
 
 ### 11.6 测试目标和命令
 
 新增可自动运行的测试目标，避免继续依赖手工打印程序：
 
 - `test_packet_data_plane`：payload、view、schema、identity 和 lease 生命周期。
-- `test_npi_layer`：安全 layer parser、hints、隧道和 `pipeno`。
-- `test_framework`：补充框架枚举/接口回归并注册 CTest。
+- `test_npi_layer`：NPI 分阶段启动、checked façade、终态传播、hints 映射、固定隧道和 `pipeno`。
+- `test_framework`：插件批次生命周期、框架枚举/接口回归并注册 CTest。
 - `test_stream`：现有 Arrow stream 回归。
 - `test_scheduler_e2e`：验证 `block_stream` 在真实 block source 接入前仍返回 `BLOCK_STREAM_NOT_IMPLEMENTED`。
 - `benchmark_packet_data_plane`：记录 descriptor-only、descriptor+hints、随机单 packet 和 `Layer()` / `LayerHints()` 对照数据。
@@ -1071,26 +1123,26 @@ ctest --test-dir build \
   --output-on-failure
 ```
 
-安全解析完成后，使用项目支持的 sanitizer 构建配置额外执行 `test_npi_layer`。若当前构建系统尚无统一 sanitizer 开关，Sprint 任务必须增加最小、可重复的 ASan / UBSan 验证入口。
+façade 契约测试完成后，使用项目支持的 sanitizer 构建配置额外执行 PB 固定 `test_npi_layer` corpus。若当前构建系统尚无统一 sanitizer 开关，Sprint 任务必须增加最小、可重复的 ASan / UBSan 验证入口。
 
 ### 11.7 文件落点、测试设计与完成出口
 
 - `src/tests/test_packet_data_plane/`：payload/context/lifecycle 与 benchmark target。
-- `src/tests/test_npi_layer/`：安全 parser、hints、协议矩阵和 boundary corpus。
-- `src/tests/test_framework/`、`src/tests/test_stream/`：既有回归并补 CTest 注册。
+- `src/tests/test_npi_layer/`：NPI 分阶段启动、checked façade、终态传播、PB 固定契约 corpus、固定 VXLAN 和旧接口对照。
+- `src/tests/test_framework/`、`src/tests/test_stream/`：loader 批次生命周期、既有回归并补 CTest 注册。
 - `src/tests/test_scheduler_e2e/`：`BLOCK_STREAM_NOT_IMPLEMENTED` 生产路径门禁。
 
-所有新增测试必须进入 CTest；Scheduler 仍拒绝真实 block stream 生产，且固定 VXLAN 样本、截断/畸形、未知 LINKTYPE、layer limit 和合法 pipeno 并发均有可执行用例后，T8 才能完成。
+所有新增测试必须进入 CTest；Scheduler 仍拒绝真实 block stream 生产，且 loader 完整批次顺序/失败回滚、NPI `Concurrency -> Start/Ready`、façade/invariant、PB 基础链、固定 VXLAN、代表性终态传播、未知 LINKTYPE、layer limit、旧接口回归和合法 pipeno 并发均有可执行证据后，T8 才能完成。不新增 NPI 能力表或其他协议认证 corpus。
 
 ## 12. T9：ASan/UBSan/TSan、ABI static_assert、性能基准和 15% 回归门槛
 
 ### 12.1 设计目标与验收 ID
 
-T9 负责 C-NONFUNCTIONAL，关闭 `S19.1-A09`、`S19.2-A09`、`S19.2-A10` 的跨 Task 验证责任。T9 不替代 T1-T8 的实现和本地测试，只定义独立构建、性能对照和失败门槛。
+T9 负责 C-NONFUNCTIONAL，关闭 `S19.1-A09`、`S19.2-A09`、`S19.2-A10` 的跨 Task 验证责任。T9 不替代 T0-T8 的实现和本地测试，只定义独立构建、性能对照和失败门槛。
 
 ### 12.2 公共依赖
 
-T9 消费 T0-T8 的 ABI、测试目标和构造型 corpus。ASan/UBSan 与 TSan 必须使用独立 build directory；benchmark 必须使用固定 release 构建和固定 batch size。
+T9 消费 T0-T8 的生命周期、ABI、测试目标和构造型 corpus。NPI 性能与 Sanitizer 门禁只使用 PB 固定契约 corpus，不扩展为协议能力认证。ASan/UBSan 与 TSan 必须使用独立 build directory；benchmark 必须使用固定 release 构建和固定 batch size。ASan/UBSan 必须运行 `test_framework` 的 loader 阶段失败/handle 回滚用例；所有 NPI 验证必须先按 T0/T5 顺序完成批次启动，不能绕过 `StartAll()` 直接调用业务接口。
 
 ### 12.3 性能验收
 
@@ -1107,9 +1159,9 @@ T9 消费 T0-T8 的 ABI、测试目标和构造型 corpus。ASan/UBSan 与 TSan 
 - `LayerHints()` 每包零 heap allocation、零锁。
 - 不出现局部 `protocol::Layers` 到 sidecar 的 64 字节复制。
 - 不对未使用的 15 层槽位做无条件清零。
-- 派生字段不触发第二次 layer 数组扫描。
+- 派生字段只触发一次最多 15 层的顺序后处理，不重复解析 packet。
 - 记录混合 AoS + sidecar 在 3 种访问模式下的 cache / throughput 差异，为后续优化提供证据。
-- 在相同安全解析核心和相同 corpus 下，`LayerHints()` 的 cycles/packet 相对安全 `Layer()` 不得回退超过 15%；若超过，必须记录具体 cache / 派生字段成本并在 Sprint Review 明确豁免，不得无证据验收。
+- 在相同 PB 固定合法契约 corpus 下，`LayerHints()` 的 cycles/packet 相对现有 `Layer()` 不得回退超过 15%；该对照量化 checked façade、必要终态和派生字段的增量成本。超过门槛即判定 T9 失败。
 
 基准目标名固定为 `benchmark_packet_data_plane`，由 `src/tests/test_packet_data_plane/benchmark_packet_data_plane.cpp` 提供。T9 必须使回归超过 15% 或零分配/零锁约束失败时返回非零状态，并保存 batch size 64/512/4096 的中位数结果。
 
@@ -1121,6 +1173,7 @@ ABI static_assert、sanitizer、TSan、benchmark 和 15% cycles/packet 回归规
 - `PacketDescriptor` 是 standard-layout、trivially-copyable，并满足 T3 冻结的 alignment、`sizeof` 和关键字段 offset。
 - `PacketLayerHints` 是 trivially-copyable，并满足 T5 冻结的 layout、`sizeof` 和关键字段 offset。
 - 虚函数签名变化对应新 IID；旧 IID 的加载测试必须失败。
+- NPI N=2 的两个 `pipeno` 仅在 `Start()/Ready()` 成功后并发执行，TSan 期间不得调用 `Concurrency()` 或重新创建 scratch。
 
 任何 static_assert 编译失败或旧 IID 仍被宿主接受都阻止 T9 完成。
 
@@ -1131,6 +1184,7 @@ ABI static_assert、sanitizer、TSan、benchmark 和 15% cycles/packet 回归规
 - `src/tests/test_packet_data_plane/benchmark_packet_data_plane.cpp`：固定 corpus、3 种访问模式、`Layer()` / `LayerHints()` 对照、allocation/lock 计数和非零失败退出。
 - `src/tests/test_packet_data_plane/CMakeLists.txt`：注册 `benchmark_packet_data_plane`，但不把耗时基准混入默认单元测试。
 - `src/common/network/layers.h`、`packet_layer_hints.h`、`src/framework/core/packet_batch.h`：放置紧邻 public type 的 ABI static_assert，或由专用 ABI 测试统一引用检查。
+- `src/tests/test_framework/`：在 ASan/UBSan 下执行 loader 阶段失败、IID 截断、handle 关闭和重新加载用例。
 - `src/tests/test_packet_data_plane/`、`src/tests/test_npi_layer/`：复用 T8 的构造型 corpus 执行 ASan/UBSan 和 TSan，不另建一套测试数据。
 
 Release 性能验证固定执行：
@@ -1148,9 +1202,9 @@ cmake -B build-asan-ubsan src -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
-cmake --build build-asan-ubsan -j$(nproc) --target test_packet_data_plane test_npi_layer
+cmake --build build-asan-ubsan -j$(nproc) --target test_framework test_packet_data_plane test_npi_layer
 ctest --test-dir build-asan-ubsan \
-  -R "test_packet_data_plane|test_npi_layer" --output-on-failure
+  -R "test_framework|test_packet_data_plane|test_npi_layer" --output-on-failure
 
 cmake -B build-tsan src -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
@@ -1161,17 +1215,17 @@ ctest --test-dir build-tsan \
   -R "test_packet_data_plane|test_npi_layer" --output-on-failure
 ```
 
-T9 只能在 T1-T8 的功能测试和 CTest target 已存在后运行。任一命令非零退出、任一 ASan/UBSan/TSan 报告、cycles/packet 回退超过 15%、每包出现 heap allocation 或锁竞争都判定失败；不得以仅记录数据代替门禁。ABI assertion、三类独立构建和 batch size 64/512/4096 的中位数证据均按 T10 格式记录后，T9 才能完成。
+T9 只能在 T0-T8 的功能测试和 CTest target 已存在后运行。任一命令非零退出、任一 ASan/UBSan/TSan 报告、cycles/packet 回退超过 15%、每包出现 heap allocation 或锁竞争都判定失败；不得以仅记录数据代替门禁。ABI assertion、三类独立构建和 batch size 64/512/4096 的中位数证据均按 T10 格式记录后，T9 才能完成。
 
 ## 13. T10：验收证据、文档同步和 Sprint 收口
 
 ### 13.1 设计目标与责任边界
 
-T10 负责把已定义的实现和验证结果整理为可复核证据，关闭文档同步门禁。它不替代任何 T1-T9 的实现或测试责任；如果 T10 需要新增证据格式、自动检查规则或验收门槛，必须先在本章冻结。
+T10 负责把已定义的实现和验证结果整理为可复核证据，关闭文档同步门禁。它不替代任何 T0-T9 的实现或测试责任；如果 T10 需要新增证据格式、自动检查规则或验收门槛，必须先在本章冻结。
 
 ### 13.2 对应验收 ID 与公共依赖
 
-T10 没有独立验收 ID，只汇总 `S19.1-A01..A09` 和 `S19.2-A01..A11` 的既有证据。它消费 T8 的 C-TEST、T9 的 C-NONFUNCTIONAL、T1-T9 各 Task 的实现/测试落点以及 planning 的 Task 状态，不得修改已冻结契约或用文档勾选替代失败验证。
+T10 没有独立验收 ID，只汇总 `S19.1-A01..A09` 和 `S19.2-A01..A11` 的既有证据。它消费 T8 的 C-TEST、T9 的 C-NONFUNCTIONAL、T0-T9 各 Task 的实现/测试落点以及 planning 的 Task 状态，不得修改已冻结契约或用文档勾选替代失败验证。
 
 ### 13.3 验收证据格式
 
@@ -1200,17 +1254,17 @@ evidence: <summary or artifact path>
 | S19.1-A06 | 19.1 | 强类型批级 sidecar、PImpl、present/absent 和发布后只读 | T3 §6.6.2、T7 §10.3-10.7 |
 | S19.1-A07 | 19.1 | `BlockLease` move-only、exactly-once release、Cancel/Close、owner queue | T2 §5.3-5.4 |
 | S19.1-A08 | 19.1 | 构造型 block source / operator 闭环，Scheduler 生产门禁保持 | T2 §5.1、T8 §11.3-11.7 |
-| S19.1-A09 | 19.1 | CTest、异常/并发/ABI/生命周期回归和 sanitizer 入口 | T0 §3.3-3.5、T8 §11.4-11.7、T9 §12.3-12.5 |
-| S19.2-A01 | 19.2 | 直接复用 `eLayer` / `protocol::Layers`，结构体布局和 helper 安全收口 | T5 §8.3、T6 §9.5 |
+| S19.1-A09 | 19.1 | 插件批次生命周期、CTest、异常/并发/ABI 回归和 sanitizer 入口 | T0 §3.3-3.7、T8 §11.4-11.7、T9 §12.3-12.5 |
+| S19.2-A01 | 19.2 | 直接复用 `eLayer` / `protocol::Layers`，结构体布局、checked helper 和输出 invariant 收口 | T5 §8.3、T6 §9.5-9.6 |
 | S19.2-A02 | 19.2 | 单一 `PacketParseStatus` 终态和字段 present/absent 语义 | T5 §8.3-8.5、T7 §10.3 |
-| S19.2-A03 | 19.2 | 最内层 L2/L3/L4、IANA L4、IP version、VLAN/tunnel depth | T5 §8.4、T6 §9.5-9.6 |
+| S19.2-A03 | 19.2 | 最内层 L2/L3/L4、IANA L4、IP version、VLAN/tunnel depth 映射 | T5 §8.4、T6 §9.5-9.6 |
 | S19.2-A04 | 19.2 | `LayerHints(pipeno, packet, cap_len, link_type, hints)` 与 NPI `IID_PROTOCOL` 边界 | T5 §8.6-8.7 |
-| S19.2-A05 | 19.2 | 安全 parser step、父协议 `next_limit`、checked add 和全支持矩阵 | T6 §9.4-9.5 |
-| S19.2-A06 | 19.2 | Ethernet、VLAN/QinQ、IPv4/IPv6、扩展头、TCP/UDP/SCTP、GRE/VXLAN/GPE/GENEVE/L2TP/GTP、IP-in-IP | T6 §9.5-9.6 |
+| S19.2-A05 | 19.2 | façade 参数校验、canonical 初始化、错误码/packet 终态分离和输出 invariant | T6 §9.4-9.6 |
+| S19.2-A06 | 19.2 | 现有 NPI parser/dispatch 可信复用、不做协议语义改造，PB 固定合法样本与旧 `Layer()` 一致 | T6 §9.3、T6 §9.6 |
 | S19.2-A07 | 19.2 | 构造型固定 VXLAN 隧道样本，最内层 offset 和 `tunnel_depth=1` | T8 §11.3-11.7 |
-| S19.2-A08 | 19.2 | 截断、畸形、unknown LINKTYPE、层数限制、旧 Layer 错误语义 | T6 §9.7、T8 §11.5-11.7 |
+| S19.2-A08 | 19.2 | 必要 NPI 终态传播、unknown LINKTYPE 和层数限制；旧 `Layer()` ABI/签名、入口及仓库已有回归保持 | T6 §9.4-9.6、T8 §11.5-11.7 |
 | S19.2-A09 | 19.2 | 原位预分配 sidecar、零分配/零锁、AoS+sidecar cache 基准和回归预算 | T7 §10.3-10.7、T9 §12.3-12.5 |
-| S19.2-A10 | 19.2 | 不调用 `Identify()` / Hyperscan，合法 pipeno 并发无串扰 | T5 §8.6-8.8、T8 §11.5、T9 §12.3-12.5 |
+| S19.2-A10 | 19.2 | 批次启动、`Concurrency(N) -> Start/Ready`、pipeno 亲和和不同 pipeno 并发无串扰 | T0 §3.3-3.7、T5 §8.6-8.8、T8 §11.5-11.7、T9 §12.3-12.5 |
 | S19.2-A11 | 19.2 | hints 供 NPM / `packet_filter.v1` checked accessor 复用，不重复解析 | T5 §8.4、T7 §10.3-10.7 |
 
 ### 13.5 Backlog 验收映射
@@ -1222,26 +1276,28 @@ evidence: <summary or artifact path>
 | `packet.v1` 字段与版本 | T4 | schema / Arrow metadata 测试 |
 | `PacketBatchView` 与 buffer 引用 | T2、T3 | 构造、访问和 lease 生命周期 |
 | schema / context 扩展策略 | T3、T4、T7 | major/minor 和 sidecar present/absent |
+| NPI adapter 可被实时来源复用 | T0、T5、T7 | 完整批次启动、worker 数冻结和输入契约测试 |
+| 现有 NPI 作为可信分层依赖 | T6 | 复用同一 parser map/dispatch，旧 `Layer()` 回归保持 |
 | `protocol::Layers` 映射 | T5、T6 | layer sequence / offset 断言 |
 | 最内层 L2/L3/L4 与 IP/L4 字段 | T5、T6 | 基础链和 VXLAN 样本 |
-| VLAN / tunnel depth | T5、T6、T8 | QinQ 和固定 VXLAN 样本 |
+| VLAN / tunnel depth | T5、T6、T8 | 单层 VLAN 和固定 VXLAN 样本 |
 | packet context 复用 | T3、T7 | sidecar 对齐和只读发布 |
-| classifier 与来源解耦 | T5、T6 | 构造型 packet 和 LINKTYPE 测试 |
+| checked façade 与来源解耦 | T5、T6 | 构造型 packet 和 LINKTYPE 测试 |
 | 不调用应用层识别 | T5、T8 | Hyperscan 不被调用 |
-| 截断、畸形、层数超限安全 | T6、T8、T9 | 边界测试和 sanitizer |
+| 必要终态与 Layers 输出收口 | T6、T8、T9 | 固定契约、output invariant 和 sanitizer 测试 |
 | DPDK / AF_XDP 可复用 | T4、T5、T6 | 输入仅 packet/cap_len/link_type |
 | 至少一种隧道样本 | T8 | VXLAN 完整链断言 |
 | `packet_filter.v1` IP/端口结构输入 | T5、T7 | checked accessor 状态和边界测试 |
 
 ### 13.6 设计门禁与文档同步
 
-`planning.md` 已于 2026-07-23 按本设计完成同步：
+`planning.md` 已于 2026-07-25 按本设计完成同步：
 
-1. Story 19.2 按完整 Story 规划，包含 tunnel depth、完整支持矩阵和固定隧道样本。
+1. Story 19.2 按 PB 完整 Story 规划，信任并复用现有 NPI parser/dispatch，只建设 checked `LayerHints()` façade、必要终态传播、PacketLayerHints 映射、PB 固定契约样本和固定 VXLAN 隧道样本。
 2. T0-T10 已按 planning 的 ID、名称和顺序建立设计章节，并绑定验收 ID、主要文件和测试目标。
-3. Scheduler 范围、ABI 迁移、CTest、Sanitizer、TSan 和性能门槛均已纳入计划。
+3. 插件完整批次生命周期、NPI 分阶段初始化、Scheduler 范围、ABI 迁移、CTest、Sanitizer、TSan 和性能门槛均已纳入计划。
 4. “可运行骨架”仅指构造型进程内闭环，Scheduler 生产装配明确延期。
-5. 当前估算为 17.5 PD，评估区间为 16-20 PD。
+5. 当前估算为 17.9 PD，评估区间为 17-21 PD。
 
 后续任何设计变化必须在同一次变更中同步更新：
 
@@ -1252,8 +1308,9 @@ evidence: <summary or artifact path>
 实现完成的 Definition of Done：
 
 - Story 19.1 和完整 Story 19.2 的验收映射全部闭合。
+- 插件批次严格满足 R/O/L/C/S 顺序，失败的 `Start()` 自行回到 stopped；NPI scratch 在业务线程启动前按冻结的 N 原子创建，失败路径无悬挂 IID、database、scratch 或已启动 worker。
 - 新增测试进入 CTest，验证命令实际执行对应二进制。
-- 安全解析边界在 ASan / UBSan 下无越界和未定义行为。
+- checked façade 与现有 NPI 在 PB 固定契约 corpus 下通过 ASan / UBSan，且终态和输出 invariant 符合约定。
 - public ABI、接口 IID、框架文档、Sprint 计划和产品待办同步更新。
 - 性能基准记录 3 种 sidecar 访问模式及原位 `LayerHints()` 路径。
 
@@ -1263,4 +1320,4 @@ evidence: <summary or artifact path>
 - `tasks/product_backlog.md`：仅在 Story 验收完成后更新状态。
 - `review.md`：记录每个 acceptance ID 的实现、命令、结果和证据。
 
-T10 只有在 T1-T9 全部完成、20 个验收 ID 均有实现与可执行证据、文档无范围漂移且 Backlog 状态同步后才能完成。
+T10 只有在 T0-T9 全部完成、20 个验收 ID 均有实现与可执行证据、文档无范围漂移且 Backlog 状态同步后才能完成。

@@ -1554,15 +1554,15 @@
 **状态**: 📋 待规划
 **价值**: 将分层识别结果写入 packet 上下文，使下游 NPM 可以复用统一层信息，同时为 Epic 22 的 `packet_filter.v1` 提供结构层过滤输入，避免 NPM 和 packet filter 在热路径重复解析 packet
 **验收标准**:
-- 盘点 `src/plugins/npi` 现有 `NetworkLayer::Layer()` / `protocol::Layers` 能力，明确其可解析的层级与封装范围，包括 Ethernet、VLAN、PPPoE、PPP、MPLS、IPv4 / IPv6、IPv6 扩展头、TCP、UDP、SCTP、GRE、VXLAN / VXLAN_GPE、GENEVE、L2TP、GTP 等
+- 将 `src/plugins/npi` 现有 `NetworkLayer::Layer()`、parser/dispatch 和 `protocol::Layers` 视为完整可用的基础分层能力；本 Story 直接复用，不重新盘点、认证或建设逐协议支持矩阵，也不引入第二套 layer parser
 - 定义 `PacketLayerHints` 与 `protocol::Layers` 的映射关系，至少包含 layer count、layer type 数组、layer offset 数组、payload offset、top layer，以及派生的 L2 / L3 / L4 offset、IP version、L4 protocol、VLAN depth 和 tunnel depth
 - `PacketLayerHints` 必须写入 `PacketBatchView` 或等价 packet 上下文，作为下游 NPM Core 的可复用输入；NPM 可以基于 hints 快速定位 L3 / L4 / payload，但仍保留必要校验能力
 - `PacketLayerHints` 必须作为 `packet_filter.v1` 结构层过滤的输入，支撑 IP、端口、L4 protocol、VLAN、tunnel depth、parse status 等过滤条件，不要求执行应用层协议识别
 - 提供轻量 adapter / classifier，使 `pcapfile`、DPDK、AF_XDP 等 packet 通道可以填充统一 layer hints；该 adapter 只消费 packet 指针、`cap_len` 和 `link_type`，不依赖 pcapfile 文件状态、buffer 生命周期或 wall-clock 时间
 - 本 Story 只复用 / 提炼 NPI 的分层识别能力，不调用 `IProtocol::Identify()`，不加载应用层协议规则，不输出 HTTP / TLS / DNS 等应用层协议结果；应用层协议识别仍归属 Epic 20 或后续 NPI 算子
-- 对截断包和异常包提供安全保护：header length 不合法、offset 超出 `cap_len`、layer 数量超过上限或无法继续解析时，必须标记 `parse_status` / `truncated` / `malformed`，不得发生越界访问
+- 在复用现有 NPI parser/dispatch 的前提下增加轻量 checked façade 和解析终态传播：接口负责参数、固定最小头长度、consumed offset、`cap_len`、layer count、payload offset 和 LINKTYPE 边界；必要的 NPI 改动仅限于让现有解析路径暴露 `parse_status` / `truncated` / `malformed` 等结果，不进行完整 parser 重构或逐协议安全加固
 - 适配接口必须可被后续 DPDK / AF_XDP 通道复用，保证实时采集与 `pcapfile` 对同一 packet 产生一致的 layer hints
-- 提供固定 packet 样本或构造型单元测试，覆盖 Ethernet + IPv4 + TCP、VLAN + IPv4 + UDP、IPv6 + TCP、截断包和至少一种隧道封装样本
+- 提供最低契约所需的固定 packet 样本或构造型单元测试，覆盖 Ethernet + IPv4 + TCP、VLAN + IPv4 + UDP、IPv6 + TCP、截断包和至少一种隧道封装样本；这些样本用于验证 façade、终态传播和上下文映射，不用于重新认证 NPI 的完整协议能力
 
 ---
 
