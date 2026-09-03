@@ -47,6 +47,7 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/plugins/baseline ${CMAKE_BINARY_DIR}/baseli
 
 # Stage 1: 框架核心
 add_subdirectory(${CMAKE_SOURCE_DIR}/framework ${CMAKE_BINARY_DIR}/framework)
+add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_packet_contract ${CMAKE_BINARY_DIR}/test_packet_contract)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_framework ${CMAKE_BINARY_DIR}/test_framework)
 
 # Stage 2: C++ ↔ Python 桥接

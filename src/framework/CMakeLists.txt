@@ -18,6 +18,7 @@ add_library(${PROJECT_NAME} SHARED
     core/fan_out_stream_channel.cpp
     core/json_error_builder.cpp
     core/memory_channel.cpp
+    core/packet_codec.cpp
     core/ring_stream_channel.cpp
     core/scheduler_control_client.cpp
     core/sql_text_splitter.cpp

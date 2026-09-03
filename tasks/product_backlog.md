@@ -10,6 +10,19 @@
 
 | 状态 | Feature | 优先级 | 目标 | 规格 |
 | --- | --- | --- | --- | --- |
+| [x] | NPM 数据包契约与解析基础 (`npm-packet-contract`) | P0 | 定义统一的 packet 数据实体、采集元数据、Arrow Schema 及截断/畸形报文语义，并复用现有 NPI 分层与协议识别能力。 | [归档](archive/feat-npm-packet-contract.md) |
+| [ ] | NPM 离线数据包全量导入 (`npm-offline-import`) | P0 | 提供 pcap/pcapng 文件的有限流读取与回放，保留原始时间戳、捕获长度、线速长度和报文顺序，接入现有流批任务运行时。 | 待创建 |
+| [ ] | NPM 离线导入过滤 (`npm-offline-filter`) | P0 | 支持离线文件按时间、MAC、IP、端口、协议、应用等条件过滤导入，并明确过滤下推能力、不可下推条件和异常处理语义。 | 待创建 |
+| [ ] | NPM 基础分析算子 (`npm-basic-analysis`) | P0 | 实现 `npm.basic`，将 packet 转换为可编排的标准化包级/流级事实数据，提供协议、方向和基础流量指标。 | 待创建 |
+| [ ] | NPM TCP/UDP 会话性能分析 (`npm-session-analysis`) | P1 | 基于五元组构建 TCP/UDP 会话状态，产出连接、时延、重传、吞吐、丢包和会话超时等网络性能指标。 | 待创建 |
+| [ ] | NPM 应用协议分析 (`npm-protocol-analysis`) | P1 | 在协议识别基础上增加 DNS、HTTP、TLS、ICMP 等应用/事务实体解析，统一输出可查询的协议分析结果。 | 待创建 |
+| [ ] | NPM 结果存储与查询 (`npm-result-query`) | P1 | 将 packet、flow、session、protocol 等结果写入现有存储/数据库通道，支持按时间、地址、协议和时间粒度查询。 | 待创建 |
+| [ ] | NPM 实时采集通道抽象 (`npm-capture-contract`) | P1 | 定义实时抓包源的配置、生命周期、时间戳、零拷贝边界、丢包/背压和运行统计契约，作为不同采集后端的共同接口。 | 待创建 |
+| [ ] | NPM Linux 实时采集后端 (`npm-linux-capture-backends`) | P1 | 在统一采集契约下提供 AF_PACKET、PF_RING Classic、AF_XDP copy/generic-SKB 三种后端，统一配置、生命周期、过滤、时间戳和丢包/吞吐统计；不包含 PF_RING ZC 与 AF_XDP native zero-copy。 | 待创建 |
+| [ ] | NPM AF_XDP Native Zero-Copy (`npm-af-xdp-native-zerocopy`) | P2 | 提供 native XDP + AF_XDP zero-copy 能力，覆盖驱动/内核能力探测、队列与 RSS、UMEM、显式降级策略和硬件性能验证。 | 待创建 |
+| [ ] | NPM DPDK 运行环境与设备管理 (`npm-dpdk-runtime`) | P2 | 提供 DPDK EAL、hugepage、PCI/VFIO、NUMA、核心绑定、设备发现、能力探测和启动诊断；不包含 NPM 分析和跨进程数据面。 | 待创建 |
+| [ ] | NPM DPDK 单进程采集 (`npm-dpdk-capture`) | P2 | 基于 DPDK PMD 实现端口/队列、mempool、rte_mbuf、RX burst、时间戳、背压/丢包统计，并接入统一采集契约；暂不包含 Primary/Secondary。 | 待创建 |
+| [ ] | NPM DPDK 跨进程零拷贝接入 (`npm-dpdk-cross-process`) | P2 | 实现 DPDK Primary/Secondary、共享 mempool/ring、mbuf 所有权回收、Scheduler/NPM 服务接入以及重启清理语义。 | 待创建 |
 | [ ] | 流式历史补算 (`stream-recompute`) | P2 | 对已落地存储按时间窗口或条件执行可幂等的批处理补算，不在流式数据面实现回放。 | [规格](specs/feat-stream-recompute.md) |
 
 ---
