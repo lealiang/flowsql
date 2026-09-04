@@ -38,6 +38,7 @@ add_dependencies(${PROJECT_NAME}
     flowsql_catalog
     flowsql_scheduler
     flowsql_database
+    flowsql_pcapfile
     flowsql_stream
     flowsql_web
 )

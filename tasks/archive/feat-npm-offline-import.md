@@ -1,6 +1,6 @@
 # Feature: NPM 离线数据包全量导入
 
-状态：`[-]` 进行中
+状态：`[x]` 已完成
 优先级：P0
 
 ## 业务意图
@@ -308,14 +308,14 @@ LINKTYPE 支持的 packet 调用一次 `IProtocol::Layer()`，由 `src/channels/
   - `[x]` T4.3：解除 `BLOCK_STREAM_NOT_IMPLEMENTED`，接入现有 `IBlockStreamOperator::OnSchemaReady()`。
   - `[x]` T4.4：接入 `ProcessBlock()`、`kTimeout`/`kEof`/`kCancelled`/`kError` 事件和 `ReleaseBlock()`。
   - `[x]` T4.5：补齐成功、主动停止、异常、取消和 operator 错误路径的任务终态传播。
-- `[ ]` T5：测试与工程闭环（每个切片 10～30 分钟）：
-  - `[ ]` T5.1：补齐 classic pcap/pcapng 格式、字段、顺序、时间量化和结构错误 fixture。
-  - `[ ]` T5.2：补齐 layer decode 调用次数、unsupported/truncated/malformed 和 raw bytes 保留测试。
-  - `[ ]` T5.3：补齐 EOF、错误、replay、cancel、背压、ReleaseBlock exactly-once、owner 生命周期和 active channel `EBUSY` 测试。
-  - `[ ]` T5.4：补齐多 provider IID 发现、冲突和 manager 路由测试。
-  - `[ ]` T5.5：补齐 Scheduler E2E 测试和 block source 终态断言。
-  - `[ ]` T5.6：注册 CTest、执行标准 CMake 构建并修复编译/测试失败。
-  - `[ ]` T5.7：执行既有 stream/framework/scheduler 回归并完成 diff 检查。
+- `[x]` T5：测试与工程闭环（每个切片 10～30 分钟）：
+  - `[x]` T5.1：补齐 classic pcap/pcapng 格式、字段、顺序、时间量化和结构错误 fixture。
+  - `[x]` T5.2：补齐 layer decode 调用次数、unsupported/truncated/malformed 和 raw bytes 保留测试。
+  - `[x]` T5.3：补齐 EOF、错误、replay、cancel、背压、ReleaseBlock exactly-once、owner 生命周期和 active channel `EBUSY` 测试。
+  - `[x]` T5.4：补齐多 provider IID 发现、冲突和 manager 路由测试。
+  - `[x]` T5.5：补齐 Scheduler E2E 测试和 block source 终态断言。
+  - `[x]` T5.6：注册 CTest、执行标准 CMake 构建并修复编译/测试失败。
+  - `[x]` T5.7：执行既有 stream/framework/scheduler 回归并完成 diff 检查。
 
 ## 实施进度与范围偏差
 

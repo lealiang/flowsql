@@ -1,64 +1,66 @@
 # Active Task
 
-Feature：`npm-offline-import`
-原子任务：T4.5 block 执行终态与 batch 快照传播
+Feature：`npm-offline-import-web`
+原子任务：T0.1 控制面/数据面与部署依赖规格修订
 状态：已完成
 
 ## 业务意图
 
-- 让 block operator 的成功、主动停止、source 取消、异常和 operator 错误形成明确内部终态。
-- 将 completed/stopped/cancelled 结果写入 `HandleExecute()` JSON，并让现有 `SchedulerBatchRuntime` 写入对应任务快照。
-- 让 operator 异常和错误稳定进入 failed 快照，不能在 release 后继续轮询并误报成功。
+- 按 `docs/framework.md` 与现有代码实现复核 `npm-offline-import-web` 规格，使浏览器上传、服务间控制请求、
+  Scheduler 数据消费三段链路明确落在各自架构平面。
+- 补齐会阻断生产闭环的 NPI provider、协议定义文件、插件批次生命周期、共享绝对路径和受管文件所有权契约，
+  作为后续 Contract/Test First 的实施边界。
 
 ## Non-Goals
 
-- 不修改 T4.1～T4.4 的 provider/manager 路由、schema 门禁、poll 事件或 exactly-once release 契约。
-- 不修改 pcapfile provider、reader、replay、背压实现、公共 block ABI 或公共 HTTP 接口。
-- 不重构 `SchedulerBatchRuntime::ExecuteSqlFn`，不为运行中的同步 SQL 新增抢占式 RequestStop 取消令牌；本任务的 cancelled 来自 source `kCancelled` 事件。
-- 不支持多 block source、多 block operator 或 Arrow/block 混合链路，不开始 T5 全量回归。
+- 不修改 PluginLoader、Web、Scheduler、pcapfile、NPI、Router、部署配置、前端或测试代码。
+- 不实现上传、删除、路径脱敏、插件生命周期修复或 T1～T5 中任一生产功能。
+- 不改变任何公共 C++ ABI、packet Schema 或现有 HTTP 路由实现。
+- 不重新打开已归档并按原 Non-Goals 完成的 `npm-offline-import` Feature。
+- 不执行 `git commit`/`git push`。
 
 ## 边界
 
-- `ExecuteBlockOperator()` 使用私有内部终态：EOF + Flush 成功为 completed，`ProcessBlock()==1` + Flush 成功为 stopped，source `kCancelled` 为 cancelled，其余非零/异常为 failed。
-- `ProcessBlock()` 返回 0 才继续，1 为主动停止，负数或大于 1 的非法正数均为 failed；抛异常转换为 `EFAULT` failed。
-- data batch 无论 operator 成功、主动停止、返回错误或抛异常，仍先执行 T4.4 冻结的 exactly-once `ReleaseBlock()`。
-- block route 的成功 JSON 使用 `status=completed|stopped|cancelled`；failed 继续使用现有 `OP_EXEC_FAIL`、`error_stage=execute` 错误 JSON。
-- batch runtime 对 successful execute JSON 中的 stopped/cancelled 立即形成对应终态；completed 保持现有完成路径，failed 保持现有错误解析路径。
+- 上传路由只绑定 WebServer 对外监听的 `httplib::Server`（默认 8081），不得通过 `EnumApiRoutes()` 注册到
+  RouterAgency（默认 18802）；capture 文件内容只终止于 Web 北向入口。
+- Web 只通过现有 HTTP URI 向 Scheduler 发送小型通道 JSON；packet 运行时数据继续使用
+  `IBlockStreamChannel`/Arrow batch，不经过 HTTP。
+- `pcap_upload_dir` 必须在启动时解析为绝对规范路径；Web 与 Scheduler 在单进程、Guardian 和 Docker
+  部署中必须看到相同绝对目录，禁止依赖当前工作目录碰巧一致。
+- Web 的受管文件存储拥有 `.part`、最终文件、失败回滚和安全删除生命周期；`PcapFileChannel` 只拥有打开的
+  文件句柄及读取/batch 状态，不主动删除文件。
+- 生产闭环必须同时部署 NPI provider、`protocols.yml` 和有效 `ldfile`，再加载 pcapfile provider；
+  PluginLoader 必须先满足“所有 Option → 所有 Load → 所有 Start”且任意非零生命周期返回值均失败。
 
 ## 允许修改的文件
 
-- `tasks/active_task.md`：冻结 T4.5 边界并记录状态和验收证据。
-- `tasks/specs/feat-npm-offline-import.md`：仅在验收通过后勾选 T4.5，并在 T4.1～T4.5 均完成时勾选 T4 父任务。
-- `src/services/scheduler/scheduler_plugin.h`：仅增加私有 block 执行终态及 helper 输出参数。
-- `src/services/scheduler/scheduler_stream_executor.cpp`：仅生成 block completed/stopped/cancelled/failed 内部终态并修正异常/非法正返回值。
-- `src/services/scheduler/scheduler_routes.cpp`：仅把 block completed/stopped/cancelled 写入同步执行 JSON。
-- `src/services/scheduler/scheduler_batch_runtime.cpp`：仅解析执行结果 status 并写入 stopped/cancelled batch 快照。
-- `src/tests/test_scheduler_e2e/test_scheduler_mutation_guard.cpp`：仅补 T4.5 同步结果和异步 batch 快照断言。
-
-开始本任务前已有且必须保留、不再修改的基线 diff：`AGENTS.md` 以及 T4.1～T4.4 涉及的
-`scheduler_plugin.h`、`scheduler_channel_admin.cpp`、`scheduler_routes.cpp`、
-`scheduler_stream_executor.cpp`、`test_scheduler_mutation_guard.cpp` 和 Feature 文档改动。
+- `tasks/active_task.md`：冻结并记录本次文档原子任务状态。
+- `tasks/specs/feat-npm-offline-import-web.md`：修订精益规格和任务/测试锚点。
 
 ## 验收
 
-- 同步 block route 的 EOF 成功、主动停止和 source 取消分别返回 completed、stopped、cancelled；异常和 operator 错误返回 `OP_EXEC_FAIL/execute`。
-- batch runtime 快照对上述路径分别为 completed、stopped、cancelled、failed、failed，且都有完成时间。
-- `ProcessBlock()` 抛异常或返回错误时，当前 data batch 恰好 release 一次，后续 batch 不再轮询。
-- 主动停止仍执行一次 `Flush()`；cancelled、异常和 operator 错误不执行 `Flush()`。
-- 定向命令：`cmake --build build --target test_scheduler_mutation_guard -j2`，随后运行 `build/output/test_scheduler_mutation_guard`。
-- 完成后执行 `git diff HEAD --check`；不运行 T5 或无关回归。
+- 规格明确给出北向上传入口、服务间控制面和 Arrow 数据面的归类，禁止文件请求进入 RouterAgency。
+- 规格冻结相同绝对共享目录，以及 Web 受管文件存储与 `PcapFileChannel` 的所有权和删除顺序。
+- 规格将 NPI provider、可部署 `protocols.yml`、有效 `ldfile` 和 pcapfile provider 纳入正式部署验收。
+- 规格将 PluginLoader 批次生命周期与“任意非零返回即失败”列为 P1 前置修复，并有顺序无关/失败阻断测试锚点。
+- Web 对外列表和上传响应不暴露 `options.path`，Scheduler 内部控制 JSON 仍保留真实绝对路径。
+- `git diff HEAD --check` 通过；本任务新增 patch 只落在两个允许文件。
+
+## 验收结果
+
+- 已按 `docs/framework.md` 和当前实现复核并冻结北向上传入口、HTTP 控制面、进程内 IID 调用及 Arrow
+  数据面边界；上传路由明确不得注册到 RouterAgency。
+- 已明确 Web `ManagedCaptureStore` 与 `PcapFileChannel` 的所有权边界、删除顺序、外部路径脱敏和三类部署的
+  相同绝对目录要求。
+- 已将 NPI provider、可部署 `protocols.yml`、有效 `ldfile`、pcapfile provider 及 PluginLoader P1 修复
+  纳入 T1～T5 任务和机器可执行测试锚点。
+- `git diff HEAD --check` 通过；新规格另以
+  `git diff --no-index --check /dev/null tasks/specs/feat-npm-offline-import-web.md` 检查，无空白错误输出。
+- 本任务只修改 `tasks/active_task.md` 和 `tasks/specs/feat-npm-offline-import-web.md`，未开始 T1 或生产代码修复。
 
 ## 时间盒与停止条件
 
-- 时间盒：30 分钟。
-- 只完成 T4.5 的 block 终态与现有 batch snapshot 传播；达到验收条件后勾选 T4.5/T4 并停止。
-- 若必须扩展公共 ABI 或重构 RequestStop/执行回调才能满足 source 事件终态，则记录具体阻塞并停止，不吸收 T5。
-
-## 验收证据
-
-- `cmake --build build --target test_scheduler_mutation_guard -j2`：通过。
-- `build/output/test_scheduler_mutation_guard`：通过，输出
-  `=== Scheduler mutation guard tests passed ===`。
-- `git diff HEAD --check`：通过，无输出。
-- 环境未提供 `clang-format`/`git-clang-format`；新增 C++ 行已人工检查，未超过 120 列。
-- T4.5 与 T4 已勾选完成；未开始 T5。
+- 时间盒：20 分钟。
+- 规格修订、diff 边界检查和文档自检完成后，把本工作台标记为已完成并立即停止，不开始 T1 或生产修复。
+- 若复核发现必须改变现有 `pcapfile` ABI、通过 Router 传输文件或实现跨主机文件复制才能满足主链路，
+  以“被明确问题阻塞”停止。

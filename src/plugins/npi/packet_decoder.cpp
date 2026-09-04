@@ -424,6 +424,14 @@ packet::PacketLayerInfo NpiPacketLayerDecoder::Decode(const packet::PacketView& 
         result.payload_offset = parsed.layers[network_index + 1].offset;
         if (result.payload_offset > packet_view.meta.captured_len) MarkTruncated(&result);
     }
+    for (uint8_t index = 0; index < result.layer_count; ++index) {
+        if (result.layers[index].offset > packet_view.meta.captured_len) {
+            result.layers[index].offset = packet_view.meta.captured_len;
+        }
+    }
+    if (result.payload_offset > packet_view.meta.captured_len) {
+        result.payload_offset = packet_view.meta.captured_len;
+    }
     return result;
 }
 

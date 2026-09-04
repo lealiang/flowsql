@@ -76,10 +76,12 @@ class TraversalBlockFactory final : public IBlockStreamFactory {
     explicit TraversalBlockFactory(int id) : id(id) {}
 
     IBlockStreamChannel* Get(const char* requested_type, const char* requested_name) override {
+        ++get_calls;
         if (!channel || !requested_type || !requested_name) return nullptr;
         return type == requested_type && name == requested_name ? channel : nullptr;
     }
     void List(std::function<void(const char*, const char*, IBlockStreamChannel*)> callback) override {
+        ++list_calls;
         if (channel && callback) callback(type.c_str(), name.c_str(), channel);
     }
 
@@ -87,22 +89,36 @@ class TraversalBlockFactory final : public IBlockStreamFactory {
     std::string type = "pcapfile";
     std::string name = "input";
     IBlockStreamChannel* channel = nullptr;
+    int get_calls = 0;
+    int list_calls = 0;
 };
 
 class TraversalBlockManager final : public IBlockStreamManager {
  public:
     explicit TraversalBlockManager(int id) : id(id) {}
 
-    int AddChannel(const std::string&, const std::string&, const std::string&) override {
+    int AddChannel(const std::string& requested_type,
+                   const std::string& requested_name,
+                   const std::string& requested_option) override {
         ++add_calls;
+        last_add_type = requested_type;
+        last_add_name = requested_name;
+        last_add_option = requested_option;
         return add_rc;
     }
-    int ModifyChannel(const std::string&, const std::string&, const std::string&) override {
+    int ModifyChannel(const std::string& requested_type,
+                      const std::string& requested_name,
+                      const std::string& requested_option) override {
         ++modify_calls;
+        last_modify_type = requested_type;
+        last_modify_name = requested_name;
+        last_modify_option = requested_option;
         return modify_rc;
     }
-    int RemoveChannel(const std::string&, const std::string&) override {
+    int RemoveChannel(const std::string& requested_type, const std::string& requested_name) override {
         ++remove_calls;
+        last_remove_type = requested_type;
+        last_remove_name = requested_name;
         return remove_rc;
     }
     void QueryChannels(
@@ -123,6 +139,14 @@ class TraversalBlockManager final : public IBlockStreamManager {
     int modify_calls = 0;
     int remove_calls = 0;
     int query_calls = 0;
+    std::string last_add_type;
+    std::string last_add_name;
+    std::string last_add_option;
+    std::string last_modify_type;
+    std::string last_modify_name;
+    std::string last_modify_option;
+    std::string last_remove_type;
+    std::string last_remove_name;
 };
 
 class RoutingBlockChannel final : public IBlockStreamChannel {
@@ -257,8 +281,10 @@ class BlockProviderQuerier final : public IQuerier {
         return 0;
     }
 
-    void* First(const Guid&) override {
+    void* First(const Guid& iid) override {
         ++first_calls;
+        if (SameGuid(iid, IID_BLOCK_STREAM_FACTORY)) ++block_factory_first_calls;
+        if (SameGuid(iid, IID_BLOCK_STREAM_MANAGER)) ++block_manager_first_calls;
         return nullptr;
     }
 
@@ -270,6 +296,8 @@ class BlockProviderQuerier final : public IQuerier {
     int operator_traverse_calls = 0;
     int unexpected_traverse_calls = 0;
     int first_calls = 0;
+    int block_factory_first_calls = 0;
+    int block_manager_first_calls = 0;
 };
 
 struct SchedulerPluginTestAccessor {
@@ -629,6 +657,13 @@ void TestBlockSourceAndManagerRouting() {
             ASSERT_TRUE(!owner);
             ASSERT_TRUE(!ambiguous);
         }
+        SqlStatement stmt;
+        stmt.sources = {"pcapfile.missing"};
+        std::string response;
+        ASSERT_EQ(SchedulerPluginTestAccessor::ResolveSourceBindings(&plugin, stmt, &response),
+                  error::BAD_REQUEST);
+        ASSERT_TRUE(response.find("source channel not found: pcapfile.missing") != std::string::npos);
+        ASSERT_EQ(querier.block_factory_first_calls, 0);
     }
     {
         BlockProviderQuerier querier;
@@ -644,6 +679,32 @@ void TestBlockSourceAndManagerRouting() {
             ASSERT_EQ(owner.get(), &channel_one);
             ASSERT_TRUE(!ambiguous);
         }
+    }
+    {
+        TraversalBlockFactory unrelated_factory(3);
+        TraversalBlockFactory matching_factory(4);
+        unrelated_factory.name = "other";
+        unrelated_factory.channel = &channel_one;
+        matching_factory.channel = &channel_two;
+        BlockProviderQuerier querier;
+        querier.factories = {&unrelated_factory, &matching_factory};
+        SchedulerPlugin plugin;
+        ASSERT_EQ(plugin.Load(&querier), 0);
+        for (const std::string& reference : {std::string("PCAPFILE.input"), std::string("input")}) {
+            std::shared_ptr<IChannel> owner;
+            bool ambiguous = true;
+            ASSERT_EQ(SchedulerPluginTestAccessor::FindChannelWithAmbiguity(
+                          &plugin, reference, &owner, &ambiguous),
+                      &channel_two);
+            ASSERT_EQ(owner.get(), &channel_two);
+            ASSERT_TRUE(!ambiguous);
+        }
+        ASSERT_EQ(unrelated_factory.get_calls, 1);
+        ASSERT_EQ(matching_factory.get_calls, 1);
+        ASSERT_EQ(unrelated_factory.list_calls, 1);
+        ASSERT_EQ(matching_factory.list_calls, 1);
+        ASSERT_EQ(querier.factory_traverse_calls, 2);
+        ASSERT_EQ(querier.block_factory_first_calls, 0);
     }
     {
         BlockProviderQuerier querier;
@@ -665,14 +726,16 @@ void TestBlockSourceAndManagerRouting() {
             ASSERT_EQ(SchedulerPluginTestAccessor::ResolveSourceBindings(
                           &plugin, stmt, &response),
                       error::CONFLICT);
+            ASSERT_TRUE(response.find("multiple block stream sources matched") != std::string::npos);
         }
+        ASSERT_EQ(querier.block_factory_first_calls, 0);
     }
 
     const std::string add_source =
-        R"({"type":"pcapfile","name":"input","role":"source","options":{}})";
+        R"({"type":"PCAPFILE","name":"input","role":"source","options":{"batch_packets":2}})";
     const std::string modify_source =
-        R"({"type":"pcapfile","name":"input","role":"source","options":{}})";
-    const std::string remove = R"({"type":"pcapfile","name":"input"})";
+        R"({"type":"PCAPFILE","name":"input","role":"source","options":{"batch_packets":3}})";
+    const std::string remove = R"({"type":"PCAPFILE","name":"input"})";
     {
         TraversalBlockManager manager(1);
         manager.add_rc = 0;
@@ -694,6 +757,10 @@ void TestBlockSourceAndManagerRouting() {
                       &plugin, add_source, &response),
                   error::OK);
         ASSERT_EQ(manager.add_calls, 1);
+        ASSERT_EQ(manager.last_add_type, "pcapfile");
+        ASSERT_EQ(manager.last_add_name, "input");
+        ASSERT_EQ(manager.last_add_option, R"({"batch_packets":2})");
+        ASSERT_EQ(querier.block_manager_first_calls, 0);
     }
     {
         TraversalBlockManager unsupported(1);
@@ -709,6 +776,10 @@ void TestBlockSourceAndManagerRouting() {
                   error::OK);
         ASSERT_EQ(unsupported.add_calls, 1);
         ASSERT_EQ(accepted.add_calls, 1);
+        ASSERT_EQ(unsupported.last_add_type, "pcapfile");
+        ASSERT_EQ(accepted.last_add_type, "pcapfile");
+        ASSERT_EQ(accepted.last_add_option, R"({"batch_packets":2})");
+        ASSERT_EQ(querier.block_manager_first_calls, 0);
     }
     {
         TraversalBlockManager first(1);
@@ -725,6 +796,24 @@ void TestBlockSourceAndManagerRouting() {
                   error::CONFLICT);
         ASSERT_EQ(first.add_calls, 1);
         ASSERT_EQ(second.add_calls, 1);
+        ASSERT_TRUE(response.find("multiple block stream managers accepted request") != std::string::npos);
+        ASSERT_EQ(querier.block_manager_first_calls, 0);
+    }
+    {
+        TraversalBlockManager first_unsupported(1);
+        TraversalBlockManager second_unsupported(2);
+        BlockProviderQuerier querier;
+        querier.managers = {&first_unsupported, &second_unsupported};
+        SchedulerPlugin plugin;
+        ASSERT_EQ(plugin.Load(&querier), 0);
+        std::string response;
+        ASSERT_EQ(SchedulerPluginTestAccessor::HandleAddStreamChannel(
+                      &plugin, add_source, &response),
+                  error::UNAVAILABLE);
+        ASSERT_EQ(first_unsupported.add_calls, 1);
+        ASSERT_EQ(second_unsupported.add_calls, 1);
+        ASSERT_TRUE(response.find("stream manager unavailable") != std::string::npos);
+        ASSERT_EQ(querier.block_manager_first_calls, 0);
     }
     {
         TraversalBlockManager owner(1);
@@ -742,11 +831,19 @@ void TestBlockSourceAndManagerRouting() {
                   error::OK);
         ASSERT_EQ(owner.modify_calls, 1);
         ASSERT_EQ(absent.modify_calls, 0);
+        ASSERT_EQ(owner.last_modify_type, "pcapfile");
+        ASSERT_EQ(owner.last_modify_name, "input");
+        ASSERT_EQ(owner.last_modify_option, R"({"batch_packets":3})");
         ASSERT_EQ(SchedulerPluginTestAccessor::HandleRemoveStreamChannel(
                       &plugin, remove, &response),
                   error::OK);
         ASSERT_EQ(owner.remove_calls, 1);
         ASSERT_EQ(absent.remove_calls, 0);
+        ASSERT_EQ(owner.last_remove_type, "pcapfile");
+        ASSERT_EQ(owner.last_remove_name, "input");
+        ASSERT_EQ(owner.query_calls, 2);
+        ASSERT_EQ(absent.query_calls, 2);
+        ASSERT_EQ(querier.block_manager_first_calls, 0);
     }
     for (const char* role : {"sink", "both"}) {
         TraversalBlockManager owner(1);
@@ -784,11 +881,16 @@ void TestBlockSourceAndManagerRouting() {
                   error::CONFLICT);
         ASSERT_EQ(first_owner.modify_calls, 0);
         ASSERT_EQ(second_owner.modify_calls, 0);
+        ASSERT_TRUE(response.find("multiple block stream managers own channel") != std::string::npos);
         ASSERT_EQ(SchedulerPluginTestAccessor::HandleRemoveStreamChannel(
                       &plugin, remove, &response),
                   error::CONFLICT);
         ASSERT_EQ(first_owner.remove_calls, 0);
         ASSERT_EQ(second_owner.remove_calls, 0);
+        ASSERT_TRUE(response.find("multiple block stream managers own channel") != std::string::npos);
+        ASSERT_EQ(first_owner.query_calls, 2);
+        ASSERT_EQ(second_owner.query_calls, 2);
+        ASSERT_EQ(querier.block_manager_first_calls, 0);
     }
     {
         TraversalBlockManager first_absent(1);
@@ -808,6 +910,10 @@ void TestBlockSourceAndManagerRouting() {
                   error::NOT_FOUND);
         ASSERT_EQ(first_absent.remove_calls, 1);
         ASSERT_EQ(second_absent.remove_calls, 1);
+        ASSERT_TRUE(response.find("block stream channel not found") != std::string::npos);
+        ASSERT_EQ(first_absent.query_calls, 2);
+        ASSERT_EQ(second_absent.query_calls, 2);
+        ASSERT_EQ(querier.block_manager_first_calls, 0);
     }
 }
 

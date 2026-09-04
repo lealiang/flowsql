@@ -30,21 +30,35 @@ class MockProtocol final : public flowsql::IProtocol {
         ++identify_calls;
         return {};
     }
-    int32_t Layer(int32_t, const uint8_t*, int32_t size, flowsql::protocol::Layers* layers) override {
+    int32_t Layer(int32_t, const uint8_t* data, int32_t size, flowsql::protocol::Layers* layers) override {
         ++layer_calls;
+        layer_sizes.push_back(size);
+        if (data && size > 0) {
+            layer_packets.emplace_back(data, data + size);
+        } else {
+            layer_packets.emplace_back();
+        }
         if (size == 0 || !layers) return -1;
         if (layer_result < 0) return layer_result;
         *layers = {};
-        layers->layercount = 1;
-        layers->layers[0].layer = flowsql::eLayer::ETHERNET;
-        layers->layers[0].offset = 0;
-        layers->payload = 0;
+        layers->layercount = reported_layer_count;
+        if (reported_layer_count != 0) {
+            layers->layers[0].layer = layer_kind;
+            layers->layers[0].offset = layer_offset;
+        }
+        layers->payload = payload_offset;
         return layer_result;
     }
     flowsql::protocol::IDictionary* Dictionary() override { return nullptr; }
     int layer_calls = 0;
     int identify_calls = 0;
     int layer_result = 1;
+    uint16_t reported_layer_count = 1;
+    flowsql::eLayer layer_kind = flowsql::eLayer::ETHERNET;
+    uint16_t layer_offset = 0;
+    uint16_t payload_offset = 0;
+    std::vector<int32_t> layer_sizes;
+    std::vector<std::vector<uint8_t>> layer_packets;
 };
 
 void Put16(std::vector<uint8_t>* out, uint16_t value, bool little) {
@@ -64,17 +78,50 @@ void WriteFile(const std::string& path, const std::vector<uint8_t>& bytes) {
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 }
 
-std::vector<uint8_t> MakeClassicPcap(bool little, bool nanosecond, uint32_t fraction,
-                                     uint32_t link_type = 1, uint32_t captured = 4,
-                                     uint32_t wire = 4) {
+std::vector<uint8_t> MakeClassicHeader(bool little, bool nanosecond,
+                                       uint32_t snaplen = 65535,
+                                       uint32_t link_type = 1) {
     std::vector<uint8_t> bytes;
     if (little && nanosecond) bytes.insert(bytes.end(), {0x4d, 0x3c, 0xb2, 0xa1});
     else if (!little && nanosecond) bytes.insert(bytes.end(), {0xa1, 0xb2, 0x3c, 0x4d});
     else if (little) bytes.insert(bytes.end(), {0xd4, 0xc3, 0xb2, 0xa1});
     else bytes.insert(bytes.end(), {0xa1, 0xb2, 0xc3, 0xd4});
-    Put16(&bytes, 2, little); Put16(&bytes, 4, little);
-    Put32(&bytes, 0, little); Put32(&bytes, 0, little); Put32(&bytes, 65535, little); Put32(&bytes, link_type, little);
-    Put32(&bytes, 2, little); Put32(&bytes, fraction, little); Put32(&bytes, captured, little); Put32(&bytes, wire, little);
+    Put16(&bytes, 2, little);
+    Put16(&bytes, 4, little);
+    Put32(&bytes, 0, little);
+    Put32(&bytes, 0, little);
+    Put32(&bytes, snaplen, little);
+    Put32(&bytes, link_type, little);
+    return bytes;
+}
+
+void AppendClassicRecord(std::vector<uint8_t>* bytes, bool little,
+                         uint32_t seconds, uint32_t fraction,
+                         const std::vector<uint8_t>& packet,
+                         uint32_t wire_len) {
+    Put32(bytes, seconds, little);
+    Put32(bytes, fraction, little);
+    Put32(bytes, static_cast<uint32_t>(packet.size()), little);
+    Put32(bytes, wire_len, little);
+    bytes->insert(bytes->end(), packet.begin(), packet.end());
+}
+
+void Store32(std::vector<uint8_t>* bytes, size_t offset, uint32_t value, bool little) {
+    assert(bytes && offset + 4 <= bytes->size());
+    for (size_t i = 0; i < 4; ++i) {
+        const size_t shift_index = little ? i : 3 - i;
+        (*bytes)[offset + i] = static_cast<uint8_t>(value >> (8 * shift_index));
+    }
+}
+
+std::vector<uint8_t> MakeClassicPcap(bool little, bool nanosecond, uint32_t fraction,
+                                     uint32_t link_type = 1, uint32_t captured = 4,
+                                     uint32_t wire = 4) {
+    std::vector<uint8_t> bytes = MakeClassicHeader(little, nanosecond, 65535, link_type);
+    Put32(&bytes, 2, little);
+    Put32(&bytes, fraction, little);
+    Put32(&bytes, captured, little);
+    Put32(&bytes, wire, little);
     bytes.insert(bytes.end(), {1, 2, 3, 4});
     return bytes;
 }
@@ -165,6 +212,30 @@ void AppendPcapngEnhancedPacket(std::vector<uint8_t>* out, bool little, uint32_t
 
 std::string Temp(const char* suffix) { return std::string("/tmp/flowsql_pcapfile_") + suffix; }
 
+void AssertNoBatchEvent(const flowsql::BlockPollEvent& event, flowsql::BlockPollEvent::Kind kind) {
+    assert(event.kind == kind);
+    assert(!event.batch);
+}
+
+void AssertCaptureSourceError(const char* suffix, const char* format,
+                              const std::vector<uint8_t>& bytes) {
+    const std::string path = Temp(suffix);
+    WriteFile(path, bytes);
+    MockProtocol protocol;
+    pcapfile::PcapFileSourceConfig config;
+    config.path = path;
+    config.format = format;
+    pcapfile::PcapFileChannel channel("capture_error", config, &protocol);
+    const int open_rc = channel.Open();
+    const auto event = channel.PollBlock(0);
+    AssertNoBatchEvent(event, flowsql::BlockPollEvent::kError);
+    assert(event.err != 0);
+    const auto after_error = channel.PollBlock(0);
+    AssertNoBatchEvent(after_error, flowsql::BlockPollEvent::kCancelled);
+    assert(after_error.err == ECANCELED);
+    if (open_rc == 0) assert(channel.IsOpened());
+}
+
 void AssertPcapngSourceError(const char* suffix, const std::vector<uint8_t>& bytes) {
     const std::string path = Temp(suffix);
     WriteFile(path, bytes);
@@ -175,9 +246,11 @@ void AssertPcapngSourceError(const char* suffix, const std::vector<uint8_t>& byt
     pcapfile::PcapFileChannel channel("pcapng_error", config, &protocol);
     assert(channel.Open() == 0);
     const auto event = channel.PollBlock(0);
-    assert(event.kind == flowsql::BlockPollEvent::kError);
-    assert(!event.batch && event.err != 0);
-    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
+    AssertNoBatchEvent(event, flowsql::BlockPollEvent::kError);
+    assert(event.err != 0);
+    const auto after_error = channel.PollBlock(0);
+    AssertNoBatchEvent(after_error, flowsql::BlockPollEvent::kCancelled);
+    assert(after_error.err == ECANCELED);
 }
 
 void TestClassicPcap() {
@@ -192,8 +265,10 @@ void TestClassicPcap() {
     pcapfile::PcapFileSourceConfig config; config.path = path; config.format = "pcap"; config.batch_packets = 1;
     pcapfile::PcapFileChannel channel("classic", config, &protocol);
     assert(channel.Open() == 0);
+    assert(channel.OutstandingBatchCount() == 0);
     auto event = channel.PollBlock(0);
     assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+    assert(channel.OutstandingBatchCount() == 1);
     assert(event.batch->num_rows() == 1);
     auto timestamp = std::static_pointer_cast<arrow::Int64Array>(event.batch->column(0));
     auto captured = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(1));
@@ -203,9 +278,14 @@ void TestClassicPcap() {
     assert(raw->GetView(0) == "\x01\x02\x03\x04");
     assert(protocol.layer_calls == 1 && protocol.identify_calls == 0);
     assert(channel.ReleaseBlock(event.batch) == 0);
+    assert(channel.OutstandingBatchCount() == 0);
     assert(channel.ReleaseBlock(event.batch) != 0);
-    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kEof);
-    assert(channel.PollBlock(0).kind != flowsql::BlockPollEvent::kData);
+    const auto eof = channel.PollBlock(0);
+    AssertNoBatchEvent(eof, flowsql::BlockPollEvent::kEof);
+    assert(eof.err == 0);
+    const auto after_eof = channel.PollBlock(0);
+    AssertNoBatchEvent(after_eof, flowsql::BlockPollEvent::kCancelled);
+    assert(after_eof.err == ECANCELED);
 }
 
 void TestClassicMagicAndEndian() {
@@ -238,6 +318,82 @@ void TestClassicMagicAndEndian() {
     }
 }
 
+void TestClassicFieldsAndFileOrder() {
+    std::vector<uint8_t> bytes = MakeClassicHeader(false, false, 8, 1);
+    AppendClassicRecord(&bytes, false, 4, 7, {0x01, 0x02, 0x03}, 5);
+    AppendClassicRecord(&bytes, false, 2, 9, {0xa0}, 0);
+    const std::string path = Temp("classic_fields_order.pcap");
+    WriteFile(path, bytes);
+
+    MockProtocol protocol;
+    pcapfile::PcapFileSourceConfig config;
+    config.path = path;
+    config.format = "pcap";
+    config.batch_packets = 8;
+    pcapfile::PcapFileChannel channel("classic_fields_order", config, &protocol);
+    assert(channel.Open() == 0);
+    const auto event = channel.PollBlock(0);
+    assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+    assert(event.batch->num_rows() == 2);
+
+    auto timestamp = std::static_pointer_cast<arrow::Int64Array>(event.batch->column(0));
+    auto captured = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(1));
+    auto wire = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(2));
+    auto link_type = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(3));
+    auto source = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(4));
+    auto sequence = std::static_pointer_cast<arrow::UInt64Array>(event.batch->column(5));
+    auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->column(6));
+    assert(timestamp->Value(0) == 4000007000LL && timestamp->Value(1) == 2000009000LL);
+    assert(captured->Value(0) == 3 && captured->Value(1) == 1);
+    assert(wire->Value(0) == 5 && wire->Value(1) == 0);
+    assert(link_type->Value(0) == 1 && link_type->Value(1) == 1);
+    assert(source->Value(0) == 0 && source->Value(1) == 0);
+    assert(sequence->Value(0) == 0 && sequence->Value(1) == 1);
+    assert(raw->GetView(0) == std::string_view("\x01\x02\x03", 3));
+    assert(raw->GetView(1) == std::string_view("\xa0", 1));
+    assert(channel.ReleaseBlock(event.batch) == 0);
+    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kEof);
+}
+
+void TestClassicStructureErrors() {
+    AssertCaptureSourceError(
+        "unsupported_capture_magic.bin", "auto", std::vector<uint8_t>(24, 0));
+    {
+        auto bytes = MakeClassicPcap(true, false, 0);
+        bytes[4] = 3;
+        AssertCaptureSourceError("classic_bad_version.pcap", "pcap", bytes);
+    }
+    {
+        auto bytes = MakeClassicPcap(true, false, 0);
+        Store32(&bytes, 16, 0, true);
+        AssertCaptureSourceError("classic_zero_snaplen.pcap", "pcap", bytes);
+    }
+    AssertCaptureSourceError(
+        "classic_bad_microseconds.pcap", "pcap",
+        MakeClassicPcap(true, false, 1000000));
+    AssertCaptureSourceError(
+        "classic_bad_nanoseconds.pcap", "pcap",
+        MakeClassicPcap(false, true, 1000000000));
+    AssertCaptureSourceError(
+        "classic_wire_shorter_than_capture.pcap", "pcap",
+        MakeClassicPcap(true, false, 0, 1, 4, 3));
+    {
+        auto bytes = MakeClassicPcap(true, false, 0);
+        Store32(&bytes, 16, 3, true);
+        AssertCaptureSourceError("classic_capture_exceeds_snaplen.pcap", "pcap", bytes);
+    }
+    {
+        auto bytes = MakeClassicHeader(true, false);
+        bytes.insert(bytes.end(), 15, 0);
+        AssertCaptureSourceError("classic_truncated_record_header.pcap", "pcap", bytes);
+    }
+    {
+        auto bytes = MakeClassicPcap(true, false, 0);
+        bytes.pop_back();
+        AssertCaptureSourceError("classic_truncated_packet.pcap", "pcap", bytes);
+    }
+}
+
 void TestPendingErrorAfterData() {
     auto bytes = MakeClassicPcap(true, false, 0);
     Put32(&bytes, 3, true);
@@ -254,39 +410,194 @@ void TestPendingErrorAfterData() {
     pcapfile::PcapFileChannel channel("pending", config, &protocol);
     assert(channel.Open() == 0);
     auto data = channel.PollBlock(0);
-    assert(data.kind == flowsql::BlockPollEvent::kData);
+    assert(data.kind == flowsql::BlockPollEvent::kData && data.batch);
     assert(data.batch->num_rows() == 1);
+    assert(channel.OutstandingBatchCount() == 1);
     assert(channel.ReleaseBlock(data.batch) == 0);
-    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kError);
-    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
+    assert(channel.OutstandingBatchCount() == 0);
+    const auto error = channel.PollBlock(0);
+    AssertNoBatchEvent(error, flowsql::BlockPollEvent::kError);
+    assert(error.err != 0);
+    const auto after_error = channel.PollBlock(0);
+    AssertNoBatchEvent(after_error, flowsql::BlockPollEvent::kCancelled);
+    assert(after_error.err == ECANCELED);
 }
 
-void TestUnsupportedAndMalformedLayer() {
-    const std::string unsupported_path = Temp("unsupported_link.pcap");
-    WriteFile(unsupported_path, MakeClassicPcap(true, false, 0, 147));
-    MockProtocol protocol;
-    pcapfile::PcapFileSourceConfig config;
-    config.path = unsupported_path;
-    pcapfile::PcapFileChannel unsupported("unsupported", config, &protocol);
-    assert(unsupported.Open() == 0);
-    auto unsupported_event = unsupported.PollBlock(0);
-    assert(unsupported_event.kind == flowsql::BlockPollEvent::kData);
-    auto unsupported_status = std::static_pointer_cast<arrow::UInt8Array>(unsupported_event.batch->column(7));
-    assert(unsupported_status->Value(0) == static_cast<uint8_t>(flowsql::packet::LayerStatus::kUnsupportedLinkType));
-    assert(protocol.layer_calls == 0);
-    assert(unsupported.ReleaseBlock(unsupported_event.batch) == 0);
+void TestSupportedLayerDecodeContract() {
+    const std::vector<std::vector<uint8_t>> packets = {
+        std::vector<uint8_t>(14, 0x11),
+        std::vector<uint8_t>(15, 0x22),
+        std::vector<uint8_t>(16, 0x33),
+    };
+    std::vector<uint8_t> bytes = MakeClassicHeader(true, true, 65535, 1);
+    for (size_t index = 0; index < packets.size(); ++index) {
+        AppendClassicRecord(&bytes, true, 1, static_cast<uint32_t>(index), packets[index],
+                            static_cast<uint32_t>(packets[index].size()));
+    }
+    const std::string path = Temp("supported_layer_contract.pcap");
+    WriteFile(path, bytes);
 
-    const std::string malformed_path = Temp("malformed_layer.pcap");
-    WriteFile(malformed_path, MakeClassicPcap(true, false, 0));
-    protocol.layer_result = -1;
-    config.path = malformed_path;
-    pcapfile::PcapFileChannel malformed("malformed", config, &protocol);
-    assert(malformed.Open() == 0);
-    auto malformed_event = malformed.PollBlock(0);
-    assert(malformed_event.kind == flowsql::BlockPollEvent::kData);
-    auto malformed_status = std::static_pointer_cast<arrow::UInt8Array>(malformed_event.batch->column(7));
-    assert(malformed_status->Value(0) == static_cast<uint8_t>(flowsql::packet::LayerStatus::kMalformed));
-    assert(malformed.ReleaseBlock(malformed_event.batch) == 0);
+    MockProtocol protocol;
+    protocol.payload_offset = 14;
+    pcapfile::PcapFileSourceConfig config;
+    config.path = path;
+    config.format = "pcap";
+    config.batch_packets = 8;
+    pcapfile::PcapFileChannel channel("supported_layer_contract", config, &protocol);
+    assert(channel.Open() == 0);
+    const auto event = channel.PollBlock(0);
+    assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+    assert(event.batch->num_rows() == static_cast<int64_t>(packets.size()));
+    assert(protocol.layer_calls == static_cast<int>(packets.size()));
+    assert(protocol.identify_calls == 0);
+    assert(protocol.layer_sizes == std::vector<int32_t>({14, 15, 16}));
+    assert(protocol.layer_packets == packets);
+
+    auto status = std::static_pointer_cast<arrow::UInt8Array>(event.batch->GetColumnByName("layer_status"));
+    auto count = std::static_pointer_cast<arrow::UInt8Array>(event.batch->GetColumnByName("layer_count"));
+    auto ids_list =
+        std::static_pointer_cast<arrow::FixedSizeListArray>(event.batch->GetColumnByName("layer_ids"));
+    auto ids = std::static_pointer_cast<arrow::UInt16Array>(ids_list->values());
+    auto offsets_list =
+        std::static_pointer_cast<arrow::FixedSizeListArray>(event.batch->GetColumnByName("layer_offsets"));
+    auto offsets = std::static_pointer_cast<arrow::UInt32Array>(offsets_list->values());
+    auto payload = std::static_pointer_cast<arrow::UInt32Array>(event.batch->GetColumnByName("payload_offset"));
+    auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->GetColumnByName("raw_data"));
+    for (size_t index = 0; index < packets.size(); ++index) {
+        assert(status->Value(index) == static_cast<uint8_t>(flowsql::packet::LayerStatus::kDecoded));
+        assert(count->Value(index) == 1);
+        const size_t layer_base = index * flowsql::packet::kMaxLayerDepth;
+        assert(ids->Value(layer_base) == static_cast<uint16_t>(flowsql::eLayer::ETHERNET));
+        assert(offsets->Value(layer_base) == 0);
+        assert(payload->Value(index) == 14);
+        const std::string_view expected(
+            reinterpret_cast<const char*>(packets[index].data()), packets[index].size());
+        assert(raw->GetView(index) == expected);
+    }
+    assert(channel.ReleaseBlock(event.batch) == 0);
+}
+
+void TestUnsupportedTruncatedAndMalformedLayer() {
+    const std::vector<uint8_t> packet(14, 0x5a);
+    const std::string_view expected_raw(
+        reinterpret_cast<const char*>(packet.data()), packet.size());
+    {
+        std::vector<uint8_t> bytes = MakeClassicHeader(true, false, 65535, 147);
+        AppendClassicRecord(&bytes, true, 1, 0, packet, packet.size());
+        const std::string path = Temp("unsupported_link.pcap");
+        WriteFile(path, bytes);
+        MockProtocol protocol;
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        pcapfile::PcapFileChannel channel("unsupported", config, &protocol);
+        assert(channel.Open() == 0);
+        const auto event = channel.PollBlock(0);
+        assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+        auto status = std::static_pointer_cast<arrow::UInt8Array>(event.batch->column(7));
+        auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->column(6));
+        assert(status->Value(0) ==
+               static_cast<uint8_t>(flowsql::packet::LayerStatus::kUnsupportedLinkType));
+        assert(raw->GetView(0) == expected_raw);
+        assert(protocol.layer_calls == 0 && protocol.identify_calls == 0);
+        assert(protocol.layer_packets.empty());
+        assert(channel.ReleaseBlock(event.batch) == 0);
+    }
+    {
+        std::vector<uint8_t> bytes = MakeClassicHeader(true, false, 65535, 1);
+        AppendClassicRecord(&bytes, true, 1, 0, packet, packet.size() + 4);
+        const std::string path = Temp("truncated_wire.pcap");
+        WriteFile(path, bytes);
+        MockProtocol protocol;
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        pcapfile::PcapFileChannel channel("truncated_wire", config, &protocol);
+        assert(channel.Open() == 0);
+        const auto event = channel.PollBlock(0);
+        assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+        auto status = std::static_pointer_cast<arrow::UInt8Array>(event.batch->column(7));
+        auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->column(6));
+        assert(status->Value(0) == static_cast<uint8_t>(flowsql::packet::LayerStatus::kTruncated));
+        assert(raw->GetView(0) == expected_raw);
+        assert(protocol.layer_calls == 1 && protocol.identify_calls == 0);
+        assert(protocol.layer_packets == std::vector<std::vector<uint8_t>>({packet}));
+        assert(channel.ReleaseBlock(event.batch) == 0);
+    }
+    {
+        std::vector<uint8_t> bytes = MakeClassicHeader(true, false, 65535, 1);
+        AppendClassicRecord(&bytes, true, 1, 0, packet, packet.size());
+        const std::string path = Temp("truncated_payload.pcap");
+        WriteFile(path, bytes);
+        MockProtocol protocol;
+        protocol.payload_offset = static_cast<uint16_t>(packet.size() + 1);
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        pcapfile::PcapFileChannel channel("truncated_payload", config, &protocol);
+        assert(channel.Open() == 0);
+        const auto event = channel.PollBlock(0);
+        assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+        auto status = std::static_pointer_cast<arrow::UInt8Array>(event.batch->column(7));
+        auto payload = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(14));
+        auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->column(6));
+        assert(status->Value(0) == static_cast<uint8_t>(flowsql::packet::LayerStatus::kTruncated));
+        assert(payload->Value(0) == packet.size());
+        assert(raw->GetView(0) == expected_raw);
+        assert(protocol.layer_calls == 1 && protocol.identify_calls == 0);
+        assert(channel.ReleaseBlock(event.batch) == 0);
+    }
+    {
+        std::vector<uint8_t> bytes = MakeClassicHeader(true, false, 65535, 1);
+        AppendClassicRecord(&bytes, true, 1, 0, packet, packet.size());
+        const std::string path = Temp("truncated_layer_offset.pcap");
+        WriteFile(path, bytes);
+        MockProtocol protocol;
+        protocol.layer_offset = static_cast<uint16_t>(packet.size() + 1);
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        pcapfile::PcapFileChannel channel("truncated_layer_offset", config, &protocol);
+        assert(channel.Open() == 0);
+        const auto event = channel.PollBlock(0);
+        assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+        auto status = std::static_pointer_cast<arrow::UInt8Array>(event.batch->column(7));
+        auto offsets_list =
+            std::static_pointer_cast<arrow::FixedSizeListArray>(event.batch->column(10));
+        auto offsets = std::static_pointer_cast<arrow::UInt32Array>(offsets_list->values());
+        auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->column(6));
+        assert(status->Value(0) == static_cast<uint8_t>(flowsql::packet::LayerStatus::kTruncated));
+        assert(offsets->Value(0) == packet.size());
+        assert(raw->GetView(0) == expected_raw);
+        assert(protocol.layer_calls == 1 && protocol.identify_calls == 0);
+        assert(protocol.layer_packets == std::vector<std::vector<uint8_t>>({packet}));
+        assert(channel.ReleaseBlock(event.batch) == 0);
+    }
+    for (const bool invalid_layer_count : {false, true}) {
+        std::vector<uint8_t> bytes = MakeClassicHeader(true, false, 65535, 1);
+        AppendClassicRecord(&bytes, true, 1, 0, packet, packet.size());
+        const std::string suffix = invalid_layer_count
+                                       ? "malformed_layer_count.pcap"
+                                       : "malformed_layer_result.pcap";
+        const std::string path = Temp(suffix.c_str());
+        WriteFile(path, bytes);
+        MockProtocol protocol;
+        if (invalid_layer_count) {
+            protocol.reported_layer_count =
+                static_cast<uint16_t>(flowsql::protocol::MAX_LAYERS + 1);
+        } else {
+            protocol.layer_result = -1;
+        }
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        pcapfile::PcapFileChannel channel("malformed", config, &protocol);
+        assert(channel.Open() == 0);
+        const auto event = channel.PollBlock(0);
+        assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+        auto status = std::static_pointer_cast<arrow::UInt8Array>(event.batch->column(7));
+        auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->column(6));
+        assert(status->Value(0) == static_cast<uint8_t>(flowsql::packet::LayerStatus::kMalformed));
+        assert(raw->GetView(0) == expected_raw);
+        assert(protocol.layer_calls == 1 && protocol.identify_calls == 0);
+        assert(protocol.layer_packets == std::vector<std::vector<uint8_t>>({packet}));
+        assert(channel.ReleaseBlock(event.batch) == 0);
+    }
 }
 
 void TestEmptyFileEof() {
@@ -297,7 +608,12 @@ void TestEmptyFileEof() {
     config.path = path;
     pcapfile::PcapFileChannel channel("empty", config, &protocol);
     assert(channel.Open() == 0);
-    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kEof);
+    const auto eof = channel.PollBlock(0);
+    AssertNoBatchEvent(eof, flowsql::BlockPollEvent::kEof);
+    assert(eof.err == 0);
+    const auto after_eof = channel.PollBlock(0);
+    AssertNoBatchEvent(after_eof, flowsql::BlockPollEvent::kCancelled);
+    assert(after_eof.err == ECANCELED);
 }
 
 void TestPcapngSectionAndResolution() {
@@ -360,6 +676,85 @@ void TestPcapngSectionsAndRounding() {
     assert(protocol.layer_calls == 3);
     assert(channel.ReleaseBlock(event.batch) == 0);
     assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kEof);
+}
+
+void TestPcapngInterfaceFieldsAndFileOrder() {
+    std::vector<uint8_t> bytes;
+    AppendPcapngSectionHeader(&bytes, true);
+    AppendPcapngInterface(&bytes, true, 1, false, 6);
+    AppendPcapngInterface(&bytes, true, 147, false, 9);
+    AppendPcapngEnhancedPacket(&bytes, true, 1, 1000000001ULL, {0xb1, 0xb2}, 4);
+    AppendPcapngEnhancedPacket(&bytes, true, 0, 2, {0xa0}, 1);
+    AppendPcapngEnhancedPacket(&bytes, true, 1, 3, {0xc0}, 0);
+    const std::string path = Temp("pcapng_interface_order.pcapng");
+    WriteFile(path, bytes);
+
+    MockProtocol protocol;
+    pcapfile::PcapFileSourceConfig config;
+    config.path = path;
+    config.format = "pcapng";
+    config.batch_packets = 8;
+    pcapfile::PcapFileChannel channel("pcapng_interface_order", config, &protocol);
+    assert(channel.Open() == 0);
+    const auto event = channel.PollBlock(0);
+    assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+    assert(event.batch->num_rows() == 3);
+
+    auto timestamp = std::static_pointer_cast<arrow::Int64Array>(event.batch->column(0));
+    auto captured = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(1));
+    auto wire = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(2));
+    auto link_type = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(3));
+    auto source = std::static_pointer_cast<arrow::UInt32Array>(event.batch->column(4));
+    auto sequence = std::static_pointer_cast<arrow::UInt64Array>(event.batch->column(5));
+    auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->column(6));
+    assert(timestamp->Value(0) == 1000000001LL);
+    assert(timestamp->Value(1) == 2000LL);
+    assert(timestamp->Value(2) == 3LL);
+    assert(captured->Value(0) == 2 && captured->Value(1) == 1 && captured->Value(2) == 1);
+    assert(wire->Value(0) == 4 && wire->Value(1) == 1 && wire->Value(2) == 0);
+    assert(link_type->Value(0) == 147 && link_type->Value(1) == 1 && link_type->Value(2) == 147);
+    assert(source->Value(0) == 1 && source->Value(1) == 0 && source->Value(2) == 1);
+    assert(sequence->Value(0) == 0 && sequence->Value(1) == 0 && sequence->Value(2) == 1);
+    assert(raw->GetView(0) == std::string_view("\xb1\xb2", 2));
+    assert(raw->GetView(1) == std::string_view("\xa0", 1));
+    assert(raw->GetView(2) == std::string_view("\xc0", 1));
+    assert(channel.ReleaseBlock(event.batch) == 0);
+    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kEof);
+}
+
+void TestPcapngTimestampQuantizationAndOverflow() {
+    {
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
+        AppendPcapngInterface(&bytes, true, 1, true, 10);
+        AppendPcapngEnhancedPacket(&bytes, true, 0, 1, {1});
+        AppendPcapngEnhancedPacket(&bytes, true, 0, 3, {2});
+        const std::string path = Temp("pcapng_binary_ties_to_even.pcapng");
+        WriteFile(path, bytes);
+
+        MockProtocol protocol;
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        config.format = "pcapng";
+        config.batch_packets = 8;
+        pcapfile::PcapFileChannel channel("pcapng_binary_ties_to_even", config, &protocol);
+        assert(channel.Open() == 0);
+        const auto event = channel.PollBlock(0);
+        assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+        assert(event.batch->num_rows() == 2);
+        auto timestamp = std::static_pointer_cast<arrow::Int64Array>(event.batch->column(0));
+        assert(timestamp->Value(0) == 976562LL);
+        assert(timestamp->Value(1) == 2929688LL);
+        assert(channel.ReleaseBlock(event.batch) == 0);
+        assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kEof);
+    }
+    {
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
+        AppendPcapngInterface(&bytes, true, 1, false, 0);
+        AppendPcapngEnhancedPacket(&bytes, true, 0, UINT64_MAX, {1});
+        AssertPcapngSourceError("pcapng_timestamp_overflow.pcapng", bytes);
+    }
 }
 
 void TestPcapngEnhancedPacketMapping() {
@@ -453,6 +848,18 @@ void TestPcapngSectionValidation() {
     {
         std::vector<uint8_t> bytes;
         AppendPcapngSectionHeader(&bytes, true);
+        bytes[12] = 2;
+        AssertCaptureSourceError("pcapng_bad_version.pcapng", "pcapng", bytes);
+    }
+    {
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
+        bytes[8] = 0;
+        AssertCaptureSourceError("pcapng_bad_byte_order_magic.pcapng", "pcapng", bytes);
+    }
+    {
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
         AssertPcapngSourceError("section_without_idb.pcapng", bytes);
     }
     {
@@ -528,6 +935,52 @@ void TestPcapngSectionValidation() {
     }
 }
 
+void TestPcapngInterfaceOptionErrors() {
+    {
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
+        std::vector<uint8_t> interface_body;
+        Put16(&interface_body, 1, true);
+        Put16(&interface_body, 0, true);
+        Put32(&interface_body, 65535, true);
+        Put16(&interface_body, 9, true);
+        Put16(&interface_body, 2, true);
+        interface_body.insert(interface_body.end(), {6, 0, 0, 0});
+        Put16(&interface_body, 0, true);
+        Put16(&interface_body, 0, true);
+        AppendPcapngBlock(&bytes, 1, interface_body, true);
+        AssertPcapngSourceError("pcapng_bad_tsresol_length.pcapng", bytes);
+    }
+    {
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
+        std::vector<uint8_t> interface_body;
+        Put16(&interface_body, 1, true);
+        Put16(&interface_body, 0, true);
+        Put32(&interface_body, 65535, true);
+        Put16(&interface_body, 14, true);
+        Put16(&interface_body, 4, true);
+        Put32(&interface_body, 1, true);
+        Put16(&interface_body, 0, true);
+        Put16(&interface_body, 0, true);
+        AppendPcapngBlock(&bytes, 1, interface_body, true);
+        AssertPcapngSourceError("pcapng_bad_tsoffset_length.pcapng", bytes);
+    }
+    {
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
+        std::vector<uint8_t> interface_body;
+        Put16(&interface_body, 1, true);
+        Put16(&interface_body, 0, true);
+        Put32(&interface_body, 65535, true);
+        Put16(&interface_body, 2, true);
+        Put16(&interface_body, 4, true);
+        Put32(&interface_body, 0, true);
+        AppendPcapngBlock(&bytes, 1, interface_body, true);
+        AssertPcapngSourceError("pcapng_missing_option_terminator.pcapng", bytes);
+    }
+}
+
 void TestManyPcapngSectionsIterative() {
     constexpr uint32_t kSectionCount = 32768;
     std::vector<uint8_t> bytes;
@@ -585,8 +1038,20 @@ void TestReplayModes() {
         const auto event = channel.PollBlock(0);
         assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
         assert(event.batch->num_rows() == static_cast<int64_t>(timestamps_ns.size()));
+        auto timestamp = std::static_pointer_cast<arrow::Int64Array>(event.batch->column(0));
+        auto sequence = std::static_pointer_cast<arrow::UInt64Array>(event.batch->column(5));
+        auto raw = std::static_pointer_cast<arrow::BinaryArray>(event.batch->column(6));
+        for (size_t index = 0; index < timestamps_ns.size(); ++index) {
+            assert(timestamp->Value(index) == static_cast<int64_t>(timestamps_ns[index]));
+            assert(sequence->Value(index) == index);
+            assert(raw->GetView(index).size() == 1);
+            assert(static_cast<uint8_t>(raw->GetView(index)[0]) == index + 1);
+        }
         assert(waits_ns.empty());
         assert(channel.ReleaseBlock(event.batch) == 0);
+        const auto eof = channel.PollBlock(0);
+        AssertNoBatchEvent(eof, flowsql::BlockPollEvent::kEof);
+        AssertNoBatchEvent(channel.PollBlock(0), flowsql::BlockPollEvent::kCancelled);
     }
 
     {
@@ -642,7 +1107,9 @@ void TestReplayModes() {
             if (index == 3) assert(waits_ns == std::vector<int64_t>({2000333, 1}));
         }
         assert(waits_ns == std::vector<int64_t>({2000333, 1, 3000333}));
-        assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kEof);
+        const auto eof = channel.PollBlock(0);
+        AssertNoBatchEvent(eof, flowsql::BlockPollEvent::kEof);
+        AssertNoBatchEvent(channel.PollBlock(0), flowsql::BlockPollEvent::kCancelled);
     }
 }
 
@@ -659,29 +1126,76 @@ void TestBackpressureAndCancelWakeup() {
     assert(channel.Open() == 0);
     const auto first = channel.PollBlock(0);
     assert(first.kind == flowsql::BlockPollEvent::kData && first.batch);
-    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kTimeout);
+    assert(channel.OutstandingBatchCount() == 1);
+    const auto timeout = channel.PollBlock(0);
+    AssertNoBatchEvent(timeout, flowsql::BlockPollEvent::kTimeout);
+    assert(timeout.err == 0);
+    assert(channel.OutstandingBatchCount() == 1);
 
     auto next_poll = std::async(std::launch::async, [&]() { return channel.PollBlock(5000); });
     assert(next_poll.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    assert(channel.OutstandingBatchCount() == 1);
     assert(channel.ReleaseBlock(first.batch) == 0);
     assert(next_poll.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
     const auto second = next_poll.get();
     assert(second.kind == flowsql::BlockPollEvent::kData && second.batch);
+    assert(channel.OutstandingBatchCount() == 1);
     auto sequence = std::static_pointer_cast<arrow::UInt64Array>(second.batch->column(5));
     assert(sequence->Value(0) == 1);
     assert(channel.ReleaseBlock(second.batch) == 0);
+    assert(channel.ReleaseBlock(second.batch) == EINVAL);
+    assert(channel.OutstandingBatchCount() == 0);
 
     assert(channel.Close() == 0);
     assert(channel.Open() == 0);
     const auto outstanding = channel.PollBlock(0);
     assert(outstanding.kind == flowsql::BlockPollEvent::kData && outstanding.batch);
+    assert(channel.OutstandingBatchCount() == 1);
     auto cancelled_poll = std::async(std::launch::async, [&]() { return channel.PollBlock(5000); });
     assert(cancelled_poll.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
     channel.Cancel();
     assert(cancelled_poll.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
-    assert(cancelled_poll.get().kind == flowsql::BlockPollEvent::kCancelled);
+    AssertNoBatchEvent(cancelled_poll.get(), flowsql::BlockPollEvent::kCancelled);
+    assert(channel.OutstandingBatchCount() == 1);
     assert(channel.ReleaseBlock(outstanding.batch) == 0);
-    assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
+    assert(channel.ReleaseBlock(outstanding.batch) == EINVAL);
+    assert(channel.OutstandingBatchCount() == 0);
+    AssertNoBatchEvent(channel.PollBlock(0), flowsql::BlockPollEvent::kCancelled);
+}
+
+void TestReleaseBlockOwnership() {
+    const std::string path = Temp("release_ownership.pcap");
+    WriteFile(path, MakeClassicPcap(true, false, 0));
+
+    MockProtocol protocol;
+    pcapfile::PcapFileSourceConfig config;
+    config.path = path;
+    pcapfile::PcapFileChannel first_channel("release_first", config, &protocol);
+    pcapfile::PcapFileChannel second_channel("release_second", config, &protocol);
+    assert(first_channel.Open() == 0);
+    assert(second_channel.Open() == 0);
+    assert(first_channel.ReleaseBlock(std::shared_ptr<arrow::RecordBatch>{}) == EINVAL);
+
+    const auto first = first_channel.PollBlock(0);
+    const auto second = second_channel.PollBlock(0);
+    assert(first.kind == flowsql::BlockPollEvent::kData && first.batch);
+    assert(second.kind == flowsql::BlockPollEvent::kData && second.batch);
+    assert(first_channel.OutstandingBatchCount() == 1);
+    assert(second_channel.OutstandingBatchCount() == 1);
+
+    assert(first_channel.ReleaseBlock(second.batch) == EINVAL);
+    assert(second_channel.ReleaseBlock(first.batch) == EINVAL);
+    const auto sliced = first.batch->Slice(0, first.batch->num_rows());
+    assert(sliced.get() != first.batch.get());
+    assert(first_channel.ReleaseBlock(sliced) == EINVAL);
+    assert(first_channel.OutstandingBatchCount() == 1);
+    assert(second_channel.OutstandingBatchCount() == 1);
+
+    assert(first_channel.ReleaseBlock(first.batch) == 0);
+    assert(first_channel.ReleaseBlock(first.batch) == EINVAL);
+    assert(second_channel.ReleaseBlock(second.batch) == 0);
+    assert(first_channel.OutstandingBatchCount() == 0);
+    assert(second_channel.OutstandingBatchCount() == 0);
 }
 
 void TestCancelInterruptsReplayWait() {
@@ -704,7 +1218,7 @@ void TestCancelInterruptsReplayWait() {
     assert(channel.Close() == EBUSY);
     channel.Cancel();
     assert(replay_poll.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
-    assert(replay_poll.get().kind == flowsql::BlockPollEvent::kCancelled);
+    AssertNoBatchEvent(replay_poll.get(), flowsql::BlockPollEvent::kCancelled);
     assert(channel.Close() == 0);
 }
 
@@ -724,7 +1238,12 @@ void TestBatchOwnerAndPluginLifecycle() {
         retained = event.batch;
         assert(channel->Close() == EBUSY);
     }
+    assert(retained);
+    assert(retained->num_rows() == 1);
+    assert(retained->schema()->Equals(*flowsql::packet::PacketSchema()));
+    auto retained_timestamp = std::static_pointer_cast<arrow::Int64Array>(retained->column(0));
     auto retained_raw = std::static_pointer_cast<arrow::BinaryArray>(retained->column(6));
+    assert(retained_timestamp->Value(0) == 2000000000LL);
     assert(retained_raw->GetView(0) == "\x01\x02\x03\x04");
 
     MockProtocol protocol;
@@ -765,6 +1284,7 @@ void TestMalformedPcapngAndFormatMismatch() {
     AppendPcapngSectionHeader(&bytes, true);
     AppendPcapngInterface(&bytes, true, 1);
     AppendPcapngEnhancedPacket(&bytes, true, 0, 0, {1, 2, 3});
+    AssertCaptureSourceError("pcapng_declared_as_pcap.pcapng", "pcap", bytes);
     bytes[bytes.size() - 1] = 0;
     bytes.back() = 0xff;
     const std::string path = Temp("bad_pcapng.pcapng");
@@ -775,9 +1295,10 @@ void TestMalformedPcapngAndFormatMismatch() {
     config.format = "pcapng";
     pcapfile::PcapFileChannel channel("bad", config, &protocol);
     assert(channel.Open() == 0);
-    auto event = channel.PollBlock(0);
-    assert(event.kind == flowsql::BlockPollEvent::kError);
-    assert(channel.PollBlock(0).kind != flowsql::BlockPollEvent::kEof);
+    const auto error = channel.PollBlock(0);
+    AssertNoBatchEvent(error, flowsql::BlockPollEvent::kError);
+    assert(error.err != 0);
+    AssertNoBatchEvent(channel.PollBlock(0), flowsql::BlockPollEvent::kCancelled);
 
     const std::string pcap_path = Temp("format_mismatch.pcap");
     WriteFile(pcap_path, MakeClassicPcap(true, false, 0));
@@ -785,8 +1306,10 @@ void TestMalformedPcapngAndFormatMismatch() {
     config.format = "pcapng";
     pcapfile::PcapFileChannel mismatch("mismatch", config, &protocol);
     assert(mismatch.Open() != 0);
-    assert(mismatch.PollBlock(0).kind == flowsql::BlockPollEvent::kError);
-    assert(mismatch.PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
+    const auto mismatch_error = mismatch.PollBlock(0);
+    AssertNoBatchEvent(mismatch_error, flowsql::BlockPollEvent::kError);
+    assert(mismatch_error.err != 0);
+    AssertNoBatchEvent(mismatch.PollBlock(0), flowsql::BlockPollEvent::kCancelled);
 }
 
 void TestIncrementalReadAfterOpen() {
@@ -887,13 +1410,20 @@ void TestCancelAndManagerBusy() {
     auto* channel = dynamic_cast<pcapfile::PcapFileChannel*>(plugin.Get("pcapfile", "busy"));
     assert(channel != nullptr);
     auto event = channel->PollBlock(0);
-    assert(event.kind == flowsql::BlockPollEvent::kData);
+    assert(event.kind == flowsql::BlockPollEvent::kData && event.batch);
+    assert(channel->OutstandingBatchCount() == 1);
+    assert(channel->Close() == EBUSY);
     assert(plugin.ModifyChannel("pcapfile", "busy", option) == EBUSY);
+    assert(plugin.Get("pcapfile", "busy") == channel);
     assert(plugin.RemoveChannel("pcapfile", "busy") == EBUSY);
+    assert(plugin.Get("pcapfile", "busy") == channel);
+    assert(channel->OutstandingBatchCount() == 1);
     assert(channel->ReleaseBlock(event.batch) == 0);
+    assert(channel->OutstandingBatchCount() == 0);
     channel->Cancel();
-    assert(channel->PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
+    AssertNoBatchEvent(channel->PollBlock(0), flowsql::BlockPollEvent::kCancelled);
     assert(plugin.RemoveChannel("pcapfile", "busy") == 0);
+    assert(plugin.Get("pcapfile", "busy") == nullptr);
     plugin.Unload();
 }
 
@@ -969,17 +1499,24 @@ void TestPluginManager() {
 int main() {
     TestClassicPcap();
     TestClassicMagicAndEndian();
+    TestClassicFieldsAndFileOrder();
+    TestClassicStructureErrors();
     TestPendingErrorAfterData();
-    TestUnsupportedAndMalformedLayer();
+    TestSupportedLayerDecodeContract();
+    TestUnsupportedTruncatedAndMalformedLayer();
     TestEmptyFileEof();
     TestPcapngSectionAndResolution();
     TestPcapngSectionsAndRounding();
+    TestPcapngInterfaceFieldsAndFileOrder();
+    TestPcapngTimestampQuantizationAndOverflow();
     TestPcapngEnhancedPacketMapping();
     TestPcapngEnhancedPacketErrors();
     TestPcapngSectionValidation();
+    TestPcapngInterfaceOptionErrors();
     TestManyPcapngSectionsIterative();
     TestReplayModes();
     TestBackpressureAndCancelWakeup();
+    TestReleaseBlockOwnership();
     TestCancelInterruptsReplayWait();
     TestBatchOwnerAndPluginLifecycle();
     TestMalformedPcapngAndFormatMismatch();

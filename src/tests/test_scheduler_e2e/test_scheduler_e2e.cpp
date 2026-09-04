@@ -1,22 +1,20 @@
-/*
- * Copyright (C) 2026 LIHUO
- *
- * Licensed under the MIT License. See LICENSE file in the project root
- * for full license information.
- *
- */
+// Copyright (C) 2026 LIHUO. All rights reserved.
+// Licensed under the MIT License.
 
 #include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -28,8 +26,10 @@
 #include <common/error_code.h>
 #include <common/loader.hpp>
 #include <framework/core/dataframe.h>
-#include <framework/core/stream_channel_adapter.h>
 #include <framework/core/dataframe_channel.h>
+#include <framework/core/packet_codec.h>
+#include <framework/core/stream_channel_adapter.h>
+#include <framework/interfaces/iblock_stream_operator.h>
 #include <framework/interfaces/idatabase_channel.h>
 #include <framework/interfaces/idatabase_factory.h>
 #include <framework/interfaces/ichannel_registry.h>
@@ -40,6 +40,7 @@
 #include <framework/interfaces/istream_channel.h>
 #include <framework/interfaces/istream_factory.h>
 #include <framework/interfaces/istream_operator.h>
+#include <plugins/npi/iprotocol.h>
 
 using namespace flowsql;
 
@@ -62,6 +63,158 @@ using namespace flowsql;
             assert(false);                                                                  \
         }                                                                                   \
     } while (0)
+
+class SchedulerE2eProtocol final : public IProtocol {
+ public:
+    void Concurrency(int32_t) override {}
+    protocol::Protocol Identify(int32_t, const uint8_t*, int32_t, const protocol::Layers*) override {
+        return {};
+    }
+    int32_t Layer(int32_t, const uint8_t* data, int32_t size, protocol::Layers* layers) override {
+        ++layer_calls;
+        if (!data || size <= 0 || !layers) return -1;
+        *layers = {};
+        return 0;
+    }
+    protocol::IDictionary* Dictionary() override { return nullptr; }
+
+    void Reset() { layer_calls = 0; }
+
+    int layer_calls = 0;
+};
+
+class SchedulerE2eBlockOperator final : public IBlockStreamOperator {
+ public:
+    std::string Category() override { return "test"; }
+    std::string Name() override { return "packet_counter"; }
+    std::string Description() override { return "scheduler pcapfile E2E packet counter"; }
+    int Configure(const char*, const char*) override { return 0; }
+    int Init(const char*) override {
+        ++init_calls;
+        return 0;
+    }
+    int OnSchemaReady(std::shared_ptr<arrow::Schema> schema) override {
+        ++schema_calls;
+        schema_matches_packet = schema && schema->Equals(packet::PacketSchema());
+        return schema_matches_packet ? 0 : EINVAL;
+    }
+    int ProcessBlock(const std::shared_ptr<arrow::RecordBatch>& batch, int64_t) override {
+        ++process_calls;
+        if (!batch) return EINVAL;
+        auto sequence = std::dynamic_pointer_cast<arrow::UInt64Array>(batch->GetColumnByName("sequence"));
+        auto raw = std::dynamic_pointer_cast<arrow::BinaryArray>(batch->GetColumnByName("raw_data"));
+        if (!sequence || !raw || sequence->length() != batch->num_rows() || raw->length() != batch->num_rows()) {
+            return EINVAL;
+        }
+        rows_seen += batch->num_rows();
+        for (int64_t row = 0; row < batch->num_rows(); ++row) {
+            sequences.push_back(sequence->Value(row));
+            const auto bytes = raw->GetView(row);
+            raw_packets.emplace_back(bytes.data(), bytes.size());
+        }
+        return 0;
+    }
+    int Flush() override {
+        ++flush_calls;
+        return 0;
+    }
+    std::string LastError() override { return "scheduler pcapfile E2E operator failed"; }
+
+    void Reset() {
+        init_calls = 0;
+        schema_calls = 0;
+        process_calls = 0;
+        flush_calls = 0;
+        rows_seen = 0;
+        schema_matches_packet = false;
+        sequences.clear();
+        raw_packets.clear();
+    }
+
+    int init_calls = 0;
+    int schema_calls = 0;
+    int process_calls = 0;
+    int flush_calls = 0;
+    int64_t rows_seen = 0;
+    bool schema_matches_packet = false;
+    std::vector<uint64_t> sequences;
+    std::vector<std::string> raw_packets;
+};
+
+static void AppendPcapLe16(std::vector<uint8_t>* bytes, uint16_t value) {
+    bytes->push_back(static_cast<uint8_t>(value));
+    bytes->push_back(static_cast<uint8_t>(value >> 8));
+}
+
+static void AppendPcapLe32(std::vector<uint8_t>* bytes, uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+        bytes->push_back(static_cast<uint8_t>(value >> shift));
+    }
+}
+
+static std::vector<uint8_t> MakeSchedulerE2ePcap(bool truncate_last_packet) {
+    std::vector<uint8_t> bytes = {0xd4, 0xc3, 0xb2, 0xa1};
+    AppendPcapLe16(&bytes, 2);
+    AppendPcapLe16(&bytes, 4);
+    AppendPcapLe32(&bytes, 0);
+    AppendPcapLe32(&bytes, 0);
+    AppendPcapLe32(&bytes, 65535);
+    AppendPcapLe32(&bytes, 1);
+    const auto append_record = [&](uint32_t seconds, const std::vector<uint8_t>& packet) {
+        AppendPcapLe32(&bytes, seconds);
+        AppendPcapLe32(&bytes, 0);
+        AppendPcapLe32(&bytes, 4);
+        AppendPcapLe32(&bytes, 4);
+        bytes.insert(bytes.end(), packet.begin(), packet.end());
+    };
+    append_record(1, {1, 2, 3, 4});
+    append_record(2, truncate_last_packet ? std::vector<uint8_t>{5} : std::vector<uint8_t>{5, 6, 7, 8});
+    return bytes;
+}
+
+static void WriteSchedulerE2eBinary(const std::filesystem::path& path,
+                                    const std::vector<uint8_t>& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(out.is_open());
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(out.good());
+}
+
+static std::string MakePcapSourceAddRequest(const std::string& name,
+                                            const std::filesystem::path& path) {
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    writer.StartObject();
+    writer.Key("type");
+    writer.String("pcapfile");
+    writer.Key("name");
+    writer.String(name.c_str());
+    writer.Key("role");
+    writer.String("source");
+    writer.Key("options");
+    writer.StartObject();
+    writer.Key("path");
+    writer.String(path.string().c_str());
+    writer.Key("format");
+    writer.String("pcap");
+    writer.Key("batch_packets");
+    writer.Uint(1);
+    writer.EndObject();
+    writer.EndObject();
+    return buffer.GetString();
+}
+
+static std::string MakePcapSourceRemoveRequest(const std::string& name) {
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    writer.StartObject();
+    writer.Key("type");
+    writer.String("pcapfile");
+    writer.Key("name");
+    writer.String(name.c_str());
+    writer.EndObject();
+    return buffer.GetString();
+}
 
 static std::shared_ptr<arrow::Buffer> SerializeBatch(const std::shared_ptr<arrow::RecordBatch>& batch) {
     auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
@@ -473,11 +626,19 @@ int main() {
     const std::filesystem::path operator_db_dir = std::filesystem::temp_directory_path() / ("flowsql_s9_3_catalog_" + suffix);
     const std::filesystem::path stream_cfg = std::filesystem::temp_directory_path() / ("flowsql_s9_3_stream_" + suffix + ".yml");
     const std::filesystem::path stream_meta_db = std::filesystem::temp_directory_path() / ("flowsql_s9_3_stream_meta_" + suffix + ".db");
+    const std::filesystem::path pcap_ok =
+        std::filesystem::temp_directory_path() / ("flowsql_scheduler_pcap_ok_" + suffix + ".pcap");
+    const std::filesystem::path pcap_error =
+        std::filesystem::temp_directory_path() / ("flowsql_scheduler_pcap_error_" + suffix + ".pcap");
     std::filesystem::remove(db_path);
     std::filesystem::remove(stream_cfg);
     std::filesystem::remove(stream_meta_db);
+    std::filesystem::remove(pcap_ok);
+    std::filesystem::remove(pcap_error);
     std::filesystem::create_directories(data_dir);
     std::filesystem::create_directories(operator_db_dir);
+    WriteSchedulerE2eBinary(pcap_ok, MakeSchedulerE2ePcap(false));
+    WriteSchedulerE2eBinary(pcap_error, MakeSchedulerE2ePcap(true));
 
     {
         std::ofstream out(stream_cfg);
@@ -512,12 +673,17 @@ int main() {
     }
 
     PluginLoader* loader = PluginLoader::Single();
-    const char* libs[] = {"libflowsql_database.so", "libflowsql_builtin.so", "libflowsql_catalog.so", "libflowsql_scheduler.so", "libflowsql_stream.so"};
+    SchedulerE2eProtocol pcap_protocol;
+    SchedulerE2eBlockOperator block_operator;
+    loader->Regist(IID_PROTOCOL, &pcap_protocol);
+    loader->Regist(IID_BLOCK_STREAM_OPERATOR, &block_operator);
+    const char* libs[] = {"libflowsql_database.so", "libflowsql_builtin.so", "libflowsql_catalog.so",
+                          "libflowsql_pcapfile.so", "libflowsql_scheduler.so", "libflowsql_stream.so"};
     std::string db_opt = "type=sqlite;name=local;path=" + db_path.string();
     std::string catalog_opt = "data_dir=" + data_dir.string() + ";operator_db_dir=" + operator_db_dir.string();
     std::string stream_opt = "config_file=" + stream_cfg.string() + ";db_path=" + stream_meta_db.string();
-    const char* opts[] = {db_opt.c_str(), nullptr, catalog_opt.c_str(), nullptr, stream_opt.c_str()};
-    ASSERT_EQ(loader->Load(get_absolute_process_path(), libs, opts, 5), 0);
+    const char* opts[] = {db_opt.c_str(), nullptr, catalog_opt.c_str(), nullptr, nullptr, stream_opt.c_str()};
+    ASSERT_EQ(loader->Load(get_absolute_process_path(), libs, opts, 6), 0);
     std::puts("[INFO] plugins loaded");
     ASSERT_EQ(loader->StartAll(), 0);
     std::puts("[INFO] plugins started");
@@ -541,6 +707,7 @@ int main() {
     auto stream_status = FindRouteHandler(loader, "POST", "/scheduler/stream/status");
     auto stream_list = FindRouteHandler(loader, "POST", "/scheduler/stream/list");
     auto stream_add = FindRouteHandler(loader, "POST", "/channels/stream/add");
+    auto stream_remove = FindRouteHandler(loader, "POST", "/channels/stream/remove");
     auto stream_reset = FindRouteHandler(loader, "POST", "/channels/stream/reset");
     auto stream_definitions_query = FindRouteHandler(loader, "POST", "/channels/stream/definitions/query");
     auto sql_classify = FindRouteHandler(loader, "POST", "/scheduler/sql/classify");
@@ -553,6 +720,7 @@ int main() {
     ASSERT_TRUE(stream_status != nullptr);
     ASSERT_TRUE(stream_list != nullptr);
     ASSERT_TRUE(stream_add != nullptr);
+    ASSERT_TRUE(stream_remove != nullptr);
     ASSERT_TRUE(stream_reset != nullptr);
     ASSERT_TRUE(stream_definitions_query != nullptr);
     ASSERT_TRUE(sql_classify != nullptr);
@@ -560,6 +728,86 @@ int main() {
     ASSERT_TRUE(deactivate != nullptr);
     ASSERT_TRUE(upsert_batch != nullptr);
     std::puts("[INFO] execute handler ready");
+
+    // npm-offline-import T5.5: real pcapfile provider -> Scheduler -> block operator.
+    {
+        const std::string channel_name = "scheduler_pcap_ok";
+        std::string rsp;
+        ASSERT_EQ(stream_add("/channels/stream/add",
+                             MakePcapSourceAddRequest(channel_name, pcap_ok),
+                             rsp),
+                  error::OK);
+
+        pcap_protocol.Reset();
+        block_operator.Reset();
+        const std::string sql =
+            "SELECT * FROM pcapfile." + channel_name + " USING test.packet_counter";
+        ASSERT_EQ(exec("/scheduler/batch/execute", MakeReq(sql), rsp), error::OK);
+        ASSERT_TRUE(rsp.find("BLOCK_STREAM_NOT_IMPLEMENTED") == std::string::npos);
+        rapidjson::Document completed;
+        completed.Parse(rsp.c_str());
+        ASSERT_TRUE(!completed.HasParseError() && completed.IsObject());
+        ASSERT_TRUE(completed.HasMember("status") && completed["status"].IsString());
+        ASSERT_EQ(std::string(completed["status"].GetString()), "completed");
+        ASSERT_TRUE(completed.HasMember("rows") && completed["rows"].IsInt64());
+        ASSERT_EQ(completed["rows"].GetInt64(), 2);
+        ASSERT_TRUE(completed.HasMember("result_row_count") && completed["result_row_count"].IsInt64());
+        ASSERT_EQ(completed["result_row_count"].GetInt64(), 2);
+        ASSERT_EQ(pcap_protocol.layer_calls, 2);
+        ASSERT_EQ(block_operator.init_calls, 1);
+        ASSERT_EQ(block_operator.schema_calls, 1);
+        ASSERT_TRUE(block_operator.schema_matches_packet);
+        ASSERT_EQ(block_operator.process_calls, 2);
+        ASSERT_EQ(block_operator.flush_calls, 1);
+        ASSERT_EQ(block_operator.rows_seen, 2);
+        ASSERT_EQ(block_operator.sequences, std::vector<uint64_t>({0, 1}));
+        ASSERT_EQ(block_operator.raw_packets,
+                  std::vector<std::string>({std::string("\x01\x02\x03\x04", 4),
+                                            std::string("\x05\x06\x07\x08", 4)}));
+
+        ASSERT_EQ(stream_remove("/channels/stream/remove",
+                                MakePcapSourceRemoveRequest(channel_name),
+                                rsp),
+                  error::OK);
+    }
+    {
+        const std::string channel_name = "scheduler_pcap_error";
+        std::string rsp;
+        ASSERT_EQ(stream_add("/channels/stream/add",
+                             MakePcapSourceAddRequest(channel_name, pcap_error),
+                             rsp),
+                  error::OK);
+
+        pcap_protocol.Reset();
+        block_operator.Reset();
+        const std::string sql =
+            "SELECT * FROM pcapfile." + channel_name + " USING test.packet_counter";
+        ASSERT_EQ(exec("/scheduler/batch/execute", MakeReq(sql), rsp), error::INTERNAL_ERROR);
+        ASSERT_TRUE(rsp.find("\"status\":\"completed\"") == std::string::npos);
+        rapidjson::Document failed;
+        failed.Parse(rsp.c_str());
+        ASSERT_TRUE(!failed.HasParseError() && failed.IsObject());
+        ASSERT_TRUE(failed.HasMember("error_code") && failed["error_code"].IsString());
+        ASSERT_EQ(std::string(failed["error_code"].GetString()), "OP_EXEC_FAIL");
+        ASSERT_TRUE(failed.HasMember("error_stage") && failed["error_stage"].IsString());
+        ASSERT_EQ(std::string(failed["error_stage"].GetString()), "execute");
+        ASSERT_EQ(pcap_protocol.layer_calls, 1);
+        ASSERT_EQ(block_operator.init_calls, 1);
+        ASSERT_EQ(block_operator.schema_calls, 1);
+        ASSERT_TRUE(block_operator.schema_matches_packet);
+        ASSERT_EQ(block_operator.process_calls, 1);
+        ASSERT_EQ(block_operator.flush_calls, 0);
+        ASSERT_EQ(block_operator.rows_seen, 1);
+        ASSERT_EQ(block_operator.sequences, std::vector<uint64_t>({0}));
+        ASSERT_EQ(block_operator.raw_packets,
+                  std::vector<std::string>({std::string("\x01\x02\x03\x04", 4)}));
+
+        ASSERT_EQ(stream_remove("/channels/stream/remove",
+                                MakePcapSourceRemoveRequest(channel_name),
+                                rsp),
+                  error::OK);
+    }
+    std::puts("[PASS] npm-offline-import Scheduler pcapfile E2E");
 
     // T17a: SQL classify 返回批/流类型
     {
@@ -3621,6 +3869,7 @@ int main() {
     stream_status = fnRouterHandler();
     stream_list = fnRouterHandler();
     stream_add = fnRouterHandler();
+    stream_remove = fnRouterHandler();
     stream_reset = fnRouterHandler();
     stream_definitions_query = fnRouterHandler();
     sql_classify = fnRouterHandler();
@@ -3632,6 +3881,8 @@ int main() {
     std::filesystem::remove(db_path);
     std::filesystem::remove(stream_cfg);
     std::filesystem::remove(stream_meta_db);
+    std::filesystem::remove(pcap_ok);
+    std::filesystem::remove(pcap_error);
     std::filesystem::remove_all(data_dir);
     std::filesystem::remove_all(operator_db_dir);
 
