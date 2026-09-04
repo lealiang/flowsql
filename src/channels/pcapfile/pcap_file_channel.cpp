@@ -12,6 +12,7 @@
 #include <rapidjson/writer.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cerrno>
@@ -19,6 +20,8 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <tuple>
 
 #include <boost/multiprecision/cpp_int.hpp>
@@ -70,10 +73,6 @@ int64_t ReadSigned64(const uint8_t* p, bool little) {
     return static_cast<int64_t>(Read64(p, little));
 }
 
-bool Has(const std::vector<uint8_t>& data, size_t pos, size_t count) {
-    return pos <= data.size() && count <= data.size() - pos;
-}
-
 bool IsMagic(const uint8_t* p, std::initializer_list<uint8_t> bytes) {
     size_t i = 0;
     for (uint8_t value : bytes) {
@@ -85,37 +84,6 @@ bool IsMagic(const uint8_t* p, std::initializer_list<uint8_t> bytes) {
 int SetError(std::string* error, const char* message, int code = EINVAL) {
     if (error) *error = message;
     return code;
-}
-
-int ValidatePcapngOptions(const std::vector<uint8_t>& data,
-                          size_t begin,
-                          size_t end,
-                          bool little,
-                          std::string* error) {
-    if (begin > end || end > data.size()) return SetError(error, "pcapng option range invalid");
-    if (begin == end) return 0;
-
-    size_t position = begin;
-    while (position < end) {
-        if (end - position < 4) return SetError(error, "pcapng option header truncated");
-        const uint16_t code = Read16(data.data() + position, little);
-        const uint16_t length = Read16(data.data() + position + 2, little);
-        position += 4;
-        if (code == 0) {
-            if (length != 0) return SetError(error, "pcapng option terminator invalid");
-            if (position != end) return SetError(error, "pcapng option data follows terminator");
-            return 0;
-        }
-        if (static_cast<size_t>(length) > end - position) {
-            return SetError(error, "pcapng option data truncated");
-        }
-        const size_t padded = (static_cast<size_t>(length) + 3u) & ~static_cast<size_t>(3u);
-        if (padded < length || padded > end - position) {
-            return SetError(error, "pcapng option padding truncated");
-        }
-        position += padded;
-    }
-    return SetError(error, "pcapng option terminator missing");
 }
 
 int64_t TimestampNs(uint64_t ticks, uint8_t exponent, bool binary, int64_t offset_seconds, bool* ok) {
@@ -172,47 +140,29 @@ class PcapLayerAdapter final {
 class PcapFileReader {
  public:
     int Open(const std::string& path, const std::string& requested_format, std::string* error) {
-        std::ifstream input(path, std::ios::binary);
-        if (!input) return SetError(error, "open capture file failed", errno ? errno : EIO);
-        input.seekg(0, std::ios::end);
-        const auto length = input.tellg();
-        if (length < 0) return SetError(error, "stat capture file failed", EIO);
-        input.seekg(0, std::ios::beg);
-        data_.resize(static_cast<size_t>(length));
-        if (!data_.empty() && !input.read(reinterpret_cast<char*>(data_.data()), length)) {
-            return SetError(error, "read capture file failed", EIO);
+        try {
+            return OpenImpl(path, requested_format, error);
+        } catch (const std::bad_alloc&) {
+            return SetError(error, "capture reader allocation failed", ENOMEM);
+        } catch (const std::length_error&) {
+            return SetError(error, "capture reader allocation length invalid", EOVERFLOW);
         }
-        if (data_.empty()) {
-            kind_ = Kind::kPcap;
-            pos_ = 0;
-            return 0;
-        }
-        if (requested_format != "auto" && requested_format != "pcap" && requested_format != "pcapng") {
-            return SetError(error, "invalid capture format");
-        }
-        const bool is_pcapng = data_.size() >= 4 && IsMagic(data_.data(), {0x0a, 0x0d, 0x0d, 0x0a});
-        if (requested_format == "pcapng" && !is_pcapng) return SetError(error, "format is not pcapng");
-        if (requested_format == "pcap" && is_pcapng) return SetError(error, "format is not classic pcap");
-        if (requested_format == "pcapng" || (requested_format == "auto" && is_pcapng)) {
-            kind_ = Kind::kPcapng;
-            pos_ = 0;
-            little_ = true;
-            have_section_ = false;
-            interfaces_.clear();
-            source_id_next_ = 0;
-            return ValidateFirstSection(error);
-        }
-        kind_ = Kind::kPcap;
-        return OpenClassic(error);
     }
 
     int Next(CaptureRecord* output, std::string* error) {
         if (!output) return EINVAL;
-        return kind_ == Kind::kPcap ? NextClassic(output, error) : NextPcapng(output, error);
+        try {
+            return kind_ == Kind::kPcap ? NextClassic(output, error) : NextPcapng(output, error);
+        } catch (const std::bad_alloc&) {
+            return SetError(error, "capture reader allocation failed", ENOMEM);
+        } catch (const std::length_error&) {
+            return SetError(error, "capture reader allocation length invalid", EOVERFLOW);
+        }
     }
 
  private:
     enum class Kind { kPcap, kPcapng };
+
     struct InterfaceInfo {
         uint32_t link_type = 0;
         uint32_t snaplen = 0;
@@ -223,9 +173,97 @@ class PcapFileReader {
         uint64_t sequence = 0;
     };
 
+    struct PcapngBlockHeader {
+        std::array<uint8_t, 12> bytes{};
+        uint32_t type = 0;
+        uint32_t total = 0;
+        bool section = false;
+        bool little = true;
+    };
+
+    int OpenImpl(const std::string& path, const std::string& requested_format, std::string* error) {
+        input_.rdbuf()->pubsetbuf(nullptr, 0);
+        input_.open(path, std::ios::binary);
+        if (!input_) return SetError(error, "open capture file failed", errno ? errno : EIO);
+        input_.seekg(0, std::ios::end);
+        const auto length = input_.tellg();
+        if (length < 0) return SetError(error, "stat capture file failed", EIO);
+        file_size_ = static_cast<uint64_t>(length);
+        if (Rewind(error) != 0) return EIO;
+        if (file_size_ == 0) {
+            kind_ = Kind::kPcap;
+            return 0;
+        }
+        if (requested_format != "auto" && requested_format != "pcap" && requested_format != "pcapng") {
+            return SetError(error, "invalid capture format");
+        }
+
+        std::array<uint8_t, 4> magic{};
+        if (ReadExact(magic.data(), magic.size(), "capture magic is truncated", error) != 0) return EIO;
+        const bool is_pcapng = IsMagic(magic.data(), {0x0a, 0x0d, 0x0d, 0x0a});
+        if (requested_format == "pcapng" && !is_pcapng) return SetError(error, "format is not pcapng");
+        if (requested_format == "pcap" && is_pcapng) return SetError(error, "format is not classic pcap");
+        if (Rewind(error) != 0) return EIO;
+
+        if (requested_format == "pcapng" || (requested_format == "auto" && is_pcapng)) {
+            kind_ = Kind::kPcapng;
+            little_ = true;
+            have_section_ = false;
+            interfaces_.clear();
+            source_id_next_ = 0;
+            PcapngBlockHeader header;
+            bool eof = false;
+            const int rc = ReadPcapngBlockHeader(&header, &eof, error);
+            if (rc != 0) return rc;
+            if (eof || !header.section) return SetError(error, "pcapng section header missing");
+            return BeginSection(header, error);
+        }
+        kind_ = Kind::kPcap;
+        return OpenClassic(error);
+    }
+
+    uint64_t Remaining() const { return position_ <= file_size_ ? file_size_ - position_ : 0; }
+
+    int Rewind(std::string* error) {
+        input_.clear();
+        input_.seekg(0, std::ios::beg);
+        if (!input_) return SetError(error, "seek capture file failed", EIO);
+        position_ = 0;
+        return 0;
+    }
+
+    int ReadExact(uint8_t* output, size_t size, const char* message, std::string* error) {
+        if (size > Remaining() || size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+            return SetError(error, message, EIO);
+        }
+        if (size == 0) return 0;
+        input_.read(reinterpret_cast<char*>(output), static_cast<std::streamsize>(size));
+        if (input_.gcount() != static_cast<std::streamsize>(size)) {
+            if (input_.gcount() > 0) position_ += static_cast<uint64_t>(input_.gcount());
+            return SetError(error, message, EIO);
+        }
+        position_ += size;
+        return 0;
+    }
+
+    int SkipExact(size_t size, const char* message, std::string* error) {
+        std::array<uint8_t, 4096> scratch{};
+        size_t remaining = size;
+        while (remaining != 0) {
+            const size_t chunk = std::min(remaining, scratch.size());
+            const int rc = ReadExact(scratch.data(), chunk, message, error);
+            if (rc != 0) return rc;
+            remaining -= chunk;
+        }
+        return 0;
+    }
+
     int OpenClassic(std::string* error) {
-        if (data_.size() < 24) return SetError(error, "classic pcap global header is truncated");
-        const uint8_t* p = data_.data();
+        std::array<uint8_t, 24> header{};
+        if (ReadExact(header.data(), header.size(), "classic pcap global header is truncated", error) != 0) {
+            return EIO;
+        }
+        const uint8_t* p = header.data();
         if (IsMagic(p, {0xd4, 0xc3, 0xb2, 0xa1})) {
             little_ = true;
             nanosecond_ = false;
@@ -247,33 +285,15 @@ class PcapFileReader {
         network_ = Read32(p + 20, little_);
         snaplen_ = Read32(p + 16, little_);
         if (snaplen_ == 0) return SetError(error, "pcap snaplen is invalid");
-        pos_ = 24;
         sequence_ = 0;
         return 0;
     }
 
-    int ValidateFirstSection(std::string* error) {
-        if (data_.size() < 28) return SetError(error, "pcapng section header is truncated");
-        if (!IsMagic(data_.data(), {0x0a, 0x0d, 0x0d, 0x0a})) return SetError(error, "pcapng section header missing");
-        const uint8_t* p = data_.data();
-        if (IsMagic(p + 8, {0x4d, 0x3c, 0x2b, 0x1a})) little_ = true;
-        else if (IsMagic(p + 8, {0x1a, 0x2b, 0x3c, 0x4d})) little_ = false;
-        else return SetError(error, "pcapng byte-order magic invalid");
-        const uint32_t total = Read32(p + 4, little_);
-        if (total < 28 || (total & 3) != 0 || total > data_.size()) return SetError(error, "pcapng section length invalid");
-        if (Read32(p + total - 4, little_) != total) return SetError(error, "pcapng section length trailer invalid");
-        if (Read16(p + 12, little_) != 1 || Read16(p + 14, little_) != 0) return SetError(error, "pcapng version unsupported");
-        if (ValidatePcapngOptions(data_, 24, total - 4, little_, error) != 0) return EINVAL;
-        pos_ = total;
-        have_section_ = true;
-        interfaces_.clear();
-        return 0;
-    }
-
     int NextClassic(CaptureRecord* output, std::string* error) {
-        if (pos_ == data_.size()) return 0;
-        if (!Has(data_, pos_, 16)) return SetError(error, "pcap record header is truncated");
-        const uint8_t* p = data_.data() + pos_;
+        if (Remaining() == 0) return 0;
+        std::array<uint8_t, 16> header{};
+        if (ReadExact(header.data(), header.size(), "pcap record header is truncated", error) != 0) return EIO;
+        const uint8_t* p = header.data();
         const uint32_t sec = Read32(p, little_);
         const uint32_t fraction = Read32(p + 4, little_);
         const uint32_t captured = Read32(p + 8, little_);
@@ -282,148 +302,228 @@ class PcapFileReader {
         if (fraction >= limit || (wire != 0 && wire < captured) || captured > snaplen_) {
             return SetError(error, "pcap record timestamp or length invalid");
         }
-        if (!Has(data_, pos_ + 16, captured)) return SetError(error, "pcap packet bytes are truncated", EIO);
+        if (captured > Remaining()) return SetError(error, "pcap packet bytes are truncated", EIO);
         const cpp_int timestamp = cpp_int(sec) * 1000000000 + cpp_int(fraction) * (nanosecond_ ? 1 : 1000);
         if (timestamp > std::numeric_limits<int64_t>::max()) return SetError(error, "pcap timestamp overflow");
+        output->bytes.resize(captured);
+        if (ReadExact(output->bytes.data(), output->bytes.size(), "pcap packet bytes are truncated", error) != 0) {
+            return EIO;
+        }
         output->timestamp_ns = timestamp.convert_to<int64_t>();
         output->captured_len = captured;
         output->wire_len = wire;
         output->link_type = network_;
         output->source_id = 0;
         output->sequence = sequence_++;
-        output->bytes.assign(data_.begin() + static_cast<std::ptrdiff_t>(pos_ + 16),
-                             data_.begin() + static_cast<std::ptrdiff_t>(pos_ + 16 + captured));
-        pos_ += 16 + captured;
         return 1;
     }
 
-    int BeginSection(std::string* error) {
-        if (!Has(data_, pos_, 28)) return SetError(error, "pcapng section header is truncated");
-        const uint8_t* p = data_.data() + pos_;
-        if (IsMagic(p + 8, {0x4d, 0x3c, 0x2b, 0x1a})) little_ = true;
-        else if (IsMagic(p + 8, {0x1a, 0x2b, 0x3c, 0x4d})) little_ = false;
-        else return SetError(error, "pcapng byte-order magic invalid");
-        const uint32_t total = Read32(p + 4, little_);
-        if (total < 28 || (total & 3) != 0 || !Has(data_, pos_, total) || Read32(p + total - 4, little_) != total) {
-            return SetError(error, "pcapng section length invalid");
+    int ReadPcapngBlockHeader(PcapngBlockHeader* header, bool* eof, std::string* error) {
+        if (!header || !eof) return EINVAL;
+        *eof = false;
+        if (Remaining() == 0) {
+            *eof = true;
+            return 0;
         }
-        if (Read16(p + 12, little_) != 1 || Read16(p + 14, little_) != 0) return SetError(error, "pcapng version unsupported");
-        if (ValidatePcapngOptions(data_, pos_ + 24, pos_ + total - 4, little_, error) != 0) return EINVAL;
-        pos_ += total;
+        if (ReadExact(header->bytes.data(), header->bytes.size(), "pcapng block header is truncated", error) != 0) {
+            return EIO;
+        }
+        header->section = IsMagic(header->bytes.data(), {0x0a, 0x0d, 0x0d, 0x0a});
+        if (header->section) {
+            if (IsMagic(header->bytes.data() + 8, {0x4d, 0x3c, 0x2b, 0x1a})) {
+                header->little = true;
+            } else if (IsMagic(header->bytes.data() + 8, {0x1a, 0x2b, 0x3c, 0x4d})) {
+                header->little = false;
+            } else {
+                return SetError(error, "pcapng byte-order magic invalid");
+            }
+            header->type = 0x0a0d0d0a;
+        } else {
+            header->little = little_;
+            header->type = Read32(header->bytes.data(), little_);
+        }
+        header->total = Read32(header->bytes.data() + 4, header->little);
+        const uint32_t minimum = header->section ? 28 : 12;
+        if (header->total < minimum || (header->total & 3u) != 0 || header->total - 12u > Remaining()) {
+            return SetError(error, header->section ? "pcapng section length invalid" : "pcapng block length invalid");
+        }
+        return 0;
+    }
+
+    int ReadPcapngTrailer(const PcapngBlockHeader& header, std::string* error) {
+        std::array<uint8_t, 4> trailer{};
+        if (ReadExact(trailer.data(), trailer.size(), "pcapng block length trailer is truncated", error) != 0) {
+            return EIO;
+        }
+        if (Read32(trailer.data(), header.little) != header.total) {
+            return SetError(error, header.section ? "pcapng section length trailer invalid"
+                                                  : "pcapng block length trailer invalid");
+        }
+        return 0;
+    }
+
+    int ReadPcapngOptions(size_t size, bool little, InterfaceInfo* info, std::string* error) {
+        if (size == 0) return 0;
+        size_t remaining = size;
+        while (remaining != 0) {
+            if (remaining < 4) return SetError(error, "pcapng option header truncated");
+            std::array<uint8_t, 4> header{};
+            if (ReadExact(header.data(), header.size(), "pcapng option header truncated", error) != 0) return EIO;
+            remaining -= header.size();
+            const uint16_t code = Read16(header.data(), little);
+            const uint16_t length = Read16(header.data() + 2, little);
+            if (code == 0) {
+                if (length != 0) return SetError(error, "pcapng option terminator invalid");
+                if (remaining != 0) return SetError(error, "pcapng option data follows terminator");
+                return 0;
+            }
+            if (static_cast<size_t>(length) > remaining) {
+                return SetError(error, "pcapng option data truncated");
+            }
+            const size_t padded = (static_cast<size_t>(length) + 3u) & ~static_cast<size_t>(3u);
+            if (padded < length || padded > remaining) {
+                return SetError(error, "pcapng option padding truncated");
+            }
+            if (info && code == 9) {
+                if (length != 1) return SetError(error, "pcapng if_tsresol option length invalid");
+                uint8_t value = 0;
+                if (ReadExact(&value, 1, "pcapng interface option truncated", error) != 0) return EIO;
+                info->binary_resolution = (value & 0x80) != 0;
+                info->resolution = value & 0x7f;
+                if (SkipExact(padded - 1, "pcapng interface option padding truncated", error) != 0) return EIO;
+            } else if (info && code == 14) {
+                if (length != 8) return SetError(error, "pcapng if_tsoffset option length invalid");
+                std::array<uint8_t, 8> value{};
+                if (ReadExact(value.data(), value.size(), "pcapng interface option truncated", error) != 0) {
+                    return EIO;
+                }
+                info->tsoffset = ReadSigned64(value.data(), little);
+            } else if (SkipExact(padded, "pcapng option data truncated", error) != 0) {
+                return EIO;
+            }
+            remaining -= padded;
+        }
+        return SetError(error, "pcapng option terminator missing");
+    }
+
+    int BeginSection(const PcapngBlockHeader& header, std::string* error) {
+        std::array<uint8_t, 12> fixed{};
+        if (ReadExact(fixed.data(), fixed.size(), "pcapng section header is truncated", error) != 0) return EIO;
+        if (Read16(fixed.data(), header.little) != 1 || Read16(fixed.data() + 2, header.little) != 0) {
+            return SetError(error, "pcapng version unsupported");
+        }
+        const int options_rc = ReadPcapngOptions(header.total - 28u, header.little, nullptr, error);
+        if (options_rc != 0) return options_rc;
+        const int trailer_rc = ReadPcapngTrailer(header, error);
+        if (trailer_rc != 0) return trailer_rc;
+        little_ = header.little;
         interfaces_.clear();
         have_section_ = true;
         return 0;
     }
 
-    int NextPcapng(CaptureRecord* output, std::string* error) {
-        while (pos_ < data_.size()) {
-            if (!Has(data_, pos_, 12)) return SetError(error, "pcapng block header is truncated");
-            const uint8_t* p = data_.data() + pos_;
-            if (IsMagic(p, {0x0a, 0x0d, 0x0d, 0x0a})) {
-                if (interfaces_.empty()) return SetError(error, "pcapng section has no interface");
-                const int rc = BeginSection(error);
-                if (rc != 0) return rc;
-                continue;
-            }
-            if (!have_section_) return SetError(error, "pcapng block precedes section header");
-            const uint32_t type = Read32(p, little_);
-            const uint32_t total = Read32(p + 4, little_);
-            if (total < 12 || (total & 3) != 0 || !Has(data_, pos_, total) || Read32(p + total - 4, little_) != total) {
-                return SetError(error, "pcapng block length invalid");
-            }
-            const size_t block_pos = pos_;
-            pos_ += total;
-            if (type == 1) {
-                if (total < 20) return SetError(error, "pcapng interface block is truncated");
-                InterfaceInfo info;
-                info.link_type = Read16(p + 8, little_);
-                info.snaplen = Read32(p + 12, little_);
-                info.resolution = 6;
-                info.source_id = source_id_next_++;
-                const size_t options_begin = block_pos + 16;
-                const size_t options_end = block_pos + total - 4;
-                size_t option_pos = options_begin;
-                bool option_terminated = options_begin == options_end;
-                while (option_pos + 4 <= options_end) {
-                    const uint16_t code = Read16(data_.data() + option_pos, little_);
-                    const uint16_t length = Read16(data_.data() + option_pos + 2, little_);
-                    option_pos += 4;
-                    if (code == 0) {
-                        if (length != 0) return SetError(error, "pcapng interface option terminator invalid");
-                        option_terminated = true;
-                        break;
-                    }
-                    if (static_cast<size_t>(length) > options_end - option_pos) {
-                        return SetError(error, "pcapng interface option truncated");
-                    }
-                    if (code == 9 && length == 1) {
-                        const uint8_t value = data_[option_pos];
-                        info.binary_resolution = (value & 0x80) != 0;
-                        info.resolution = value & 0x7f;
-                    } else if (code == 9) {
-                        return SetError(error, "pcapng if_tsresol option length invalid");
-                    } else if (code == 14 && length == 8) {
-                        info.tsoffset = ReadSigned64(data_.data() + option_pos, little_);
-                    } else if (code == 14) {
-                        return SetError(error, "pcapng if_tsoffset option length invalid");
-                    }
-                    const size_t padded = (static_cast<size_t>(length) + 3u) & ~static_cast<size_t>(3u);
-                    if (padded < length || padded > options_end - option_pos) {
-                        return SetError(error, "pcapng interface option padding truncated");
-                    }
-                    option_pos += padded;
-                }
-                if (!option_terminated || option_pos != options_end) {
-                    return SetError(error, "pcapng interface options are truncated");
-                }
-                interfaces_.push_back(info);
-                continue;
-            }
-            if (type == 2 || type == 3) return SetError(error, "unsupported pcapng packet block");
-            if (type != 6) return SetError(error, "unsupported pcapng block");
-            if (total < 32) return SetError(error, "pcapng enhanced packet block is truncated");
-            const uint32_t interface_id = Read32(p + 8, little_);
-            if (interface_id >= interfaces_.size()) {
-                return SetError(error, "pcapng packet references unknown interface");
-            }
-            auto& info = interfaces_[interface_id];
-            const uint64_t timestamp = (static_cast<uint64_t>(Read32(p + 12, little_)) << 32) |
-                                       Read32(p + 16, little_);
-            const uint32_t captured = Read32(p + 20, little_);
-            const uint32_t wire = Read32(p + 24, little_);
-            if ((info.snaplen != 0 && captured > info.snaplen) || (wire != 0 && wire < captured)) {
-                return SetError(error, "pcapng packet length invalid");
-            }
-            const size_t bytes_pos = block_pos + 28;
-            const size_t padded_captured = (static_cast<size_t>(captured) + 3u) & ~static_cast<size_t>(3u);
-            if (!Has(data_, bytes_pos, static_cast<size_t>(captured)) ||
-                padded_captured > block_pos + total - 4 - bytes_pos) {
-                return SetError(error, "pcapng packet bytes are truncated", EIO);
-            }
-            const size_t options_begin = bytes_pos + padded_captured;
-            const size_t options_end = block_pos + total - 4;
-            if (ValidatePcapngOptions(data_, options_begin, options_end, little_, error) != 0) {
-                return EINVAL;
-            }
-            bool timestamp_ok = false;
-            output->timestamp_ns =
-                TimestampNs(timestamp, info.resolution, info.binary_resolution, info.tsoffset, &timestamp_ok);
-            if (!timestamp_ok) return SetError(error, "pcapng timestamp overflow");
-            output->captured_len = captured;
-            output->wire_len = wire;
-            output->link_type = info.link_type;
-            output->source_id = info.source_id;
-            output->sequence = info.sequence++;
-            output->bytes.assign(data_.begin() + static_cast<std::ptrdiff_t>(bytes_pos),
-                                 data_.begin() + static_cast<std::ptrdiff_t>(bytes_pos + captured));
-            return 1;
+    int ReadPcapngInterface(const PcapngBlockHeader& header, std::string* error) {
+        if (header.total < 20) return SetError(error, "pcapng interface block is truncated");
+        std::array<uint8_t, 4> snaplen{};
+        if (ReadExact(snaplen.data(), snaplen.size(), "pcapng interface block is truncated", error) != 0) {
+            return EIO;
         }
-        if (have_section_ && interfaces_.empty()) return SetError(error, "pcapng section has no interface");
+        InterfaceInfo info;
+        info.link_type = Read16(header.bytes.data() + 8, little_);
+        info.snaplen = Read32(snaplen.data(), little_);
+        info.resolution = 6;
+        info.source_id = source_id_next_;
+        const int options_rc = ReadPcapngOptions(header.total - 20u, little_, &info, error);
+        if (options_rc != 0) return options_rc;
+        const int trailer_rc = ReadPcapngTrailer(header, error);
+        if (trailer_rc != 0) return trailer_rc;
+        interfaces_.push_back(info);
+        ++source_id_next_;
         return 0;
     }
 
-    std::vector<uint8_t> data_;
-    size_t pos_ = 0;
+    int ReadPcapngPacket(const PcapngBlockHeader& header, CaptureRecord* output, std::string* error) {
+        if (header.total < 32) return SetError(error, "pcapng enhanced packet block is truncated");
+        std::array<uint8_t, 16> fixed{};
+        if (ReadExact(fixed.data(), fixed.size(), "pcapng enhanced packet block is truncated", error) != 0) {
+            return EIO;
+        }
+        const uint32_t interface_id = Read32(header.bytes.data() + 8, little_);
+        if (interface_id >= interfaces_.size()) {
+            return SetError(error, "pcapng packet references unknown interface");
+        }
+        auto& info = interfaces_[interface_id];
+        const uint64_t timestamp = (static_cast<uint64_t>(Read32(fixed.data(), little_)) << 32) |
+                                   Read32(fixed.data() + 4, little_);
+        const uint32_t captured = Read32(fixed.data() + 8, little_);
+        const uint32_t wire = Read32(fixed.data() + 12, little_);
+        if ((info.snaplen != 0 && captured > info.snaplen) || (wire != 0 && wire < captured)) {
+            return SetError(error, "pcapng packet length invalid");
+        }
+        const uint64_t padded_captured = (static_cast<uint64_t>(captured) + 3u) & ~uint64_t{3u};
+        const uint64_t payload_size = header.total - 32u;
+        if (padded_captured > payload_size) return SetError(error, "pcapng packet bytes are truncated", EIO);
+        output->bytes.resize(captured);
+        if (ReadExact(output->bytes.data(), output->bytes.size(), "pcapng packet bytes are truncated", error) != 0) {
+            return EIO;
+        }
+        if (SkipExact(static_cast<size_t>(padded_captured - captured),
+                      "pcapng packet padding is truncated", error) != 0) {
+            return EIO;
+        }
+        const int options_rc =
+            ReadPcapngOptions(static_cast<size_t>(payload_size - padded_captured), little_, nullptr, error);
+        if (options_rc != 0) return options_rc;
+        const int trailer_rc = ReadPcapngTrailer(header, error);
+        if (trailer_rc != 0) return trailer_rc;
+
+        bool timestamp_ok = false;
+        output->timestamp_ns =
+            TimestampNs(timestamp, info.resolution, info.binary_resolution, info.tsoffset, &timestamp_ok);
+        if (!timestamp_ok) return SetError(error, "pcapng timestamp overflow");
+        output->captured_len = captured;
+        output->wire_len = wire;
+        output->link_type = info.link_type;
+        output->source_id = info.source_id;
+        output->sequence = info.sequence++;
+        return 1;
+    }
+
+    int NextPcapng(CaptureRecord* output, std::string* error) {
+        while (true) {
+            PcapngBlockHeader header;
+            bool eof = false;
+            const int header_rc = ReadPcapngBlockHeader(&header, &eof, error);
+            if (header_rc != 0) return header_rc;
+            if (eof) {
+                if (have_section_ && interfaces_.empty()) {
+                    return SetError(error, "pcapng section has no interface");
+                }
+                return 0;
+            }
+            if (header.section) {
+                if (interfaces_.empty()) return SetError(error, "pcapng section has no interface");
+                const int section_rc = BeginSection(header, error);
+                if (section_rc != 0) return section_rc;
+                continue;
+            }
+            if (!have_section_) return SetError(error, "pcapng block precedes section header");
+            if (header.type == 1) {
+                const int interface_rc = ReadPcapngInterface(header, error);
+                if (interface_rc != 0) return interface_rc;
+                continue;
+            }
+            if (header.type == 2 || header.type == 3) {
+                return SetError(error, "unsupported pcapng packet block");
+            }
+            if (header.type != 6) return SetError(error, "unsupported pcapng block");
+            return ReadPcapngPacket(header, output, error);
+        }
+    }
+
+    std::ifstream input_;
+    uint64_t file_size_ = 0;
+    uint64_t position_ = 0;
     Kind kind_ = Kind::kPcap;
     bool little_ = true;
     bool nanosecond_ = false;

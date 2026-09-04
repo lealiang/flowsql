@@ -284,7 +284,7 @@ LINKTYPE 支持的 packet 调用一次 `IProtocol::Layer()`，由 `src/channels/
   - `[x]` T1.1：新增两个公共头文件，冻结上文 IID、include、纯虚方法签名、非拥有指针和 `ReleaseBlock()` exactly-once 语义。
   - `[x]` T1.2：冻结 `pcapfile` 的 type/category/role、option JSON 校验、插件注册和 IID-only 多 provider 发现规则。
   - `[x]` T1.3：新增最小接口契约测试，覆盖头文件独立编译、同 IID 多实现 `Traverse()`、factory 枚举和 manager 的 `ENOTSUP`/`ENOENT` 返回。
-- `[-]` T2：文件解析与记录归一化（每个切片 10～30 分钟）：
+- `[x]` T2：文件解析与记录归一化（每个切片 10～30 分钟）：
   - `[x]` T2.1：实现 classic pcap magic/端序数值读取和 v2.4 global header 校验，加入最小 fixture。
   - `[x]` T2.2：实现 classic pcap record header、时间精度、长度校验和 packet bytes 读取，加入字段断言。
   - `[x]` T2.3：实现 pcapng SHB、section endian 和 block length 校验，加入多 section fixture。
@@ -292,7 +292,8 @@ LINKTYPE 支持的 packet 调用一次 `IProtocol::Layer()`，由 `src/channels/
   - `[x]` T2.5：实现 pcapng EPB、未知 interface/不支持 block 拒绝和结构错误终态。
   - `[x]` T2.6：将记录映射为 `PacketRecord`，完成 owning bytes、source/sequence、整数时间量化和 `EncodePacketBatch()` 单元测试。
   - `[x]` T2.7：修正 pcapng section 结构处理，迭代解析连续 SHB、校验 SHB options，并拒绝缺少 IDB 的 section。
-- `[-]` T3：`pcapfile` 通道生命周期与生产语义（每个切片 10～30 分钟）：
+  - `[x]` T2.8：以持久文件句柄增量读取 classic pcap/pcapng，移除 `Open()` 整文件加载，并把读取或分配失败收敛为 source error；该切片同时作为 T3 生命周期与错误终态的完成前置。
+- `[x]` T3：`pcapfile` 通道生命周期与生产语义（每个切片 10～30 分钟）：
   - `[x]` T3.1：实现 option parser/normalizer 和 `PcapFileChannel` 构造、`Open()`/`Close()`。
   - `[x]` T3.2：完成 pcapfile plugin 的 `IPlugin`/factory/manager 注册适配。
   - `[x]` T3.3：完成 factory 通道实例表、`Get/List` 和 provider 生命周期保持。

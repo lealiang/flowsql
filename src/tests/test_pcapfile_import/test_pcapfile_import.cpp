@@ -789,6 +789,78 @@ void TestMalformedPcapngAndFormatMismatch() {
     assert(mismatch.PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
 }
 
+void TestIncrementalReadAfterOpen() {
+    {
+        const std::string path = Temp("classic_truncated_after_open.pcap");
+        auto bytes = MakeClassicPcap(true, false, 0);
+        WriteFile(path, bytes);
+        MockProtocol protocol;
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        config.format = "pcap";
+        pcapfile::PcapFileChannel channel("classic_truncated_after_open", config, &protocol);
+        assert(channel.Open() == 0);
+        bytes.resize(24);
+        WriteFile(path, bytes);
+        const auto error = channel.PollBlock(0);
+        assert(error.kind == flowsql::BlockPollEvent::kError && !error.batch && error.err != 0);
+        assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
+    }
+    {
+        const std::string path = Temp("pcapng_truncated_after_open.pcapng");
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
+        const size_t section_header_size = bytes.size();
+        AppendPcapngInterface(&bytes, true, 1);
+        AppendPcapngEnhancedPacket(&bytes, true, 0, 0, {1, 2, 3, 4});
+        WriteFile(path, bytes);
+        MockProtocol protocol;
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        config.format = "pcapng";
+        pcapfile::PcapFileChannel channel("pcapng_truncated_after_open", config, &protocol);
+        assert(channel.Open() == 0);
+        bytes.resize(section_header_size);
+        WriteFile(path, bytes);
+        const auto error = channel.PollBlock(0);
+        assert(error.kind == flowsql::BlockPollEvent::kError && !error.batch && error.err != 0);
+        assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
+    }
+    {
+        std::vector<uint8_t> bytes;
+        AppendPcapngSectionHeader(&bytes, true);
+        AppendPcapngInterface(&bytes, true, 1);
+        Put32(&bytes, 6, true);
+        Put32(&bytes, 0xfffffffcU, true);
+        Put32(&bytes, 0, true);
+        AssertPcapngSourceError("oversized_declared_block.pcapng", bytes);
+    }
+    {
+        std::vector<uint8_t> bytes = {0xd4, 0xc3, 0xb2, 0xa1};
+        Put16(&bytes, 2, true);
+        Put16(&bytes, 4, true);
+        Put32(&bytes, 0, true);
+        Put32(&bytes, 0, true);
+        Put32(&bytes, 0xffffffffU, true);
+        Put32(&bytes, 1, true);
+        Put32(&bytes, 0, true);
+        Put32(&bytes, 0, true);
+        Put32(&bytes, 0xffffffffU, true);
+        Put32(&bytes, 0xffffffffU, true);
+        const std::string path = Temp("oversized_declared_packet.pcap");
+        WriteFile(path, bytes);
+        MockProtocol protocol;
+        pcapfile::PcapFileSourceConfig config;
+        config.path = path;
+        config.format = "pcap";
+        pcapfile::PcapFileChannel channel("oversized_declared_packet", config, &protocol);
+        assert(channel.Open() == 0);
+        const auto error = channel.PollBlock(0);
+        assert(error.kind == flowsql::BlockPollEvent::kError && !error.batch && error.err != 0);
+        assert(channel.PollBlock(0).kind == flowsql::BlockPollEvent::kCancelled);
+    }
+}
+
 void TestCancelAndManagerBusy() {
     const std::string path = Temp("manager_busy.pcap");
     auto bytes = MakeClassicPcap(true, false, 0);
@@ -911,6 +983,7 @@ int main() {
     TestCancelInterruptsReplayWait();
     TestBatchOwnerAndPluginLifecycle();
     TestMalformedPcapngAndFormatMismatch();
+    TestIncrementalReadAfterOpen();
     TestOptions();
     TestPluginManager();
     TestCancelAndManagerBusy();
