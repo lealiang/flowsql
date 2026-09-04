@@ -45,9 +45,13 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/plugins/npi ${CMAKE_BINARY_DIR}/npi_plugin)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_npi ${CMAKE_BINARY_DIR}/test_npi)
 add_subdirectory(${CMAKE_SOURCE_DIR}/plugins/baseline ${CMAKE_BINARY_DIR}/baseline_plugin)
 
+# Block-stream channel providers
+add_subdirectory(${CMAKE_SOURCE_DIR}/channels ${CMAKE_BINARY_DIR}/channels)
+
 # Stage 1: 框架核心
 add_subdirectory(${CMAKE_SOURCE_DIR}/framework ${CMAKE_BINARY_DIR}/framework)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_packet_contract ${CMAKE_BINARY_DIR}/test_packet_contract)
+add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_pcapfile_import ${CMAKE_BINARY_DIR}/test_pcapfile_import)
 add_subdirectory(${CMAKE_SOURCE_DIR}/tests/test_framework ${CMAKE_BINARY_DIR}/test_framework)
 
 # Stage 2: C++ ↔ Python 桥接

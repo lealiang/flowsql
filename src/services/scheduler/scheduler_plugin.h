@@ -25,6 +25,8 @@
 #include <framework/interfaces/ibridge.h>
 #include <framework/interfaces/ischeduler_control_service.h>
 #include <framework/interfaces/istream_channel.h>
+#include <framework/interfaces/iblock_stream_channel.h>
+#include <framework/interfaces/iblock_stream_operator.h>
 
 #include <rapidjson/document.h>
 
@@ -113,6 +115,11 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     // 算子查找
     std::shared_ptr<IOperator> FindOperator(const std::string& category, const std::string& name);
     std::shared_ptr<IOperator> CreateOperator(const std::string& category, const std::string& name);
+    IBlockStreamOperator* FindBlockOperator(const std::string& category, const std::string& name);
+    int ExecuteBlockOperator(IBlockStreamChannel* source,
+                             IBlockStreamOperator* op,
+                             int64_t* rows_affected,
+                             std::string* error);
 
     // 执行路径
     int ExecuteTransfer(IChannel* source, IChannel* sink,
@@ -213,11 +220,13 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
         std::vector<IChannel*> channels;
         std::vector<std::shared_ptr<IChannel>> channel_holders;
         std::vector<std::shared_ptr<IStreamChannel>> stream_channels;
+        std::vector<std::shared_ptr<IBlockStreamChannel>> block_channels;
         std::vector<std::string> source_keys;
         std::vector<std::string> resolved_sources;
         std::string source_expand_rule = "explicit";
         bool has_stream_source = false;
         bool has_non_stream_source = false;
+        bool has_block_source = false;
     };
     int32_t ResolveSourceBindings(const SqlStatement& stmt,
                                   SourceResolveResult* out,

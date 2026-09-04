@@ -29,6 +29,7 @@
 #include <unordered_set>
 
 #include "framework/core/channel_adapter.h"
+#include "framework/core/packet_codec.h"
 #include "framework/core/dataframe.h"
 #include "framework/core/dataframe_channel.h"
 #include "framework/core/fan_in_stream_channel.h"
@@ -51,6 +52,8 @@
 #include "framework/interfaces/istream_channel.h"
 #include "framework/interfaces/istream_factory.h"
 #include "framework/interfaces/istream_manager.h"
+#include "framework/interfaces/iblock_stream_channel.h"
+#include "framework/interfaces/iblock_stream_factory.h"
 #include "scheduler_json_codec.h"
 #include "scheduler_internal_utils.h"
 
@@ -417,6 +420,91 @@ std::shared_ptr<IOperator> SchedulerPlugin::CreateOperator(const std::string& ca
     return nullptr;
 }
 
+IBlockStreamOperator* SchedulerPlugin::FindBlockOperator(const std::string& category,
+                                                          const std::string& name) {
+    if (!querier_) return nullptr;
+    IBlockStreamOperator* found = nullptr;
+    size_t matches = 0;
+    querier_->Traverse(IID_BLOCK_STREAM_OPERATOR, [&](void* value) -> int {
+        auto* candidate = static_cast<IBlockStreamOperator*>(value);
+        if (!candidate || !IEquals(candidate->Category(), category) || candidate->Name() != name) return 0;
+        found = candidate;
+        ++matches;
+        return 0;
+    });
+    return matches == 1 ? found : nullptr;
+}
+
+int SchedulerPlugin::ExecuteBlockOperator(IBlockStreamChannel* source,
+                                           IBlockStreamOperator* op,
+                                           int64_t* rows_affected,
+                                           std::string* error) {
+    if (!source || !op) return EINVAL;
+    std::shared_ptr<arrow::Schema> schema;
+    int64_t rows = 0;
+    bool schema_ready = false;
+    while (true) {
+        const BlockPollEvent event = source->PollBlock(0);
+        if (event.kind == BlockPollEvent::kData) {
+            if (!event.batch) {
+                if (error) *error = "block operator received empty data batch";
+                return EINVAL;
+            }
+            const int64_t batch_rows = event.batch->num_rows();
+            int rc = 0;
+            try {
+                if (!schema_ready) {
+                    schema = event.batch->schema();
+                    if (!schema || !schema->Equals(flowsql::packet::PacketSchema())) {
+                        rc = EINVAL;
+                        if (error) *error = "block source schema does not match packet schema";
+                    } else {
+                        rc = op->OnSchemaReady(schema);
+                        schema_ready = rc == 0;
+                    }
+                }
+                if (rc == 0) rc = op->ProcessBlock(event.batch, 0);
+            } catch (const std::exception& ex) {
+                rc = EFAULT;
+                if (error) *error = ex.what();
+            } catch (...) {
+                rc = EFAULT;
+                if (error) *error = "block operator threw an unknown exception";
+            }
+            int release_rc = 0;
+            try {
+                release_rc = source->ReleaseBlock(event.batch);
+            } catch (...) {
+                release_rc = EFAULT;
+            }
+            if (release_rc != 0) {
+                if (error) *error = "block source ReleaseBlock failed";
+                return release_rc;
+            }
+            if (rc == 1) {
+                rows += batch_rows;
+                break;
+            }
+            if (rc < 0) {
+                if (error && error->empty()) *error = op->LastError();
+                return rc;
+            }
+            rows += batch_rows;
+            continue;
+        }
+        if (event.kind == BlockPollEvent::kEof) break;
+        if (error) *error = event.kind == BlockPollEvent::kCancelled ? "block source cancelled" : "block source poll failed";
+        return event.err != 0 ? event.err : EIO;
+    }
+    const int flush_rc = op->Flush();
+    if (flush_rc != 0) {
+        if (error && error->empty()) *error = op->LastError();
+        return flush_rc;
+    }
+    if (rows_affected) *rows_affected = rows;
+    return 0;
+}
+
 // --- Build Database Query ---
 
 // 从目标名称中提取表名（支持三段式 type.name.table）
@@ -473,6 +561,70 @@ int SchedulerPlugin::ExecuteTransfer(IChannel* source, IChannel* sink,
                                       const std::string& sink_type,
                                       const SqlStatement& stmt, int64_t* rows_affected,
                                       std::string* error) {
+    if (source_type == ChannelType::kBlockStream && sink_type == ChannelType::kDataFrame) {
+        auto* src = dynamic_cast<IBlockStreamChannel*>(source);
+        auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
+        if (!src || !dst) return -1;
+        if (!stmt.where_clause.empty()) {
+            if (error) *error = "WHERE is not supported for direct block source transfer";
+            return -1;
+        }
+        int64_t rows = 0;
+        bool wrote = false;
+        while (true) {
+            const BlockPollEvent event = src->PollBlock(0);
+            if (event.kind == BlockPollEvent::kData) {
+                if (!event.batch) {
+                    if (error) *error = "block source returned empty data batch";
+                    return -1;
+                }
+                int rc = 0;
+                const int64_t batch_rows = event.batch->num_rows();
+                try {
+                    DataFrame frame;
+                    frame.FromArrow(event.batch);
+                    if (auto* appendable = dynamic_cast<IAppendableDataFrameChannel*>(dst)) {
+                        rc = appendable->Append(&frame);
+                    } else if (!wrote) {
+                        rc = dst->Write(&frame);
+                    }
+                } catch (const std::exception& ex) {
+                    if (error) *error = ex.what();
+                    rc = EFAULT;
+                } catch (...) {
+                    if (error) *error = "block source sink threw an unknown exception";
+                    rc = EFAULT;
+                }
+                int release_rc = 0;
+                try {
+                    release_rc = src->ReleaseBlock(event.batch);
+                } catch (...) {
+                    release_rc = EFAULT;
+                }
+                if (release_rc != 0) {
+                    if (error) *error = "block source ReleaseBlock failed";
+                    return -1;
+                }
+                if (rc != 0) {
+                    if (error) *error = "write block source batch failed";
+                    return -1;
+                }
+                wrote = true;
+                rows += batch_rows;
+                continue;
+            }
+            if (event.kind == BlockPollEvent::kEof) break;
+            if (event.kind == BlockPollEvent::kCancelled) {
+                if (error) *error = "block source cancelled";
+                return -1;
+            }
+            if (error) *error = "block source poll failed";
+            return -1;
+        }
+        if (rows_affected) *rows_affected = rows;
+        return 0;
+    }
+
     if (source_type == ChannelType::kDataFrame && sink_type == ChannelType::kDataFrame) {
         auto* src = dynamic_cast<IDataFrameChannel*>(source);
         auto* dst = dynamic_cast<IDataFrameChannel*>(sink);
@@ -711,11 +863,13 @@ int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
     out->channels.clear();
     out->channel_holders.clear();
     out->stream_channels.clear();
+    out->block_channels.clear();
     out->source_keys.clear();
     out->resolved_sources.clear();
     out->source_expand_rule = "explicit";
     out->has_stream_source = false;
     out->has_non_stream_source = false;
+    out->has_block_source = false;
     if (err_rsp) err_rsp->clear();
 
     auto fail = [&](int32_t status,
@@ -754,9 +908,18 @@ int32_t SchedulerPlugin::ResolveSourceBindings(const SqlStatement& stmt,
 
         const std::string source_type = source_ch->Type() ? source_ch->Type() : "";
         if (source_type == ChannelType::kBlockStream) {
-            return fail(error::BAD_REQUEST,
-                        "block stream source is not implemented in current release",
-                        ErrorCodeId::kBlockStreamNotImplemented);
+            if (ref.has_selector) {
+                return fail(error::BAD_REQUEST, "block stream source does not support selector",
+                            ErrorCodeId::kStreamHubSelectorInvalid);
+            }
+            auto* block_ch = dynamic_cast<IBlockStreamChannel*>(source_ch);
+            if (!block_ch) return fail(error::BAD_REQUEST, "source channel cast to IBlockStreamChannel failed: " + ref.base);
+            out->has_block_source = true;
+            out->channels.push_back(source_ch);
+            out->block_channels.emplace_back(block_ch, [](IBlockStreamChannel*) {});
+            out->source_keys.push_back(std::string(block_ch->Category()) + "." + block_ch->Name());
+            out->resolved_sources.push_back(ref.base);
+            continue;
         }
 
         if (source_type != ChannelType::kStream) {

@@ -2,6 +2,9 @@
 // Licensed under the MIT License.
 
 #include <framework/core/packet_codec.h>
+#include <framework/interfaces/iblock_stream_factory.h>
+#include <framework/interfaces/iblock_stream_manager.h>
+#include <common/loader.hpp>
 #include <plugins/npi/packet_decoder.h>
 
 #include <common/network/netbase.h>
@@ -12,10 +15,12 @@
 
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <map>
 #include <string>
 #include <type_traits>
 #include <variant>
@@ -23,6 +28,105 @@
 namespace packet = flowsql::packet;
 
 namespace {
+
+class ContractBlockChannel final : public flowsql::IBlockStreamChannel {
+ public:
+    const char* Category() override { return "pcapfile"; }
+    const char* Name() override { return "contract"; }
+    const char* Type() override { return flowsql::ChannelType::kBlockStream; }
+    const char* Schema() override { return "packet"; }
+    int Open() override { return 0; }
+    int Close() override { return 0; }
+    bool IsOpened() const override { return true; }
+    int Flush() override { return 0; }
+    flowsql::BlockPollEvent PollBlock(int) override { return {}; }
+    int ReleaseBlock(const std::shared_ptr<arrow::RecordBatch>& block) override {
+        if (!block || released_) return EINVAL;
+        released_ = true;
+        return 0;
+    }
+    void Cancel() override {}
+    bool IsFinished() const override { return true; }
+    bool released_ = false;
+};
+
+class ContractFactory final : public flowsql::IBlockStreamFactory {
+ public:
+    explicit ContractFactory(flowsql::IBlockStreamChannel* channel) : channel_(channel) {}
+    flowsql::IBlockStreamChannel* Get(const char* type, const char* name) override {
+        return type && name && std::string(type) == "pcapfile" && std::string(name) == "contract" ? channel_ : nullptr;
+    }
+    void List(std::function<void(const char*, const char*, flowsql::IBlockStreamChannel*)> callback) override {
+        if (callback) callback("pcapfile", "contract", channel_);
+    }
+    flowsql::IBlockStreamChannel* channel_;
+};
+
+class ContractManager final : public flowsql::IBlockStreamManager {
+ public:
+    int AddChannel(const std::string&, const std::string&, const std::string&) override { return ENOTSUP; }
+    int ModifyChannel(const std::string&, const std::string&, const std::string&) override { return ENOENT; }
+    int RemoveChannel(const std::string&, const std::string&) override { return ENOENT; }
+    void QueryChannels(std::function<void(const std::string&, const std::string&, const std::string&, const std::string&)> callback) override {
+        if (callback) callback("pcapfile", "contract", "{}", "active");
+    }
+};
+
+class ContractQuerier final : public flowsql::IQuerier {
+ public:
+    void Add(const flowsql::Guid& iid, void* value) { entries_[iid].push_back(value); }
+    int Traverse(const flowsql::Guid& iid, fntraverse callback) override {
+        auto it = entries_.find(iid);
+        if (it == entries_.end()) return 0;
+        for (void* value : it->second) {
+            if (callback && callback(value) != 0) break;
+        }
+        return 0;
+    }
+    void* First(const flowsql::Guid& iid) override {
+        auto it = entries_.find(iid);
+        return it == entries_.end() || it->second.empty() ? nullptr : it->second.front();
+    }
+
+ private:
+    std::map<flowsql::Guid, std::vector<void*>> entries_;
+};
+
+void TestBlockStreamPublicContracts() {
+    static_assert(sizeof(flowsql::IID_BLOCK_STREAM_FACTORY.d4_) == 8);
+    static_assert(sizeof(flowsql::IID_BLOCK_STREAM_MANAGER.d4_) == 8);
+
+    ContractBlockChannel channel;
+    ContractFactory factory(&channel);
+    ContractManager manager;
+    ContractQuerier loader;
+    loader.Add(flowsql::IID_BLOCK_STREAM_FACTORY, &factory);
+    loader.Add(flowsql::IID_BLOCK_STREAM_FACTORY, &factory);
+    loader.Add(flowsql::IID_BLOCK_STREAM_MANAGER, &manager);
+
+    int factory_count = 0;
+    assert(loader.Traverse(flowsql::IID_BLOCK_STREAM_FACTORY, [&](void* value) {
+        assert(value == &factory);
+        ++factory_count;
+        return 0;
+    }) == 0);
+    assert(factory_count == 2);
+    assert(factory.Get("pcapfile", "contract") == &channel);
+    int listed = 0;
+    factory.List([&](const char* type, const char* name, flowsql::IBlockStreamChannel* value) {
+        assert(std::string(type) == "pcapfile");
+        assert(std::string(name) == "contract");
+        assert(value == &channel);
+        ++listed;
+    });
+    assert(listed == 1);
+    assert(manager.AddChannel("unsupported", "x", "{}") == ENOTSUP);
+    assert(manager.ModifyChannel("pcapfile", "missing", "{}") == ENOENT);
+    auto batch = arrow::RecordBatch::Make(flowsql::packet::PacketSchema(), 0,
+                                          std::vector<std::shared_ptr<arrow::Array>>{});
+    assert(channel.ReleaseBlock(batch) == 0);
+    assert(channel.ReleaseBlock(batch) != 0);
+}
 
 class MockLayerDecoder final : public packet::IPacketLayerDecoder {
  public:
@@ -689,6 +793,7 @@ void TestNpiProtocolIdentifier() {
 
 int main() {
     TestAddressReuseAndVariant();
+    TestBlockStreamPublicContracts();
     TestContractDefaultsAndInterfaces();
     TestPacketEnvelopeAndSchema();
     TestPacketRecordBatchEncoding();

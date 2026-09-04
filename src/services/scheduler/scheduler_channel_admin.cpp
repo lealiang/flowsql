@@ -13,6 +13,8 @@
 #include "framework/interfaces/ichannel_registry.h"
 #include "framework/interfaces/idatabase_factory.h"
 #include "framework/interfaces/idataframe_channel.h"
+#include "framework/interfaces/iblock_stream_factory.h"
+#include "framework/interfaces/iblock_stream_channel.h"
 #include "framework/interfaces/istream_factory.h"
 #include "scheduler_internal_utils.h"
 
@@ -106,6 +108,40 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name, std::shared_ptr<
                 if (owner_out) *owner_out = MakeNonOwningChannelHolderLocal(matched);
                 return matched;
             }
+        }
+    }
+
+    // Block-stream providers are discovered by IID and may be present more than once.
+    if (querier_) {
+        const auto dot = name.find('.');
+        const std::string requested_type = dot == std::string::npos ? "" : ToLowerAscii(name.substr(0, dot));
+        const std::string requested_name = dot == std::string::npos ? name : name.substr(dot + 1);
+        IBlockStreamChannel* matched = nullptr;
+        bool ambiguous = false;
+        size_t match_count = 0;
+        querier_->Traverse(IID_BLOCK_STREAM_FACTORY, [&](void* value) -> int {
+            auto* factory = static_cast<IBlockStreamFactory*>(value);
+            if (!factory) return 0;
+            if (!requested_type.empty()) {
+                auto* candidate = factory->Get(requested_type.c_str(), requested_name.c_str());
+                if (candidate) {
+                    ++match_count;
+                    if (matched != candidate) matched = candidate;
+                    if (match_count > 1) ambiguous = true;
+                }
+            } else {
+                factory->List([&](const char* type, const char* candidate_name, IBlockStreamChannel* candidate) {
+                    if (!type || !candidate_name || !candidate || std::string(candidate_name) != requested_name) return;
+                    ++match_count;
+                    if (matched != candidate) matched = candidate;
+                    if (match_count > 1) ambiguous = true;
+                });
+            }
+            return 0;
+        });
+        if (!ambiguous && matched) {
+            if (owner_out) *owner_out = MakeNonOwningChannelHolderLocal(matched);
+            return matched;
         }
     }
 
