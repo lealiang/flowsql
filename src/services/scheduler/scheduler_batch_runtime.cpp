@@ -1,10 +1,5 @@
-/*
- * Copyright (C) 2026 LIHUO
- *
- * Licensed under the MIT License. See LICENSE file in the project root
- * for full license information.
- *
- */
+// Copyright (C) 2026 LIHUO. All rights reserved.
+// Licensed under the MIT License.
 
 #include "scheduler_batch_runtime.h"
 
@@ -16,6 +11,24 @@
 
 namespace flowsql {
 namespace scheduler {
+
+namespace {
+
+BatchRuntimeStatus ParseExecuteTerminalStatus(const std::string& rsp) {
+    if (rsp.empty()) return BatchRuntimeStatus::kCompleted;
+    rapidjson::Document d;
+    d.Parse(rsp.c_str());
+    if (d.HasParseError() || !d.IsObject() ||
+        !d.HasMember("status") || !d["status"].IsString()) {
+        return BatchRuntimeStatus::kCompleted;
+    }
+    const std::string status = d["status"].GetString();
+    if (status == "stopped") return BatchRuntimeStatus::kStopped;
+    if (status == "cancelled") return BatchRuntimeStatus::kCancelled;
+    return BatchRuntimeStatus::kCompleted;
+}
+
+}  // namespace
 
 const char* BatchRuntimeStatusName(BatchRuntimeStatus status) {
     switch (status) {
@@ -299,6 +312,7 @@ void SchedulerBatchRuntime::ExecuteTask(const std::shared_ptr<BatchRuntimeTask>&
         int64_t rows = 0;
         int64_t cols = 0;
         std::string target;
+        const BatchRuntimeStatus execute_status = ParseExecuteTerminalStatus(exec_rsp);
         ParseExecuteResult(exec_rsp, &rows, &cols, &target);
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -313,6 +327,13 @@ void SchedulerBatchRuntime::ExecuteTask(const std::shared_ptr<BatchRuntimeTask>&
                 task->snapshot.error_code = "TIMEOUT";
                 task->snapshot.error_stage = "timeout";
                 task->snapshot.error_message = "batch runtime task timeout";
+                task->snapshot.finished_ms = CurrentTimeMs();
+                task->snapshot.last_active_ms = task->snapshot.finished_ms;
+                return;
+            }
+            if (execute_status == BatchRuntimeStatus::kStopped ||
+                execute_status == BatchRuntimeStatus::kCancelled) {
+                task->snapshot.status = execute_status;
                 task->snapshot.finished_ms = CurrentTimeMs();
                 task->snapshot.last_active_ms = task->snapshot.finished_ms;
                 return;

@@ -1,10 +1,5 @@
-/*
- * Copyright (C) 2026 LIHUO
- *
- * Licensed under the MIT License. See LICENSE file in the project root
- * for full license information.
- *
- */
+// Copyright (C) 2026 LIHUO. All rights reserved.
+// Licensed under the MIT License.
 
 #include "scheduler_plugin.h"
 
@@ -67,24 +62,44 @@ static std::shared_ptr<IChannel> MakeNonOwningChannelHolder(IChannel* ch) {
     return std::shared_ptr<IChannel>(ch, [](IChannel*) {});
 }
 
-struct BlockManagerRouteResult {
+size_t SchedulerPlugin::TraverseBlockFactories(
+    const std::function<int(IBlockStreamFactory*)>& visitor) const {
+    if (!querier_ || !visitor) return 0;
     size_t provider_count = 0;
-    size_t accepted_count = 0;
-    int accepted_rc = ENOTSUP;
-    bool conflict = false;
-};
+    querier_->Traverse(IID_BLOCK_STREAM_FACTORY, [&](void* value) -> int {
+        auto* provider = static_cast<IBlockStreamFactory*>(value);
+        if (!provider) return 0;
+        ++provider_count;
+        return visitor(provider);
+    });
+    return provider_count;
+}
 
-static BlockManagerRouteResult RouteBlockManagers(
-    IQuerier* querier,
-    const std::function<int(IBlockStreamManager*)>& operation) {
+size_t SchedulerPlugin::TraverseBlockManagers(
+    const std::function<int(IBlockStreamManager*)>& visitor) const {
+    if (!querier_ || !visitor) return 0;
+    size_t provider_count = 0;
+    querier_->Traverse(IID_BLOCK_STREAM_MANAGER, [&](void* value) -> int {
+        auto* provider = static_cast<IBlockStreamManager*>(value);
+        if (!provider) return 0;
+        ++provider_count;
+        return visitor(provider);
+    });
+    return provider_count;
+}
+
+SchedulerPlugin::BlockManagerRouteResult SchedulerPlugin::RouteBlockManagers(
+    const std::function<int(IBlockStreamManager*)>& operation,
+    bool ignore_not_found) const {
     BlockManagerRouteResult result;
-    if (!querier || !operation) return result;
-    querier->Traverse(IID_BLOCK_STREAM_MANAGER, [&](void* value) -> int {
-        auto* manager = static_cast<IBlockStreamManager*>(value);
-        if (!manager) return 0;
-        ++result.provider_count;
+    if (!operation) return result;
+    result.provider_count = TraverseBlockManagers([&](IBlockStreamManager* manager) -> int {
         const int rc = operation(manager);
         if (rc == ENOTSUP) return 0;
+        if (ignore_not_found && rc == ENOENT) {
+            ++result.not_found_count;
+            return 0;
+        }
         ++result.accepted_count;
         if (result.accepted_count == 1) {
             result.accepted_rc = rc;
@@ -96,23 +111,22 @@ static BlockManagerRouteResult RouteBlockManagers(
     return result;
 }
 
-static bool BlockManagerOwnsChannel(IQuerier* querier,
-                                    const std::string& type,
-                                    const std::string& name) {
-    if (!querier) return false;
-    bool found = false;
-    querier->Traverse(IID_BLOCK_STREAM_MANAGER, [&](void* value) -> int {
-        auto* manager = static_cast<IBlockStreamManager*>(value);
-        if (!manager) return 0;
+std::vector<IBlockStreamManager*> SchedulerPlugin::FindBlockManagerOwners(
+    const std::string& type,
+    const std::string& name) const {
+    std::vector<IBlockStreamManager*> owners;
+    TraverseBlockManagers([&](IBlockStreamManager* manager) -> int {
+        bool owns_channel = false;
         manager->QueryChannels([&](const std::string& item_type,
                                    const std::string& item_name,
                                    const std::string&,
                                    const std::string&) {
-            if (ToLowerAscii(item_type) == ToLowerAscii(type) && item_name == name) found = true;
+            if (ToLowerAscii(item_type) == ToLowerAscii(type) && item_name == name) owns_channel = true;
         });
-        return found ? -1 : 0;
+        if (owns_channel) owners.push_back(manager);
+        return 0;
     });
-    return found;
+    return owners;
 }
 
 static std::shared_ptr<IStreamChannel> MakeStreamOwner(IStreamChannel* stream_ch,
@@ -897,17 +911,25 @@ int32_t SchedulerPlugin::HandleExecute(const std::string&, const std::string& re
             }
             int64_t rows = 0;
             std::string block_error;
+            BlockExecutionTerminal block_terminal = BlockExecutionTerminal::kFailed;
             const int block_rc = ExecuteBlockOperator(source_resolved.block_channels.front().get(), block_op,
-                                                      &rows, &block_error);
-            if (block_rc != 0) {
+                                                      &block_terminal, &rows, &block_error);
+            if (block_terminal == BlockExecutionTerminal::kFailed ||
+                (block_terminal != BlockExecutionTerminal::kCancelled && block_rc != 0)) {
                 rsp = BuildExecutionErrorJson(block_error.empty() ? "block stream execution failed" : block_error,
                                               ErrorCodeId::kOpExecFail, ErrorStageId::kExecute);
                 return error::INTERNAL_ERROR;
             }
+            const char* block_status = "completed";
+            if (block_terminal == BlockExecutionTerminal::kStopped) {
+                block_status = "stopped";
+            } else if (block_terminal == BlockExecutionTerminal::kCancelled) {
+                block_status = "cancelled";
+            }
             rapidjson::StringBuffer block_buf;
             rapidjson::Writer<rapidjson::StringBuffer> block_writer(block_buf);
             block_writer.StartObject();
-            block_writer.Key("status"); block_writer.String("completed");
+            block_writer.Key("status"); block_writer.String(block_status);
             block_writer.Key("rows"); block_writer.Int64(rows);
             block_writer.Key("result_row_count"); block_writer.Int64(rows);
             block_writer.EndObject();
@@ -1182,9 +1204,7 @@ int32_t SchedulerPlugin::HandleGetChannels(const std::string&, const std::string
             });
         }
 
-        querier_->Traverse(IID_BLOCK_STREAM_FACTORY, [&w](void* value) -> int {
-            auto* factory = static_cast<IBlockStreamFactory*>(value);
-            if (!factory) return 0;
+        TraverseBlockFactories([&w](IBlockStreamFactory* factory) -> int {
             factory->List([&w](const char* type, const char* name, IBlockStreamChannel* channel) {
                 if (!type || !name || !channel) return;
                 w.StartObject();
@@ -1381,9 +1401,7 @@ int32_t SchedulerPlugin::HandleQueryStreamChannels(const std::string&,
         });
     }
 
-    if (querier_) querier_->Traverse(IID_BLOCK_STREAM_MANAGER, [&w](void* value) -> int {
-        auto* manager = static_cast<IBlockStreamManager*>(value);
-        if (!manager) return 0;
+    TraverseBlockManagers([&w](IBlockStreamManager* manager) -> int {
         manager->QueryChannels([&w](const std::string& type,
                                     const std::string& name,
                                     const std::string& option,
@@ -1458,8 +1476,16 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
         rsp = BuildErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"role\":\"...\",\"options\":{...}}");
         return error::BAD_REQUEST;
     }
+    std::string role = role_raw.empty() ? "both" : NormalizeStreamRole(role_raw);
+    if (role.empty()) {
+        rsp = BuildErrorJson("invalid role, expected source|sink|both");
+        return error::BAD_REQUEST;
+    }
+    if (!option_legacy.empty() && role_raw.empty()) {
+        role = ReadRoleFromOption(option_legacy);
+    }
 
-    {
+    if (role == "source") {
         std::string option;
         if (options_obj) {
             option = OptionObjectToJson(*options_obj);
@@ -1475,9 +1501,10 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
             option = "{}";
         }
         const auto route = RouteBlockManagers(
-            querier_, [&](IBlockStreamManager* manager) {
+            [&](IBlockStreamManager* manager) {
                 return manager->AddChannel(ToLowerAscii(type), name, option);
-            });
+            },
+            false);
         if (route.conflict) {
             rsp = BuildErrorJson("multiple block stream managers accepted request: " + type + "." + name);
             return error::CONFLICT;
@@ -1494,14 +1521,6 @@ int32_t SchedulerPlugin::HandleAddStreamChannel(const std::string&,
     if (!stream_manager) {
         rsp = BuildErrorJson("stream manager unavailable");
         return error::UNAVAILABLE;
-    }
-    std::string role = role_raw.empty() ? "both" : NormalizeStreamRole(role_raw);
-    if (role.empty()) {
-        rsp = BuildErrorJson("invalid role, expected source|sink|both");
-        return error::BAD_REQUEST;
-    }
-    if (!option_legacy.empty() && role_raw.empty()) {
-        role = ReadRoleFromOption(option_legacy);
     }
 
     auto* builtin_registry = querier_ ? static_cast<IBuiltinRegistry*>(querier_->First(IID_BUILTIN_REGISTRY)) : nullptr;
@@ -1594,6 +1613,14 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
         rsp = BuildErrorJson("invalid request, expected {\"type\":\"...\",\"name\":\"...\",\"role\":\"...\",\"options\":{...}}");
         return error::BAD_REQUEST;
     }
+    std::string role = role_raw.empty() ? "both" : NormalizeStreamRole(role_raw);
+    if (role.empty()) {
+        rsp = BuildErrorJson("invalid role, expected source|sink|both");
+        return error::BAD_REQUEST;
+    }
+    if (!option_legacy.empty() && role_raw.empty()) {
+        role = ReadRoleFromOption(option_legacy);
+    }
 
     {
         std::string option;
@@ -1610,9 +1637,17 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
         } else {
             option = "{}";
         }
-        const bool block_channel_exists = BlockManagerOwnsChannel(querier_, type, name);
+        const auto owners = FindBlockManagerOwners(type, name);
+        if (owners.size() > 1) {
+            rsp = BuildErrorJson("multiple block stream managers own channel: " + type + "." + name);
+            return error::CONFLICT;
+        }
+        if (!owners.empty() && role != "source") {
+            rsp = BuildErrorJson("block stream channel role must be source: " + type + "." + name);
+            return error::BAD_REQUEST;
+        }
         std::unique_ptr<void, std::function<void(void*)>> mutation_guard;
-        if (block_channel_exists) {
+        if (!owners.empty()) {
             SweepFinishedTaskLeases();
             const std::string key = MakeStreamChannelKey(type, name);
             std::string mutation_reason;
@@ -1628,36 +1663,43 @@ int32_t SchedulerPlugin::HandleModifyStreamChannel(const std::string&,
                 reinterpret_cast<void*>(1),
                 [this, key](void*) { EndStreamChannelMutation(key); });
         }
-        const auto route = RouteBlockManagers(
-            querier_, [&](IBlockStreamManager* manager) {
-                return manager->ModifyChannel(ToLowerAscii(type), name, option);
-            });
-        if (route.conflict) {
-            rsp = BuildErrorJson("multiple block stream managers accepted request: " + type + "." + name);
-            return error::CONFLICT;
-        }
-        if (route.accepted_count == 1) {
-            if (route.accepted_rc != 0) {
+        if (!owners.empty()) {
+            const int rc = owners.front()->ModifyChannel(ToLowerAscii(type), name, option);
+            if (rc != 0) {
                 rsp = BuildErrorJson("modify block stream channel failed: " + type + "." + name);
-                return MapStreamManagerErrorToStatus(route.accepted_rc);
+                return MapStreamManagerErrorToStatus(rc);
             }
             rsp = R"({"ok":true})";
             return error::OK;
+        }
+        if (role == "source") {
+            const auto route = RouteBlockManagers(
+                [&](IBlockStreamManager* manager) {
+                    return manager->ModifyChannel(ToLowerAscii(type), name, option);
+                },
+                true);
+            if (route.conflict) {
+                rsp = BuildErrorJson("multiple block stream managers accepted request: " + type + "." + name);
+                return error::CONFLICT;
+            }
+            if (route.accepted_count == 1) {
+                if (route.accepted_rc != 0) {
+                    rsp = BuildErrorJson("modify block stream channel failed: " + type + "." + name);
+                    return MapStreamManagerErrorToStatus(route.accepted_rc);
+                }
+                rsp = R"({"ok":true})";
+                return error::OK;
+            }
+            if (route.not_found_count != 0 && !stream_manager) {
+                rsp = BuildErrorJson("block stream channel not found: " + type + "." + name);
+                return error::NOT_FOUND;
+            }
         }
     }
     if (!stream_manager) {
         rsp = BuildErrorJson("stream manager unavailable");
         return error::UNAVAILABLE;
     }
-    std::string role = role_raw.empty() ? "both" : NormalizeStreamRole(role_raw);
-    if (role.empty()) {
-        rsp = BuildErrorJson("invalid role, expected source|sink|both");
-        return error::BAD_REQUEST;
-    }
-    if (!option_legacy.empty() && role_raw.empty()) {
-        role = ReadRoleFromOption(option_legacy);
-    }
-
     auto* builtin_registry = querier_ ? static_cast<IBuiltinRegistry*>(querier_->First(IID_BUILTIN_REGISTRY)) : nullptr;
     if (builtin_registry) {
         StreamChannelTypeDescriptor def;
@@ -1810,10 +1852,14 @@ int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
     const std::string name = doc["name"].GetString();
 
     {
-        const bool block_channel_exists = BlockManagerOwnsChannel(querier_, type, name);
+        const auto owners = FindBlockManagerOwners(type, name);
+        if (owners.size() > 1) {
+            rsp = BuildErrorJson("multiple block stream managers own channel: " + type + "." + name);
+            return error::CONFLICT;
+        }
         std::unique_ptr<void, std::function<void(void*)>> mutation_guard;
         std::string mutation_key;
-        if (block_channel_exists) {
+        if (!owners.empty()) {
             SweepFinishedTaskLeases();
             mutation_key = MakeStreamChannelKey(type, name);
             std::string mutation_reason;
@@ -1829,10 +1875,20 @@ int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
                 reinterpret_cast<void*>(1),
                 [this, mutation_key](void*) { EndStreamChannelMutation(mutation_key); });
         }
+        if (!owners.empty()) {
+            const int rc = owners.front()->RemoveChannel(ToLowerAscii(type), name);
+            if (rc != 0) {
+                rsp = BuildErrorJson("remove block stream channel failed: " + type + "." + name);
+                return MapStreamManagerErrorToStatus(rc);
+            }
+            rsp = R"({"ok":true})";
+            return error::OK;
+        }
         const auto route = RouteBlockManagers(
-            querier_, [&](IBlockStreamManager* manager) {
+            [&](IBlockStreamManager* manager) {
                 return manager->RemoveChannel(ToLowerAscii(type), name);
-            });
+            },
+            true);
         if (route.conflict) {
             rsp = BuildErrorJson("multiple block stream managers accepted request: " + type + "." + name);
             return error::CONFLICT;
@@ -1844,6 +1900,10 @@ int32_t SchedulerPlugin::HandleRemoveStreamChannel(const std::string&,
             }
             rsp = R"({"ok":true})";
             return error::OK;
+        }
+        if (route.not_found_count != 0 && !stream_manager) {
+            rsp = BuildErrorJson("block stream channel not found: " + type + "." + name);
+            return error::NOT_FOUND;
         }
     }
     if (!stream_manager) {

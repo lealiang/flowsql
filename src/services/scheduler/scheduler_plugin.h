@@ -1,10 +1,5 @@
-/*
- * Copyright (C) 2026 LIHUO
- *
- * Licensed under the MIT License. See LICENSE file in the project root
- * for full license information.
- *
- */
+// Copyright (C) 2026 LIHUO. All rights reserved.
+// Licensed under the MIT License.
 
 #ifndef _FLOWSQL_SCHEDULER_SCHEDULER_PLUGIN_H_
 #define _FLOWSQL_SCHEDULER_SCHEDULER_PLUGIN_H_
@@ -40,6 +35,8 @@
 namespace flowsql {
 
 class IChannel;
+class IBlockStreamFactory;
+class IBlockStreamManager;
 class IOperator;
 struct SqlStatement;
 
@@ -110,14 +107,40 @@ class SchedulerPlugin : public IPlugin, public IRouterHandle, public ISchedulerC
     std::vector<std::pair<std::string, std::shared_ptr<IChannel>>> SnapshotManagedChannels();
     IChannel* FindChannel(const std::string& name);
     IChannel* FindChannel(const std::string& name, std::shared_ptr<IChannel>* owner_out);
+    IChannel* FindChannel(const std::string& name,
+                          std::shared_ptr<IChannel>* owner_out,
+                          bool* ambiguous_out);
     void RegisterChannel(const std::string& key, std::shared_ptr<IChannel> ch);
+    size_t TraverseBlockFactories(const std::function<int(IBlockStreamFactory*)>& visitor) const;
+    size_t TraverseBlockManagers(const std::function<int(IBlockStreamManager*)>& visitor) const;
+
+    struct BlockManagerRouteResult {
+        size_t provider_count = 0;
+        size_t accepted_count = 0;
+        size_t not_found_count = 0;
+        int accepted_rc = 0;
+        bool conflict = false;
+    };
+    BlockManagerRouteResult RouteBlockManagers(
+        const std::function<int(IBlockStreamManager*)>& operation,
+        bool ignore_not_found) const;
+    std::vector<IBlockStreamManager*> FindBlockManagerOwners(
+        const std::string& type,
+        const std::string& name) const;
 
     // 算子查找
     std::shared_ptr<IOperator> FindOperator(const std::string& category, const std::string& name);
     std::shared_ptr<IOperator> CreateOperator(const std::string& category, const std::string& name);
     IBlockStreamOperator* FindBlockOperator(const std::string& category, const std::string& name);
+    enum class BlockExecutionTerminal {
+        kCompleted,
+        kStopped,
+        kCancelled,
+        kFailed,
+    };
     int ExecuteBlockOperator(IBlockStreamChannel* source,
                              IBlockStreamOperator* op,
+                             BlockExecutionTerminal* terminal,
                              int64_t* rows_affected,
                              std::string* error);
 

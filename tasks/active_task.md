@@ -1,56 +1,64 @@
 # Active Task
 
 Feature：`npm-offline-import`
-原子任务：T2.8 增量 reader 与资源错误收敛
+原子任务：T4.5 block 执行终态与 batch 快照传播
 状态：已完成
 
 ## 业务意图
 
-- 让 `PcapFileReader::Open()` 只读取容器头，并通过持久文件句柄在 `Next()` 中增量读取记录或 block。
-- 消除文件大小直接决定 `Open()` 内存占用的问题，并让晚到的截断、读取失败和 reader 分配失败稳定进入 source error 终态。
+- 让 block operator 的成功、主动停止、source 取消、异常和 operator 错误形成明确内部终态。
+- 将 completed/stopped/cancelled 结果写入 `HandleExecute()` JSON，并让现有 `SchedulerBatchRuntime` 写入对应任务快照。
+- 让 operator 异常和错误稳定进入 failed 快照，不能在 release 后继续轮询并误报成功。
 
 ## Non-Goals
 
-- 不修改公共 block stream ABI、option parser、回放、layer decode 或 Scheduler 路由。
-- 不增加未在规格中定义的文件大小、packet 大小或 batch 字节数硬限制；单包 owning bytes 和 batch owner 语义保持不变。
-- 不改 manager/factory 行为，也不处理 T1、T4 或 T5 的纠偏问题。
-- 不修改 Scheduler block source 执行路径或多 provider 路由。
+- 不修改 T4.1～T4.4 的 provider/manager 路由、schema 门禁、poll 事件或 exactly-once release 契约。
+- 不修改 pcapfile provider、reader、replay、背压实现、公共 block ABI 或公共 HTTP 接口。
+- 不重构 `SchedulerBatchRuntime::ExecuteSqlFn`，不为运行中的同步 SQL 新增抢占式 RequestStop 取消令牌；本任务的 cancelled 来自 source `kCancelled` 事件。
+- 不支持多 block source、多 block operator 或 Arrow/block 混合链路，不开始 T5 全量回归。
 
 ## 边界
 
-- classic pcap 的 global header 在 `Open()` 读取，record header 和 packet bytes 在 `Next()` 按需读取。
-- pcapng 的首个 SHB 在 `Open()` 读取，后续 block 在 `Next()` 逐块读取；不得保留整文件副本。
-- 在按声明长度分配 block/packet 内存前，先以文件剩余字节数拒绝不可能满足的长度，避免恶意长度触发大分配。
-- reader 内的 `std::bad_alloc`/`std::length_error` 转换为明确错误码；channel 仍保持一次 `kError`、后续 `kCancelled`。
-- 保持 T2.1～T2.7 已有格式、字段、section、source/sequence、EOF 和错误语义不变。
+- `ExecuteBlockOperator()` 使用私有内部终态：EOF + Flush 成功为 completed，`ProcessBlock()==1` + Flush 成功为 stopped，source `kCancelled` 为 cancelled，其余非零/异常为 failed。
+- `ProcessBlock()` 返回 0 才继续，1 为主动停止，负数或大于 1 的非法正数均为 failed；抛异常转换为 `EFAULT` failed。
+- data batch 无论 operator 成功、主动停止、返回错误或抛异常，仍先执行 T4.4 冻结的 exactly-once `ReleaseBlock()`。
+- block route 的成功 JSON 使用 `status=completed|stopped|cancelled`；failed 继续使用现有 `OP_EXEC_FAIL`、`error_stage=execute` 错误 JSON。
+- batch runtime 对 successful execute JSON 中的 stopped/cancelled 立即形成对应终态；completed 保持现有完成路径，failed 保持现有错误解析路径。
 
 ## 允许修改的文件
 
-- `tasks/active_task.md`：更新本任务状态、验收证据和停止结果。
-- `tasks/specs/feat-npm-offline-import.md`：仅新增并勾选 T2.8，以及在全部验收通过后收敛 T2/T3 父任务状态。
-- `src/channels/pcapfile/pcap_file_channel.cpp`：仅将 reader 改为持久句柄增量读取并收敛 reader 资源错误。
-- `src/tests/test_pcapfile_import/test_pcapfile_import.cpp`：仅补增量读取、晚到截断和声明长度不触发大分配的回归断言。
+- `tasks/active_task.md`：冻结 T4.5 边界并记录状态和验收证据。
+- `tasks/specs/feat-npm-offline-import.md`：仅在验收通过后勾选 T4.5，并在 T4.1～T4.5 均完成时勾选 T4 父任务。
+- `src/services/scheduler/scheduler_plugin.h`：仅增加私有 block 执行终态及 helper 输出参数。
+- `src/services/scheduler/scheduler_stream_executor.cpp`：仅生成 block completed/stopped/cancelled/failed 内部终态并修正异常/非法正返回值。
+- `src/services/scheduler/scheduler_routes.cpp`：仅把 block completed/stopped/cancelled 写入同步执行 JSON。
+- `src/services/scheduler/scheduler_batch_runtime.cpp`：仅解析执行结果 status 并写入 stopped/cancelled batch 快照。
+- `src/tests/test_scheduler_e2e/test_scheduler_mutation_guard.cpp`：仅补 T4.5 同步结果和异步 batch 快照断言。
+
+开始本任务前已有且必须保留、不再修改的基线 diff：`AGENTS.md` 以及 T4.1～T4.4 涉及的
+`scheduler_plugin.h`、`scheduler_channel_admin.cpp`、`scheduler_routes.cpp`、
+`scheduler_stream_executor.cpp`、`test_scheduler_mutation_guard.cpp` 和 Feature 文档改动。
 
 ## 验收
 
-- classic pcap 和 pcapng 在 `Open()` 后截断尚未读取的数据时，首次 `PollBlock()` 产生 `kError`，后续为 `kCancelled`；不得从 `Open()` 的缓存继续发布旧数据。
-- 声明长度远大于实际剩余文件时直接产生 source error，不先按声明长度分配内存。
-- 既有 classic pcap、pcapng、多 section、replay、cancel、owner 和错误终态测试保持通过。
-- 定向命令：`cmake --build build --target test_pcapfile_import -j2`，随后运行 `build/output/test_pcapfile_import`。
-- 完成后执行 `git diff --check`；不运行 T4/T5 的 Scheduler 或 Feature 全量回归。
+- 同步 block route 的 EOF 成功、主动停止和 source 取消分别返回 completed、stopped、cancelled；异常和 operator 错误返回 `OP_EXEC_FAIL/execute`。
+- batch runtime 快照对上述路径分别为 completed、stopped、cancelled、failed、failed，且都有完成时间。
+- `ProcessBlock()` 抛异常或返回错误时，当前 data batch 恰好 release 一次，后续 batch 不再轮询。
+- 主动停止仍执行一次 `Flush()`；cancelled、异常和 operator 错误不执行 `Flush()`。
+- 定向命令：`cmake --build build --target test_scheduler_mutation_guard -j2`，随后运行 `build/output/test_scheduler_mutation_guard`。
+- 完成后执行 `git diff HEAD --check`；不运行 T5 或无关回归。
 
 ## 时间盒与停止条件
 
 - 时间盒：30 分钟。
-- 仅在允许文件内完成 T2.8 测试、最小实现和定向验收；发现其他任务问题只记录，不扩展范围。
-- 到达验收条件后立即勾选 T2.8、记录验收证据并停止；若当前错误无法在边界内修复，则记录复现依据后停止。
+- 只完成 T4.5 的 block 终态与现有 batch snapshot 传播；达到验收条件后勾选 T4.5/T4 并停止。
+- 若必须扩展公共 ABI 或重构 RequestStop/执行回调才能满足 source 事件终态，则记录具体阻塞并停止，不吸收 T5。
 
 ## 验收证据
 
-- 测试先行红灯：classic pcap 在 `Open()` 后截断到 global header，旧实现仍从整文件缓存发布 data，新增断言失败。
-- `PcapFileReader` 现仅在 `Open()` 读取 classic global header 或首个 pcapng SHB；record、后续 block、options 和 packet bytes 均通过持久文件句柄顺序读取。
-- classic packet 与 pcapng block 在按声明长度分配前先核对文件剩余长度；reader 内的 `std::bad_alloc`/`std::length_error` 分别收敛为 `ENOMEM`/`EOVERFLOW`。
-- `cmake --build build --target test_pcapfile_import -j2`：通过。
-- `build/output/test_pcapfile_import`：通过，输出 `[PASS] pcapfile import`；覆盖 Open 后 classic/pcapng 截断、超大声明 packet/block、原有格式解析、回放、cancel、背压、错误终态和 owner 生命周期。
-- `git diff --check`：通过。
-- 停止结果：T2.8 及其作为 T3 的完成前置已通过，T2/T3 父任务收敛为完成；未处理 T1、T4 或 T5 问题。
+- `cmake --build build --target test_scheduler_mutation_guard -j2`：通过。
+- `build/output/test_scheduler_mutation_guard`：通过，输出
+  `=== Scheduler mutation guard tests passed ===`。
+- `git diff HEAD --check`：通过，无输出。
+- 环境未提供 `clang-format`/`git-clang-format`；新增 C++ 行已人工检查，未超过 120 列。
+- T4.5 与 T4 已勾选完成；未开始 T5。

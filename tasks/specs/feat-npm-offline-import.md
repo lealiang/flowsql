@@ -302,12 +302,12 @@ LINKTYPE 支持的 packet 调用一次 `IProtocol::Layer()`，由 `src/channels/
   - `[x]` T3.6：实现 `PcapLayerAdapter`，接入 `IID_PROTOCOL`/`IProtocol::Layer()` 及 layer 状态映射。
   - `[x]` T3.7：实现 fast/timestamp replay 和相邻时间差的确定性等待。
   - `[x]` T3.8：实现 cancel、背压、I/O/格式错误终态和 batch owner 生命周期。
-- `[ ]` T4：Scheduler block source 接入（每个切片 10～30 分钟）：
-  - `[ ]` T4.1：新增 block factory/manager 的 IID 遍历 helper，覆盖零个、一个和多个实现。
-  - `[ ]` T4.2：实现 `(type,name)` source 查找、重复通道冲突和 manager `ENOTSUP`/唯一命中路由。
-  - `[ ]` T4.3：解除 `BLOCK_STREAM_NOT_IMPLEMENTED`，接入现有 `IBlockStreamOperator::OnSchemaReady()`。
-  - `[ ]` T4.4：接入 `ProcessBlock()`、`kTimeout`/`kEof`/`kCancelled`/`kError` 事件和 `ReleaseBlock()`。
-  - `[ ]` T4.5：补齐成功、主动停止、异常、取消和 operator 错误路径的任务终态传播。
+- `[x]` T4：Scheduler block source 接入（每个切片 10～30 分钟）：
+  - `[x]` T4.1：新增 block factory/manager 的 IID 遍历 helper，覆盖零个、一个和多个实现。
+  - `[x]` T4.2：实现 `(type,name)` source 查找、重复通道冲突和 manager `ENOTSUP`/唯一命中路由。
+  - `[x]` T4.3：解除 `BLOCK_STREAM_NOT_IMPLEMENTED`，接入现有 `IBlockStreamOperator::OnSchemaReady()`。
+  - `[x]` T4.4：接入 `ProcessBlock()`、`kTimeout`/`kEof`/`kCancelled`/`kError` 事件和 `ReleaseBlock()`。
+  - `[x]` T4.5：补齐成功、主动停止、异常、取消和 operator 错误路径的任务终态传播。
 - `[ ]` T5：测试与工程闭环（每个切片 10～30 分钟）：
   - `[ ]` T5.1：补齐 classic pcap/pcapng 格式、字段、顺序、时间量化和结构错误 fixture。
   - `[ ]` T5.2：补齐 layer decode 调用次数、unsupported/truncated/malformed 和 raw bytes 保留测试。

@@ -1,10 +1,5 @@
-/*
- * Copyright (C) 2026 LIHUO
- *
- * Licensed under the MIT License. See LICENSE file in the project root
- * for full license information.
- *
- */
+// Copyright (C) 2026 LIHUO. All rights reserved.
+// Licensed under the MIT License.
 
 #include "scheduler_plugin.h"
 
@@ -69,11 +64,18 @@ void SchedulerPlugin::RegisterChannel(const std::string& key, std::shared_ptr<IC
 }
 
 IChannel* SchedulerPlugin::FindChannel(const std::string& name) {
-    return FindChannel(name, nullptr);
+    return FindChannel(name, nullptr, nullptr);
 }
 
 IChannel* SchedulerPlugin::FindChannel(const std::string& name, std::shared_ptr<IChannel>* owner_out) {
+    return FindChannel(name, owner_out, nullptr);
+}
+
+IChannel* SchedulerPlugin::FindChannel(const std::string& name,
+                                       std::shared_ptr<IChannel>* owner_out,
+                                       bool* ambiguous_out) {
     if (owner_out) owner_out->reset();
+    if (ambiguous_out) *ambiguous_out = false;
     auto* ch_registry = querier_ ? static_cast<IChannelRegistry*>(querier_->First(IID_CHANNEL_REGISTRY)) : nullptr;
     if (IsDataframeRefName(name) && ch_registry) {
         auto ch = ch_registry->Get(DataframeNamePart(name).c_str());
@@ -119,9 +121,7 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name, std::shared_ptr<
         IBlockStreamChannel* matched = nullptr;
         bool ambiguous = false;
         size_t match_count = 0;
-        querier_->Traverse(IID_BLOCK_STREAM_FACTORY, [&](void* value) -> int {
-            auto* factory = static_cast<IBlockStreamFactory*>(value);
-            if (!factory) return 0;
+        TraverseBlockFactories([&](IBlockStreamFactory* factory) -> int {
             if (!requested_type.empty()) {
                 auto* candidate = factory->Get(requested_type.c_str(), requested_name.c_str());
                 if (candidate) {
@@ -139,6 +139,10 @@ IChannel* SchedulerPlugin::FindChannel(const std::string& name, std::shared_ptr<
             }
             return 0;
         });
+        if (ambiguous) {
+            if (ambiguous_out) *ambiguous_out = true;
+            return nullptr;
+        }
         if (!ambiguous && matched) {
             if (owner_out) *owner_out = MakeNonOwningChannelHolderLocal(matched);
             return matched;
